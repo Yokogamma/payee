@@ -2,7 +2,8 @@
 
 /* ─── Reset & Variables ─────────────────────────────────────── */
 
-:root {
+:root,
+[data-theme="dark"] {
   --bg: #0a0a0f;
   --bg-card: #12121a;
   --bg-input: #1a1a26;
@@ -22,6 +23,24 @@
   --radius-sm: 8px;
   --font: 'Outfit', -apple-system, system-ui, sans-serif;
   --mono: 'JetBrains Mono', monospace;
+}
+
+[data-theme="light"] {
+  --bg: #f5f5f7;
+  --bg-card: #ffffff;
+  --bg-input: #eeeef2;
+  --bg-hover: #e5e5eb;
+  --border: #d1d1d9;
+  --border-focus: #a0a0b4;
+  --text: #1a1a2e;
+  --text-dim: #6b6b80;
+  --text-muted: #9999ad;
+  --accent: #5b52ee;
+  --accent-glow: rgba(91, 82, 238, 0.12);
+  --green: #1aab8a;
+  --green-glow: rgba(26, 171, 138, 0.1);
+  --red: #dc3545;
+  --yellow: #d4a017;
 }
 
 *, *::before, *::after {

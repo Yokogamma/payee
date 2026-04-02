@@ -28,7 +28,16 @@ export function Main() {
   const [inviteError, setInviteError] = useState('');
   const [inviteLoading, setInviteLoading] = useState(false);
   const [checkingAccess, setCheckingAccess] = useState(false);
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    return (localStorage.getItem('theme') as 'dark' | 'light') || 'dark';
+  });
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Apply theme
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('theme', theme);
+  }, [theme]);
 
   // Autofocus on mount
   useEffect(() => {
@@ -241,6 +250,17 @@ export function Main() {
                 <div>📝 Заметок: <strong>{notes.length}</strong></div>
                 <div>🔐 Шифрование: <strong>AES-256-GCM</strong></div>
               </div>
+            </div>
+
+            <div className="settings-section">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={theme === 'light'}
+                  onChange={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+                />
+                <span>Светлая тема</span>
+              </label>
             </div>
 
             {/* Arweave Section */}
