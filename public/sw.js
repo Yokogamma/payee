@@ -1,4 +1,4 @@
-const CACHE_NAME = 'eternal-notes-v2';
+const CACHE_NAME = 'eternal-notes-__BUILD_HASH__';
 const BASE = '/payee/';
 
 // App shell — cached on install
