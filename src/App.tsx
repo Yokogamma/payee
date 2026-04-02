@@ -1,4 +1,5 @@
 import { NotesProvider, useNotes } from './lib/store';
+import { Landing } from './screens/Landing';
 import { Onboarding } from './screens/Onboarding';
 import { Restore } from './screens/Restore';
 import { Main } from './screens/Main';
@@ -9,6 +10,8 @@ function AppRouter() {
   switch (screen) {
     case 'loading':
       return <div className="screen-center"><div className="loader" /></div>;
+    case 'landing':
+      return <Landing />;
     case 'onboarding':
       return <Onboarding />;
     case 'restore':

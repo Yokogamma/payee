@@ -1,0 +1,28 @@
+name = "eternal-notes-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-03-31"
+
+[durable_objects]
+bindings = [
+  { name = "RATE_LIMITER", class_name = "RateLimiter" },
+  { name = "INVITE_MANAGER", class_name = "InviteManager" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter", "InviteManager"]
+
+# KV namespace for allowlist cache (fast lookup during /upload)
+# Source of truth = InviteManager DO. KV = read-through cache.
+# Create via: wrangler kv namespace create ALLOWLIST
+[[kv_namespaces]]
+binding = "ALLOWLIST"
+id = "8d9e7ee08bff44f793933d69718600ef"
+
+[vars]
+ALLOWED_ORIGINS = "https://yokogamma.github.io,http://localhost:5173"
+MAX_BODY_BYTES = "51200"
+RATE_LIMIT_PER_HOUR = "20"
+
+# Secrets (via `wrangler secret put`):
+# ARWEAVE_JWK — server Arweave wallet (JSON string)

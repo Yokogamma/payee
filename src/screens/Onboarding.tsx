@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNotes } from '../lib/store';
 
 export function Onboarding() {
-  const { createNewWallet, confirmMnemonic, goToRestore } = useNotes();
+  const { createNewWallet, confirmMnemonic, goToRestore, goToLanding } = useNotes();
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
@@ -42,6 +42,9 @@ export function Onboarding() {
             </button>
             <button className="btn btn-ghost" onClick={goToRestore}>
               У меня есть seed-фраза
+            </button>
+            <button className="btn btn-ghost" onClick={goToLanding}>
+              ← Назад
             </button>
           </>
         ) : (

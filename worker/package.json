@@ -1,0 +1,19 @@
+{
+  "name": "eternal-notes-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "seed-invite": "wrangler dev --test-scheduled"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260301.0",
+    "wrangler": "^4.0.0",
+    "typescript": "~5.8.0"
+  },
+  "dependencies": {
+    "arweave": "^1.15.5",
+    "@noble/ed25519": "^2.2.3"
+  }
+}

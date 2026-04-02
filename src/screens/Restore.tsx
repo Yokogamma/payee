@@ -1,11 +1,17 @@
 import { useState } from 'react';
 import { useNotes } from '../lib/store';
+import { VaultMismatchError } from '../lib/store';
 
 export function Restore() {
-  const { restoreFromMnemonic, goToOnboarding } = useNotes();
+  const { restoreFromMnemonic, goToOnboarding, resetApp, vaultError } = useNotes();
   const [words, setWords] = useState<string[]>(Array(12).fill(''));
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showReset, setShowReset] = useState(false);
+
+  // Show vault error from bootstrap if present
+  const displayError = error || vaultError;
+  const displayShowReset = showReset || !!vaultError;
 
   function handleWordChange(index: number, value: string) {
     const updated = [...words];
@@ -33,10 +39,21 @@ export function Restore() {
     setLoading(true);
     try {
       await restoreFromMnemonic(mnemonic);
-    } catch {
-      setError('Неверная seed-фраза. Проверьте слова.');
+    } catch (err) {
+      if (err instanceof VaultMismatchError) {
+        setError(err.message);
+        setShowReset(true);
+      } else {
+        setError('Неверная seed-фраза. Проверьте слова.');
+      }
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleReset() {
+    if (confirm('Удалить все локальные данные? Это действие необратимо.')) {
+      await resetApp();
     }
   }
 
@@ -65,7 +82,13 @@ export function Restore() {
           ))}
         </div>
 
-        {error && <div className="error-msg">{error}</div>}
+        {displayError && <div className="error-msg">{displayError}</div>}
+
+        {displayShowReset && (
+          <button className="btn btn-danger full-width" onClick={handleReset}>
+            Сбросить приложение
+          </button>
+        )}
 
         <button
           className="btn btn-primary"

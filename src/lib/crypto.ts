@@ -1,32 +1,37 @@
 /**
  * Eternal Notes — Core Crypto Module
  *
- * Всё шифрование на клиенте. Ключ никогда не покидает устройство.
+ * Pure cryptographic operations. No storage/persistence.
  *
  * Flow:
- *   generateMnemonic() → 12 слов
+ *   generateMnemonic() → 12 words
  *   deriveKey(mnemonic) → CryptoKey (AES-256-GCM)
- *   encrypt(key, plaintext) → { ciphertext, iv, salt }
+ *   encrypt(key, plaintext) → EncryptedNote { noteId, ciphertext, iv, createdAt }
  *   decrypt(key, encrypted) → plaintext
  *
- * Восстановление:
- *   Ввёл 12 слов → deriveKey() → тот же ключ → расшифровка всех заметок
+ * Signing (Ed25519):
+ *   deriveSigningKeypair(mnemonic) → { privateKey, publicKey }
+ *   deriveOwnerHash(publicKey) → SHA-256(publicKey) base64
+ *   signPayload(privateKey, payload) → signature base64
  */
 
 import { generateMnemonic as genMnemonic, validateMnemonic, mnemonicToSeedSync } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
+import * as ed25519 from '@noble/ed25519';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface EncryptedNote {
-  /** Base64-encoded ciphertext */
+  /** Unique ID (crypto.randomUUID). Primary key in IndexedDB and Arweave tag. */
+  noteId: string;
+  /** Base64-encoded ciphertext (includes GCM auth tag — integrity guaranteed) */
   ciphertext: string;
   /** Base64-encoded 12-byte IV (unique per note) */
   iv: string;
   /** Timestamp of creation */
   createdAt: number;
-  /** SHA-256 hash of plaintext (for deduplication/integrity) */
-  hash: string;
+  // No hash field. GCM auth tag inside ciphertext ensures integrity.
+  // If decrypt succeeds — data is not corrupted.
 }
 
 export interface NoteData {
@@ -62,10 +67,8 @@ export function isValidMnemonic(mnemonic: string): boolean {
  * Deterministic: same mnemonic always produces same key.
  */
 export async function deriveKey(mnemonic: string): Promise<CryptoKey> {
-  // BIP-39: mnemonic → 64-byte seed
   const seed = mnemonicToSeedSync(mnemonic);
 
-  // Import the first 32 bytes as raw key material for HKDF
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
     seed.slice(0, 32),
@@ -74,45 +77,80 @@ export async function deriveKey(mnemonic: string): Promise<CryptoKey> {
     ['deriveKey']
   );
 
-  // HKDF: derive AES-256-GCM key
-  // Salt and info are fixed — deterministic derivation from the same seed
   const salt = new TextEncoder().encode('eternal-notes-v1');
   const info = new TextEncoder().encode('aes-256-gcm-encryption');
 
   return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt,
-      info,
-    },
+    { name: 'HKDF', hash: 'SHA-256', salt, info },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
-    false, // not extractable — key never leaves CryptoKey object
+    false,
     ['encrypt', 'decrypt']
   );
 }
 
+// ─── Ed25519 Signing ────────────────────────────────────────────────
+
 /**
- * Derive a deterministic "owner hash" from a mnemonic.
- * Used as a public identifier on Arweave to find all notes by this user.
- * Does NOT reveal the mnemonic or encryption key.
+ * Derive deterministic Ed25519 keypair from mnemonic.
+ * seed → HKDF(info="ed25519-signing-v1") → 32 bytes → Ed25519 private key → public key
  */
-export async function deriveOwnerHash(mnemonic: string): Promise<string> {
+export async function deriveSigningKeypair(mnemonic: string): Promise<{
+  privateKey: Uint8Array;
+  publicKey: Uint8Array;
+}> {
   const seed = mnemonicToSeedSync(mnemonic);
-  // Use the second half of the seed (bytes 32-64) for owner hash
-  // This ensures owner hash is independent from encryption key
-  const hashBuffer = await crypto.subtle.digest('SHA-256', seed.slice(32, 64));
+
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    seed.slice(0, 32),
+    'HKDF',
+    false,
+    ['deriveBits']
+  );
+
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new TextEncoder().encode('eternal-notes-v1'),
+      info: new TextEncoder().encode('ed25519-signing-v1'),
+    },
+    keyMaterial,
+    256
+  );
+
+  const privateKey = new Uint8Array(bits);
+  const publicKey = await ed25519.getPublicKeyAsync(privateKey);
+
+  return { privateKey, publicKey };
+}
+
+/**
+ * Derive owner hash from Ed25519 public key.
+ * ownerHash = SHA-256(publicKey) — verifiable by Worker (R5).
+ */
+export async function deriveOwnerHash(publicKey: Uint8Array): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', publicKey as BufferSource);
   return bufferToBase64(hashBuffer);
+}
+
+/**
+ * Sign SHA-256 digest of a payload string with Ed25519 private key.
+ * Returns base64-encoded signature.
+ */
+export async function signPayload(privateKey: Uint8Array, payload: string): Promise<string> {
+  const data = new TextEncoder().encode(payload);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  const signature = await ed25519.signAsync(digest, privateKey);
+  return bufferToBase64(signature);
 }
 
 // ─── Encryption / Decryption ─────────────────────────────────────────
 
 /**
  * Encrypt a plaintext note with AES-256-GCM.
- *
- * Each note gets a unique random IV (12 bytes).
- * Returns base64-encoded ciphertext + IV.
+ * Each note gets a unique random IV (12 bytes) and a random noteId (UUID).
  */
 export async function encrypt(
   key: CryptoKey,
@@ -124,26 +162,24 @@ export async function encrypt(
   // Random 12-byte IV — MUST be unique per encryption
   const iv = crypto.getRandomValues(new Uint8Array(12));
 
-  // AES-256-GCM encryption
+  // AES-256-GCM encryption (auth tag is appended to ciphertext)
   const ciphertextBuffer = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     key,
     data
   );
 
-  // SHA-256 hash of plaintext (for integrity/dedup)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-
   return {
+    noteId: crypto.randomUUID(),
     ciphertext: bufferToBase64(ciphertextBuffer),
     iv: bufferToBase64(iv),
     createdAt: Date.now(),
-    hash: bufferToBase64(hashBuffer),
   };
 }
 
 /**
  * Decrypt an encrypted note back to plaintext.
+ * If decryption fails, the ciphertext was tampered with or wrong key used.
  */
 export async function decrypt(
   key: CryptoKey,
@@ -163,7 +199,7 @@ export async function decrypt(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-function bufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
+export function bufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let binary = '';
   for (let i = 0; i < bytes.byteLength; i++) {
@@ -172,58 +208,11 @@ function bufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
   return btoa(binary);
 }
 
-function base64ToBuffer(base64: string): Uint8Array {
+export function base64ToBuffer(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
-}
-
-// ─── Storage (local cache) ───────────────────────────────────────────
-
-const STORAGE_KEY = 'eternal-notes-encrypted';
-const MNEMONIC_CHECK_KEY = 'eternal-notes-init';
-
-/**
- * Save encrypted notes to local storage (cache for offline/fast access)
- */
-export function saveToLocal(notes: EncryptedNote[]): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
-}
-
-/**
- * Load encrypted notes from local storage
- */
-export function loadFromLocal(): EncryptedNote[] {
-  const data = localStorage.getItem(STORAGE_KEY);
-  if (!data) return [];
-  try {
-    return JSON.parse(data);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Check if app is initialized (has a mnemonic set up)
- */
-export function isInitialized(): boolean {
-  return localStorage.getItem(MNEMONIC_CHECK_KEY) === 'true';
-}
-
-/**
- * Mark app as initialized
- */
-export function markInitialized(): void {
-  localStorage.setItem(MNEMONIC_CHECK_KEY, 'true');
-}
-
-/**
- * Clear all local data (for testing/reset)
- */
-export function clearLocal(): void {
-  localStorage.removeItem(STORAGE_KEY);
-  localStorage.removeItem(MNEMONIC_CHECK_KEY);
 }

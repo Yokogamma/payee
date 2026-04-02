@@ -581,13 +581,119 @@ h1 {
   margin-bottom: 4px;
 }
 
-.wallet-addr {
-  font-family: var(--mono);
-  font-size: 11px;
-  background: var(--bg-input);
-  padding: 2px 6px;
-  border-radius: 4px;
+/* ─── Landing ──────────────────────────────────────────────── */
+
+.landing-card {
+  max-width: 520px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.landing-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.landing-logo {
+  font-size: 56px;
+}
+
+.landing-features {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.feature {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  text-align: left;
+}
+
+.feature-icon {
+  font-size: 22px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.feature-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 3px;
+}
+
+.feature-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+.landing-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ─── Restoring Banner ─────────────────────────────────────── */
+
+.restoring-banner {
+  background: var(--accent-glow);
+  border-bottom: 1px solid rgba(108, 99, 255, 0.2);
   color: var(--accent);
-  user-select: all;
-  word-break: break-all;
+  font-size: 13px;
+  padding: 8px 16px;
+  text-align: center;
+  flex-shrink: 0;
+  animation: pulse-bg 2s ease-in-out infinite;
+}
+
+@keyframes pulse-bg {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* ─── Invite Section ───────────────────────────────────────── */
+
+.invite-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.invite-row {
+  display: flex;
+  gap: 8px;
+}
+
+.invite-input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
+}
+
+.invite-input:focus {
+  border-color: var(--accent);
+}
+
+.invite-btn {
+  width: auto !important;
+  white-space: nowrap;
+  padding: 8px 16px !important;
+  font-size: 13px !important;
 }

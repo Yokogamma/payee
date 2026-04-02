@@ -12,9 +12,11 @@ export function Main() {
     resetApp,
     notes,
     arweave,
-    syncToArweave,
-    restoreFromArweave,
     toggleArweave,
+    retrySync,
+    restoring,
+    registerWithInvite,
+    checkAccess,
   } = useNotes();
 
   const [text, setText] = useState('');
@@ -22,6 +24,10 @@ export function Main() {
   const [showSettings, setShowSettings] = useState(false);
   const [showSeed, setShowSeed] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+  const [inviteCode, setInviteCode] = useState('');
+  const [inviteError, setInviteError] = useState('');
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [checkingAccess, setCheckingAccess] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // Autofocus on mount
@@ -46,6 +52,29 @@ export function Main() {
     }
   }
 
+  async function handleInvite() {
+    if (!inviteCode.trim()) return;
+    setInviteLoading(true);
+    setInviteError('');
+    try {
+      await registerWithInvite(inviteCode.trim());
+      setInviteCode('');
+    } catch (err) {
+      setInviteError(err instanceof Error ? err.message : 'Ошибка регистрации');
+    } finally {
+      setInviteLoading(false);
+    }
+  }
+
+  async function handleCheckAccess() {
+    setCheckingAccess(true);
+    try {
+      await checkAccess();
+    } finally {
+      setCheckingAccess(false);
+    }
+  }
+
   function formatDate(ts: number): string {
     const d = new Date(ts);
     const now = new Date();
@@ -67,6 +96,13 @@ export function Main() {
 
   return (
     <div className="main-screen">
+      {/* Restoring Banner */}
+      {restoring && (
+        <div className="restoring-banner">
+          ⏳ Восстанавливаем заметки из Arweave...
+        </div>
+      )}
+
       {/* Header */}
       <header className="main-header">
         <div className="header-left">
@@ -224,56 +260,76 @@ export function Main() {
                 <div>Статус: <strong style={{color: arweave.online ? '#2dd4a8' : '#f05365'}}>
                   {arweave.online ? '● Онлайн' : '○ Оффлайн'}
                 </strong></div>
-                {arweave.walletAddress && (
-                  <div>Кошелёк: <code className="wallet-addr">
-                    {arweave.walletAddress.slice(0, 8)}...{arweave.walletAddress.slice(-6)}
-                  </code></div>
+                <div>Синхронизировано: <strong>{arweave.acceptedCount}</strong> из <strong>{notes.length}</strong></div>
+                {arweave.unsyncedCount > 0 && (
+                  <div>⏳ Ожидают загрузки: <strong>{arweave.unsyncedCount}</strong></div>
                 )}
-                {arweave.balance !== null && (
-                  <div>Баланс: <strong>{parseFloat(arweave.balance).toFixed(6)} AR</strong></div>
-                )}
-                {arweave.pendingUploads > 0 && (
-                  <div>⏳ Ожидают загрузки: <strong>{arweave.pendingUploads}</strong></div>
+                {arweave.errorCount > 0 && (
+                  <div style={{color: 'var(--red)'}}>⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
                 )}
                 {arweave.lastSync && (
                   <div>Последняя синхронизация: {new Date(arweave.lastSync).toLocaleString('ru')}</div>
                 )}
               </div>
 
-              {arweave.error && (
-                <div className="error-msg">{arweave.error}</div>
+              {arweave.lastError && (
+                <div className="error-msg">{arweave.lastError}</div>
               )}
 
-              <div style={{display: 'flex', gap: 8}}>
+              {/* Retry button */}
+              {arweave.enabled && (arweave.unsyncedCount > 0 || arweave.lastError) && (
                 <button
                   className="btn btn-outline full-width"
-                  onClick={syncToArweave}
-                  disabled={arweave.syncing || !arweave.online}
+                  onClick={retrySync}
+                  disabled={arweave.syncing}
                 >
-                  {arweave.syncing ? '⏳ Загрузка...' : '↑ Загрузить в Arweave'}
+                  {arweave.syncing ? '⏳ Загрузка...' : '↻ Повторить загрузку'}
                 </button>
-                <button
-                  className="btn btn-outline full-width"
-                  onClick={restoreFromArweave}
-                  disabled={arweave.syncing || !arweave.online}
-                >
-                  {arweave.syncing ? '⏳ ...' : '↓ Скачать из Arweave'}
-                </button>
-              </div>
+              )}
 
-              {arweave.balance === '0.000000000000' && arweave.walletAddress && (
-                <div className="seed-warning">
-                  💡 Для загрузки заметок в Arweave нужен токен AR.
-                  Пополните кошелёк: <code className="wallet-addr">{arweave.walletAddress}</code>
-                  <br/><br/>
-                  ~0.001 AR ≈ $0.01 хватит на сотни заметок.
+              {/* Invite / Registration section */}
+              {!arweave.registered && (
+                <div className="invite-section">
+                  <div className="settings-info">
+                    <div>Для синхронизации введите invite code</div>
+                  </div>
+                  <div className="invite-row">
+                    <input
+                      type="text"
+                      className="invite-input"
+                      placeholder="Invite code..."
+                      value={inviteCode}
+                      onChange={e => { setInviteCode(e.target.value); setInviteError(''); }}
+                    />
+                    <button
+                      className="btn btn-primary invite-btn"
+                      onClick={handleInvite}
+                      disabled={inviteLoading || !inviteCode.trim()}
+                    >
+                      {inviteLoading ? '...' : 'Активировать'}
+                    </button>
+                  </div>
+                  {inviteError && <div className="error-msg">{inviteError}</div>}
+                  <button
+                    className="btn btn-ghost full-width"
+                    onClick={handleCheckAccess}
+                    disabled={checkingAccess}
+                  >
+                    {checkingAccess ? 'Проверяю...' : 'Проверить доступ к синхронизации'}
+                  </button>
+                </div>
+              )}
+
+              {arweave.registered && (
+                <div className="settings-info">
+                  <div style={{color: 'var(--green)'}}>✓ Синхронизация доступна</div>
                 </div>
               )}
             </div>
 
             <div className="settings-section">
               <button className="btn btn-danger full-width" onClick={() => {
-                if (confirm('Удалить все локальные данные? Заметки в блокчейне сохранятся (когда будет интеграция).')) {
+                if (confirm('Удалить все локальные данные? Заметки в блокчейне сохранятся.')) {
                   resetApp();
                 }
               }}>
