@@ -80,6 +80,22 @@ export class VaultMismatchError extends Error {
   }
 }
 
+export class PinLockedError extends Error {
+  secondsLeft: number;
+  constructor(secondsLeft: number) {
+    super(`PIN заблокирован на ${secondsLeft} сек`);
+    this.name = 'PinLockedError';
+    this.secondsLeft = secondsLeft;
+  }
+}
+
+export class PinWipedError extends Error {
+  constructor() {
+    super('PIN удалён после 10 неудачных попыток. Введите seed-фразу.');
+    this.name = 'PinWipedError';
+  }
+}
+
 interface NotesStore {
   screen: AppScreen;
   isReady: boolean;
@@ -689,11 +705,52 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const unlockWithPinAction = useCallback(async (pin: string) => {
+    // 1. Check lockout
+    const lockedUntil = await getMeta<number>('pin-locked-until');
+    if (lockedUntil && Date.now() < lockedUntil) {
+      const secsLeft = Math.ceil((lockedUntil - Date.now()) / 1000);
+      throw new PinLockedError(secsLeft);
+    }
+
     const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
     if (!pinData) throw new Error('No PIN set');
 
-    // decryptWithPin throws on wrong PIN (GCM auth failure)
-    const mn = await decryptWithPin(pinData, pin);
+    // 2. Try decrypt
+    let mn: string;
+    try {
+      mn = await decryptWithPin(pinData, pin);
+    } catch {
+      // Wrong PIN — increment attempts
+      const attempts = ((await getMeta<number>('pin-attempts')) ?? 0) + 1;
+      await setMeta('pin-attempts', attempts);
+
+      if (attempts >= 10) {
+        // Wipe PIN — require seed
+        await deleteMeta('pin-seed');
+        await deleteMeta('pin-attempts');
+        await deleteMeta('pin-locked-until');
+        setHasPin(false);
+        throw new PinWipedError();
+      }
+
+      // Progressive lockout
+      const lockSeconds =
+        attempts <= 3 ? 0 :
+        attempts <= 5 ? 30 :
+        attempts <= 7 ? 300 :
+        1800;
+
+      if (lockSeconds > 0) {
+        await setMeta('pin-locked-until', Date.now() + lockSeconds * 1000);
+        throw new PinLockedError(lockSeconds);
+      }
+
+      throw new Error('wrong_pin');
+    }
+
+    // 3. Success — reset attempts
+    await deleteMeta('pin-attempts');
+    await deleteMeta('pin-locked-until');
 
     await setupFromMnemonic(mn);
     sessionStorage.setItem('eternal-notes-session', mn);
