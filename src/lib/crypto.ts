@@ -216,3 +216,71 @@ export function base64ToBuffer(base64: string): Uint8Array {
   }
   return bytes;
 }
+
+// ─── PIN Encryption ─────────────────────────────────────────────────
+
+/**
+ * Derive AES-256 key from PIN using PBKDF2.
+ * Salt ensures different keys for same PIN across devices.
+ */
+async function derivePinKey(pin: string, salt: Uint8Array): Promise<CryptoKey> {
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(pin),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt as BufferSource, iterations: 600_000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+export interface PinEncryptedSeed {
+  ciphertext: string; // base64
+  iv: string;         // base64
+  salt: string;       // base64
+}
+
+/**
+ * Encrypt mnemonic with PIN. Returns ciphertext + iv + salt.
+ */
+export async function encryptWithPin(mnemonic: string, pin: string): Promise<PinEncryptedSeed> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await derivePinKey(pin, salt);
+
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(mnemonic)
+  );
+
+  return {
+    ciphertext: bufferToBase64(ciphertext),
+    iv: bufferToBase64(iv),
+    salt: bufferToBase64(salt),
+  };
+}
+
+/**
+ * Decrypt mnemonic with PIN. Throws on wrong PIN (GCM auth failure).
+ */
+export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<string> {
+  const salt = base64ToBuffer(encrypted.salt);
+  const iv = base64ToBuffer(encrypted.iv);
+  const ciphertext = base64ToBuffer(encrypted.ciphertext);
+  const key = await derivePinKey(pin, salt);
+
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    key,
+    ciphertext as BufferSource
+  );
+
+  return new TextDecoder().decode(decrypted);
+}

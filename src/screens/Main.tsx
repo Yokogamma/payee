@@ -17,6 +17,9 @@ export function Main() {
     restoring,
     registerWithInvite,
     checkAccess,
+    hasPin,
+    setupPin,
+    removePin,
   } = useNotes();
 
   const [text, setText] = useState('');
@@ -28,6 +31,10 @@ export function Main() {
   const [inviteError, setInviteError] = useState('');
   const [inviteLoading, setInviteLoading] = useState(false);
   const [checkingAccess, setCheckingAccess] = useState(false);
+  const [pinInput, setPinInput] = useState('');
+  const [pinConfirm, setPinConfirm] = useState('');
+  const [pinError, setPinError] = useState('');
+  const [showPinSetup, setShowPinSetup] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     return (localStorage.getItem('theme') as 'dark' | 'light') || 'dark';
   });
@@ -82,6 +89,18 @@ export function Main() {
     } finally {
       setCheckingAccess(false);
     }
+  }
+
+  async function handleSetupPin() {
+    if (pinInput.length < 4) { setPinError('Минимум 4 цифры'); return; }
+    if (pinInput !== pinConfirm) { setPinError('PIN-коды не совпадают'); return; }
+    await setupPin(pinInput);
+    setPinInput(''); setPinConfirm(''); setPinError(''); setShowPinSetup(false);
+  }
+
+  async function handleRemovePin() {
+    await removePin();
+    setShowPinSetup(false);
   }
 
   function formatDate(ts: number): string {
@@ -249,7 +268,56 @@ export function Main() {
               <div className="settings-info">
                 <div>📝 Заметок: <strong>{notes.length}</strong></div>
                 <div>🔐 Шифрование: <strong>AES-256-GCM</strong></div>
+                <div>🔑 PIN-код: <strong>{hasPin ? 'установлен' : 'не установлен'}</strong></div>
               </div>
+            </div>
+
+            {/* PIN Section */}
+            <div className="settings-section">
+              {!hasPin ? (
+                !showPinSetup ? (
+                  <button
+                    className="btn btn-outline full-width"
+                    onClick={() => setShowPinSetup(true)}
+                  >
+                    Установить PIN-код
+                  </button>
+                ) : (
+                  <div className="pin-setup">
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      className="pin-input"
+                      placeholder="PIN (мин. 4 цифры)"
+                      value={pinInput}
+                      maxLength={8}
+                      onChange={e => { setPinInput(e.target.value.replace(/\D/g, '')); setPinError(''); }}
+                    />
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      className="pin-input"
+                      placeholder="Повторите PIN"
+                      value={pinConfirm}
+                      maxLength={8}
+                      onChange={e => { setPinConfirm(e.target.value.replace(/\D/g, '')); setPinError(''); }}
+                    />
+                    {pinError && <div className="error-msg">{pinError}</div>}
+                    <button className="btn btn-primary full-width" onClick={handleSetupPin}>
+                      Сохранить PIN
+                    </button>
+                    <button className="btn btn-ghost full-width" onClick={() => { setShowPinSetup(false); setPinError(''); }}>
+                      Отмена
+                    </button>
+                  </div>
+                )
+              ) : (
+                <button className="btn btn-outline full-width" onClick={handleRemovePin}>
+                  Удалить PIN-код
+                </button>
+              )}
             </div>
 
             <div className="settings-section">

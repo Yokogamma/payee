@@ -2,6 +2,7 @@ import { NotesProvider, useNotes } from './lib/store';
 import { Landing } from './screens/Landing';
 import { Onboarding } from './screens/Onboarding';
 import { Restore } from './screens/Restore';
+import { PinUnlock } from './screens/PinUnlock';
 import { Main } from './screens/Main';
 import './index.css';
 
@@ -16,6 +17,8 @@ function AppRouter() {
       return <Onboarding />;
     case 'restore':
       return <Restore />;
+    case 'pin':
+      return <PinUnlock />;
     case 'main':
       return <Main />;
   }

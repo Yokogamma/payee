@@ -15,9 +15,12 @@ import {
   signPayload,
   encrypt,
   decrypt,
+  encryptWithPin,
+  decryptWithPin,
   bufferToBase64,
   type EncryptedNote,
   type NoteData,
+  type PinEncryptedSeed,
 } from './crypto';
 import {
   isArweaveOnline,
@@ -38,12 +41,13 @@ import {
   setSyncRecord,
   getMeta,
   setMeta,
+  deleteMeta,
   resetAll,
 } from './storage';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
-export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'main';
+export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main';
 
 export interface ArweaveState {
   enabled: boolean;
@@ -87,6 +91,7 @@ interface NotesStore {
   arweave: ArweaveState;
   restoring: boolean;
   vaultError: string | null;
+  hasPin: boolean;
 
   // Actions
   createNewWallet: () => Promise<string>;
@@ -103,6 +108,9 @@ interface NotesStore {
   retrySync: () => Promise<void>;
   registerWithInvite: (inviteCode: string) => Promise<void>;
   checkAccess: () => Promise<void>;
+  setupPin: (pin: string) => Promise<void>;
+  removePin: () => Promise<void>;
+  unlockWithPin: (pin: string) => Promise<void>;
 }
 
 const StoreContext = createContext<NotesStore | null>(null);
@@ -126,6 +134,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [restoring, setRestoring] = useState(false);
   const [vaultError, setVaultError] = useState<string | null>(null);
+  const [hasPin, setHasPin] = useState(false);
 
   // Crypto refs (not React state — needed synchronously in async flows)
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
@@ -171,10 +180,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // 3. Check session
+      // 3. Check for PIN-encrypted seed
+      const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
+      if (pinData) setHasPin(true);
+
+      // 4. Check session (survives tab refresh but not browser close)
       const sessionMn = sessionStorage.getItem('eternal-notes-session');
       if (!sessionMn) {
-        setScreen('restore');
+        // No active session — show PIN screen if PIN is set, otherwise restore
+        setScreen(pinData ? 'pin' : 'restore');
         return;
       }
 
@@ -647,6 +661,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setNotes([]);
     setMnemonic(null);
     setVaultError(null);
+    setHasPin(false);
 
     // 4. Upload queue
     uploadQueueRef.current = [];
@@ -655,6 +670,40 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     // 5. Redirect
     setScreen('landing');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── PIN Actions ────────────────────────────────────────────────────
+
+  const setupPinAction = useCallback(async (pin: string) => {
+    if (!mnemonic) return;
+    const encrypted = await encryptWithPin(mnemonic, pin);
+    await setMeta('pin-seed', encrypted);
+    setHasPin(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mnemonic]);
+
+  const removePinAction = useCallback(async () => {
+    await deleteMeta('pin-seed');
+    setHasPin(false);
+  }, []);
+
+  const unlockWithPinAction = useCallback(async (pin: string) => {
+    const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
+    if (!pinData) throw new Error('No PIN set');
+
+    // decryptWithPin throws on wrong PIN (GCM auth failure)
+    const mn = await decryptWithPin(pinData, pin);
+
+    await setupFromMnemonic(mn);
+    sessionStorage.setItem('eternal-notes-session', mn);
+
+    await checkAndSetRegistration();
+    setScreen('main');
+
+    if (arweaveRef.current.enabled) {
+      void retryAllPending().catch(err => console.error('pin unlock retryAllPending:', err));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -679,6 +728,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     arweave: arweaveState,
     restoring,
     vaultError,
+    hasPin,
 
     createNewWallet,
     confirmMnemonic,
@@ -694,6 +744,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     retrySync,
     registerWithInvite: registerWithInviteAction,
     checkAccess: checkAccessAction,
+    setupPin: setupPinAction,
+    removePin: removePinAction,
+    unlockWithPin: unlockWithPinAction,
   };
 
   return (
