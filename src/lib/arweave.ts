@@ -51,6 +51,34 @@ export async function isArweaveOnline(): Promise<boolean> {
   }
 }
 
+// ─── TX Status ──────────────────────────────────────────────────────
+
+interface TxStatusResponse {
+  block_height: number;
+  number_of_confirmations: number;
+}
+
+export type TxStatusResult =
+  | { kind: 'confirmed'; confirmations: number; blockHeight: number }
+  | { kind: 'pending' }
+  | { kind: 'unavailable' };
+
+/** Check finalization status of an Arweave transaction. */
+export async function getTxStatus(txId: string): Promise<TxStatusResult> {
+  try {
+    const response = await fetch(`https://arweave.net/tx/${txId}/status`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(10000),
+    });
+    if (response.status === 404) return { kind: 'pending' };
+    if (!response.ok) return { kind: 'unavailable' };
+    const data: TxStatusResponse = await response.json();
+    return { kind: 'confirmed', confirmations: data.number_of_confirmations, blockHeight: data.block_height };
+  } catch {
+    return { kind: 'unavailable' };
+  }
+}
+
 // ─── Registration ────────────────────────────────────────────────────
 
 /**

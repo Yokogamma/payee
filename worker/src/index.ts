@@ -73,6 +73,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 // ─── /admin/seed-invite ─────────────────────────────────────────────
 
 async function handleAdminSeedInvite(request: Request, env: Env): Promise<Response> {
+  if (!env.ADMIN_SECRET) return error('Admin endpoint not configured', 503);
   const authHeader = request.headers.get('Authorization');
   if (authHeader !== `Bearer ${env.ADMIN_SECRET}`) {
     return error('Unauthorized', 401);
@@ -232,7 +233,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (ownerHash !== expectedOwnerHash) return error('ownerHash/publicKey mismatch', 400);
 
   // 6. Validate publicKey in allowlist (anti-sybil, R6)
-  let allowed = await env.ALLOWLIST.get(`pk:${publicKeyB64}`);
+  const allowed = await env.ALLOWLIST.get(`pk:${publicKeyB64}`);
   if (!allowed) {
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
     const checkResp = await inviteMgr.fetch(new Request('http://internal/check-allowed', {

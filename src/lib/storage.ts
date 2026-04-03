@@ -19,7 +19,7 @@ export interface SyncRecord {
   noteId: string;
   txId?: string;
   /** 'uploading' with updatedAt > 10 min = stale → retryable */
-  status: 'uploading' | 'accepted' | 'error';
+  status: 'uploading' | 'accepted' | 'confirmed' | 'error';
   transport: 'proxy';
   lastError?: string;
   updatedAt: number;
@@ -160,8 +160,10 @@ async function migrateFromLocalStorage(): Promise<{ notesMigrated: number }> {
   }>;
   try {
     oldNotes = JSON.parse(raw);
-  } catch {
-    await database.put('meta', true, 'migration-v1-done');
+  } catch (err) {
+    // Do NOT mark migration as done — will retry on next launch.
+    // localStorage data preserved for future retry.
+    console.error('Migration: failed to parse localStorage data, will retry next launch', err);
     return { notesMigrated: 0 };
   }
 

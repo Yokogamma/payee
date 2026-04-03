@@ -26,3 +26,4 @@ RATE_LIMIT_PER_HOUR = "20"
 
 # Secrets (via `wrangler secret put`):
 # ARWEAVE_JWK — server Arweave wallet (JSON string)
+# ADMIN_SECRET — bearer token for /admin/* endpoints

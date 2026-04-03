@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 /**
  * Eternal Notes — App Store (React Context)
  *
@@ -28,6 +29,7 @@ import {
   registerWithProxy,
   uploadViaProxy,
   fetchAllNotes,
+  getTxStatus,
   APP_NAME,
   APP_VERSION,
   type ProxyUploadPayload,
@@ -38,6 +40,7 @@ import {
   getNoteById,
   saveNote,
   getAllSyncRecords,
+  getRecordsByStatus,
   setSyncRecord,
   getMeta,
   setMeta,
@@ -57,6 +60,7 @@ export interface ArweaveState {
   unsyncedCount: number;
   errorCount: number;
   acceptedCount: number;
+  confirmedCount: number;
   lastSync: number | null;
   lastError: string | null;
 }
@@ -69,6 +73,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   unsyncedCount: 0,
   errorCount: 0,
   acceptedCount: 0,
+  confirmedCount: 0,
   lastSync: null,
   lastError: null,
 };
@@ -134,6 +139,9 @@ const StoreContext = createContext<NotesStore | null>(null);
 // ─── Stale uploading threshold ───────────────────────────────────────
 
 const STALE_UPLOADING_MS = 10 * 60 * 1000; // 10 minutes (matches server reservation timeout)
+const TX_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const TX_CONFIRM_THRESHOLD = 25;            // Arweave confirmations needed
+const TX_TIMEOUT_MS = 60 * 60 * 1000;      // 1 hour — mark pending TX as error
 
 // ─── Provider ────────────────────────────────────────────────────────
 
@@ -183,6 +191,43 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     bootstrap();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ─── TX Status Polling Effect ──────────────────────────────────────
+  useEffect(() => {
+    if (!isReady) return;
+    const intervalId = setInterval(() => {
+      void pollTxStatuses().catch(err => console.error('pollTxStatuses:', err));
+    }, TX_POLL_INTERVAL_MS);
+    void pollTxStatuses().catch(err => console.error('pollTxStatuses:', err));
+    function onVisible() {
+      if (document.visibilityState === 'visible')
+        void pollTxStatuses().catch(err => console.error('pollTxStatuses visibility:', err));
+    }
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(intervalId); document.removeEventListener('visibilitychange', onVisible); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady]);
+
+  // ─── Online/Offline Auto-Reconnect ────────────────────────────────
+  useEffect(() => {
+    if (!isReady) return;
+    async function handleOnline() {
+      const online = await isArweaveOnline();
+      setArweave(prev => ({ ...prev, online }));
+      if (online && arweaveRef.current.enabled)
+        void retryAllPending().catch(err => console.error('auto-reconnect:', err));
+    }
+    function handleOffline() {
+      setArweave(prev => ({ ...prev, online: false }));
+    }
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady]);
 
   async function bootstrap() {
     try {
@@ -320,17 +365,19 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const allNotes = await getAllNotes();
     const allSync = await getAllSyncRecords();
 
-    let accepted = 0, errors = 0;
+    let accepted = 0, confirmed = 0, errors = 0;
     for (const r of allSync) {
       if (r.status === 'accepted') accepted++;
+      else if (r.status === 'confirmed') confirmed++;
       else if (r.status === 'error') errors++;
     }
 
-    const unsynced = allNotes.length - accepted;
+    const unsynced = allNotes.length - accepted - confirmed;
 
     setArweave(prev => ({
       ...prev,
       acceptedCount: accepted,
+      confirmedCount: confirmed,
       unsyncedCount: unsynced,
       errorCount: errors,
     }));
@@ -382,6 +429,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
 
     isProcessingRef.current = true;
+    setArweave(prev => ({ ...prev, syncing: true }));
 
     try {
       while (uploadQueueRef.current.length > 0) {
@@ -410,6 +458,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     } finally {
       isProcessingRef.current = false;
+      setArweave(prev => ({ ...prev, syncing: false }));
     }
   }
 
@@ -459,6 +508,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         await setMeta(`registered:${pkB64}`, true);
         setArweave(prev => ({ ...prev, registered: true }));
       }
+      setArweave(prev => ({ ...prev, lastSync: Date.now() }));
       await refreshSyncCounts();
       return 'accepted';
     }
@@ -490,6 +540,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const skipIds = new Set(
       allSync.filter(r =>
         r.status === 'accepted' ||
+        r.status === 'confirmed' ||
         (r.status === 'uploading' && (now - r.updatedAt) < STALE_UPLOADING_MS)
       ).map(r => r.noteId)
     );
@@ -503,6 +554,41 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setArweave(prev => ({ ...prev, lastError: null }));
     await syncPendingNotes();
     kickQueue();
+  }
+
+  // ─── TX Status Polling ──────────────────────────────────────────────
+
+  async function pollTxStatuses() {
+    if (document.visibilityState !== 'visible') return;
+    if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
+
+    const accepted = await getRecordsByStatus('accepted');
+    if (accepted.length === 0) return;
+
+    const now = Date.now();
+    let changed = false;
+
+    for (const record of accepted) {
+      if (!record.txId) continue;
+
+      const status = await getTxStatus(record.txId);
+
+      if (status.kind === 'confirmed' && status.confirmations >= TX_CONFIRM_THRESHOLD) {
+        await setSyncRecord({ ...record, status: 'confirmed', updatedAt: now });
+        changed = true;
+      } else if (status.kind === 'pending' && (now - record.updatedAt) > TX_TIMEOUT_MS) {
+        await setSyncRecord({
+          ...record,
+          status: 'error',
+          lastError: 'TX not found after 1 hour — will retry',
+          updatedAt: now,
+        });
+        changed = true;
+      }
+      // kind === 'unavailable' → skip, don't change status (gateway degradation)
+    }
+
+    if (changed) await refreshSyncCounts();
   }
 
   // ─── Actions ────────────────────────────────────────────────────────
@@ -686,7 +772,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     // 5. Redirect
     setScreen('landing');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ─── PIN Actions ────────────────────────────────────────────────────
@@ -696,7 +781,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const encrypted = await encryptWithPin(mnemonic, pin);
     await setMeta('pin-seed', encrypted);
     setHasPin(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mnemonic]);
 
   const removePinAction = useCallback(async () => {

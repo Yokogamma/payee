@@ -677,6 +677,18 @@ h1 {
   50% { opacity: 0.7; }
 }
 
+/* ─── Offline Banner ──────────────────────────────────────── */
+
+.offline-banner {
+  background: rgba(240, 83, 101, 0.08);
+  border-bottom: 1px solid rgba(240, 83, 101, 0.2);
+  color: var(--red);
+  font-size: 13px;
+  padding: 8px 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
 /* ─── Invite Section ───────────────────────────────────────── */
 
 .invite-section {

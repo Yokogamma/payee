@@ -131,6 +131,13 @@ export function Main() {
         </div>
       )}
 
+      {/* Offline Banner */}
+      {arweave.enabled && !arweave.online && (
+        <div className="offline-banner">
+          Оффлайн — заметки сохраняются локально
+        </div>
+      )}
+
       {/* Header */}
       <header className="main-header">
         <div className="header-left">
@@ -348,7 +355,13 @@ export function Main() {
                 <div>Статус: <strong style={{color: arweave.online ? '#2dd4a8' : '#f05365'}}>
                   {arweave.online ? '● Онлайн' : '○ Оффлайн'}
                 </strong></div>
-                <div>Синхронизировано: <strong>{arweave.acceptedCount}</strong> из <strong>{notes.length}</strong></div>
+                <div>Синхронизировано: <strong>{arweave.acceptedCount + arweave.confirmedCount}</strong> из <strong>{notes.length}</strong></div>
+                {arweave.confirmedCount > 0 && (
+                  <div style={{color: 'var(--green)'}}>✓ Подтверждено в блокчейне: <strong>{arweave.confirmedCount}</strong></div>
+                )}
+                {arweave.acceptedCount > 0 && (
+                  <div>⏳ Ожидают подтверждения: <strong>{arweave.acceptedCount}</strong></div>
+                )}
                 {arweave.unsyncedCount > 0 && (
                   <div>⏳ Ожидают загрузки: <strong>{arweave.unsyncedCount}</strong></div>
                 )}
@@ -417,9 +430,11 @@ export function Main() {
 
             <div className="settings-section">
               <button className="btn btn-danger full-width" onClick={() => {
-                if (confirm('Удалить все локальные данные? Заметки в блокчейне сохранятся.')) {
-                  resetApp();
-                }
+                const hasUnsynced = arweave.unsyncedCount > 0;
+                const msg = hasUnsynced
+                  ? `⚠️ ${arweave.unsyncedCount} заметок НЕ синхронизированы и будут потеряны!\n\nУдалить все локальные данные?`
+                  : 'Удалить все локальные данные? Заметки в блокчейне сохранятся.';
+                if (confirm(msg)) resetApp();
               }}>
                 Сбросить приложение
               </button>
