@@ -32,6 +32,10 @@ interface Env {
 const IP_RATE_LIMIT = 60;              // requests per window per IP
 const IP_RATE_WINDOW_MS = 60_000;      // 1 minute
 
+// A committed TX must be at least this old before a recheck may re-post it
+// (guards against re-posting a TX that just hasn't propagated yet).
+const MIN_COMMITTED_AGE_MS = 30 * 60_000; // 30 min
+
 // ─── Entry ──────────────────────────────────────────────────────────
 
 export default {
@@ -273,12 +277,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
     return error('Invalid body: must be a JSON object', 400);
   }
-  const { data, tags, ownerHash, timestamp } = parsedBody as {
-    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown;
+  const { data, tags, ownerHash, timestamp, recheck } = parsedBody as {
+    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown;
   };
   if (typeof data !== 'string' || typeof ownerHash !== 'string' || !Array.isArray(tags)) {
     return error('Missing/invalid required fields', 400);
   }
+  const wantsRecheck = recheck === true;
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
   if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
@@ -399,56 +404,78 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(parsedData.id)) return error('Note-Id must be a valid UUID', 400);
 
-  // 10. COMBINED: check idempotency + rate limit + reserve (ONE DO call, R7)
-  const limiterStub = env.RATE_LIMITER.get(
-    env.RATE_LIMITER.idFromName(publicKeyB64)
-  );
-  const checkResp = await limiterStub.fetch(new Request('http://internal/check-and-reserve', {
-    method: 'POST',
-    body: JSON.stringify({ noteId: parsedData.id, limit: parseInt(env.RATE_LIMIT_PER_HOUR) }),
-  }));
-  const checkResult: { status: string; txId?: string; remaining?: number } = await checkResp.json();
+  // 10. Idempotency + rate limit + reserve (C1/M6 lifecycle).
+  const limiterStub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(publicKeyB64));
+  const noteId = parsedData.id;
+  const doCall = (path: string, payload: unknown) =>
+    limiterStub.fetch(new Request(`http://internal${path}`, {
+      method: 'POST', body: JSON.stringify(payload),
+    }));
+
+  const checkResp = await doCall('/check-and-reserve', { noteId, limit: parseInt(env.RATE_LIMIT_PER_HOUR) });
+  const checkResult: { status: string; txId?: string; committedAt?: number; token?: string } = await checkResp.json();
+
+  let reserveToken: string;
 
   if (checkResult.status === 'exists') {
-    return json({ txId: checkResult.txId, status: 'accepted' });
-  }
-  if (checkResult.status === 'reserved') {
-    return error('Upload already in progress for this noteId', 409);
-  }
-  if (checkResult.status === 'rate_limited') {
-    return error('Rate limit exceeded', 429);
-  }
+    // Already committed. Without recheck this is the idempotent happy path.
+    if (!wantsRecheck) return json({ txId: checkResult.txId, status: 'accepted' });
 
-  // 11. Create Arweave TX
-  const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
-  const serverWallet = JSON.parse(env.ARWEAVE_JWK);
-  const tx = await arweave.createTransaction({ data }, serverWallet);
-  for (const tag of tags) {
-    tx.addTag(tag.name, tag.value);
-  }
-  await arweave.transactions.sign(tx, serverWallet);
-  const response = await arweave.transactions.post(tx);
-
-  if (response.status === 200 || response.status === 202) {
-    // 12. Commit noteId → txId in DO — WITH RETRY (R7 commit failure handling)
-    let commitOk = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await limiterStub.fetch(new Request('http://internal/commit', {
-          method: 'POST',
-          body: JSON.stringify({ noteId: parsedData.id, txId: tx.id }),
-        }));
-        commitOk = true;
-        break;
-      } catch {
-        if (attempt < 2) await new Promise(r => setTimeout(r, 100 * Math.pow(3, attempt)));
-      }
+    // Recheck: is the committed TX still alive on-chain?
+    const live = await getTxStatusWorker(checkResult.txId!);
+    if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted' });
+    if (live === 'unavailable') return error('Arweave status unavailable', 503); // keep committed, retry later
+    // live === 'dead' — only re-post once the commit is old enough (race guard).
+    if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
+      return json({ txId: checkResult.txId, status: 'accepted' });
     }
-    if (!commitOk) console.error(`COMMIT_FAILED noteId=${parsedData.id} txId=${tx.id}`);
-    return json({ txId: tx.id, status: 'accepted' });
+    const redropResp = await doCall('/redrop', { noteId, txId: checkResult.txId });
+    const redrop: { ok: boolean; token?: string } = await redropResp.json();
+    if (!redrop.ok || !redrop.token) return json({ txId: checkResult.txId, status: 'accepted' }); // handled elsewhere
+    reserveToken = redrop.token;
+  } else if (checkResult.status === 'reserved') {
+    return error('Upload already in progress for this noteId', 409);
+  } else if (checkResult.status === 'rate_limited') {
+    return error('Rate limit exceeded', 429);
+  } else {
+    reserveToken = checkResult.token!;
   }
 
-  return error(`Arweave error: ${response.status}`, 502);
+  // 11. Create + sign + post the Arweave TX. Any failure releases the reservation
+  //     (quota is not spent, so the note can be retried) and returns 502.
+  let txId: string;
+  try {
+    const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
+    const serverWallet = JSON.parse(env.ARWEAVE_JWK);
+    const tx = await arweave.createTransaction({ data }, serverWallet);
+    for (const tag of tags) tx.addTag(tag.name, tag.value);
+    await arweave.transactions.sign(tx, serverWallet);
+    const response = await arweave.transactions.post(tx);
+    if (response.status !== 200 && response.status !== 202) {
+      await doCall('/release', { noteId, token: reserveToken });
+      return error(`Arweave error: ${response.status}`, 502);
+    }
+    txId = tx.id;
+  } catch (e) {
+    await doCall('/release', { noteId, token: reserveToken });
+    console.error('ARWEAVE_POST_FAILED', noteId, e);
+    return error('Arweave upload failed', 502);
+  }
+
+  // 12. Commit noteId → txId — retry, checking resp.ok / stale (L7).
+  let committed = false;
+  for (let attempt = 0; attempt < 3 && !committed; attempt++) {
+    try {
+      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken });
+      const commit: { ok: boolean; stale?: boolean } = await commitResp.json();
+      if (commitResp.ok && commit.ok) committed = true;
+      else if (commit.stale) break; // reservation superseded — do not keep retrying
+    } catch {
+      if (attempt < 2) await new Promise(r => setTimeout(r, 100 * Math.pow(3, attempt)));
+    }
+  }
+  if (!committed) console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
+  return json({ txId, status: 'accepted' });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -493,6 +520,24 @@ function error(message: string, status: number): Response {
 /** Anti-replay freshness: a real number within ±5 min (rejects NaN/non-number). */
 function isFreshTimestamp(ts: unknown): boolean {
   return typeof ts === 'number' && Number.isFinite(ts) && Math.abs(Date.now() - ts) <= 300_000;
+}
+
+/**
+ * Server-side liveness check for a committed TX (recheck path). Maps the gateway
+ * contract to a coarse verdict: 200/202 → alive, 404/400 → dead, else unknown.
+ */
+async function getTxStatusWorker(txId: string): Promise<'alive' | 'dead' | 'unavailable'> {
+  try {
+    const r = await fetch(`https://arweave.net/tx/${txId}/status`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (r.status === 200 || r.status === 202) return 'alive';
+    if (r.status === 404 || r.status === 400) return 'dead';
+    return 'unavailable';
+  } catch {
+    return 'unavailable';
+  }
 }
 
 /**

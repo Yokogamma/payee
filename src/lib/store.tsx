@@ -40,6 +40,7 @@ import {
   saveNoteWithSync,
   getAllSyncRecords,
   getRecordsByStatus,
+  getSyncRecord,
   setSyncRecord,
   getMeta,
   setMeta,
@@ -464,17 +465,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   async function uploadSingleNote(note: EncryptedNote): Promise<string> {
     if (!ownerHashRef.current || !signingKeyRef.current || !publicKeyRef.current) return 'error';
 
-    // Mark uploading
+    // A dropped/timed-out TX asks the server to re-verify + re-post (C1).
+    const prev = await getSyncRecord(note.noteId);
+    const recheck = prev?.needsRecheck === true;
+
+    // Mark uploading (preserve the recheck intent across a crash mid-upload).
     await setSyncRecord({
       noteId: note.noteId,
       status: 'uploading',
       transport: 'proxy',
       updatedAt: Date.now(),
+      needsRecheck: recheck,
     });
 
     // Build payload — serialized per the note's own version (v1 or v2), so a
     // restored v2 ciphertext can never be re-published under v1 tags.
-    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now());
+    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck);
 
     const bodyText = JSON.stringify(payload);
     const signature = await signPayload(signingKeyRef.current, bodyText);
@@ -489,6 +495,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         status: 'accepted',
         transport: 'proxy',
         updatedAt: Date.now(),
+        needsRecheck: false, // re-verified/re-posted — intent satisfied
       });
       // Auto-discovery
       const pkB64 = bufferToBase64(publicKeyRef.current!);
@@ -513,6 +520,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       transport: 'proxy',
       lastError: result.error,
       updatedAt: Date.now(),
+      needsRecheck: recheck, // keep the recheck intent for the next retry
     });
     await refreshSyncCounts();
     return result.kind;
@@ -523,11 +531,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const allSync = await getAllSyncRecords();
     const now = Date.now();
 
-    // Skip: accepted (final) + fresh uploading (< 10 min)
-    // Enqueue: error (retry), stale uploading (> 10 min), no SyncRecord (new/migrated)
+    // Skip: accepted-and-not-flagged + confirmed + fresh uploading (< 10 min)
+    // Enqueue: error, accepted+needsRecheck (dropped TX), stale uploading, no record
     const skipIds = new Set(
       allSync.filter(r =>
-        r.status === 'accepted' ||
+        (r.status === 'accepted' && !r.needsRecheck) ||
         r.status === 'confirmed' ||
         (r.status === 'uploading' && (now - r.updatedAt) < STALE_UPLOADING_MS)
       ).map(r => r.noteId)
@@ -555,6 +563,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     const now = Date.now();
     let changed = false;
+    let flaggedForRecheck = false;
 
     for (const record of accepted) {
       if (!record.txId) continue;
@@ -562,21 +571,31 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const status = await getTxStatus(record.txId);
 
       if (status.kind === 'confirmed' && status.confirmations >= TX_CONFIRM_THRESHOLD) {
-        await setSyncRecord({ ...record, status: 'confirmed', updatedAt: now });
+        await setSyncRecord({ ...record, status: 'confirmed', needsRecheck: false, updatedAt: now });
         changed = true;
+      } else if (status.kind === 'dropped' || status.kind === 'invalid') {
+        // TX is gone → flag for server-side re-verify + re-post (keep 'accepted').
+        if (!record.needsRecheck) {
+          await setSyncRecord({ ...record, needsRecheck: true, updatedAt: now });
+          changed = true;
+          flaggedForRecheck = true;
+        }
       } else if (status.kind === 'pending' && (now - record.updatedAt) > TX_TIMEOUT_MS) {
-        await setSyncRecord({
-          ...record,
-          status: 'error',
-          lastError: 'TX not found after 1 hour — will retry',
-          updatedAt: now,
-        });
-        changed = true;
+        // Accepted but not mined within the timeout → re-verify.
+        if (!record.needsRecheck) {
+          await setSyncRecord({ ...record, needsRecheck: true, updatedAt: now });
+          changed = true;
+          flaggedForRecheck = true;
+        }
       }
       // kind === 'unavailable' → skip, don't change status (gateway degradation)
     }
 
     if (changed) await refreshSyncCounts();
+    if (flaggedForRecheck && arweaveRef.current.enabled && arweaveRef.current.online) {
+      await syncPendingNotes();
+      kickQueue();
+    }
   }
 
   // ─── Actions ────────────────────────────────────────────────────────

@@ -57,6 +57,39 @@ describe('fetchAllNotes owner filter (C2)', () => {
   });
 });
 
+describe('getTxStatus semantics (L1)', () => {
+  const cases: Array<[number, string]> = [
+    [202, 'pending'],
+    [404, 'dropped'],
+    [400, 'invalid'],
+    [500, 'unavailable'],
+    [503, 'unavailable'],
+  ];
+  for (const [httpStatus, kind] of cases) {
+    it(`maps HTTP ${httpStatus} → ${kind}`, async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response('x', { status: httpStatus })));
+      const { getTxStatus } = await import('./arweave');
+      expect((await getTxStatus('tx')).kind).toBe(kind);
+    });
+  }
+
+  it('maps HTTP 200 + confirmations → confirmed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ block_height: 5, number_of_confirmations: 42 }), { status: 200 }),
+    ));
+    const { getTxStatus } = await import('./arweave');
+    const r = await getTxStatus('tx');
+    expect(r.kind).toBe('confirmed');
+    if (r.kind === 'confirmed') expect(r.confirmations).toBe(42);
+  });
+
+  it('maps a network error → unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network'); }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus('tx')).kind).toBe('unavailable');
+  });
+});
+
 describe('buildUploadPayload version-aware serialization', () => {
   it('serializes a v1 note with Timestamp tag and outer t', async () => {
     const { buildUploadPayload } = await import('./arweave');

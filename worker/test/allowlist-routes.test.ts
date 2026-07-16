@@ -83,9 +83,10 @@ describe('/upload allowlist (D3 typed model)', () => {
     await ALLOWLIST.put(`pk:${pkB64}`, 'true'); // legacy value → treated as miss
     await seedDO(pkB64); // DO is the source of truth and says allowed
 
-    // Passes the allowlist (miss → DO allowed → rewrite) and only throws later at
-    // the stubbed Arweave step.
-    await expect(send()).rejects.toThrow();
+    // Passes the allowlist (miss → DO allowed → rewrite); the KV is rewritten
+    // before the (stubbed) Arweave step fails with 502.
+    const r = await send();
+    expect(r.status).toBe(502);
 
     const rewritten = await ALLOWLIST.get(`pk:${pkB64}`);
     expect(rewritten).not.toBeNull();

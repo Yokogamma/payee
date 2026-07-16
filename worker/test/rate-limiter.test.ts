@@ -1,59 +1,136 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 
-// Phase 0 smoke test — pins current RateLimiter DO behavior before Phase 2 rework.
-// The DO exposes an internal HTTP interface (/check-and-reserve, /commit).
+// RateLimiter DO lifecycle: reserve → commit/release, token CAS, redrop, and the
+// split attempt/quota counters (C1/M6).
 
 const RATE_LIMITER = (env as unknown as {
   RATE_LIMITER: DurableObjectNamespace;
 }).RATE_LIMITER;
 
-// Unique per-run suffix so reused workerd state (watch mode, isolatedStorage off)
-// never leaks exhausted counters into the next run.
 const RUN = crypto.randomUUID().slice(0, 8);
-
 function stubFor(name: string) {
   return RATE_LIMITER.get(RATE_LIMITER.idFromName(`${name}-${RUN}`));
 }
 
 async function reserve(stub: DurableObjectStub, noteId: string, limit = 20) {
-  const resp = await stub.fetch('http://do/check-and-reserve', {
-    method: 'POST',
-    body: JSON.stringify({ noteId, limit }),
+  const r = await stub.fetch('http://do/check-and-reserve', {
+    method: 'POST', body: JSON.stringify({ noteId, limit }),
   });
-  return resp.json() as Promise<{ status: string; txId?: string; remaining?: number }>;
+  return r.json() as Promise<{ status: string; token?: string; txId?: string; committedAt?: number }>;
+}
+async function commit(stub: DurableObjectStub, noteId: string, txId: string, token: string) {
+  const r = await stub.fetch('http://do/commit', {
+    method: 'POST', body: JSON.stringify({ noteId, txId, token }),
+  });
+  return r.json() as Promise<{ ok: boolean; stale?: boolean }>;
+}
+async function release(stub: DurableObjectStub, noteId: string, token: string) {
+  const r = await stub.fetch('http://do/release', {
+    method: 'POST', body: JSON.stringify({ noteId, token }),
+  });
+  return r.json() as Promise<{ ok: boolean }>;
+}
+async function redrop(stub: DurableObjectStub, noteId: string, txId: string) {
+  const r = await stub.fetch('http://do/redrop', {
+    method: 'POST', body: JSON.stringify({ noteId, txId }),
+  });
+  return r.json() as Promise<{ ok: boolean; token?: string }>;
 }
 
-describe('RateLimiter DO (current behavior)', () => {
-  it('reserves a new noteId, then reports exists after commit', async () => {
-    const stub = stubFor('pk-A');
-    const first = await reserve(stub, 'note-1');
-    expect(first.status).toBe('ok');
+describe('RateLimiter reserve/commit', () => {
+  it('reserves with a token, then reports exists after commit', async () => {
+    const s = stubFor('pk-A');
+    const res = await reserve(s, 'n1');
+    expect(res.status).toBe('ok');
+    expect(res.token).toBeTruthy();
 
-    await stub.fetch('http://do/commit', {
-      method: 'POST',
-      body: JSON.stringify({ noteId: 'note-1', txId: 'tx-abc' }),
-    });
+    const c = await commit(s, 'n1', 'tx-abc', res.token!);
+    expect(c.ok).toBe(true);
 
-    const second = await reserve(stub, 'note-1');
-    expect(second.status).toBe('exists');
-    expect(second.txId).toBe('tx-abc');
+    const again = await reserve(s, 'n1');
+    expect(again.status).toBe('exists');
+    expect(again.txId).toBe('tx-abc');
   });
 
   it('reports reserved while an upload is in progress', async () => {
-    const stub = stubFor('pk-B');
-    await reserve(stub, 'note-2');
-    const again = await reserve(stub, 'note-2');
-    expect(again.status).toBe('reserved');
+    const s = stubFor('pk-B');
+    await reserve(s, 'n2');
+    expect((await reserve(s, 'n2')).status).toBe('reserved');
   });
 
-  it('rate-limits once the per-window quota is exhausted', async () => {
-    const stub = stubFor('pk-C');
+  it('rejects a commit with a stale token (CAS)', async () => {
+    const s = stubFor('pk-C');
+    await reserve(s, 'n3');
+    const c = await commit(s, 'n3', 'tx', 'wrong-token');
+    expect(c.ok).toBe(false);
+    expect(c.stale).toBe(true);
+  });
+});
+
+describe('RateLimiter quota vs attempts (M6)', () => {
+  it('spends quota only on commit, so releases do not consume it', async () => {
+    const s = stubFor('pk-Q');
+    // Reserve + RELEASE three times at limit=2 — quota must stay 0.
     for (let i = 0; i < 3; i++) {
-      const r = await reserve(stub, `n-${i}`, 3);
+      const r = await reserve(s, `r-${i}`, 2);
       expect(r.status).toBe('ok');
+      await release(s, `r-${i}`, r.token!);
     }
-    const over = await reserve(stub, 'n-over', 3);
-    expect(over.status).toBe('rate_limited');
+    // Now two successful commits fit under the quota…
+    for (let i = 0; i < 2; i++) {
+      const r = await reserve(s, `c-${i}`, 2);
+      expect(r.status).toBe('ok');
+      expect((await commit(s, `c-${i}`, `tx-${i}`, r.token!)).ok).toBe(true);
+    }
+    // …and the third commit-bound reserve is rate limited (quota=2).
+    expect((await reserve(s, 'c-over', 2)).status).toBe('rate_limited');
+  });
+
+  it('caps reserve attempts even without commits (anti-abuse)', async () => {
+    const s = stubFor('pk-Att');
+    // limit=1 → attempt ceiling = 3. Reserve+release burns an attempt each time.
+    let limited = false;
+    for (let i = 0; i < 6; i++) {
+      const r = await reserve(s, `a-${i}`, 1);
+      if (r.status === 'rate_limited') { limited = true; break; }
+      await release(s, `a-${i}`, r.token!);
+    }
+    expect(limited).toBe(true);
+  });
+});
+
+describe('RateLimiter release + redrop', () => {
+  it('release frees the reservation so the note can be reserved again', async () => {
+    const s = stubFor('pk-R');
+    const r1 = await reserve(s, 'n');
+    await release(s, 'n', r1.token!);
+    const r2 = await reserve(s, 'n');
+    expect(r2.status).toBe('ok'); // reservable again
+  });
+
+  it('release is token-scoped (wrong token is a no-op)', async () => {
+    const s = stubFor('pk-R2');
+    await reserve(s, 'n');
+    await release(s, 'n', 'wrong');
+    expect((await reserve(s, 'n')).status).toBe('reserved'); // still held
+  });
+
+  it('redrop converts a committed dropped-TX back to a fresh reservation', async () => {
+    const s = stubFor('pk-D');
+    const r = await reserve(s, 'n');
+    await commit(s, 'n', 'tx-dead', r.token!);
+    const rd = await redrop(s, 'n', 'tx-dead');
+    expect(rd.ok).toBe(true);
+    expect(rd.token).toBeTruthy();
+    // It is now reservable/re-postable (reserved), not 'exists'.
+    expect((await reserve(s, 'n')).status).toBe('reserved');
+  });
+
+  it('redrop is a no-op if the txId no longer matches', async () => {
+    const s = stubFor('pk-D2');
+    const r = await reserve(s, 'n');
+    await commit(s, 'n', 'tx-current', r.token!);
+    expect((await redrop(s, 'n', 'tx-old')).ok).toBe(false);
   });
 });

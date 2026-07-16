@@ -98,18 +98,16 @@ function rawUpload(body: string, ip: string): Promise<Response> {
 
 describe('upload validation: version contract (v1/v2)', () => {
   // A fully-valid upload passes all validation/auth and reaches the Arweave
-  // signing step, which throws under the stub JWK ('{}'). That thrown error
-  // (rather than a 400/401/403 Response) proves validation + auth passed.
-  it('accepts a well-formed v1 upload past validation (reaches Arweave stage)', async () => {
-    await expect(
-      upload(v1Tags(), { id: NOTE_ID, c: C, iv: IV, t: 1700000000000 }, nextIp()),
-    ).rejects.toThrow();
+  // signing step, which fails under the stub JWK ('{}'). The handler catches it,
+  // releases the reservation, and returns 502 — proving validation + auth passed.
+  it('accepts a well-formed v1 upload past validation (502 at Arweave stage)', async () => {
+    const r = await upload(v1Tags(), { id: NOTE_ID, c: C, iv: IV, t: 1700000000000 }, nextIp());
+    expect(r.status).toBe(502);
   });
 
-  it('accepts a well-formed v2 upload past validation (reaches Arweave stage)', async () => {
-    await expect(
-      upload(v2Tags(), { id: NOTE_ID, c: C, iv: IV }, nextIp()),
-    ).rejects.toThrow();
+  it('accepts a well-formed v2 upload past validation (502 at Arweave stage)', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: C, iv: IV }, nextIp());
+    expect(r.status).toBe(502);
   });
 
   it('rejects a v2 upload that carries a Timestamp tag', async () => {
@@ -188,5 +186,33 @@ describe('upload validation: version contract (v1/v2)', () => {
     const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV }, nextIp());
     expect(r.status).toBe(400);
     expect(await r.text()).toMatch(/Invalid tag structure/);
+  });
+
+  it('releases the reservation on Arweave failure so the note can retry (M6)', async () => {
+    // Reuse ONE key so both uploads hit the same RateLimiter shard + noteId.
+    const priv = ed.utils.randomPrivateKey();
+    const pub = await ed.getPublicKeyAsync(priv);
+    const pkB64 = b64(pub);
+    const ownerHash = b64(await sha256(pub));
+    await (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST.put(
+      `pk:${pkB64}`, JSON.stringify({ status: 'allowed' }),
+    );
+    const tags = v2Tags().map(t => (t.name === 'Owner-Hash' ? { ...t, value: ownerHash } : t));
+    const body = JSON.stringify({
+      data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
+      tags, ownerHash, timestamp: Date.now(),
+    });
+    const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), priv));
+    const ip = nextIp();
+    const send = () => SELF.fetch('https://proxy.example.com/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Public-Key': pkB64, 'X-Signature': sig, 'CF-Connecting-IP': ip },
+      body,
+    });
+
+    const r1 = await send();
+    expect(r1.status).toBe(502); // Arweave stub fails → reservation released
+    const r2 = await send();
+    expect(r2.status).toBe(502); // reservable again (NOT 409) → release worked
   });
 });

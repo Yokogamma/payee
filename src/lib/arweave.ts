@@ -37,6 +37,7 @@ export function buildUploadPayload(
   note: EncryptedNote,
   ownerHash: string,
   now: number,
+  recheck = false,
 ): ProxyUploadPayload {
   const isV2 = note.v === 2;
   const data = isV2
@@ -52,7 +53,9 @@ export function buildUploadPayload(
     { name: 'Note-Id', value: note.noteId },
   ];
 
-  return { data, tags, ownerHash, timestamp: now };
+  const payload: ProxyUploadPayload = { data, tags, ownerHash, timestamp: now };
+  if (recheck) payload.recheck = true;
+  return payload;
 }
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -62,6 +65,8 @@ export interface ProxyUploadPayload {
   tags: { name: string; value: string }[];
   ownerHash: string;
   timestamp: number;
+  /** Ask the server to re-verify a committed TX and re-post if it was dropped. */
+  recheck?: boolean;
 }
 
 export type UploadResult =
@@ -97,17 +102,29 @@ interface TxStatusResponse {
 
 export type TxStatusResult =
   | { kind: 'confirmed'; confirmations: number; blockHeight: number }
-  | { kind: 'pending' }
-  | { kind: 'unavailable' };
+  | { kind: 'pending' }     // accepted, not yet mined
+  | { kind: 'dropped' }     // not found — fell out of the mempool
+  | { kind: 'invalid' }     // malformed tx id
+  | { kind: 'unavailable' };// gateway degraded — status unknown
 
-/** Check finalization status of an Arweave transaction. */
+/**
+ * Check finalization status of an Arweave transaction, per the gateway's HTTP
+ * contract:
+ *   200 + confirmations → confirmed
+ *   202 "Pending"       → pending (NOT 404)
+ *   404                 → dropped (unknown tx / evicted from mempool)
+ *   400                 → invalid tx id
+ *   other / network     → unavailable (do not act on it)
+ */
 export async function getTxStatus(txId: string): Promise<TxStatusResult> {
   try {
     const response = await fetch(`https://arweave.net/tx/${txId}/status`, {
       method: 'GET',
       signal: AbortSignal.timeout(10000),
     });
-    if (response.status === 404) return { kind: 'pending' };
+    if (response.status === 202) return { kind: 'pending' };
+    if (response.status === 404) return { kind: 'dropped' };
+    if (response.status === 400) return { kind: 'invalid' };
     if (!response.ok) return { kind: 'unavailable' };
     const data: TxStatusResponse = await response.json();
     return { kind: 'confirmed', confirmations: data.number_of_confirmations, blockHeight: data.block_height };

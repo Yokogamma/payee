@@ -23,6 +23,12 @@ export interface SyncRecord {
   transport: 'proxy';
   lastError?: string;
   updatedAt: number;
+  /**
+   * An 'accepted' TX that polling found dropped/invalid, or pending past the
+   * timeout. Re-upload with recheck=true so the server re-verifies and re-posts
+   * if the TX is truly gone. Cleared once accepted afresh or confirmed.
+   */
+  needsRecheck?: boolean;
 }
 
 // ─── Database ────────────────────────────────────────────────────────
