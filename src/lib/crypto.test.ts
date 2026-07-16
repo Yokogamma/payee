@@ -1,0 +1,83 @@
+import { describe, it, expect } from 'vitest';
+import {
+  generateMnemonic,
+  isValidMnemonic,
+  deriveKey,
+  deriveSigningKeypair,
+  deriveOwnerHash,
+  encrypt,
+  decrypt,
+  encryptWithPin,
+  decryptWithPin,
+  bufferToBase64,
+} from './crypto';
+
+// Phase 0 smoke tests — pin down current crypto behavior before Phase 1/3 changes.
+
+describe('mnemonic', () => {
+  it('generates a valid 12-word mnemonic', () => {
+    const mn = generateMnemonic();
+    expect(mn.split(' ')).toHaveLength(12);
+    expect(isValidMnemonic(mn)).toBe(true);
+  });
+
+  it('rejects an invalid mnemonic', () => {
+    expect(isValidMnemonic('not a real seed phrase at all here now')).toBe(false);
+  });
+});
+
+describe('key derivation', () => {
+  it('is deterministic for the same mnemonic', async () => {
+    const mn = generateMnemonic();
+    const k1 = await deriveKey(mn);
+    const k2 = await deriveKey(mn);
+    const a = await encrypt(k1, 'hello');
+    const text = await decrypt(k2, a);
+    expect(text).toBe('hello');
+  });
+
+  it('derives a stable signing keypair and owner hash', async () => {
+    const mn = generateMnemonic();
+    const kp1 = await deriveSigningKeypair(mn);
+    const kp2 = await deriveSigningKeypair(mn);
+    expect(bufferToBase64(kp1.publicKey)).toBe(bufferToBase64(kp2.publicKey));
+    const oh = await deriveOwnerHash(kp1.publicKey);
+    expect(typeof oh).toBe('string');
+    expect(oh.length).toBeGreaterThan(0);
+  });
+});
+
+describe('encrypt/decrypt', () => {
+  it('round-trips plaintext', async () => {
+    const key = await deriveKey(generateMnemonic());
+    const enc = await encrypt(key, 'секретная заметка');
+    expect(enc.noteId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await decrypt(key, enc)).toBe('секретная заметка');
+  });
+
+  it('uses a unique IV per encryption', async () => {
+    const key = await deriveKey(generateMnemonic());
+    const a = await encrypt(key, 'x');
+    const b = await encrypt(key, 'x');
+    expect(a.iv).not.toBe(b.iv);
+  });
+
+  it('fails to decrypt with the wrong key', async () => {
+    const enc = await encrypt(await deriveKey(generateMnemonic()), 'x');
+    const other = await deriveKey(generateMnemonic());
+    await expect(decrypt(other, enc)).rejects.toBeDefined();
+  });
+});
+
+describe('PIN wrapping', () => {
+  it('round-trips the mnemonic through a PIN', async () => {
+    const mn = generateMnemonic();
+    const blob = await encryptWithPin(mn, '1234');
+    expect(await decryptWithPin(blob, '1234')).toBe(mn);
+  });
+
+  it('fails to unwrap with the wrong PIN', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '1234');
+    await expect(decryptWithPin(blob, '9999')).rejects.toBeDefined();
+  });
+});

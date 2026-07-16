@@ -7,15 +7,18 @@
 
 import Arweave from 'arweave';
 import * as ed25519 from '@noble/ed25519';
+import { readAllowCache, writeAllowCache } from './allowlist';
 
 export { RateLimiter } from './rate-limiter';
 export { InviteManager } from './invite-manager';
+export { IpRateLimiter } from './ip-rate-limiter';
 
 // ─── Types ──────────────────────────────────────────────────────────
 
 interface Env {
   RATE_LIMITER: DurableObjectNamespace;
   INVITE_MANAGER: DurableObjectNamespace;
+  IP_RATE_LIMITER: DurableObjectNamespace;
   ALLOWLIST: KVNamespace;
   ALLOWED_ORIGINS: string;
   MAX_BODY_BYTES: string;
@@ -23,6 +26,11 @@ interface Env {
   ARWEAVE_JWK: string;
   ADMIN_SECRET: string;
 }
+
+// ─── Per-IP baseline rate limit (D-baseline) ────────────────────────
+// Primary anti-abuse on Cloudflare Free (no WAF rate-limiting).
+const IP_RATE_LIMIT = 60;              // requests per window per IP
+const IP_RATE_WINDOW_MS = 60_000;      // 1 minute
 
 // ─── Entry ──────────────────────────────────────────────────────────
 
@@ -46,6 +54,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   if (url.pathname === '/health') return json({ ok: true });
 
+  // Diagnostics only: lets an operator discover the proxy wallet address to pin
+  // in the client's VITE_TRUSTED_OWNERS. NEVER used as the client's root of trust.
+  if (url.pathname === '/wallet-address' && request.method === 'GET') {
+    return handleWalletAddress(request, env);
+  }
+
   // All POST endpoints require JSON
   if (request.method === 'POST') {
     const ct = request.headers.get('Content-Type') || '';
@@ -68,6 +82,37 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   }
 
   return new Response('Not found', { status: 404 });
+}
+
+// ─── /wallet-address (diagnostics) ──────────────────────────────────
+
+// Isolate-level cache: the address is constant per deployment, so derive it once
+// instead of parsing the full JWK on every request.
+let walletAddressPromise: Promise<string> | null = null;
+
+function getWalletAddress(env: Env): Promise<string> {
+  if (!walletAddressPromise) {
+    walletAddressPromise = (async () => {
+      const wallet = JSON.parse(env.ARWEAVE_JWK);
+      const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
+      return arweave.wallets.jwkToAddress(wallet);
+    })();
+  }
+  return walletAddressPromise;
+}
+
+async function handleWalletAddress(request: Request, env: Env): Promise<Response> {
+  // Rate-limit even this diagnostic endpoint (it is public and otherwise
+  // unauthenticated) so it can't be hammered.
+  const ipBlock = await enforceIpLimit(request, env);
+  if (ipBlock) return ipBlock;
+
+  try {
+    return json({ address: await getWalletAddress(env) });
+  } catch {
+    walletAddressPromise = null; // never cache a failure
+    return error('Wallet not configured', 503);
+  }
 }
 
 // ─── /admin/seed-invite ─────────────────────────────────────────────
@@ -100,6 +145,9 @@ async function handleAdminSeedInvite(request: Request, env: Env): Promise<Respon
 // ─── /check-registration ────────────────────────────────────────────
 
 async function handleCheckRegistration(request: Request, env: Env): Promise<Response> {
+  const ipBlock = await enforceIpLimit(request, env);
+  if (ipBlock) return ipBlock;
+
   const bodyText = await request.text();
   const publicKeyB64 = request.headers.get('X-Public-Key');
   const signatureB64 = request.headers.get('X-Signature');
@@ -121,9 +169,15 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
   const verifyResult = await verifySignature(publicKeyB64, signatureB64, bodyText);
   if (verifyResult) return verifyResult;
 
-  // 3. Check KV cache first, then DO fallback
-  let allowed = !!(await env.ALLOWLIST.get(`pk:${publicKeyB64}`));
-  if (!allowed) {
+  // 3. Check KV cache (typed model, D3), then DO fallback on miss
+  const cached = await readAllowCache(env.ALLOWLIST, publicKeyB64);
+  let allowed: boolean;
+  if (cached === 'allowed') {
+    allowed = true;
+  } else if (cached === 'denied') {
+    allowed = false;
+  } else {
+    // miss (absent / legacy 'true' / invalid) → re-derive from DO, rewrite cache
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
     const checkResp = await inviteMgr.fetch(new Request('http://internal/check-allowed', {
       method: 'POST',
@@ -131,7 +185,7 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
     allowed = checkResult.allowed;
-    if (allowed) await env.ALLOWLIST.put(`pk:${publicKeyB64}`, 'true');
+    if (allowed) await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
   }
 
   return json({ allowed });
@@ -140,6 +194,9 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
 // ─── /register ──────────────────────────────────────────────────────
 
 async function handleRegister(request: Request, env: Env): Promise<Response> {
+  const ipBlock = await enforceIpLimit(request, env);
+  if (ipBlock) return ipBlock;
+
   const bodyText = await request.text();
   const publicKeyB64 = request.headers.get('X-Public-Key');
   const signatureB64 = request.headers.get('X-Signature');
@@ -185,8 +242,8 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     return error(body.error || 'Registration failed', doResp.status);
   }
 
-  // 5. Cache allowlist entry in KV
-  await env.ALLOWLIST.put(`pk:${publicKeyB64}`, 'true');
+  // 5. Cache allowlist entry in KV (typed model, D3)
+  await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
 
   return json({ ok: true });
 }
@@ -194,6 +251,9 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 // ─── /upload ────────────────────────────────────────────────────────
 
 async function handleUpload(request: Request, env: Env): Promise<Response> {
+  const ipBlock = await enforceIpLimit(request, env);
+  if (ipBlock) return ipBlock;
+
   // 1. Read body and check actual size
   const bodyText = await request.text();
   const actualBytes = new TextEncoder().encode(bodyText).byteLength;
@@ -232,9 +292,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   );
   if (ownerHash !== expectedOwnerHash) return error('ownerHash/publicKey mismatch', 400);
 
-  // 6. Validate publicKey in allowlist (anti-sybil, R6)
-  const allowed = await env.ALLOWLIST.get(`pk:${publicKeyB64}`);
-  if (!allowed) {
+  // 6. Validate publicKey in allowlist (anti-sybil, R6) — typed model (D3)
+  const cachedAccess = await readAllowCache(env.ALLOWLIST, publicKeyB64);
+  if (cachedAccess === 'denied') return error('Not registered', 403);
+  if (cachedAccess === 'miss') {
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
     const checkResp = await inviteMgr.fetch(new Request('http://internal/check-allowed', {
       method: 'POST',
@@ -242,7 +303,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
     if (!checkResult.allowed) return error('Not registered', 403);
-    await env.ALLOWLIST.put(`pk:${publicKeyB64}`, 'true');
+    await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
   }
 
   // 7. Validate tags — STRICT: require EXACTLY the expected set
@@ -377,6 +438,31 @@ function json(data: unknown): Response {
 
 function error(message: string, status: number): Response {
   return new Response(message, { status });
+}
+
+/**
+ * Per-IP baseline rate limit (D-baseline). Call at the START of protected
+ * handlers — after route/method dispatch, before body read / signature / KV / DO.
+ * Fails CLOSED (503) if the sharded IpRateLimiter DO is unreachable, since on
+ * Free this is the primary anti-abuse layer.
+ * Returns a Response to short-circuit, or null to continue.
+ */
+async function enforceIpLimit(request: Request, env: Env): Promise<Response | null> {
+  // CF-Connecting-IP is set by Cloudflare at the edge and cannot be spoofed by
+  // the client. Absent only in local dev → shared 'unknown' bucket (still limited).
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  try {
+    const stub = env.IP_RATE_LIMITER.get(env.IP_RATE_LIMITER.idFromName(ip));
+    const resp = await stub.fetch('http://ip-limiter/check', {
+      method: 'POST',
+      body: JSON.stringify({ limit: IP_RATE_LIMIT, windowMs: IP_RATE_WINDOW_MS }),
+    });
+    if (resp.status === 429) return error('Too many requests from this IP', 429);
+    if (!resp.ok) return error('Rate limiter unavailable', 503); // fail-closed
+    return null;
+  } catch {
+    return error('Rate limiter unavailable', 503); // fail-closed
+  }
 }
 
 /**

@@ -5,12 +5,17 @@ compatibility_date = "2026-03-31"
 [durable_objects]
 bindings = [
   { name = "RATE_LIMITER", class_name = "RateLimiter" },
-  { name = "INVITE_MANAGER", class_name = "InviteManager" }
+  { name = "INVITE_MANAGER", class_name = "InviteManager" },
+  { name = "IP_RATE_LIMITER", class_name = "IpRateLimiter" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RateLimiter", "InviteManager"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["IpRateLimiter"]
 
 # KV namespace for allowlist cache (fast lookup during /upload)
 # Source of truth = InviteManager DO. KV = read-through cache.

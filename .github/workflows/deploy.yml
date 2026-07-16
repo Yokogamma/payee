@@ -17,10 +17,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
+      # ── Quality gates (must pass before build/deploy) ──
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm --prefix worker ci
+      - run: npm --prefix worker run typecheck
+      - run: npm --prefix worker test
+      # ── Build ──
       - run: npm run build
         env:
           VITE_PROXY_URL: ${{ secrets.VITE_PROXY_URL }}
+          VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
       - run: cp dist/index.html dist/404.html
       - run: sed -i "s/__BUILD_HASH__/$(git rev-parse --short HEAD)/" dist/sw.js
       - uses: actions/upload-pages-artifact@v3

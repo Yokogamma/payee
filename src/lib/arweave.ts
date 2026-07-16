@@ -8,6 +8,7 @@
  */
 
 import type { EncryptedNote } from './crypto';
+import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
 
 // ─── Config ──────────────────────────────────────────────────────────
 
@@ -226,8 +227,12 @@ async function fetchPage(
   ownerHash: string,
   after: string | null
 ): Promise<{ edges: ArweaveEdge[]; hasNextPage: boolean }> {
-  const query = `query($ownerHash: [String!]!, $appName: [String!]!, $after: String) {
+  // `owners` restricts results to TX signed by the trusted proxy wallet(s) (C2):
+  // an attacker cannot post under these addresses, so squatted/replayed Note-Ids
+  // never appear. `Owner-Hash` tag still scopes to this user's notes.
+  const query = `query($ownerHash: [String!]!, $appName: [String!]!, $owners: [String!]!, $after: String) {
     transactions(
+      owners: $owners,
       tags: [
         { name: "App-Name", values: $appName },
         { name: "Owner-Hash", values: $ownerHash }
@@ -247,6 +252,7 @@ async function fetchPage(
   const variables = {
     ownerHash: [ownerHash],
     appName: [APP_NAME],
+    owners: TRUSTED_OWNERS,
     after: after,
   };
 
@@ -272,6 +278,8 @@ async function fetchPage(
  * Paginated, deduplicated by Note-Id, version-gated.
  */
 export async function fetchAllNotes(ownerHash: string): Promise<EncryptedNote[]> {
+  assertTrustedOwners(); // fail-closed: never trust arbitrary on-chain TX
+
   const allNotes: EncryptedNote[] = [];
   const seenNoteIds = new Set<string>();
   let cursor: string | null = null;
