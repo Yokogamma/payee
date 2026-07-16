@@ -345,29 +345,52 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (tagMap.get(name) !== expected) return error(`Invalid ${name}: expected "${expected}"`, 400);
   }
 
-  // 8. Validate payload consistency (tags ↔ data)
+  // 8. Parse data — must be a plain object (not null/array/primitive)
   let parsedData: { id?: unknown; c?: unknown; iv?: unknown; t?: unknown };
   try {
     parsedData = JSON.parse(data);
   } catch {
     return error('Invalid data JSON', 400);
   }
+  if (typeof parsedData !== 'object' || parsedData === null || Array.isArray(parsedData)) {
+    return error('Invalid data: must be a JSON object', 400);
+  }
+
+  // 9. STRICT data schema — EXACT key set per version (no extra fields, so a v2
+  //    payload cannot smuggle a Timestamp/`t` and leak the date on-chain).
+  const allowedKeys = isV2 ? ['id', 'c', 'iv'] : ['id', 'c', 'iv', 't'];
+  const actualKeys = Object.keys(parsedData);
+  if (actualKeys.length !== allowedKeys.length || actualKeys.some(k => !allowedKeys.includes(k))) {
+    return error(`Invalid data fields: expected exactly [${allowedKeys.join(', ')}]`, 400);
+  }
+
+  // id / c / iv: non-empty strings; c & iv valid base64; iv exactly 12 bytes.
+  if (typeof parsedData.id !== 'string' || typeof parsedData.c !== 'string' || typeof parsedData.iv !== 'string') {
+    return error('Invalid data structure: id, c, iv (strings) required', 400);
+  }
+  if (parsedData.c.length === 0 || parsedData.iv.length === 0) {
+    return error('Invalid data: c and iv must be non-empty', 400);
+  }
+  let ivBytes: Uint8Array;
+  try {
+    ivBytes = base64ToBytes(parsedData.iv);
+    base64ToBytes(parsedData.c); // validate base64
+  } catch {
+    return error('Invalid data: c and iv must be base64', 400);
+  }
+  if (ivBytes.length !== 12) return error('Invalid data: iv must be 12 bytes', 400);
+
+  if (!isV2 && typeof parsedData.t !== 'number') {
+    return error('Invalid data structure: t (number) required for v1', 400);
+  }
+
+  // Cross-check tags ↔ data
   if (tagMap.get('Note-Id') !== parsedData.id) return error('Note-Id mismatch', 400);
   if (tagMap.get('Owner-Hash') !== ownerHash) return error('Owner-Hash mismatch', 400);
   if (!isV2 && tagMap.get('Timestamp') !== String(parsedData.t)) {
     return error('Timestamp mismatch', 400);
   }
 
-  // 9. Validate data structure
-  if (typeof parsedData.id !== 'string' || typeof parsedData.c !== 'string' || typeof parsedData.iv !== 'string') {
-    return error('Invalid data structure: id, c, iv (strings) required', 400);
-  }
-  if (isV2) {
-    // v2 hides the date inside the envelope — it must NOT leak in outer data.
-    if (parsedData.t !== undefined) return error('v2 data must not include t', 400);
-  } else if (typeof parsedData.t !== 'number') {
-    return error('Invalid data structure: t (number) required for v1', 400);
-  }
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(parsedData.id)) return error('Note-Id must be a valid UUID', 400);
 

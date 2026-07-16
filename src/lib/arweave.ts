@@ -28,6 +28,33 @@ export interface RestoredNote {
   txId: string;
 }
 
+/**
+ * Build the proxy upload payload for a note, serializing per its OWN version.
+ * A v2 note is ALWAYS sent as v2 (5 tags, no Timestamp, {id,c,iv}); a v1 note as
+ * v1. This guarantees a restored v2 ciphertext can never be re-published as v1.
+ */
+export function buildUploadPayload(
+  note: EncryptedNote,
+  ownerHash: string,
+  now: number,
+): ProxyUploadPayload {
+  const isV2 = note.v === 2;
+  const data = isV2
+    ? JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv })
+    : JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv, t: note.createdAt });
+
+  const tags = [
+    { name: 'App-Name', value: APP_NAME },
+    { name: 'App-Version', value: isV2 ? '2' : APP_VERSION },
+    { name: 'Owner-Hash', value: ownerHash },
+    { name: 'Content-Type', value: 'application/json' },
+    ...(isV2 ? [] : [{ name: 'Timestamp', value: note.createdAt.toString() }]),
+    { name: 'Note-Id', value: note.noteId },
+  ];
+
+  return { data, tags, ownerHash, timestamp: now };
+}
+
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface ProxyUploadPayload {

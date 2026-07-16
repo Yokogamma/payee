@@ -1,0 +1,26 @@
+name: Deploy Worker (proxy)
+
+# Manual trigger, intentionally decoupled from the Pages deploy: the Worker
+# reader release (M4, IP limiter, DO migration v2, v1/v2 validation) must be
+# deployed and smoke-tested BEFORE the client (reader-before-writer ordering).
+# Requires repo secret CLOUDFLARE_API_TOKEN.
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

@@ -54,6 +54,8 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
 }
 
 const NOTE_ID = '11111111-2222-4333-8444-555555555555'; // valid UUID shape
+const C = 'AAAA';                 // valid base64 (3 bytes)
+const IV = 'AAAAAAAAAAAAAAAA';    // valid base64, exactly 12 bytes
 
 function v1Tags(): Tag[] {
   return [
@@ -84,37 +86,71 @@ describe('upload validation: version contract (v1/v2)', () => {
   // (rather than a 400/401/403 Response) proves validation + auth passed.
   it('accepts a well-formed v1 upload past validation (reaches Arweave stage)', async () => {
     await expect(
-      upload(v1Tags(), { id: NOTE_ID, c: 'ct', iv: 'iv', t: 1700000000000 }, nextIp()),
+      upload(v1Tags(), { id: NOTE_ID, c: C, iv: IV, t: 1700000000000 }, nextIp()),
     ).rejects.toThrow();
   });
 
   it('accepts a well-formed v2 upload past validation (reaches Arweave stage)', async () => {
     await expect(
-      upload(v2Tags(), { id: NOTE_ID, c: 'ct', iv: 'iv' }, nextIp()),
+      upload(v2Tags(), { id: NOTE_ID, c: C, iv: IV }, nextIp()),
     ).rejects.toThrow();
   });
 
   it('rejects a v2 upload that carries a Timestamp tag', async () => {
     const tags = [...v2Tags(), { name: 'Timestamp', value: '1700000000000' }]; // 6 tags
-    const r = await upload(tags, { id: NOTE_ID, c: 'ct', iv: 'iv' }, nextIp());
+    const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV }, nextIp());
     expect(r.status).toBe(400);
   });
 
-  it('rejects a v2 upload whose data still includes t', async () => {
-    const r = await upload(v2Tags(), { id: NOTE_ID, c: 'ct', iv: 'iv', t: 1700000000000 }, nextIp());
+  it('rejects a v2 upload whose data still includes t (strict key set)', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: C, iv: IV, t: 1700000000000 }, nextIp());
     expect(r.status).toBe(400);
-    expect(await r.text()).toMatch(/v2 data must not include t/);
+    expect(await r.text()).toMatch(/Invalid data fields/);
   });
 
   it('rejects a v1 upload missing the Timestamp tag', async () => {
     const tags = v1Tags().filter(t => t.name !== 'Timestamp'); // 5 tags
-    const r = await upload(tags, { id: NOTE_ID, c: 'ct', iv: 'iv', t: 1700000000000 }, nextIp());
+    const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV, t: 1700000000000 }, nextIp());
     expect(r.status).toBe(400);
   });
 
   it('rejects an unsupported App-Version', async () => {
     const tags = v2Tags().map(t => (t.name === 'App-Version' ? { ...t, value: '3' } : t));
-    const r = await upload(tags, { id: NOTE_ID, c: 'ct', iv: 'iv' }, nextIp());
+    const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV }, nextIp());
     expect(r.status).toBe(400);
+  });
+
+  // ── strict wire schema (extra fields / empty / null / mismatch) ──
+  it('rejects an extra data field (v2 with a smuggled property)', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: C, iv: IV, timestamp: 1 } as unknown, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/Invalid data fields/);
+  });
+
+  it('rejects empty c/iv', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: '', iv: '' }, nextIp());
+    expect(r.status).toBe(400);
+  });
+
+  it('rejects a non-12-byte IV', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: C, iv: 'AAAA' }, nextIp()); // 3 bytes
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/iv must be 12 bytes/);
+  });
+
+  it('rejects null data', async () => {
+    const r = await upload(v2Tags(), null, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/must be a JSON object/);
+  });
+
+  it('rejects Note-Id tag not matching data.id', async () => {
+    const r = await upload(
+      v2Tags(),
+      { id: '99999999-2222-4333-8444-555555555555', c: C, iv: IV },
+      nextIp(),
+    );
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/Note-Id mismatch/);
   });
 });

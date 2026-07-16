@@ -72,6 +72,22 @@ export async function saveNote(note: EncryptedNote): Promise<void> {
   await getDB().put('notes', note);
 }
 
+/**
+ * Persist a note and its sync record together in a SINGLE transaction, so a
+ * crash can never leave a note without its sync state (or vice versa). Used on
+ * restore to record the already-on-chain TX as `confirmed`, which stops
+ * syncPendingNotes from re-uploading it (and, for v2 notes, mis-serializing).
+ */
+export async function saveNoteWithSync(
+  note: EncryptedNote,
+  record: SyncRecord,
+): Promise<void> {
+  const tx = getDB().transaction(['notes', 'sync'], 'readwrite');
+  await tx.objectStore('notes').put(note);
+  await tx.objectStore('sync').put(record);
+  await tx.done;
+}
+
 export async function saveNotes(notes: EncryptedNote[]): Promise<void> {
   const tx = getDB().transaction('notes', 'readwrite');
   for (const note of notes) {

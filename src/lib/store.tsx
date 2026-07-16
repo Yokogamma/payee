@@ -30,15 +30,14 @@ import {
   uploadViaProxy,
   fetchAllNotes,
   getTxStatus,
-  APP_NAME,
-  APP_VERSION,
-  type ProxyUploadPayload,
+  buildUploadPayload,
 } from './arweave';
 import {
   initStorage,
   getAllNotes,
   getNoteById,
   saveNote,
+  saveNoteWithSync,
   getAllSyncRecords,
   getRecordsByStatus,
   setSyncRecord,
@@ -473,20 +472,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       updatedAt: Date.now(),
     });
 
-    // Build payload
-    const payload: ProxyUploadPayload = {
-      data: JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv, t: note.createdAt }),
-      tags: [
-        { name: 'App-Name', value: APP_NAME },
-        { name: 'App-Version', value: APP_VERSION },
-        { name: 'Owner-Hash', value: ownerHashRef.current },
-        { name: 'Content-Type', value: 'application/json' },
-        { name: 'Timestamp', value: note.createdAt.toString() },
-        { name: 'Note-Id', value: note.noteId },
-      ],
-      ownerHash: ownerHashRef.current,
-      timestamp: Date.now(),
-    };
+    // Build payload — serialized per the note's own version (v1 or v2), so a
+    // restored v2 ciphertext can never be re-published under v1 tags.
+    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now());
 
     const bodyText = JSON.stringify(payload);
     const signature = await signPayload(signingKeyRef.current, bodyText);
@@ -647,7 +635,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         const existing = await getNoteById(remote.encrypted.noteId);
         if (existing) continue;
 
-        await saveNote(remote.encrypted);
+        // Persist the note AND a confirmed sync record atomically: the TX is
+        // already on-chain, so it must never be re-queued/re-uploaded.
+        await saveNoteWithSync(remote.encrypted, {
+          noteId: remote.encrypted.noteId,
+          txId: remote.txId,
+          status: 'confirmed',
+          transport: 'proxy',
+          updatedAt: Date.now(),
+        });
         setNotes(prev =>
           [...prev, { id: remote.encrypted.noteId, text: remote.text, createdAt: remote.encrypted.createdAt }]
             .sort((a, b) => b.createdAt - a.createdAt)

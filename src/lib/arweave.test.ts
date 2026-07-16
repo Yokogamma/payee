@@ -57,6 +57,30 @@ describe('fetchAllNotes owner filter (C2)', () => {
   });
 });
 
+describe('buildUploadPayload version-aware serialization', () => {
+  it('serializes a v1 note with Timestamp tag and outer t', async () => {
+    const { buildUploadPayload } = await import('./arweave');
+    const note = { noteId: 'id1', ciphertext: 'c', iv: 'iv', createdAt: 123 };
+    const p = buildUploadPayload(note, 'owner-hash', 1000);
+    const names = p.tags.map(t => t.name);
+    expect(names).toHaveLength(6);
+    expect(names).toContain('Timestamp');
+    expect(p.tags.find(t => t.name === 'App-Version')?.value).toBe('1');
+    expect(JSON.parse(p.data)).toEqual({ id: 'id1', c: 'c', iv: 'iv', t: 123 });
+  });
+
+  it('serializes a v2 note WITHOUT Timestamp/outer t', async () => {
+    const { buildUploadPayload } = await import('./arweave');
+    const note = { noteId: 'id2', ciphertext: 'c', iv: 'iv', createdAt: 456, v: 2 as const };
+    const p = buildUploadPayload(note, 'owner-hash', 1000);
+    const names = p.tags.map(t => t.name);
+    expect(names).toHaveLength(5);
+    expect(names).not.toContain('Timestamp');
+    expect(p.tags.find(t => t.name === 'App-Version')?.value).toBe('2');
+    expect(JSON.parse(p.data)).toEqual({ id: 'id2', c: 'c', iv: 'iv' });
+  });
+});
+
 describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
   it('decrypts a v2 note and takes id/date from the authenticated envelope', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
