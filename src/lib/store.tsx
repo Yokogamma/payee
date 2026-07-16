@@ -638,25 +638,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!key || !ownerHashRef.current) return;
 
     try {
-      const remoteNotes = await fetchAllNotes(ownerHashRef.current);
+      // fetchAllNotes decrypts + validates (v1/v2) and drops any TX not signed
+      // by a trusted owner or that fails to decrypt.
+      const remoteNotes = await fetchAllNotes(ownerHashRef.current, key);
       let restoredCount = 0;
 
-      for (const remoteNote of remoteNotes) {
-        const existing = await getNoteById(remoteNote.noteId);
+      for (const remote of remoteNotes) {
+        const existing = await getNoteById(remote.encrypted.noteId);
         if (existing) continue;
 
-        try {
-          const text = await decrypt(key, remoteNote);
-          await saveNote(remoteNote);
-          setNotes(prev =>
-            [...prev, { id: remoteNote.noteId, text, createdAt: remoteNote.createdAt }]
-              .sort((a, b) => b.createdAt - a.createdAt)
-          );
-          restoredCount++;
-        } catch {
-          // Decrypt failed → not our note (spam/garbage) → skip
-          continue;
-        }
+        await saveNote(remote.encrypted);
+        setNotes(prev =>
+          [...prev, { id: remote.encrypted.noteId, text: remote.text, createdAt: remote.encrypted.createdAt }]
+            .sort((a, b) => b.createdAt - a.createdAt)
+        );
+        restoredCount++;
       }
 
       if (restoredCount > 0) {

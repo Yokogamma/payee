@@ -6,7 +6,9 @@ import {
   deriveSigningKeypair,
   deriveOwnerHash,
   encrypt,
+  encryptEnvelope,
   decrypt,
+  decryptNote,
   encryptWithPin,
   decryptWithPin,
   bufferToBase64,
@@ -66,6 +68,36 @@ describe('encrypt/decrypt', () => {
     const enc = await encrypt(await deriveKey(generateMnemonic()), 'x');
     const other = await deriveKey(generateMnemonic());
     await expect(decrypt(other, enc)).rejects.toBeDefined();
+  });
+});
+
+describe('v2 envelope', () => {
+  it('round-trips text through an encrypted envelope', async () => {
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'envelope secret');
+    expect(note.v).toBe(2);
+    expect(await decrypt(key, note)).toBe('envelope secret');
+  });
+
+  it('exposes the timestamp from inside the envelope, not from the record', async () => {
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'x');
+    // Corrupt the outer createdAt — decryptNote must ignore it for v2.
+    const decoded = await decryptNote(key, { ...note, createdAt: 0 });
+    expect(decoded.text).toBe('x');
+    expect(decoded.createdAt).toBe(note.createdAt);
+  });
+
+  it('rejects a v2 record whose outer noteId was swapped', async () => {
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'x');
+    // Same ciphertext, forged outer noteId → inner id mismatch → reject.
+    await expect(decrypt(key, { ...note, noteId: 'forged-id' })).rejects.toThrow(/envelope integrity/);
+  });
+
+  it('fails to decrypt a v2 envelope with the wrong key', async () => {
+    const note = await encryptEnvelope(await deriveKey(generateMnemonic()), 'x');
+    await expect(decrypt(await deriveKey(generateMnemonic()), note)).rejects.toBeDefined();
   });
 });
 

@@ -306,13 +306,26 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
   }
 
-  // 7. Validate tags — STRICT: require EXACTLY the expected set
+  // 7. Validate tags — STRICT, version-specific (reader-before-writer: accept both).
+  //    v1: 6 tags incl. Timestamp; outer data {id,c,iv,t}.
+  //    v2: 5 tags, NO Timestamp (date lives inside the encrypted envelope);
+  //        outer data {id,c,iv} — no t on-chain.
+  const declaredVersion = Array.isArray(tags)
+    ? tags.find(t => t && t.name === 'App-Version')?.value
+    : undefined;
+  if (declaredVersion !== '1' && declaredVersion !== '2') {
+    return error('Unsupported App-Version', 400);
+  }
+  const isV2 = declaredVersion === '2';
+
   const REQUIRED_TAGS = new Map<string, string>([
     ['App-Name', 'EternalNotes'],
-    ['App-Version', '1'],
+    ['App-Version', declaredVersion],
     ['Content-Type', 'application/json'],
   ]);
-  const REQUIRED_DYNAMIC = new Set(['Owner-Hash', 'Timestamp', 'Note-Id']);
+  const REQUIRED_DYNAMIC = isV2
+    ? new Set(['Owner-Hash', 'Note-Id'])
+    : new Set(['Owner-Hash', 'Timestamp', 'Note-Id']);
   const ALL_EXPECTED = new Set([...REQUIRED_TAGS.keys(), ...REQUIRED_DYNAMIC]);
 
   if (!Array.isArray(tags)) return error('tags must be an array', 400);
@@ -321,6 +334,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const tagMap = new Map<string, string>();
   for (const tag of tags) {
     if (!tag.name || typeof tag.value !== 'string') return error('Invalid tag structure', 400);
+    // Timestamp is not in ALL_EXPECTED for v2, so a v2 upload carrying it is rejected here.
     if (!ALL_EXPECTED.has(tag.name)) return error(`Forbidden tag: ${tag.name}`, 400);
     if (tagMap.has(tag.name)) return error(`Duplicate tag: ${tag.name}`, 400);
     tagMap.set(tag.name, tag.value);
@@ -332,19 +346,27 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
 
   // 8. Validate payload consistency (tags ↔ data)
-  let parsedData: { id: string; c: string; iv: string; t: number };
+  let parsedData: { id?: unknown; c?: unknown; iv?: unknown; t?: unknown };
   try {
     parsedData = JSON.parse(data);
   } catch {
     return error('Invalid data JSON', 400);
   }
   if (tagMap.get('Note-Id') !== parsedData.id) return error('Note-Id mismatch', 400);
-  if (tagMap.get('Timestamp') !== String(parsedData.t)) return error('Timestamp mismatch', 400);
   if (tagMap.get('Owner-Hash') !== ownerHash) return error('Owner-Hash mismatch', 400);
+  if (!isV2 && tagMap.get('Timestamp') !== String(parsedData.t)) {
+    return error('Timestamp mismatch', 400);
+  }
 
   // 9. Validate data structure
-  if (!parsedData.id || !parsedData.c || !parsedData.iv || typeof parsedData.t !== 'number') {
-    return error('Invalid data structure: id, c, iv (strings) and t (number) required', 400);
+  if (typeof parsedData.id !== 'string' || typeof parsedData.c !== 'string' || typeof parsedData.iv !== 'string') {
+    return error('Invalid data structure: id, c, iv (strings) required', 400);
+  }
+  if (isV2) {
+    // v2 hides the date inside the envelope — it must NOT leak in outer data.
+    if (parsedData.t !== undefined) return error('v2 data must not include t', 400);
+  } else if (typeof parsedData.t !== 'number') {
+    return error('Invalid data structure: t (number) required for v1', 400);
   }
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(parsedData.id)) return error('Note-Id must be a valid UUID', 400);

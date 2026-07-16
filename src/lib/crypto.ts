@@ -30,8 +30,23 @@ export interface EncryptedNote {
   iv: string;
   /** Timestamp of creation */
   createdAt: number;
+  /**
+   * Data format version. Absent/1 = v1: ciphertext is the raw note text and
+   * noteId/createdAt live in plaintext (Arweave tags / outer JSON). 2 = v2:
+   * ciphertext is an encrypted envelope {v,id,t,text}, so id/date are
+   * authenticated by the GCM tag and never exposed on-chain.
+   */
+  v?: 1 | 2;
   // No hash field. GCM auth tag inside ciphertext ensures integrity.
   // If decrypt succeeds — data is not corrupted.
+}
+
+/** v2 plaintext payload — encrypted whole so metadata is hidden + authenticated. */
+interface NoteEnvelopeV2 {
+  v: 2;
+  id: string;
+  t: number;
+  text: string;
 }
 
 export interface NoteData {
@@ -178,23 +193,84 @@ export async function encrypt(
 }
 
 /**
- * Decrypt an encrypted note back to plaintext.
- * If decryption fails, the ciphertext was tampered with or wrong key used.
+ * Encrypt a note as a v2 envelope: the whole {v,id,t,text} object is encrypted,
+ * so the note id and timestamp are authenticated by the GCM tag and never appear
+ * in cleartext on-chain. Not yet wired into the write path (reader-before-writer
+ * rollout) — v2 is accepted for reading first, then writes flip over.
  */
-export async function decrypt(
+export async function encryptEnvelope(
   key: CryptoKey,
-  encrypted: EncryptedNote
-): Promise<string> {
+  plaintext: string
+): Promise<EncryptedNote> {
+  const noteId = crypto.randomUUID();
+  const createdAt = Date.now();
+  const envelope: NoteEnvelopeV2 = { v: 2, id: noteId, t: createdAt, text: plaintext };
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertextBuffer = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(envelope))
+  );
+
+  return {
+    noteId,
+    ciphertext: bufferToBase64(ciphertextBuffer),
+    iv: bufferToBase64(iv),
+    createdAt,
+    v: 2,
+  };
+}
+
+/** Low-level AES-256-GCM decrypt → UTF-8 string. Throws on wrong key/tamper. */
+async function aesDecrypt(key: CryptoKey, encrypted: EncryptedNote): Promise<string> {
   const ciphertext = base64ToBuffer(encrypted.ciphertext);
   const iv = base64ToBuffer(encrypted.iv);
-
   const decrypted = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: iv as BufferSource },
     key,
     ciphertext as BufferSource
   );
-
   return new TextDecoder().decode(decrypted);
+}
+
+/**
+ * Decrypt a note to its text AND authoritative timestamp, dispatching on version.
+ * - v1 (absent/1): ciphertext IS the text; createdAt comes from the record.
+ * - v2: ciphertext is an envelope; validate it, cross-check the inner id against
+ *   the record's noteId (defeats swapping ciphertext under a forged outer id),
+ *   and take the timestamp from the (authenticated) envelope.
+ * Throws if decryption fails or the envelope is inconsistent.
+ */
+export async function decryptNote(
+  key: CryptoKey,
+  encrypted: EncryptedNote
+): Promise<{ text: string; createdAt: number }> {
+  const raw = await aesDecrypt(key, encrypted);
+
+  if (encrypted.v === 2) {
+    const env = JSON.parse(raw) as NoteEnvelopeV2;
+    if (
+      env.v !== 2 ||
+      typeof env.text !== 'string' ||
+      typeof env.id !== 'string' ||
+      typeof env.t !== 'number' ||
+      env.id !== encrypted.noteId
+    ) {
+      throw new Error('v2 envelope integrity check failed');
+    }
+    return { text: env.text, createdAt: env.t };
+  }
+
+  return { text: raw, createdAt: encrypted.createdAt };
+}
+
+/** Decrypt a note to its text only (v1 or v2). Throws on failure/tamper. */
+export async function decrypt(
+  key: CryptoKey,
+  encrypted: EncryptedNote
+): Promise<string> {
+  return (await decryptNote(key, encrypted)).text;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────

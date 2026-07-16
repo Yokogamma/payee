@@ -8,6 +8,7 @@
  */
 
 import type { EncryptedNote } from './crypto';
+import { decryptNote } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
 
 // ─── Config ──────────────────────────────────────────────────────────
@@ -16,8 +17,16 @@ const PROXY_URL = import.meta.env.VITE_PROXY_URL || '';
 export const APP_NAME = 'EternalNotes';
 export const APP_VERSION = '1';
 
-// Supported data format versions. When payload structure changes, add new version.
-const SUPPORTED_VERSIONS = new Set(['1']);
+// Supported data format versions for READING. Client still writes v1 in this
+// release (reader-before-writer); v2 is accepted so the writer flip is seamless.
+const SUPPORTED_VERSIONS = new Set(['1', '2']);
+
+/** A note recovered from Arweave: the record to persist + its decrypted text. */
+export interface RestoredNote {
+  encrypted: EncryptedNote;
+  text: string;
+  txId: string;
+}
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -277,10 +286,13 @@ async function fetchPage(
  * Fetch all encrypted notes from Arweave for a given owner hash.
  * Paginated, deduplicated by Note-Id, version-gated.
  */
-export async function fetchAllNotes(ownerHash: string): Promise<EncryptedNote[]> {
+export async function fetchAllNotes(
+  ownerHash: string,
+  key: CryptoKey,
+): Promise<RestoredNote[]> {
   assertTrustedOwners(); // fail-closed: never trust arbitrary on-chain TX
 
-  const allNotes: EncryptedNote[] = [];
+  const restored: RestoredNote[] = [];
   const seenNoteIds = new Set<string>();
   let cursor: string | null = null;
 
@@ -307,23 +319,21 @@ export async function fetchAllNotes(ownerHash: string): Promise<EncryptedNote[]>
       if (!appNameTag || appNameTag.value !== APP_NAME) continue;
       if (!versionTag || !SUPPORTED_VERSIONS.has(versionTag.value)) continue;
       if (!noteIdTag) continue;
+      // Dedup is checked here but the Note-Id is CLAIMED only after a successful
+      // decrypt below (truth after decryption) — a candidate that can't be
+      // decrypted (replay/garbage) must not shadow the real note.
       if (seenNoteIds.has(noteIdTag.value)) continue;
-      seenNoteIds.add(noteIdTag.value);
 
       try {
         const dataResponse = await fetch(`https://arweave.net/${edge.node.id}`);
         if (!dataResponse.ok) continue;
         const raw = await dataResponse.json();
 
-        // Validate structure
-        if (!raw.c || !raw.iv || !raw.t || !raw.id) continue;
+        const built = await buildRestoredNote(key, versionTag.value, noteIdTag.value, raw, edge.node.id);
+        if (!built) continue; // wrong shape or not ours (decrypt failed)
 
-        allNotes.push({
-          noteId: raw.id,
-          ciphertext: raw.c,
-          iv: raw.iv,
-          createdAt: raw.t,
-        });
+        seenNoteIds.add(noteIdTag.value); // claim only after success
+        restored.push(built);
       } catch {
         continue; // Skip malformed entries
       }
@@ -333,6 +343,44 @@ export async function fetchAllNotes(ownerHash: string): Promise<EncryptedNote[]>
     cursor = edges[edges.length - 1].cursor;
   }
 
-  allNotes.sort((a, b) => b.createdAt - a.createdAt);
-  return allNotes;
+  restored.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);
+  return restored;
+}
+
+/**
+ * Assemble + decrypt a candidate TX by version. Returns null (skip) on any
+ * shape mismatch or decryption failure. For v2 the createdAt comes from the
+ * authenticated envelope, not from any on-chain field.
+ */
+async function buildRestoredNote(
+  key: CryptoKey,
+  version: string,
+  noteIdTag: string,
+  raw: { id?: unknown; c?: unknown; iv?: unknown; t?: unknown },
+  txId: string,
+): Promise<RestoredNote | null> {
+  let encrypted: EncryptedNote;
+
+  if (version === '2') {
+    if (typeof raw.c !== 'string' || typeof raw.iv !== 'string' || typeof raw.id !== 'string') return null;
+    if (raw.id !== noteIdTag) return null; // outer id must match the tag
+    encrypted = { noteId: raw.id, ciphertext: raw.c, iv: raw.iv, createdAt: 0, v: 2 };
+  } else {
+    if (
+      typeof raw.c !== 'string' || typeof raw.iv !== 'string' ||
+      typeof raw.t !== 'number' || typeof raw.id !== 'string'
+    ) return null;
+    if (raw.id !== noteIdTag) return null;
+    encrypted = { noteId: raw.id, ciphertext: raw.c, iv: raw.iv, createdAt: raw.t };
+  }
+
+  let decoded: { text: string; createdAt: number };
+  try {
+    decoded = await decryptNote(key, encrypted);
+  } catch {
+    return null; // not ours / replay / tampered
+  }
+
+  encrypted.createdAt = decoded.createdAt; // v2: authoritative from envelope
+  return { encrypted, text: decoded.text, txId };
 }

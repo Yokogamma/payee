@@ -1,0 +1,120 @@
+import { env, SELF } from 'cloudflare:test';
+import { describe, it, expect } from 'vitest';
+import * as ed from '@noble/ed25519';
+
+// Worker contract tests for version-specific upload validation (v1 vs v2).
+// A valid Ed25519 signature + ownerHash + allowlist entry are required to reach
+// the tag/data validation, so we forge a real signed request per case.
+
+const ALLOWLIST = (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST;
+
+function b64(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+interface Tag { name: string; value: string }
+
+/** Sign and send an /upload with the given tags + data object, as an allowlisted key. */
+async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Response> {
+  const priv = ed.utils.randomPrivateKey();
+  const pub = await ed.getPublicKeyAsync(priv);
+  const pkB64 = b64(pub);
+  const ownerHash = b64(await sha256(pub));
+
+  // Owner-Hash tag must match the derived value; patch it into the provided tags.
+  const finalTags = tags.map(t => (t.name === 'Owner-Hash' ? { ...t, value: ownerHash } : t));
+
+  await ALLOWLIST.put(`pk:${pkB64}`, JSON.stringify({ status: 'allowed' }));
+
+  const body = JSON.stringify({
+    data: JSON.stringify(dataObj),
+    tags: finalTags,
+    ownerHash,
+    timestamp: Date.now(),
+  });
+  const digest = await sha256(new TextEncoder().encode(body));
+  const sig = b64(await ed.signAsync(digest, priv));
+
+  return SELF.fetch('https://proxy.example.com/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Public-Key': pkB64,
+      'X-Signature': sig,
+      'CF-Connecting-IP': ip,
+    },
+    body,
+  });
+}
+
+const NOTE_ID = '11111111-2222-4333-8444-555555555555'; // valid UUID shape
+
+function v1Tags(): Tag[] {
+  return [
+    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Version', value: '1' },
+    { name: 'Content-Type', value: 'application/json' },
+    { name: 'Owner-Hash', value: 'PLACEHOLDER' },
+    { name: 'Timestamp', value: '1700000000000' },
+    { name: 'Note-Id', value: NOTE_ID },
+  ];
+}
+function v2Tags(): Tag[] {
+  return [
+    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Version', value: '2' },
+    { name: 'Content-Type', value: 'application/json' },
+    { name: 'Owner-Hash', value: 'PLACEHOLDER' },
+    { name: 'Note-Id', value: NOTE_ID },
+  ];
+}
+
+let ipCounter = 0;
+const nextIp = () => `uv-${crypto.randomUUID().slice(0, 6)}-${ipCounter++}`;
+
+describe('upload validation: version contract (v1/v2)', () => {
+  // A fully-valid upload passes all validation/auth and reaches the Arweave
+  // signing step, which throws under the stub JWK ('{}'). That thrown error
+  // (rather than a 400/401/403 Response) proves validation + auth passed.
+  it('accepts a well-formed v1 upload past validation (reaches Arweave stage)', async () => {
+    await expect(
+      upload(v1Tags(), { id: NOTE_ID, c: 'ct', iv: 'iv', t: 1700000000000 }, nextIp()),
+    ).rejects.toThrow();
+  });
+
+  it('accepts a well-formed v2 upload past validation (reaches Arweave stage)', async () => {
+    await expect(
+      upload(v2Tags(), { id: NOTE_ID, c: 'ct', iv: 'iv' }, nextIp()),
+    ).rejects.toThrow();
+  });
+
+  it('rejects a v2 upload that carries a Timestamp tag', async () => {
+    const tags = [...v2Tags(), { name: 'Timestamp', value: '1700000000000' }]; // 6 tags
+    const r = await upload(tags, { id: NOTE_ID, c: 'ct', iv: 'iv' }, nextIp());
+    expect(r.status).toBe(400);
+  });
+
+  it('rejects a v2 upload whose data still includes t', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: 'ct', iv: 'iv', t: 1700000000000 }, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/v2 data must not include t/);
+  });
+
+  it('rejects a v1 upload missing the Timestamp tag', async () => {
+    const tags = v1Tags().filter(t => t.name !== 'Timestamp'); // 5 tags
+    const r = await upload(tags, { id: NOTE_ID, c: 'ct', iv: 'iv', t: 1700000000000 }, nextIp());
+    expect(r.status).toBe(400);
+  });
+
+  it('rejects an unsupported App-Version', async () => {
+    const tags = v2Tags().map(t => (t.name === 'App-Version' ? { ...t, value: '3' } : t));
+    const r = await upload(tags, { id: NOTE_ID, c: 'ct', iv: 'iv' }, nextIp());
+    expect(r.status).toBe(400);
+  });
+});
