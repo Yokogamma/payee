@@ -11,7 +11,9 @@ import {
   decryptNote,
   encryptWithPin,
   decryptWithPin,
+  isPinKdfLegacy,
   bufferToBase64,
+  type PinEncryptedSeed,
 } from './crypto';
 
 // Phase 0 smoke tests — pin down current crypto behavior before Phase 1/3 changes.
@@ -101,15 +103,37 @@ describe('v2 envelope', () => {
   });
 });
 
+// Build a legacy (PBKDF2-600k, no `kdf` field) blob the way the old code did.
+async function makeLegacyPinBlob(mnemonic: string, pin: string): Promise<PinEncryptedSeed> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' },
+    km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'],
+  );
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(mnemonic));
+  return { ciphertext: bufferToBase64(ct), iv: bufferToBase64(iv), salt: bufferToBase64(salt) }; // no kdf
+}
+
 describe('PIN wrapping', () => {
-  it('round-trips the mnemonic through a PIN', async () => {
+  it('round-trips the mnemonic through an Argon2id PIN', async () => {
     const mn = generateMnemonic();
-    const blob = await encryptWithPin(mn, '1234');
-    expect(await decryptWithPin(blob, '1234')).toBe(mn);
+    const blob = await encryptWithPin(mn, '123456');
+    expect(blob.kdf).toBe('argon2id');
+    expect(isPinKdfLegacy(blob)).toBe(false);
+    expect(await decryptWithPin(blob, '123456')).toBe(mn);
   });
 
   it('fails to unwrap with the wrong PIN', async () => {
-    const blob = await encryptWithPin(generateMnemonic(), '1234');
-    await expect(decryptWithPin(blob, '9999')).rejects.toBeDefined();
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    await expect(decryptWithPin(blob, '999999')).rejects.toBeDefined();
+  });
+
+  it('still reads a legacy PBKDF2 blob (no kdf field) and flags it for rewrap', async () => {
+    const mn = generateMnemonic();
+    const legacy = await makeLegacyPinBlob(mn, '1234');
+    expect(isPinKdfLegacy(legacy)).toBe(true);
+    expect(await decryptWithPin(legacy, '1234')).toBe(mn);
   });
 });

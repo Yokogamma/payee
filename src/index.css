@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap');
+/* Fonts are self-hosted via @fontsource (imported in main.tsx) — no external CDN. */
 
 /* ─── Reset & Variables ─────────────────────────────────────── */
 
@@ -48,6 +48,10 @@
   margin: 0;
   padding: 0;
 }
+
+/* Theme-aware text-color utilities (replace inline styles for CSP). */
+.text-green { color: var(--green); }
+.text-red { color: var(--red); }
 
 html, body, #root {
   height: 100%;

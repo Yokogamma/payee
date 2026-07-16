@@ -92,7 +92,7 @@ export function Main() {
   }
 
   async function handleSetupPin() {
-    if (pinInput.length < 4) { setPinError('Минимум 4 цифры'); return; }
+    if (pinInput.length < 6) { setPinError('Минимум 6 цифр'); return; }
     if (pinInput !== pinConfirm) { setPinError('PIN-коды не совпадают'); return; }
     await setupPin(pinInput);
     setPinInput(''); setPinConfirm(''); setPinError(''); setShowPinSetup(false);
@@ -146,9 +146,8 @@ export function Main() {
           <span className="note-count">{notes.length}</span>
           {arweave.enabled && (
             <span
-              className="ar-badge"
+              className={`ar-badge ${arweave.online ? 'text-green' : 'text-red'}`}
               title={arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
-              style={{color: arweave.online ? '#2dd4a8' : '#f05365'}}
             >
               {arweave.syncing ? '⏳' : arweave.online ? '♾️' : '⚠️'}
             </span>
@@ -296,7 +295,7 @@ export function Main() {
                       inputMode="numeric"
                       pattern="[0-9]*"
                       className="pin-input"
-                      placeholder="PIN (мин. 4 цифры)"
+                      placeholder="PIN (мин. 6 цифр)"
                       value={pinInput}
                       maxLength={8}
                       onChange={e => { setPinInput(e.target.value.replace(/\D/g, '')); setPinError(''); }}
@@ -352,12 +351,12 @@ export function Main() {
               </label>
 
               <div className="settings-info">
-                <div>Статус: <strong style={{color: arweave.online ? '#2dd4a8' : '#f05365'}}>
+                <div>Статус: <strong className={arweave.online ? 'text-green' : 'text-red'}>
                   {arweave.online ? '● Онлайн' : '○ Оффлайн'}
                 </strong></div>
                 <div>Синхронизировано: <strong>{arweave.acceptedCount + arweave.confirmedCount}</strong> из <strong>{notes.length}</strong></div>
                 {arweave.confirmedCount > 0 && (
-                  <div style={{color: 'var(--green)'}}>✓ Подтверждено в блокчейне: <strong>{arweave.confirmedCount}</strong></div>
+                  <div className="text-green">✓ Подтверждено в блокчейне: <strong>{arweave.confirmedCount}</strong></div>
                 )}
                 {arweave.acceptedCount > 0 && (
                   <div>⏳ Ожидают подтверждения: <strong>{arweave.acceptedCount}</strong></div>
@@ -366,7 +365,7 @@ export function Main() {
                   <div>⏳ Ожидают загрузки: <strong>{arweave.unsyncedCount}</strong></div>
                 )}
                 {arweave.errorCount > 0 && (
-                  <div style={{color: 'var(--red)'}}>⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
+                  <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
                 )}
                 {arweave.lastSync && (
                   <div>Последняя синхронизация: {new Date(arweave.lastSync).toLocaleString('ru')}</div>
@@ -423,7 +422,7 @@ export function Main() {
 
               {arweave.registered && (
                 <div className="settings-info">
-                  <div style={{color: 'var(--green)'}}>✓ Синхронизация доступна</div>
+                  <div className="text-green">✓ Синхронизация доступна</div>
                 </div>
               )}
             </div>

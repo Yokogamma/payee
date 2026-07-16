@@ -18,6 +18,7 @@ import {
   decrypt,
   encryptWithPin,
   decryptWithPin,
+  isPinKdfLegacy,
   bufferToBase64,
   type EncryptedNote,
   type NoteData,
@@ -846,6 +847,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // 3. Success — reset attempts
     await deleteMeta('pin-attempts');
     await deleteMeta('pin-locked-until');
+
+    // Transparently upgrade a legacy PBKDF2 blob to Argon2id. If the rewrap
+    // fails, keep the working legacy blob and continue — don't block login.
+    if (isPinKdfLegacy(pinData)) {
+      try {
+        await setMeta('pin-seed', await encryptWithPin(mn, pin));
+      } catch (err) {
+        console.error('PIN rewrap to Argon2id failed (keeping legacy blob):', err);
+      }
+    }
 
     await setupFromMnemonic(mn);
     sessionStorage.setItem('eternal-notes-session', mn);

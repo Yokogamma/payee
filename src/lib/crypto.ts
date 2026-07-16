@@ -294,68 +294,101 @@ export function base64ToBuffer(base64: string): Uint8Array {
 }
 
 // ─── PIN Encryption ─────────────────────────────────────────────────
+//
+// Versioned KDF. NEW blobs use Argon2id (memory-hard → far costlier to brute
+// force a short PIN on a GPU). LEGACY blobs (no `kdf` field) used PBKDF2-600k and
+// are still readable, then transparently re-wrapped to Argon2id on next unlock.
 
-/**
- * Derive AES-256 key from PIN using PBKDF2.
- * Salt ensures different keys for same PIN across devices.
- */
-async function derivePinKey(pin: string, salt: Uint8Array): Promise<CryptoKey> {
+interface Argon2Params {
+  iterations: number;
+  memorySize: number;   // KiB
+  parallelism: number;
+  hashLength: number;
+}
+
+// Mobile-tuned starting point (~64 MiB, t=3). Revisit with device benchmarks.
+const ARGON2_PARAMS: Argon2Params = { iterations: 3, memorySize: 65_536, parallelism: 1, hashLength: 32 };
+const PIN_KDF_VERSION = 1;
+
+export interface PinEncryptedSeed {
+  ciphertext: string; // base64
+  iv: string;         // base64
+  salt: string;       // base64
+  /** Absent = legacy PBKDF2-600k; 'argon2id' = memory-hard (current). */
+  kdf?: 'pbkdf2' | 'argon2id';
+  v?: number;
+  argon2?: Argon2Params; // present iff kdf === 'argon2id'
+}
+
+/** Legacy PBKDF2 (SHA-256, 600k) key derivation — read path only. */
+async function derivePinKeyPbkdf2(pin: string, salt: Uint8Array): Promise<CryptoKey> {
   const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(pin),
-    'PBKDF2',
-    false,
-    ['deriveKey']
+    'raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey'],
   );
   return crypto.subtle.deriveKey(
     { name: 'PBKDF2', salt: salt as BufferSource, iterations: 600_000, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
-    ['encrypt', 'decrypt']
+    ['encrypt', 'decrypt'],
   );
 }
 
-export interface PinEncryptedSeed {
-  ciphertext: string; // base64
-  iv: string;         // base64
-  salt: string;       // base64
+/** Argon2id key derivation (current). Uses the hash-wasm WASM implementation. */
+async function derivePinKeyArgon2(pin: string, salt: Uint8Array, params: Argon2Params): Promise<CryptoKey> {
+  const { argon2id } = await import('hash-wasm');
+  const raw = await argon2id({
+    password: pin,
+    salt,
+    iterations: params.iterations,
+    memorySize: params.memorySize,
+    parallelism: params.parallelism,
+    hashLength: params.hashLength,
+    outputType: 'binary',
+  });
+  return crypto.subtle.importKey('raw', raw as BufferSource, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-/**
- * Encrypt mnemonic with PIN. Returns ciphertext + iv + salt.
- */
+/** True if the blob predates Argon2id and should be re-wrapped after unlock. */
+export function isPinKdfLegacy(encrypted: PinEncryptedSeed): boolean {
+  return encrypted.kdf !== 'argon2id';
+}
+
+/** Encrypt mnemonic with PIN using Argon2id (current KDF). */
 export async function encryptWithPin(mnemonic: string, pin: string): Promise<PinEncryptedSeed> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await derivePinKey(pin, salt);
+  const key = await derivePinKeyArgon2(pin, salt, ARGON2_PARAMS);
 
   const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    new TextEncoder().encode(mnemonic)
+    { name: 'AES-GCM', iv }, key, new TextEncoder().encode(mnemonic),
   );
 
   return {
     ciphertext: bufferToBase64(ciphertext),
     iv: bufferToBase64(iv),
     salt: bufferToBase64(salt),
+    kdf: 'argon2id',
+    v: PIN_KDF_VERSION,
+    argon2: ARGON2_PARAMS,
   };
 }
 
 /**
- * Decrypt mnemonic with PIN. Throws on wrong PIN (GCM auth failure).
+ * Decrypt mnemonic with PIN, dispatching on the blob's KDF. Throws on wrong PIN
+ * (GCM auth failure). A missing `kdf` field means a legacy PBKDF2-600k blob.
  */
 export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<string> {
   const salt = base64ToBuffer(encrypted.salt);
   const iv = base64ToBuffer(encrypted.iv);
   const ciphertext = base64ToBuffer(encrypted.ciphertext);
-  const key = await derivePinKey(pin, salt);
+
+  const key = encrypted.kdf === 'argon2id'
+    ? await derivePinKeyArgon2(pin, salt, encrypted.argon2 ?? ARGON2_PARAMS)
+    : await derivePinKeyPbkdf2(pin, salt);
 
   const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource },
-    key,
-    ciphertext as BufferSource
+    { name: 'AES-GCM', iv: iv as BufferSource }, key, ciphertext as BufferSource,
   );
 
   return new TextDecoder().decode(decrypted);

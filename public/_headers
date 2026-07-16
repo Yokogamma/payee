@@ -1,3 +1,6 @@
+# Baseline headers. The build (scripts/gen-headers.mjs) OVERWRITES dist/_headers
+# with these PLUS a Content-Security-Policy whose connect-src is pinned to the
+# real VITE_PROXY_URL origin. Edit the generator, not just this file.
 /*
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
