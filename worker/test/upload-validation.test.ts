@@ -28,7 +28,8 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
   const ownerHash = b64(await sha256(pub));
 
   // Owner-Hash tag must match the derived value; patch it into the provided tags.
-  const finalTags = tags.map(t => (t.name === 'Owner-Hash' ? { ...t, value: ownerHash } : t));
+  // Guard null entries so callers can intentionally inject a malformed tag.
+  const finalTags = tags.map(t => (t && t.name === 'Owner-Hash' ? { ...t, value: ownerHash } : t));
 
   await ALLOWLIST.put(`pk:${pkB64}`, JSON.stringify({ status: 'allowed' }));
 
@@ -79,6 +80,21 @@ function v2Tags(): Tag[] {
 
 let ipCounter = 0;
 const nextIp = () => `uv-${crypto.randomUUID().slice(0, 6)}-${ipCounter++}`;
+
+/** Send a raw (unsigned) body — the top-level shape/timestamp checks run BEFORE
+ * signature verification, so dummy auth headers are enough to reach them. */
+function rawUpload(body: string, ip: string): Promise<Response> {
+  return SELF.fetch('https://proxy.example.com/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Public-Key': 'x',
+      'X-Signature': 'y',
+      'CF-Connecting-IP': ip,
+    },
+    body,
+  });
+}
 
 describe('upload validation: version contract (v1/v2)', () => {
   // A fully-valid upload passes all validation/auth and reaches the Arweave
@@ -152,5 +168,25 @@ describe('upload validation: version contract (v1/v2)', () => {
     );
     expect(r.status).toBe(400);
     expect(await r.text()).toMatch(/Note-Id mismatch/);
+  });
+
+  // ── top-level request hardening (checked before signature) ──
+  it('rejects a null JSON body', async () => {
+    const r = await rawUpload('null', nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/must be a JSON object/);
+  });
+
+  it('rejects a non-number timestamp (anti-replay NaN bypass)', async () => {
+    const body = JSON.stringify({ data: '{}', tags: [], ownerHash: 'oh', timestamp: 'soon' });
+    const r = await rawUpload(body, nextIp());
+    expect(r.status).toBe(401);
+  });
+
+  it('rejects a null entry inside the tags array', async () => {
+    const tags = [null as unknown as Tag, ...v2Tags().slice(1)]; // 5 entries, one null
+    const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV }, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/Invalid tag structure/);
   });
 });

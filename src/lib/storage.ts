@@ -83,9 +83,18 @@ export async function saveNoteWithSync(
   record: SyncRecord,
 ): Promise<void> {
   const tx = getDB().transaction(['notes', 'sync'], 'readwrite');
-  await tx.objectStore('notes').put(note);
-  await tx.objectStore('sync').put(record);
-  await tx.done;
+  try {
+    await tx.objectStore('notes').put(note);
+    await tx.objectStore('sync').put(record);
+    await tx.done;
+  } catch (e) {
+    // Explicitly roll back so a failure on the SECOND put can't leave the first
+    // committed (a sync keyPath error throws synchronously and would otherwise
+    // let the transaction auto-commit with only the note written).
+    tx.done.catch(() => {}); // swallow the resulting abort rejection (we rethrow e)
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
 }
 
 export async function saveNotes(notes: EncryptedNote[]): Promise<void> {

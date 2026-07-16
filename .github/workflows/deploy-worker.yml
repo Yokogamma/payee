@@ -1,26 +1,27 @@
 name: Deploy Worker (proxy)
 
-# Manual trigger, intentionally decoupled from the Pages deploy: the Worker
-# reader release (M4, IP limiter, DO migration v2, v1/v2 validation) must be
-# deployed and smoke-tested BEFORE the client (reader-before-writer ordering).
-# Requires repo secret CLOUDFLARE_API_TOKEN.
+# Manual trigger, intentionally decoupled from the Pages deploy so the operator
+# controls the reader-before-writer sequence:  Worker → smoke → Pages.
+# NOTE: a workflow_dispatch workflow must already exist on the default branch
+# before it can be run from the Actions UI, so land this file in main FIRST
+# (both deploys here are manual, so merging does not auto-publish anything).
+# Requires repo secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
 on:
   workflow_dispatch:
 
 jobs:
   deploy-worker:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: worker
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npx wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      - run: npm --prefix worker ci
+      - run: npm --prefix worker run typecheck
+      - run: npm --prefix worker test
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker

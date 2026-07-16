@@ -8,6 +8,7 @@ import {
   getNoteById,
   getAllSyncRecords,
   getRecordsByStatus,
+  type SyncRecord,
 } from './storage';
 
 // jsdom gives us localStorage (for the migration path); fake-indexeddb gives us
@@ -43,5 +44,18 @@ describe('saveNoteWithSync', () => {
     const rec = all.find(r => r.noteId === 'n2');
     // syncPendingNotes skips accepted/confirmed → this note won't be re-uploaded.
     expect(rec?.status).toBe('confirmed');
+  });
+
+  it('rolls back the note if the sync write fails (atomic — both or neither)', async () => {
+    // The sync store has keyPath 'noteId'; a record without it makes the second
+    // put fail, which must abort the whole transaction and roll back the note.
+    const badRecord = { txId: 'tx3', status: 'confirmed', transport: 'proxy', updatedAt: 2 } as unknown as SyncRecord;
+    await expect(
+      saveNoteWithSync({ noteId: 'n3', ciphertext: 'c', iv: 'iv', createdAt: 1 }, badRecord),
+    ).rejects.toBeDefined();
+
+    expect(await getNoteById('n3')).toBeUndefined(); // note rolled back
+    const all = await getAllSyncRecords();
+    expect(all.find(r => r.noteId === 'n3')).toBeUndefined();
   });
 });

@@ -1,8 +1,13 @@
 name: Deploy to GitHub Pages
 
+# Manual trigger so the client (Pages) is NEVER auto-published ahead of the
+# Worker. Reader-before-writer rollout is operator-driven:
+#   1. merge to main (nothing deploys),
+#   2. run "Deploy Worker (proxy)" and smoke-test it,
+#   3. then run this workflow to publish the client.
+# (Phase 3 migrates this to Cloudflare Pages and finalizes the runbook.)
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -163,7 +163,7 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
     return error('Invalid JSON', 400);
   }
   if (bodyPK !== publicKeyB64) return error('publicKey mismatch (body vs header)', 400);
-  if (Math.abs(Date.now() - timestamp) > 300_000) return error('Timestamp expired', 401);
+  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
 
   // 2. Verify Ed25519 signature — BEFORE any lookup
   const verifyResult = await verifySignature(publicKeyB64, signatureB64, bodyText);
@@ -227,7 +227,7 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
   if (!inviteCode || !bodyPK) return error('Missing inviteCode or publicKey', 400);
   if (bodyPK !== publicKeyB64) return error('publicKey mismatch', 400);
-  if (Math.abs(Date.now() - regTimestamp) > 300_000) return error('Timestamp expired', 401);
+  if (!isFreshTimestamp(regTimestamp)) return error('Timestamp expired', 401);
 
   // 4. Delegate to InviteManager DO — ATOMIC check + use
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -264,22 +264,24 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const signatureB64 = request.headers.get('X-Signature');
   if (!publicKeyB64 || !signatureB64) return error('Missing auth headers', 401);
 
-  let body: {
-    data: string;
-    tags: { name: string; value: string }[];
-    ownerHash: string;
-    timestamp: number;
-  };
+  let parsedBody: unknown;
   try {
-    body = JSON.parse(bodyText);
+    parsedBody = JSON.parse(bodyText);
   } catch {
     return error('Invalid JSON', 400);
   }
-  const { data, tags, ownerHash, timestamp } = body;
-  if (!data || !tags || !ownerHash || !timestamp) return error('Missing required fields', 400);
+  if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
+    return error('Invalid body: must be a JSON object', 400);
+  }
+  const { data, tags, ownerHash, timestamp } = parsedBody as {
+    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown;
+  };
+  if (typeof data !== 'string' || typeof ownerHash !== 'string' || !Array.isArray(tags)) {
+    return error('Missing/invalid required fields', 400);
+  }
 
-  // 3. Validate timestamp (5 min window)
-  if (Math.abs(Date.now() - timestamp) > 300_000) return error('Timestamp expired', 401);
+  // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
+  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
 
   // 4. Verify Ed25519 signature FIRST — before any KV/DO lookups
   const verifyResult = await verifySignature(publicKeyB64, signatureB64, bodyText);
@@ -333,7 +335,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   const tagMap = new Map<string, string>();
   for (const tag of tags) {
-    if (!tag.name || typeof tag.value !== 'string') return error('Invalid tag structure', 400);
+    if (typeof tag !== 'object' || tag === null ||
+        typeof tag.name !== 'string' || typeof tag.value !== 'string') {
+      return error('Invalid tag structure', 400);
+    }
     // Timestamp is not in ALL_EXPECTED for v2, so a v2 upload carrying it is rejected here.
     if (!ALL_EXPECTED.has(tag.name)) return error(`Forbidden tag: ${tag.name}`, 400);
     if (tagMap.has(tag.name)) return error(`Duplicate tag: ${tag.name}`, 400);
@@ -483,6 +488,11 @@ function json(data: unknown): Response {
 
 function error(message: string, status: number): Response {
   return new Response(message, { status });
+}
+
+/** Anti-replay freshness: a real number within ±5 min (rejects NaN/non-number). */
+function isFreshTimestamp(ts: unknown): boolean {
+  return typeof ts === 'number' && Number.isFinite(ts) && Math.abs(Date.now() - ts) <= 300_000;
 }
 
 /**
