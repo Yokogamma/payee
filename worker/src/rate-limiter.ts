@@ -90,12 +90,18 @@ export class RateLimiter implements DurableObject {
       return Response.json({ status: 'reserved' });
     }
 
+    // Either no record, or a STALE reservation we're replacing. A stale
+    // reservation of the CURRENT window still occupies an inFlight slot that was
+    // never reclaimed — exclude it so its slot is reused, not double-counted.
     const w = await this.window(now);
-    if (w.count + w.inFlight >= limit) return Response.json({ status: 'rate_limited' }, { status: 429 });
+    const staleOwnSlot = record?.status === 'reserved' && record.gen === w.resetAt ? 1 : 0;
+    const effectiveInFlight = Math.max(0, w.inFlight - staleOwnSlot);
+
+    if (w.count + effectiveInFlight >= limit) return Response.json({ status: 'rate_limited' }, { status: 429 });
     if (w.attempts >= limit * ATTEMPT_FACTOR) return Response.json({ status: 'rate_limited' }, { status: 429 });
 
     const token = crypto.randomUUID();
-    await this.state.storage.put('inFlight', w.inFlight + 1);
+    await this.state.storage.put('inFlight', effectiveInFlight + 1); // reuse the reclaimed slot
     await this.state.storage.put('attempts', w.attempts + 1);
     await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
@@ -112,14 +118,18 @@ export class RateLimiter implements DurableObject {
 
     const now = Date.now();
     const w = await this.window(now);
-    // Move the slot inFlight→count. Only touch inFlight if the reservation
-    // belongs to the CURRENT window (else it was already reset on rollover).
-    if (record.gen === w.resetAt && w.inFlight > 0) {
-      await this.state.storage.put('inFlight', w.inFlight - 1);
+    // Fixed-window semantics: a reservation's quota was accounted in the window
+    // it was made in. If that window is still current, move the slot inFlight→
+    // count. If it belongs to a PREVIOUS (now-reset) window, do NOT charge the
+    // current window's count — its budget was already spent-and-reset there.
+    let committedGen = record.gen;
+    if (record.gen === w.resetAt) {
+      if (w.inFlight > 0) await this.state.storage.put('inFlight', w.inFlight - 1);
+      await this.state.storage.put('count', w.count + 1);
+      committedGen = w.resetAt;
     }
-    await this.state.storage.put('count', w.count + 1);
     await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
-      status: 'committed', token, gen: w.resetAt, txId, committedAt: now,
+      status: 'committed', token, gen: committedGen, txId, committedAt: now,
     });
     return Response.json({ ok: true });
   }
@@ -143,8 +153,14 @@ export class RateLimiter implements DurableObject {
   private async handleRedrop(request: Request): Promise<Response> {
     const { noteId, txId, limit } = await request.json<RedropRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
-    if (!record || record.status !== 'committed' || record.txId !== txId) {
-      return Response.json({ ok: false });
+
+    // Concurrency: distinguish the outcomes so the caller never resolves a note
+    // against a stale/dead txId.
+    if (!record) return Response.json({ ok: false, gone: true });
+    if (record.status === 'reserved') return Response.json({ ok: false, inProgress: true });
+    if (record.txId !== txId) {
+      // Already re-posted by another request under a NEW committed txId.
+      return Response.json({ ok: false, committed: true, txId: record.txId });
     }
 
     const now = Date.now();

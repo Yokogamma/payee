@@ -70,7 +70,7 @@ export interface ProxyUploadPayload {
 }
 
 export type UploadResult =
-  | { kind: 'accepted'; txId: string }
+  | { kind: 'accepted'; txId: string; committed: boolean }
   | { kind: 'rate_limited'; error: string }
   | { kind: 'not_registered'; error: string }
   | { kind: 'in_progress'; error: string }
@@ -239,7 +239,9 @@ export async function uploadViaProxy(
 
     if (response.ok) {
       const data = await response.json();
-      return { kind: 'accepted', txId: data.txId };
+      // committed:false means the TX posted but the server's idempotency record
+      // isn't confirmed yet → caller keeps needsRecheck.
+      return { kind: 'accepted', txId: data.txId, committed: data.committed !== false };
     }
 
     // Structured error classification by HTTP status (not text)

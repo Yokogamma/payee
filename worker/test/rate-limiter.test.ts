@@ -35,7 +35,9 @@ async function redrop(stub: DurableObjectStub, noteId: string, txId: string, lim
   const r = await stub.fetch('http://do/redrop', {
     method: 'POST', body: JSON.stringify({ noteId, txId, limit }),
   });
-  return r.json() as Promise<{ ok: boolean; token?: string; rateLimited?: boolean }>;
+  return r.json() as Promise<{
+    ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean; committed?: boolean; txId?: string;
+  }>;
 }
 
 describe('RateLimiter reserve/commit', () => {
@@ -136,11 +138,50 @@ describe('RateLimiter release + redrop', () => {
     expect((await reserve(s, 'n')).status).toBe('reserved');
   });
 
-  it('redrop is a no-op if the txId no longer matches', async () => {
+  it('redrop reports committed + the new txId when already re-posted', async () => {
     const s = stubFor('pk-D2');
     const r = await reserve(s, 'n');
     await commit(s, 'n', 'tx-current', r.token!);
-    expect((await redrop(s, 'n', 'tx-old')).ok).toBe(false);
+    const rd = await redrop(s, 'n', 'tx-old'); // caller's txId is stale
+    expect(rd.ok).toBe(false);
+    expect(rd.committed).toBe(true);
+    expect(rd.txId).toBe('tx-current');
+  });
+
+  it('redrop reports inProgress when another request is mid-repost', async () => {
+    const s = stubFor('pk-D3');
+    await reserve(s, 'n'); // reserved, not committed
+    const rd = await redrop(s, 'n', 'anything');
+    expect(rd.ok).toBe(false);
+    expect(rd.inProgress).toBe(true);
+  });
+
+  it('reclaims a stale reservation slot on re-reserve (no quota deadlock)', async () => {
+    const s = stubFor('pk-Stale');
+    expect((await reserve(s, 'n', 1)).status).toBe('ok'); // inFlight=1 at limit=1
+    // Backdate the reservation past the 10-min TTL.
+    await runInDurableObject(s, async (_i, state) => {
+      const rec = await state.storage.get<Record<string, unknown>>('note:n');
+      await state.storage.put('note:n', { ...rec, reservedAt: Date.now() - 11 * 60_000 });
+    });
+    // Re-reserve must succeed by reclaiming the stale slot, not rate_limited.
+    expect((await reserve(s, 'n', 1)).status).toBe('ok');
+  });
+
+  it('does not charge the current window for a previous-generation commit', async () => {
+    const s = stubFor('pk-Gen');
+    await runInDurableObject(s, async (_i, state) => {
+      // New window fully spent (count=2 at limit=2) + an OLD-gen reservation.
+      await state.storage.put('count', 2);
+      await state.storage.put('inFlight', 0);
+      await state.storage.put('attempts', 0);
+      await state.storage.put('resetAt', Date.now() + 3_600_000);
+      await state.storage.put('note:old', { status: 'reserved', token: 'tk', gen: 1, reservedAt: Date.now() });
+    });
+    expect((await commit(s, 'old', 'tx-old', 'tk')).ok).toBe(true);
+    await runInDurableObject(s, async (_i, state) => {
+      expect(await state.storage.get('count')).toBe(2); // not charged to the new window
+    });
   });
 });
 

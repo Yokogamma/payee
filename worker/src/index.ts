@@ -426,11 +426,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   if (checkResult.status === 'exists') {
     // Already committed. Without recheck this is the idempotent happy path.
-    if (!wantsRecheck) return json({ txId: checkResult.txId, status: 'accepted' });
+    if (!wantsRecheck) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
 
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!);
-    if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted' });
+    if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted', committed: true });
     // Retryable (503): the client keeps 'accepted + needsRecheck' and backs off.
     // NOT a plain 'accepted' — that would wrongly clear the recheck flag.
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
@@ -439,11 +439,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       return error('Recheck deferred: committed too recently', 503);
     }
     const redropResp = await doCall('/redrop', { noteId, txId: checkResult.txId, limit: parseInt(env.RATE_LIMIT_PER_HOUR) });
-    const redrop: { ok: boolean; token?: string; rateLimited?: boolean } = await redropResp.json();
-    if (redrop.rateLimited) return error('Rate limit exceeded on recheck', 503); // retryable
-    if (!redrop.ok || !redrop.token) {
-      // Record changed (another flow already re-handled it) — treat as resolved.
-      return json({ txId: checkResult.txId, status: 'accepted' });
+    const redrop: { ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean; committed?: boolean; txId?: string } = await redropResp.json();
+    // Another request already re-posted under a NEW committed txId → resolved.
+    if (redrop.committed && redrop.txId) return json({ txId: redrop.txId, status: 'accepted', committed: true });
+    // Quota exhausted, another repost in flight, or the record vanished → retryable.
+    if (redrop.rateLimited || redrop.inProgress || !redrop.ok || !redrop.token) {
+      return error('Recheck deferred', 503);
     }
     reserveToken = redrop.token;
   } else if (checkResult.status === 'reserved') {
@@ -488,7 +489,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     }
   }
   if (!committed) console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
-  return json({ txId, status: 'accepted' });
+  // The TX is on-chain, but if the DO didn't record the commit the note isn't
+  // idempotency-safe yet — report committed:false so the client keeps
+  // needsRecheck and reconciles server state on a later cycle.
+  return json({ txId, status: 'accepted', committed });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────

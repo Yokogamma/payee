@@ -57,6 +57,35 @@ describe('fetchAllNotes owner filter (C2)', () => {
   });
 });
 
+describe('uploadViaProxy committed flag', () => {
+  it('passes through committed:false (server did not confirm the DO commit)', async () => {
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ txId: 'tx1', committed: false }), { status: 200 }),
+    ));
+    const { uploadViaProxy } = await import('./arweave');
+    expect(await uploadViaProxy('{}', 'pk', 'sig')).toEqual({ kind: 'accepted', txId: 'tx1', committed: false });
+  });
+
+  it('defaults committed:true when the field is absent', async () => {
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ txId: 'tx2' }), { status: 200 }),
+    ));
+    const { uploadViaProxy } = await import('./arweave');
+    const r = await uploadViaProxy('{}', 'pk', 'sig');
+    expect(r.kind).toBe('accepted');
+    if (r.kind === 'accepted') expect(r.committed).toBe(true);
+  });
+
+  it('maps 503 to a retryable unavailable result', async () => {
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('deferred', { status: 503 })));
+    const { uploadViaProxy } = await import('./arweave');
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('unavailable');
+  });
+});
+
 describe('getTxStatus semantics (L1)', () => {
   const cases: Array<[number, string]> = [
     [202, 'pending'],

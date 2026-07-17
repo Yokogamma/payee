@@ -499,7 +499,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         status: 'accepted',
         transport: 'proxy',
         updatedAt: Date.now(),
-        needsRecheck: false, // re-verified/re-posted — intent satisfied
+        // Clear the flag ONLY when the server confirmed the commit; if the TX
+        // posted but the DO commit didn't stick, keep rechecking to reconcile.
+        needsRecheck: !result.committed,
       });
       // Auto-discovery
       const pkB64 = bufferToBase64(publicKeyRef.current!);
