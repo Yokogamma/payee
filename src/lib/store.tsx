@@ -140,6 +140,7 @@ const StoreContext = createContext<NotesStore | null>(null);
 // ─── Stale uploading threshold ───────────────────────────────────────
 
 const STALE_UPLOADING_MS = 10 * 60 * 1000; // 10 minutes (matches server reservation timeout)
+const RECHECK_BACKOFF_MS = 5 * 60 * 1000;  // min gap between recheck re-attempts (503 backoff)
 const TX_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TX_CONFIRM_THRESHOLD = 25;            // Arweave confirmations needed
 const TX_TIMEOUT_MS = 60 * 60 * 1000;      // 1 hour — mark pending TX as error
@@ -470,9 +471,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const prev = await getSyncRecord(note.noteId);
     const recheck = prev?.needsRecheck === true;
 
-    // Mark uploading (preserve the recheck intent across a crash mid-upload).
+    // Mark uploading (preserve the prior txId + recheck intent so a crash or a
+    // retryable failure mid-recheck doesn't lose the accepted TX).
     await setSyncRecord({
       noteId: note.noteId,
+      txId: prev?.txId,
       status: 'uploading',
       transport: 'proxy',
       updatedAt: Date.now(),
@@ -515,6 +518,32 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       return 'in_progress';
     }
 
+    if (result.kind === 'unavailable') {
+      // 503 retryable (recheck deferred / gateway). If this was a recheck of an
+      // already-accepted TX, restore that state (keep the real txId + flag) and
+      // back off — never downgrade to 'error' or drop the txId.
+      if (prev?.txId) {
+        await setSyncRecord({
+          noteId: note.noteId,
+          txId: prev.txId,
+          status: 'accepted',
+          transport: 'proxy',
+          updatedAt: Date.now(),
+          needsRecheck: true,
+        });
+      } else {
+        await setSyncRecord({
+          noteId: note.noteId,
+          status: 'error',
+          transport: 'proxy',
+          lastError: result.error || 'Временно недоступно',
+          updatedAt: Date.now(),
+        });
+      }
+      await refreshSyncCounts();
+      return 'unavailable';
+    }
+
     await setSyncRecord({
       noteId: note.noteId,
       status: 'error',
@@ -532,11 +561,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const allSync = await getAllSyncRecords();
     const now = Date.now();
 
-    // Skip: accepted-and-not-flagged + confirmed + fresh uploading (< 10 min)
-    // Enqueue: error, accepted+needsRecheck (dropped TX), stale uploading, no record
+    // Skip: accepted-and-not-flagged + confirmed + fresh uploading (< 10 min) +
+    //       recheck notes still within their backoff window.
+    // Enqueue: error, accepted+needsRecheck past backoff, stale uploading, no record
     const skipIds = new Set(
       allSync.filter(r =>
         (r.status === 'accepted' && !r.needsRecheck) ||
+        (r.status === 'accepted' && r.needsRecheck && (now - r.updatedAt) < RECHECK_BACKOFF_MS) ||
         r.status === 'confirmed' ||
         (r.status === 'uploading' && (now - r.updatedAt) < STALE_UPLOADING_MS)
       ).map(r => r.noteId)
@@ -564,7 +595,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     const now = Date.now();
     let changed = false;
-    let flaggedForRecheck = false;
 
     for (const record of accepted) {
       if (!record.txId) continue;
@@ -579,21 +609,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (!record.needsRecheck) {
           await setSyncRecord({ ...record, needsRecheck: true, updatedAt: now });
           changed = true;
-          flaggedForRecheck = true;
         }
       } else if (status.kind === 'pending' && (now - record.updatedAt) > TX_TIMEOUT_MS) {
         // Accepted but not mined within the timeout → re-verify.
         if (!record.needsRecheck) {
           await setSyncRecord({ ...record, needsRecheck: true, updatedAt: now });
           changed = true;
-          flaggedForRecheck = true;
         }
       }
       // kind === 'unavailable' → skip, don't change status (gateway degradation)
     }
 
     if (changed) await refreshSyncCounts();
-    if (flaggedForRecheck && arweaveRef.current.enabled && arweaveRef.current.online) {
+    // Drain any ready work each cycle (recheck notes past their backoff).
+    if (arweaveRef.current.enabled && arweaveRef.current.online) {
       await syncPendingNotes();
       kickQueue();
     }

@@ -412,6 +412,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       method: 'POST', body: JSON.stringify(payload),
     }));
 
+  // Releasing must never throw out of the failure path — the reservation frees
+  // itself via TTL anyway, so a DO hiccup here shouldn't turn a 502 into a 500.
+  const safeRelease = async (token: string) => {
+    try { await doCall('/release', { noteId, token }); }
+    catch (e) { console.error('RELEASE_FAILED', noteId, e); }
+  };
+
   const checkResp = await doCall('/check-and-reserve', { noteId, limit: parseInt(env.RATE_LIMIT_PER_HOUR) });
   const checkResult: { status: string; txId?: string; committedAt?: number; token?: string } = await checkResp.json();
 
@@ -424,14 +431,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!);
     if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted' });
-    if (live === 'unavailable') return error('Arweave status unavailable', 503); // keep committed, retry later
-    // live === 'dead' — only re-post once the commit is old enough (race guard).
+    // Retryable (503): the client keeps 'accepted + needsRecheck' and backs off.
+    // NOT a plain 'accepted' — that would wrongly clear the recheck flag.
+    if (live === 'unavailable') return error('Arweave status unavailable', 503);
+    // live === 'dead' — re-post only once the commit is old enough (race guard).
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
+      return error('Recheck deferred: committed too recently', 503);
+    }
+    const redropResp = await doCall('/redrop', { noteId, txId: checkResult.txId, limit: parseInt(env.RATE_LIMIT_PER_HOUR) });
+    const redrop: { ok: boolean; token?: string; rateLimited?: boolean } = await redropResp.json();
+    if (redrop.rateLimited) return error('Rate limit exceeded on recheck', 503); // retryable
+    if (!redrop.ok || !redrop.token) {
+      // Record changed (another flow already re-handled it) — treat as resolved.
       return json({ txId: checkResult.txId, status: 'accepted' });
     }
-    const redropResp = await doCall('/redrop', { noteId, txId: checkResult.txId });
-    const redrop: { ok: boolean; token?: string } = await redropResp.json();
-    if (!redrop.ok || !redrop.token) return json({ txId: checkResult.txId, status: 'accepted' }); // handled elsewhere
     reserveToken = redrop.token;
   } else if (checkResult.status === 'reserved') {
     return error('Upload already in progress for this noteId', 409);
@@ -452,12 +465,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     await arweave.transactions.sign(tx, serverWallet);
     const response = await arweave.transactions.post(tx);
     if (response.status !== 200 && response.status !== 202) {
-      await doCall('/release', { noteId, token: reserveToken });
+      await safeRelease(reserveToken);
       return error(`Arweave error: ${response.status}`, 502);
     }
     txId = tx.id;
   } catch (e) {
-    await doCall('/release', { noteId, token: reserveToken });
+    await safeRelease(reserveToken);
     console.error('ARWEAVE_POST_FAILED', noteId, e);
     return error('Arweave upload failed', 502);
   }

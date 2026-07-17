@@ -74,6 +74,7 @@ export type UploadResult =
   | { kind: 'rate_limited'; error: string }
   | { kind: 'not_registered'; error: string }
   | { kind: 'in_progress'; error: string }
+  | { kind: 'unavailable'; error: string } // 503 — retryable (recheck deferred / gateway)
   | { kind: 'error'; error: string };
 
 export type RegistrationStatus = 'allowed' | 'denied' | 'unavailable' | 'invalid_request';
@@ -246,6 +247,7 @@ export async function uploadViaProxy(
     if (response.status === 429) return { kind: 'rate_limited', error: text };
     if (response.status === 403) return { kind: 'not_registered', error: text };
     if (response.status === 409) return { kind: 'in_progress', error: text };
+    if (response.status === 503) return { kind: 'unavailable', error: text }; // retryable
     return { kind: 'error', error: `HTTP ${response.status}: ${text}` };
   } catch (e) {
     return { kind: 'error', error: e instanceof Error ? e.message : 'Network error' };

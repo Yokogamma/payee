@@ -1,19 +1,24 @@
 /**
- * RateLimiter Durable Object — per-user rate limit + idempotency + reservation
+ * RateLimiter Durable Object — per-user quota + idempotency + reservation
  * lifecycle (R4, R7, C1/M6).
  *
- * One instance per publicKey (= per user). Single-threaded → strict consistency.
+ * One instance per publicKey. Single-threaded → strict consistency.
  *
- * Two SEPARATE per-window counters (M6 / review #7):
- *   - `count`   : SUCCESSFUL commits — the real quota. Incremented ONLY on commit.
- *   - `attempts`: reserve attempts — anti-abuse ceiling (limit × ATTEMPT_FACTOR).
- *                 NEVER refunded, so a failing client can't retry forever.
- * A failed upload calls `/release`, which frees the reservation (so the same
- * noteId can be retried) WITHOUT spending quota and WITHOUT refunding attempts.
+ * Quota accounting tracks BOTH committed successes and in-flight reservations so
+ * concurrent reserves cannot collectively exceed the limit (review: parallel
+ * uploads must not bypass the quota):
+ *   - `count`    : committed successes in the current window.
+ *   - `inFlight` : active quota reservations (reserved-but-not-committed).
+ *   - `attempts` : reserve attempts in the window — anti-abuse ceiling; never
+ *                  refunded, so churn is bounded.
+ * A reserve is admitted only while `count + inFlight < limit`. commit moves a
+ * slot from inFlight→count; release frees the inFlight slot (no quota spent, no
+ * attempt refunded).
  *
- * Every reservation carries a unique `token`; `/commit` and `/release` only act
- * on the CURRENT token (compare-and-swap), so a stale/duplicate call can't
- * commit or release a reservation that was superseded.
+ * Every record is tagged with `gen` = the window's resetAt, so a reservation
+ * that straddles a window boundary adjusts only its OWN window's counters.
+ * Reservations carry a `token`; commit/release/redrop act only on the current
+ * token (CAS).
  */
 
 const WINDOW_MS = 3_600_000;        // 1 hour
@@ -23,15 +28,18 @@ const ATTEMPT_FACTOR = 3;           // attempts ceiling = limit × 3
 interface NoteRecord {
   status: 'reserved' | 'committed';
   token: string;
+  gen: number;         // window resetAt this record's slot belongs to
   txId?: string;
   reservedAt?: number;
   committedAt?: number;
 }
 
+interface Window { count: number; inFlight: number; attempts: number; resetAt: number }
+
 interface CheckAndReserveRequest { noteId: string; limit: number }
 interface CommitRequest { noteId: string; txId: string; token: string }
 interface ReleaseRequest { noteId: string; token: string }
-interface RedropRequest { noteId: string; txId: string }
+interface RedropRequest { noteId: string; txId: string; limit: number }
 
 export class RateLimiter implements DurableObject {
   private state: DurableObjectState;
@@ -49,45 +57,52 @@ export class RateLimiter implements DurableObject {
     return new Response('Not found', { status: 404 });
   }
 
-  /** Read the window counters, resetting them if the window has rolled over. */
-  private async window(now: number): Promise<{ count: number; attempts: number; resetAt: number }> {
+  /** Read counters, resetting + persisting them if the window has rolled over. */
+  private async window(now: number): Promise<Window> {
     let count = (await this.state.storage.get<number>('count')) ?? 0;
+    let inFlight = (await this.state.storage.get<number>('inFlight')) ?? 0;
     let attempts = (await this.state.storage.get<number>('attempts')) ?? 0;
     let resetAt = (await this.state.storage.get<number>('resetAt')) ?? 0;
     if (now > resetAt) {
-      count = 0;
-      attempts = 0;
-      resetAt = now + WINDOW_MS;
+      count = 0; inFlight = 0; attempts = 0; resetAt = now + WINDOW_MS;
+      await this.state.storage.put('count', 0);
+      await this.state.storage.put('inFlight', 0);
+      await this.state.storage.put('attempts', 0);
+      await this.state.storage.put('resetAt', resetAt);
     }
-    return { count, attempts, resetAt };
+    return { count, inFlight, attempts, resetAt };
   }
 
-  /** Idempotency + rate limit + reserve. Quota is spent only on commit. */
   private async handleCheckAndReserve(request: Request): Promise<Response> {
     const { noteId, limit } = await request.json<CheckAndReserveRequest>();
     const now = Date.now();
 
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     if (record?.status === 'committed') {
-      return Response.json({ status: 'exists', txId: record.txId, committedAt: record.committedAt });
+      // Legacy records (pre-committedAt) stored their time in reservedAt.
+      return Response.json({
+        status: 'exists',
+        txId: record.txId,
+        committedAt: record.committedAt ?? record.reservedAt ?? now,
+      });
     }
     if (record?.status === 'reserved' && now - (record.reservedAt ?? 0) < RESERVE_TTL_MS) {
       return Response.json({ status: 'reserved' });
     }
 
-    const { count, attempts, resetAt } = await this.window(now);
-    if (count >= limit) return Response.json({ status: 'rate_limited' }, { status: 429 });
-    if (attempts >= limit * ATTEMPT_FACTOR) return Response.json({ status: 'rate_limited' }, { status: 429 });
+    const w = await this.window(now);
+    if (w.count + w.inFlight >= limit) return Response.json({ status: 'rate_limited' }, { status: 429 });
+    if (w.attempts >= limit * ATTEMPT_FACTOR) return Response.json({ status: 'rate_limited' }, { status: 429 });
 
     const token = crypto.randomUUID();
-    await this.state.storage.put('attempts', attempts + 1);
-    await this.state.storage.put('resetAt', resetAt);
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, { status: 'reserved', token, reservedAt: now });
-
+    await this.state.storage.put('inFlight', w.inFlight + 1);
+    await this.state.storage.put('attempts', w.attempts + 1);
+    await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
+      status: 'reserved', token, gen: w.resetAt, reservedAt: now,
+    });
     return Response.json({ status: 'ok', token });
   }
 
-  /** Commit noteId → txId. Only the active reservation token may commit. */
   private async handleCommit(request: Request): Promise<Response> {
     const { noteId, txId, token } = await request.json<CommitRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
@@ -96,43 +111,58 @@ export class RateLimiter implements DurableObject {
     }
 
     const now = Date.now();
-    const { count, resetAt } = await this.window(now);
-    await this.state.storage.put('count', count + 1); // spend quota only here
-    await this.state.storage.put('resetAt', resetAt);
+    const w = await this.window(now);
+    // Move the slot inFlight→count. Only touch inFlight if the reservation
+    // belongs to the CURRENT window (else it was already reset on rollover).
+    if (record.gen === w.resetAt && w.inFlight > 0) {
+      await this.state.storage.put('inFlight', w.inFlight - 1);
+    }
+    await this.state.storage.put('count', w.count + 1);
     await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
-      status: 'committed', token, txId, committedAt: now,
+      status: 'committed', token, gen: w.resetAt, txId, committedAt: now,
     });
     return Response.json({ ok: true });
   }
 
-  /** Release a reservation on upload failure. Idempotent; token-scoped. Does not
-   *  refund attempts or touch quota. */
   private async handleRelease(request: Request): Promise<Response> {
     const { noteId, token } = await request.json<ReleaseRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     if (record && record.status === 'reserved' && record.token === token) {
+      const w = await this.window(Date.now());
+      if (record.gen === w.resetAt && w.inFlight > 0) {
+        await this.state.storage.put('inFlight', w.inFlight - 1); // free the slot
+      }
       await this.state.storage.delete(`note:${noteId}`);
     }
     return Response.json({ ok: true });
   }
 
-  /** Recheck path: a committed TX was found dropped. Convert it back to a fresh
-   *  reservation and free the quota slot the dead commit consumed, so the note
-   *  can be re-posted under a NEW txId. No-op if the record changed meanwhile. */
+  /** Recheck: a committed TX was found dropped. Convert it back to a fresh
+   *  reservation (a new posting attempt), respecting quota + attempts. Frees the
+   *  dead commit's count slot only if it belongs to the current window. */
   private async handleRedrop(request: Request): Promise<Response> {
-    const { noteId, txId } = await request.json<RedropRequest>();
+    const { noteId, txId, limit } = await request.json<RedropRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     if (!record || record.status !== 'committed' || record.txId !== txId) {
       return Response.json({ ok: false });
     }
 
     const now = Date.now();
-    const { count, resetAt } = await this.window(now);
-    if (count > 0) await this.state.storage.put('count', count - 1); // give the slot back
-    await this.state.storage.put('resetAt', resetAt);
+    const w = await this.window(now);
+    const sameGen = record.gen === w.resetAt;
+    // Effective committed count excluding this dead commit (only if same window).
+    const baseCount = sameGen ? Math.max(0, w.count - 1) : w.count;
+    if (baseCount + w.inFlight >= limit) return Response.json({ ok: false, rateLimited: true });
+    if (w.attempts >= limit * ATTEMPT_FACTOR) return Response.json({ ok: false, rateLimited: true });
+
+    if (sameGen) await this.state.storage.put('count', baseCount); // give the slot back
+    await this.state.storage.put('inFlight', w.inFlight + 1);
+    await this.state.storage.put('attempts', w.attempts + 1);
 
     const token = crypto.randomUUID();
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, { status: 'reserved', token, reservedAt: now });
+    await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
+      status: 'reserved', token, gen: w.resetAt, reservedAt: now,
+    });
     return Response.json({ ok: true, token });
   }
 }

@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 
 // RateLimiter DO lifecycle: reserve → commit/release, token CAS, redrop, and the
@@ -31,11 +31,11 @@ async function release(stub: DurableObjectStub, noteId: string, token: string) {
   });
   return r.json() as Promise<{ ok: boolean }>;
 }
-async function redrop(stub: DurableObjectStub, noteId: string, txId: string) {
+async function redrop(stub: DurableObjectStub, noteId: string, txId: string, limit = 20) {
   const r = await stub.fetch('http://do/redrop', {
-    method: 'POST', body: JSON.stringify({ noteId, txId }),
+    method: 'POST', body: JSON.stringify({ noteId, txId, limit }),
   });
-  return r.json() as Promise<{ ok: boolean; token?: string }>;
+  return r.json() as Promise<{ ok: boolean; token?: string; rateLimited?: boolean }>;
 }
 
 describe('RateLimiter reserve/commit', () => {
@@ -69,6 +69,15 @@ describe('RateLimiter reserve/commit', () => {
 });
 
 describe('RateLimiter quota vs attempts (M6)', () => {
+  it('counts in-flight reservations so concurrent reserves cannot exceed the limit', async () => {
+    const s = stubFor('pk-Par');
+    // Two DIFFERENT noteIds reserved without committing must fill the quota.
+    expect((await reserve(s, 'p0', 2)).status).toBe('ok');
+    expect((await reserve(s, 'p1', 2)).status).toBe('ok');
+    // Third distinct note: count=0 but inFlight=2 → rate limited (the bug fix).
+    expect((await reserve(s, 'p2', 2)).status).toBe('rate_limited');
+  });
+
   it('spends quota only on commit, so releases do not consume it', async () => {
     const s = stubFor('pk-Q');
     // Reserve + RELEASE three times at limit=2 — quota must stay 0.
@@ -132,5 +141,22 @@ describe('RateLimiter release + redrop', () => {
     const r = await reserve(s, 'n');
     await commit(s, 'n', 'tx-current', r.token!);
     expect((await redrop(s, 'n', 'tx-old')).ok).toBe(false);
+  });
+});
+
+describe('RateLimiter legacy records', () => {
+  it('reports committedAt from reservedAt for a legacy committed record', async () => {
+    const s = stubFor('pk-Legacy');
+    const legacyTime = 1_000_000;
+    // Inject a pre-committedAt record (time lived in reservedAt only).
+    await runInDurableObject(s, async (_inst, state) => {
+      await state.storage.put('note:leg', {
+        status: 'committed', token: 't', gen: 0, txId: 'tx-legacy', reservedAt: legacyTime,
+      });
+    });
+    const res = await reserve(s, 'leg');
+    expect(res.status).toBe('exists');
+    // Falls back to reservedAt (not 0) — so the 30-min recheck guard still holds.
+    expect(res.committedAt).toBe(legacyTime);
   });
 });
