@@ -483,10 +483,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     });
 
     // Build payload — serialized per the note's own version (v1 or v2), so a
-    // restored v2 ciphertext can never be re-published under v1 tags. On a
-    // recheck, pass the known txId so the server can reconcile a lost commit
-    // instead of re-posting a duplicate.
-    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck, prev?.txId);
+    // restored v2 ciphertext can never be re-published under v1 tags. Recheck
+    // reconciliation is server-authoritative (no client txId is sent).
+    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck);
 
     const bodyText = JSON.stringify(payload);
     const signature = await signPayload(signingKeyRef.current, bodyText);
@@ -522,40 +521,31 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       return 'in_progress';
     }
 
-    if (result.kind === 'unavailable') {
-      // 503 retryable (recheck deferred / gateway). If this was a recheck of an
-      // already-accepted TX, restore that state (keep the real txId + flag) and
-      // back off — never downgrade to 'error' or drop the txId.
-      if (prev?.txId) {
-        await setSyncRecord({
-          noteId: note.noteId,
-          txId: prev.txId,
-          status: 'accepted',
-          transport: 'proxy',
-          updatedAt: Date.now(),
-          needsRecheck: true,
-        });
-      } else {
-        await setSyncRecord({
-          noteId: note.noteId,
-          status: 'error',
-          transport: 'proxy',
-          lastError: result.error || 'Временно недоступно',
-          updatedAt: Date.now(),
-        });
-      }
-      await refreshSyncCounts();
-      return 'unavailable';
+    // Any non-definitive outcome (unavailable/rate_limited/not_registered/error).
+    // If the note was ALREADY accepted (has a txId), never downgrade it to a hard
+    // 'error' or drop the txId — keep 'accepted' + txId + needsRecheck so the next
+    // cycle can reconcile. Only a note that was never accepted becomes 'error'.
+    const errText = 'error' in result ? result.error : undefined;
+    if (prev?.txId) {
+      await setSyncRecord({
+        noteId: note.noteId,
+        txId: prev.txId,
+        status: 'accepted',
+        transport: 'proxy',
+        updatedAt: Date.now(),
+        needsRecheck: true,
+        lastError: errText,
+      });
+    } else {
+      await setSyncRecord({
+        noteId: note.noteId,
+        status: 'error',
+        transport: 'proxy',
+        lastError: errText,
+        updatedAt: Date.now(),
+        needsRecheck: recheck, // keep the recheck intent for the next retry
+      });
     }
-
-    await setSyncRecord({
-      noteId: note.noteId,
-      status: 'error',
-      transport: 'proxy',
-      lastError: result.error,
-      updatedAt: Date.now(),
-      needsRecheck: recheck, // keep the recheck intent for the next retry
-    });
     await refreshSyncCounts();
     return result.kind;
   }

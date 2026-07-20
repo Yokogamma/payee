@@ -143,9 +143,15 @@ describe('PIN wrapping', () => {
     await expect(decryptWithPin(hostile, '123456')).rejects.toThrow(/Unknown PIN kdf/);
   });
 
-  it('rejects out-of-range Argon2 params (OOM guard)', async () => {
+  it('rejects Argon2 params that deviate from the pinned v1 profile (OOM guard)', async () => {
     const blob = await encryptWithPin(generateMnemonic(), '123456');
     const hostile = { ...blob, argon2: { ...blob.argon2!, memorySize: 4_000_000_000 } };
-    await expect(decryptWithPin(hostile, '123456')).rejects.toThrow(/out of allowed range/);
+    await expect(decryptWithPin(hostile, '123456')).rejects.toThrow(/pinned v1 profile/);
+  });
+
+  it('rejects an unknown PIN kdf version', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    const hostile = { ...blob, v: 99 };
+    await expect(decryptWithPin(hostile, '123456')).rejects.toThrow(/version/);
   });
 });

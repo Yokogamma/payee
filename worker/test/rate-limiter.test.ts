@@ -19,6 +19,12 @@ async function reserve(stub: DurableObjectStub, noteId: string, limit = 20) {
   });
   return r.json() as Promise<{ status: string; token?: string; txId?: string; committedAt?: number }>;
 }
+async function markPosted(stub: DurableObjectStub, noteId: string, txId: string, token: string) {
+  const r = await stub.fetch('http://do/mark-posted', {
+    method: 'POST', body: JSON.stringify({ noteId, txId, token }),
+  });
+  return r.json() as Promise<{ ok: boolean; stale?: boolean }>;
+}
 async function commit(stub: DurableObjectStub, noteId: string, txId: string, token: string) {
   const r = await stub.fetch('http://do/commit', {
     method: 'POST', body: JSON.stringify({ noteId, txId, token }),
@@ -59,6 +65,25 @@ describe('RateLimiter reserve/commit', () => {
     const s = stubFor('pk-B');
     await reserve(s, 'n2');
     expect((await reserve(s, 'n2')).status).toBe('reserved');
+  });
+
+  it('reserve → mark-posted → commit, and exposes the posted anchor for recheck', async () => {
+    const s = stubFor('pk-P');
+    const res = await reserve(s, 'n');
+    expect((await markPosted(s, 'n', 'tx-p', res.token!)).ok).toBe(true);
+    // While posted (commit not yet done), check-and-reserve surfaces the anchor.
+    const posted = await reserve(s, 'n');
+    expect(posted.status).toBe('posted');
+    expect(posted.txId).toBe('tx-p');
+    // Commit works from the posted state too.
+    expect((await commit(s, 'n', 'tx-p', res.token!)).ok).toBe(true);
+    expect((await reserve(s, 'n')).status).toBe('exists');
+  });
+
+  it('mark-posted is rejected with a stale token', async () => {
+    const s = stubFor('pk-MP');
+    await reserve(s, 'n');
+    expect((await markPosted(s, 'n', 'tx', 'wrong')).ok).toBe(false);
   });
 
   it('rejects a commit with a stale token (CAS)', async () => {

@@ -39,8 +39,12 @@ jobs:
           VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
           BUILD_SHA: ${{ github.sha }}
       # ── Deploy ──
-      - uses: cloudflare/wrangler-action@v3
+      - id: deploy
+        uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy dist --project-name=${{ secrets.CF_PAGES_PROJECT }}
+      # ── Post-deploy security gate: prove the CSP + headers are actually applied.
+      #     Fails the run if they are missing (e.g. a misconfigured Pages project). ──
+      - run: node scripts/smoke-headers.mjs "${{ steps.deploy.outputs.deployment-url }}"

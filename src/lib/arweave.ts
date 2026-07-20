@@ -38,7 +38,6 @@ export function buildUploadPayload(
   ownerHash: string,
   now: number,
   recheck = false,
-  knownTxId?: string,
 ): ProxyUploadPayload {
   const isV2 = note.v === 2;
   const data = isV2
@@ -56,7 +55,6 @@ export function buildUploadPayload(
 
   const payload: ProxyUploadPayload = { data, tags, ownerHash, timestamp: now };
   if (recheck) payload.recheck = true;
-  if (recheck && knownTxId) payload.knownTxId = knownTxId;
   return payload;
 }
 
@@ -67,11 +65,10 @@ export interface ProxyUploadPayload {
   tags: { name: string; value: string }[];
   ownerHash: string;
   timestamp: number;
-  /** Ask the server to re-verify a committed TX and re-post if it was dropped. */
+  /** Ask the server to re-verify a committed TX and re-post if it was dropped.
+   *  Reconciliation is server-authoritative (the DO records the posted txId), so
+   *  the client never supplies a txId here. */
   recheck?: boolean;
-  /** The txId the client believes exists — lets the server reconcile a lost
-   *  commit (re-record an alive TX) instead of blindly re-posting a duplicate. */
-  knownTxId?: string;
 }
 
 export type UploadResult =
@@ -257,7 +254,9 @@ export async function uploadViaProxy(
     if (response.status === 503) return { kind: 'unavailable', error: text }; // retryable
     return { kind: 'error', error: `HTTP ${response.status}: ${text}` };
   } catch (e) {
-    return { kind: 'error', error: e instanceof Error ? e.message : 'Network error' };
+    // A network exception is transient/retryable — classify as unavailable so the
+    // caller preserves an accepted TX rather than downgrading it to a hard error.
+    return { kind: 'unavailable', error: e instanceof Error ? e.message : 'Network error' };
   }
 }
 

@@ -258,10 +258,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const ipBlock = await enforceIpLimit(request, env);
   if (ipBlock) return ipBlock;
 
+  // 0. Strict config — fail CLOSED (503) rather than disabling a limit on NaN.
+  const maxBytes = parsePositiveInt(env.MAX_BODY_BYTES);
+  const quotaLimit = parsePositiveInt(env.RATE_LIMIT_PER_HOUR);
+  if (maxBytes === null || quotaLimit === null) return error('Server misconfigured', 503);
+
   // 1. Read body and check actual size
   const bodyText = await request.text();
   const actualBytes = new TextEncoder().encode(bodyText).byteLength;
-  if (actualBytes > parseInt(env.MAX_BODY_BYTES)) return error('Body too large', 413);
+  if (actualBytes > maxBytes) return error('Body too large', 413);
 
   // 2. Parse headers + body
   const publicKeyB64 = request.headers.get('X-Public-Key');
@@ -277,14 +282,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
     return error('Invalid body: must be a JSON object', 400);
   }
-  const { data, tags, ownerHash, timestamp, recheck, knownTxId } = parsedBody as {
-    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown; knownTxId?: unknown;
+  const { data, tags, ownerHash, timestamp, recheck } = parsedBody as {
+    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown;
   };
   if (typeof data !== 'string' || typeof ownerHash !== 'string' || !Array.isArray(tags)) {
     return error('Missing/invalid required fields', 400);
   }
   const wantsRecheck = recheck === true;
-  const priorTxId = typeof knownTxId === 'string' ? knownTxId : undefined;
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
   if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
@@ -420,8 +424,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     catch (e) { console.error('RELEASE_FAILED', noteId, e); }
   };
 
-  const checkResp = await doCall('/check-and-reserve', { noteId, limit: parseInt(env.RATE_LIMIT_PER_HOUR) });
-  const checkResult: { status: string; txId?: string; committedAt?: number; token?: string } = await checkResp.json();
+  // Convert a dropped server TX back to a fresh reservation for re-post.
+  const doRedrop = async (deadTxId: string):
+    Promise<{ kind: 'resolved'; txId: string } | { kind: 'defer' } | { kind: 'repost'; token: string }> => {
+    const resp = await doCall('/redrop', { noteId, txId: deadTxId, limit: quotaLimit });
+    const r: { ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean; committed?: boolean; txId?: string } = await resp.json();
+    if (r.committed && r.txId) return { kind: 'resolved', txId: r.txId }; // reposted elsewhere
+    if (r.rateLimited || r.inProgress || !r.ok || !r.token) return { kind: 'defer' };
+    return { kind: 'repost', token: r.token };
+  };
+
+  const checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit });
+  const checkResult: { status: string; txId?: string; committedAt?: number; postedAt?: number; token?: string } = await checkResp.json();
 
   let reserveToken: string;
 
@@ -432,48 +446,38 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!);
     if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted', committed: true });
-    // Retryable (503): the client keeps 'accepted + needsRecheck' and backs off.
-    // NOT a plain 'accepted' — that would wrongly clear the recheck flag.
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
-    // live === 'dead' — re-post only once the commit is old enough (race guard).
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
-      return error('Recheck deferred: committed too recently', 503);
+      return error('Recheck deferred: committed too recently', 503); // race guard
     }
-    const redropResp = await doCall('/redrop', { noteId, txId: checkResult.txId, limit: parseInt(env.RATE_LIMIT_PER_HOUR) });
-    const redrop: { ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean; committed?: boolean; txId?: string } = await redropResp.json();
-    // Another request already re-posted under a NEW committed txId → resolved.
-    if (redrop.committed && redrop.txId) return json({ txId: redrop.txId, status: 'accepted', committed: true });
-    // Quota exhausted, another repost in flight, or the record vanished → retryable.
-    if (redrop.rateLimited || redrop.inProgress || !redrop.ok || !redrop.token) {
-      return error('Recheck deferred', 503);
+    const rd = await doRedrop(checkResult.txId!);
+    if (rd.kind === 'resolved') return json({ txId: rd.txId, status: 'accepted', committed: true });
+    if (rd.kind === 'defer') return error('Recheck deferred', 503);
+    reserveToken = rd.token;
+  } else if (checkResult.status === 'posted') {
+    // POST succeeded but the commit was lost. Reconcile using the SERVER's txId
+    // (never a client-supplied one), its CAS token, and the postedAt age guard.
+    const live = await getTxStatusWorker(checkResult.txId!);
+    if (live === 'unavailable') return error('Arweave status unavailable', 503);
+    if (live === 'alive') {
+      const commitResp = await doCall('/commit', { noteId, txId: checkResult.txId, token: checkResult.token });
+      const commit: { ok: boolean } = await commitResp.json();
+      if (commit.ok) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
+      return error('Recheck deferred', 503); // raced — retry
     }
-    reserveToken = redrop.token;
+    if (Date.now() - (checkResult.postedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
+      return error('Recheck deferred: posted too recently', 503);
+    }
+    const rd = await doRedrop(checkResult.txId!);
+    if (rd.kind === 'resolved') return json({ txId: rd.txId, status: 'accepted', committed: true });
+    if (rd.kind === 'defer') return error('Recheck deferred', 503);
+    reserveToken = rd.token;
   } else if (checkResult.status === 'reserved') {
     return error('Upload already in progress for this noteId', 409);
   } else if (checkResult.status === 'rate_limited') {
     return error('Rate limit exceeded', 429);
   } else {
     reserveToken = checkResult.token!;
-
-    // Reconciliation (fixes committed:false without duplicate posts): we got a
-    // FRESH reservation, but if this is a recheck with a known txId, don't blindly
-    // re-post — an alive TX just needs its commit re-recorded.
-    if (wantsRecheck && priorTxId) {
-      const live = await getTxStatusWorker(priorTxId);
-      if (live === 'alive') {
-        const commitResp = await doCall('/commit', { noteId, txId: priorTxId, token: reserveToken });
-        const commit: { ok: boolean } = await commitResp.json();
-        if (commit.ok) return json({ txId: priorTxId, status: 'accepted', committed: true });
-        // commit failed (raced) → release and let the client retry.
-        await safeRelease(reserveToken);
-        return error('Recheck deferred', 503);
-      }
-      if (live === 'unavailable') {
-        await safeRelease(reserveToken);
-        return error('Arweave status unavailable', 503);
-      }
-      // live === 'dead' → fall through to re-post under this reservation.
-    }
   }
 
   // 11. Create + sign + post the Arweave TX. Any failure releases the reservation
@@ -497,7 +501,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Arweave upload failed', 502);
   }
 
-  // 12. Commit noteId → txId — retry, checking resp.ok / stale (L7).
+  // 12a. Record the POST in the DO BEFORE commit (retry). This is the
+  //      server-authoritative anchor that makes a lost commit reconcilable
+  //      without trusting any client-supplied txId.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken });
+      if (resp.ok) break;
+    } catch { /* fall through to retry */ }
+    if (attempt < 2) await new Promise(r => setTimeout(r, 100 * Math.pow(3, attempt)));
+  }
+
+  // 12b. Commit noteId → txId — retry, checking resp.ok / stale (L7).
   let committed = false;
   for (let attempt = 0; attempt < 3 && !committed; attempt++) {
     try {
@@ -558,6 +573,14 @@ function error(message: string, status: number): Response {
 /** Anti-replay freshness: a real number within ±5 min (rejects NaN/non-number). */
 function isFreshTimestamp(ts: unknown): boolean {
   return typeof ts === 'number' && Number.isFinite(ts) && Math.abs(Date.now() - ts) <= 300_000;
+}
+
+/** Parse a required positive-integer config value. Returns null (→ fail closed,
+ *  503) on missing/NaN/non-integer/≤0 — never silently disables a limit. */
+function parsePositiveInt(v: string | undefined): number | null {
+  if (typeof v !== 'string' || v.trim() === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /**

@@ -371,13 +371,16 @@ function assertValidPinBlob(e: PinEncryptedSeed): void {
     throw new Error(`Unknown PIN kdf: ${e.kdf}`);
   }
   if (e.kdf === 'argon2id') {
+    // Pin to the exact v1 profile — an untrusted blob must not be able to request
+    // huge memory/iterations (OOM/hang on weak mobiles). New tuning ⇒ new version.
+    if (e.v !== PIN_KDF_VERSION) throw new Error(`Unsupported PIN kdf version: ${e.v}`);
     const p = e.argon2;
     if (!p ||
-        !(p.iterations >= 1 && p.iterations <= 10) ||
-        !(p.memorySize >= 8_192 && p.memorySize <= 262_144) ||   // 8 MiB … 256 MiB
-        !(p.parallelism >= 1 && p.parallelism <= 4) ||
-        p.hashLength !== 32) {
-      throw new Error('Argon2 params out of allowed range');
+        p.iterations !== ARGON2_PARAMS.iterations ||
+        p.memorySize !== ARGON2_PARAMS.memorySize ||
+        p.parallelism !== ARGON2_PARAMS.parallelism ||
+        p.hashLength !== ARGON2_PARAMS.hashLength) {
+      throw new Error('Argon2 params do not match the pinned v1 profile');
     }
   }
 }
