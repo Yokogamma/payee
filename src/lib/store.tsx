@@ -48,7 +48,9 @@ import {
   deleteMeta,
   resetAll,
   recoverStorage,
+  StorageBlockedError,
 } from './storage';
+import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll } from './sync-transitions';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -510,18 +512,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const prev = await getSyncRecord(note.noteId);
     const recheck = prev?.needsRecheck === true;
 
-    // Mark uploading (preserve the prior txId + recheck intent + recovery hint
-    // so a crash, an aborted request, or a retryable failure mid-recheck doesn't
-    // lose the accepted TX or the server-signed recovery proof).
-    await setSyncRecord({
-      noteId: note.noteId,
-      txId: prev?.txId,
-      status: 'uploading',
-      transport: 'proxy',
-      updatedAt: Date.now(),
-      needsRecheck: recheck,
-      recovery: prev?.recovery,
-    });
+    // All SyncRecord transitions are pure functions (sync-transitions.ts) so
+    // the recovery-protocol invariants stay unit-tested.
+    await setSyncRecord(toUploading(note.noteId, prev, Date.now()));
 
     // Build payload — serialized per the note's own version (v1 or v2), so a
     // restored v2 ciphertext can never be re-published under v1 tags. Recheck
@@ -536,19 +529,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const result = await uploadViaProxy(bodyText, publicKeyB64, signature);
 
     if (result.kind === 'accepted') {
-      await setSyncRecord({
-        noteId: note.noteId,
-        txId: result.txId,
-        status: 'accepted',
-        transport: 'proxy',
-        updatedAt: Date.now(),
-        // Clear the flag ONLY when the server confirmed the commit; if the TX
-        // posted but the DO commit didn't stick, keep rechecking to reconcile.
-        needsRecheck: !result.committed,
-        // Persist a recovery hint until committed; carry the previous one forward
-        // if the server didn't return a fresh one.
-        recovery: result.committed ? undefined : (result.recovery ?? prev?.recovery),
-      });
+      await setSyncRecord(toAccepted(note.noteId, prev, result, Date.now()));
       // Auto-discovery
       const pkB64 = bufferToBase64(publicKeyRef.current!);
       if (!(await getMeta<boolean>(`registered:${pkB64}`))) {
@@ -563,49 +544,19 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (result.kind === 'in_progress') {
       // 409: a reservation is alive on the server (e.g. the pre-triple-failure
       // reserved slot still within its TTL). Restore the prior accepted state —
-      // leaving the record 'uploading' here would drop txId/recovery on the
-      // floor if the app closes before the next attempt.
-      if (prev?.txId) {
-        await setSyncRecord({
-          noteId: note.noteId,
-          txId: prev.txId,
-          status: 'accepted',
-          transport: 'proxy',
-          updatedAt: Date.now(),
-          needsRecheck: true,
-          recovery: prev.recovery,
-        });
-      }
+      // leaving the record 'uploading' would strand txId/recovery if the app
+      // closes before the next attempt.
+      const restored = afterInProgress(note.noteId, prev, Date.now());
+      if (restored) await setSyncRecord(restored);
       await refreshSyncCounts();
       return 'in_progress';
     }
 
     // Any non-definitive outcome (unavailable/rate_limited/not_registered/error).
-    // If the note was ALREADY accepted (has a txId), never downgrade it to a hard
-    // 'error' or drop the txId — keep 'accepted' + txId + needsRecheck so the next
-    // cycle can reconcile. Only a note that was never accepted becomes 'error'.
+    // An already-accepted note keeps 'accepted' + txId + recovery and stays in
+    // the recheck loop; only a never-accepted note becomes a hard 'error'.
     const errText = 'error' in result ? result.error : undefined;
-    if (prev?.txId) {
-      await setSyncRecord({
-        noteId: note.noteId,
-        txId: prev.txId,
-        status: 'accepted',
-        transport: 'proxy',
-        updatedAt: Date.now(),
-        needsRecheck: true,
-        lastError: errText,
-        recovery: prev.recovery, // keep the hint across a transient failure
-      });
-    } else {
-      await setSyncRecord({
-        noteId: note.noteId,
-        status: 'error',
-        transport: 'proxy',
-        lastError: errText,
-        updatedAt: Date.now(),
-        needsRecheck: recheck, // keep the recheck intent for the next retry
-      });
-    }
+    await setSyncRecord(afterFailure(note.noteId, prev, recheck, errText, Date.now()));
     await refreshSyncCounts();
     return result.kind;
   }
@@ -654,29 +605,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
       const status = await getTxStatus(record.txId);
 
-      if (status.kind === 'confirmed' && status.confirmations >= TX_CONFIRM_THRESHOLD) {
-        // Terminal ONLY when server reconciliation is finished. A needsRecheck
-        // record (committed:false) still owes the server a commit/quota fix —
-        // confirming it here would drop it from the queue with the DO stuck in
-        // `posted` (or no anchor at all) forever.
-        if (!record.needsRecheck) {
-          await setSyncRecord({ ...record, status: 'confirmed', needsRecheck: false, updatedAt: now });
-          changed = true;
-        }
-      } else if (status.kind === 'dropped' || status.kind === 'invalid') {
-        // TX is gone → flag for server-side re-verify + re-post (keep 'accepted').
-        if (!record.needsRecheck) {
-          await setSyncRecord({ ...record, needsRecheck: true, updatedAt: now });
-          changed = true;
-        }
-      } else if (status.kind === 'pending' && (now - record.updatedAt) > TX_TIMEOUT_MS) {
-        // Accepted but not mined within the timeout → re-verify.
-        if (!record.needsRecheck) {
-          await setSyncRecord({ ...record, needsRecheck: true, updatedAt: now });
-          changed = true;
-        }
+      // Pure transition (sync-transitions.ts): confirm only after server
+      // reconciliation; dropped/invalid/timed-out pending → needsRecheck;
+      // unavailable → unchanged (gateway degradation).
+      const next = afterPoll(record, status, now, TX_CONFIRM_THRESHOLD, TX_TIMEOUT_MS);
+      if (next) {
+        await setSyncRecord(next);
+        changed = true;
       }
-      // kind === 'unavailable' → skip, don't change status (gateway degradation)
     }
 
     if (changed) await refreshSyncCounts();
@@ -918,11 +854,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     try {
       await recoverStorage();
     } catch (err) {
+      // Do NOT reload on failure — the user would land on the same error screen
+      // with no idea the reset never happened. Show what to do instead.
       console.error('recoverStorage failed:', err);
-    } finally {
-      sessionStorage.removeItem('eternal-notes-session');
-      window.location.reload();
+      setBootError(err instanceof StorageBlockedError
+        ? 'Хранилище открыто в другой вкладке — сброс заблокирован. Закройте остальные вкладки приложения и нажмите «Сбросить данные» ещё раз.'
+        : `Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
+      throw err;
     }
+    // Success: clean boot from scratch.
+    sessionStorage.removeItem('eternal-notes-session');
+    window.location.reload();
   }, []);
 
   // ─── PIN Actions ────────────────────────────────────────────────────
