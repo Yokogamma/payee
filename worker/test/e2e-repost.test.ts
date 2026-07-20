@@ -94,6 +94,32 @@ describe('invalid env config fails closed on the real route (L6)', () => {
   });
 });
 
+describe('mandatory RECOVERY_HMAC_SECRET (upload gate)', () => {
+  // Without the secret a triple-failure has NO provable recovery hint: after the
+  // reservation TTL the recheck degrades into a duplicate paid POST. So /upload
+  // must refuse to post at all. fetchMock has net-connect disabled and NO
+  // interceptors registered here — had the request reached the Arweave post
+  // path it would have errored as 502, so a 503 proves no outbound call.
+  it('503s a valid signed upload when the secret is missing', async () => {
+    const id = await makeIdentity();
+    const r = await worker.fetch(
+      await recheckRequest(id, `sec-${crypto.randomUUID().slice(0, 6)}`),
+      { ...baseEnv, RECOVERY_HMAC_SECRET: '' },
+    );
+    expect(r.status).toBe(503);
+    expect(await r.text()).toMatch(/misconfigured/i);
+  });
+
+  it('503s when the secret is too short to be a real secret', async () => {
+    const id = await makeIdentity();
+    const r = await worker.fetch(
+      await recheckRequest(id, `sec-${crypto.randomUUID().slice(0, 6)}`),
+      { ...baseEnv, RECOVERY_HMAC_SECRET: 'short' },
+    );
+    expect(r.status).toBe(503);
+  });
+});
+
 describe('e2e: lost commit → posted anchor → TTL → redrop → successful re-post', () => {
   it('re-posts a dropped, aged posted TX and commits under a NEW txId', async () => {
     const id = await makeIdentity();

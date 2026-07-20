@@ -3,14 +3,41 @@
 Both deploys are **manual** (`workflow_dispatch`) so nothing auto-publishes on
 merge. Reader-before-writer ordering is operator-driven.
 
-## Roll-forward order (reader release R)
+## FIRST rollout of the recovery protocol — CLIENT BEFORE WORKER
+
+The usual "worker first" order is **wrong for the first deploy of this branch**.
+The new Worker is a *writer* of the recovery protocol (`committed:false` +
+`recovery` token), and clients from current `main` neither persist the token nor
+understand `committed:false`. If the new Worker goes live against legacy
+clients, a triple-failure in that window ends in a confirmed TX with no quota
+commit, then a duplicate paid POST after the reservation TTL. Order:
 
 1. Merge to `main` — nothing deploys.
-2. **Worker first:** run **Deploy Worker (proxy)** (`deploy-worker.yml`). Smoke it
-   (`GET /health`, a signed `/upload` round-trip on staging).
-3. **Client:** run **Deploy to Cloudflare Pages** (`deploy-pages-cf.yml`). It runs
-   `scripts/smoke-headers.mjs` against the deployment URL and **fails** if the CSP
-   / `X-Frame-Options` / `nosniff` / `Referrer-Policy` headers are not applied.
+2. `wrangler secret put RECOVERY_HMAC_SECRET` (mandatory: the new Worker 503s
+   uploads without it — see wrangler.toml).
+3. **Client first:** deploy the recovery-aware client to the CURRENT legacy
+   origin (github.io). It still writes v1 and is fully compatible with the old
+   Worker (which simply never sends `committed:false`).
+4. **Worker:** run **Deploy Worker (proxy)** (`deploy-worker.yml`). Smoke it
+   (`GET /health`, a signed `/upload` round-trip on staging). Tag + record the
+   floor (see below).
+5. **Cloudflare Pages:** deploy the same client build to Pages
+   (`deploy-pages-cf.yml`) once `ALLOWED_ORIGINS` contains the Pages origin. The
+   workflow runs `scripts/smoke-headers.mjs` against the deployment URL and
+   **fails** if the CSP / `X-Frame-Options` / `nosniff` / `Referrer-Policy`
+   headers are not applied.
+
+(Equivalent alternative: a Worker feature flag that suppresses `recovery`
+responses until the minimum client version is confirmed — not implemented;
+the client-first order above is the supported path.)
+
+## Roll-forward order (subsequent releases: reader release R)
+
+Once both sides speak the recovery protocol, the usual order applies:
+
+1. Merge to `main` — nothing deploys.
+2. **Worker first** (`deploy-worker.yml`), smoke, append the release tag below.
+3. **Client** (`deploy-pages-cf.yml`), smoke-headers must pass.
 
 The worker + client at this point READ v1+v2 but the client still WRITES v1.
 

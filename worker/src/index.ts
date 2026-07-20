@@ -266,6 +266,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const maxBytes = parsePositiveInt(env.MAX_BODY_BYTES);
   const quotaLimit = parsePositiveInt(env.RATE_LIMIT_PER_HOUR);
   if (maxBytes === null || quotaLimit === null) return error('Server misconfigured', 503);
+  // RECOVERY_HMAC_SECRET is MANDATORY for uploads: without it a triple-failure
+  // (POST ok, mark-posted + commit both lost) leaves the client with no provable
+  // recovery hint, and once the reservation TTL lapses the recheck degrades into
+  // a duplicate paid POST. Refuse to post at all rather than post unrecoverably.
+  if (typeof env.RECOVERY_HMAC_SECRET !== 'string' || env.RECOVERY_HMAC_SECRET.length < 16) {
+    return error('Server misconfigured', 503);
+  }
 
   // 1. Read body and check actual size
   const bodyText = await request.text();
@@ -592,8 +599,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
   const recoveryToken = await signRecovery(env, noteId, txId, postedAt);
   if (recoveryToken === null) {
-    // RECOVERY_HMAC_SECRET unset — cannot issue a provable hint. The client
-    // keeps needsRecheck and reconciles via the normal (anchorless) path.
+    // Unreachable: the step-0 gate 503s uploads without RECOVERY_HMAC_SECRET.
+    // Kept as defense in depth — never imply a hint exists when it doesn't.
     return json({ txId, status: 'accepted', committed: false });
   }
   return json({ txId, status: 'accepted', committed: false, recovery: { txId, postedAt, token: recoveryToken } });
@@ -661,8 +668,9 @@ function parsePositiveInt(v: string | undefined): number | null {
 //
 // The HMAC key comes from the DEDICATED RECOVERY_HMAC_SECRET (stable across
 // ARWEAVE_JWK rotations — a wallet rotation must not orphan outstanding tokens).
-// If the secret is unset: no tokens are issued, and any presented token fails
-// verification → the caller fails closed (400), never a duplicate post.
+// The secret is MANDATORY: /upload 503s without it (step-0 gate), because an
+// unrecoverable triple-failure would otherwise end in a duplicate paid POST.
+// The null-handling below is defense in depth for any other caller.
 let recoveryKeyPromise: Promise<CryptoKey> | null = null;
 function getRecoveryKey(env: Env): Promise<CryptoKey> | null {
   if (!env.RECOVERY_HMAC_SECRET) return null;
