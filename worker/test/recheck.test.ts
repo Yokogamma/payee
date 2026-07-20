@@ -75,10 +75,10 @@ function mockStatus(txId: string, status: number, bodyText = 'x') {
   fetchMock.get('https://arweave.net').intercept({ path: `/tx/${txId}/status`, method: 'GET' }).reply(status, bodyText);
 }
 
-// Recompute the server's recovery HMAC (key = SHA-256(ARWEAVE_JWK + ':recovery');
-// the test JWK stub is '{}').
+// Recompute the server's recovery HMAC (key = SHA-256(RECOVERY_HMAC_SECRET +
+// ':recovery'); the test binding is 'test-recovery-secret').
 async function signRecovery(noteId: string, txId: string, postedAt: number): Promise<string> {
-  const material = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('{}:recovery')));
+  const material = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('test-recovery-secret:recovery')));
   const key = await crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`));
   return b64(new Uint8Array(sig));
@@ -157,15 +157,59 @@ describe('recovery token (triple-failure reconciliation)', () => {
     expect(body.txId).toBe('TX-REC');
   });
 
-  it('ignores a FORGED recovery token and does not commit it', async () => {
+  it('FAILS CLOSED (400) on a forged recovery token — no post, reservation released', async () => {
     const id = await makeIdentity();
-    // Wrong signature → verifyRecovery fails → falls through to a normal post,
-    // which hits the stubbed Arweave and 502s (never commits TX-FORGED).
+    // Wrong signature → verifyRecovery fails → 400. It must NOT fall through to
+    // a fresh paid post: the token's TX may be alive on-chain (duplicate risk).
     const r = await recoveryUpload(
       id,
       { txId: 'TX-FORGED', postedAt: Date.now() - 60_000, token: 'Zm9yZ2Vk' },
       `rc-${crypto.randomUUID().slice(0, 6)}`,
     );
-    expect(r.status).toBe(502);
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/recovery/i);
+
+    // The fresh reservation was released — a later legitimate upload can proceed
+    // immediately (no lingering reserved slot → no 409).
+    const rec = await readNote(id.pkB64);
+    expect(rec?.status).not.toBe('reserved');
+  });
+
+  it('FAILS CLOSED (400) on a malformed recovery hint (wrong shape)', async () => {
+    const id = await makeIdentity();
+    const r = await recoveryUpload(
+      id,
+      { txId: 'TX-X', postedAt: 'yesterday', token: 42 }, // wrong field types
+      `rc-${crypto.randomUUID().slice(0, 6)}`,
+    );
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/recovery/i);
+  });
+
+  it('rejects (400) a recovery hint sent WITHOUT recheck', async () => {
+    const id = await makeIdentity();
+    const postedAt = Date.now() - 60_000;
+    const token = await signRecovery(NOTE_ID, 'TX-NORECHECK', postedAt);
+    // recoveryUpload always sets recheck:true, so build the body manually.
+    const body = JSON.stringify({
+      data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
+      tags: [
+        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Version', value: '2' },
+        { name: 'Content-Type', value: 'application/json' },
+        { name: 'Owner-Hash', value: id.ownerHash },
+        { name: 'Note-Id', value: NOTE_ID },
+      ],
+      ownerHash: id.ownerHash,
+      timestamp: Date.now(),
+      recovery: { txId: 'TX-NORECHECK', postedAt, token },
+    });
+    const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), id.priv));
+    const r = await SELF.fetch('https://proxy.example.com/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Public-Key': id.pkB64, 'X-Signature': sig, 'CF-Connecting-IP': `rc-${crypto.randomUUID().slice(0, 6)}` },
+      body,
+    });
+    expect(r.status).toBe(400);
   });
 });

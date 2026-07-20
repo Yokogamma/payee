@@ -25,6 +25,10 @@ interface Env {
   RATE_LIMIT_PER_HOUR: string;
   ARWEAVE_JWK: string;
   ADMIN_SECRET: string;
+  /** Dedicated stable secret for recovery-token HMACs. Deliberately NOT derived
+   *  from ARWEAVE_JWK: wallet rotation must not invalidate outstanding tokens
+   *  (an unverifiable token fails closed and blocks reconciliation). */
+  RECOVERY_HMAC_SECRET: string;
 }
 
 // ─── Per-IP baseline rate limit (D-baseline) ────────────────────────
@@ -290,12 +294,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
   const wantsRecheck = recheck === true;
   // Optional server-signed recovery hint (validated by HMAC below, never trusted raw).
+  const hasRecoveryField = recovery !== undefined && recovery !== null;
   const recoveryHint = (recovery && typeof recovery === 'object'
     && typeof (recovery as { txId?: unknown }).txId === 'string'
     && typeof (recovery as { postedAt?: unknown }).postedAt === 'number'
     && typeof (recovery as { token?: unknown }).token === 'string')
     ? (recovery as { txId: string; postedAt: number; token: string })
     : undefined;
+  // FAIL CLOSED on a present-but-unusable recovery hint. A malformed hint (or
+  // one sent outside a recheck) must never silently degrade into a fresh paid
+  // post — the referenced TX may be alive on-chain (duplicate + quota burn).
+  if (hasRecoveryField && (!recoveryHint || !wantsRecheck)) {
+    return error('Invalid recovery token', 400);
+  }
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
   if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
@@ -491,8 +502,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // Triple-failure recovery: the DO has no record, but the client holds a
     // server-signed recovery token for a previously-posted txId. Verify the HMAC,
     // then reconcile like the posted path — never re-post an alive TX.
-    if (wantsRecheck && recoveryHint
-        && await verifyRecovery(env, noteId, recoveryHint.txId, recoveryHint.postedAt, recoveryHint.token)) {
+    if (wantsRecheck && recoveryHint) {
+      // FAIL CLOSED: a bad HMAC (corrupt, forged, or signed under a rotated /
+      // missing secret) releases the fresh reservation and 400s — it must NOT
+      // fall through to a new post while the referenced TX may be alive.
+      const recoveryValid = await verifyRecovery(env, noteId, recoveryHint.txId, recoveryHint.postedAt, recoveryHint.token);
+      if (!recoveryValid) {
+        await safeRelease(reserveToken);
+        return error('Invalid recovery token', 400);
+      }
       const live = await getTxStatusWorker(recoveryHint.txId);
       if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
       if (live === 'alive') {
@@ -573,6 +591,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
   const recoveryToken = await signRecovery(env, noteId, txId, postedAt);
+  if (recoveryToken === null) {
+    // RECOVERY_HMAC_SECRET unset — cannot issue a provable hint. The client
+    // keeps needsRecheck and reconciles via the normal (anchorless) path.
+    return json({ txId, status: 'accepted', committed: false });
+  }
   return json({ txId, status: 'accepted', committed: false, recovery: { txId, postedAt, token: recoveryToken } });
 }
 
@@ -635,26 +658,37 @@ function parsePositiveInt(v: string | undefined): number | null {
 // binding {noteId, txId, postedAt}; on reconciliation the client returns it and
 // we verify the HMAC — so it can prove which TX is ours WITHOUT us trusting an
 // arbitrary client-supplied txId.
+//
+// The HMAC key comes from the DEDICATED RECOVERY_HMAC_SECRET (stable across
+// ARWEAVE_JWK rotations — a wallet rotation must not orphan outstanding tokens).
+// If the secret is unset: no tokens are issued, and any presented token fails
+// verification → the caller fails closed (400), never a duplicate post.
 let recoveryKeyPromise: Promise<CryptoKey> | null = null;
-function getRecoveryKey(env: Env): Promise<CryptoKey> {
+function getRecoveryKey(env: Env): Promise<CryptoKey> | null {
+  if (!env.RECOVERY_HMAC_SECRET) return null;
   if (!recoveryKeyPromise) {
     recoveryKeyPromise = (async () => {
       const material = new Uint8Array(
-        await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.ARWEAVE_JWK + ':recovery')),
+        await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.RECOVERY_HMAC_SECRET + ':recovery')),
       );
       return crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     })();
   }
   return recoveryKeyPromise;
 }
-async function signRecovery(env: Env, noteId: string, txId: string, postedAt: number): Promise<string> {
-  const key = await getRecoveryKey(env);
+/** Returns null when RECOVERY_HMAC_SECRET is not configured (feature disabled). */
+async function signRecovery(env: Env, noteId: string, txId: string, postedAt: number): Promise<string | null> {
+  const keyPromise = getRecoveryKey(env);
+  if (!keyPromise) return null;
+  const key = await keyPromise;
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`));
   return bytesToBase64(new Uint8Array(sig));
 }
 async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: number, token: string): Promise<boolean> {
   try {
-    const key = await getRecoveryKey(env);
+    const keyPromise = getRecoveryKey(env);
+    if (!keyPromise) return false; // no secret → cannot verify → fail closed
+    const key = await keyPromise;
     const expected = new Uint8Array(
       await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`)),
     );

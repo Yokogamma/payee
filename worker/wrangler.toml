@@ -35,3 +35,7 @@ RATE_LIMIT_PER_HOUR = "20"
 # Secrets (via `wrangler secret put`):
 # ARWEAVE_JWK — server Arweave wallet (JSON string)
 # ADMIN_SECRET — bearer token for /admin/* endpoints
+# RECOVERY_HMAC_SECRET — STABLE secret for recovery-token HMACs. Set once and
+#   never rotate together with ARWEAVE_JWK (wallet rotation must not invalidate
+#   outstanding recovery tokens; an unverifiable token fails closed). If it must
+#   rotate, plan a dual-verify window (current + previous, keyed by `kid`).

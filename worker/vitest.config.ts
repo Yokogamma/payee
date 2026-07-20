@@ -17,6 +17,7 @@ export default defineWorkersConfig({
           bindings: {
             ADMIN_SECRET: 'test-admin-secret',
             ARWEAVE_JWK: '{}',
+            RECOVERY_HMAC_SECRET: 'test-recovery-secret',
           },
         },
       },
