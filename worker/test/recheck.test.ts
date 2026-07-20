@@ -75,6 +75,38 @@ function mockStatus(txId: string, status: number, bodyText = 'x') {
   fetchMock.get('https://arweave.net').intercept({ path: `/tx/${txId}/status`, method: 'GET' }).reply(status, bodyText);
 }
 
+// Recompute the server's recovery HMAC (key = SHA-256(ARWEAVE_JWK + ':recovery');
+// the test JWK stub is '{}').
+async function signRecovery(noteId: string, txId: string, postedAt: number): Promise<string> {
+  const material = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('{}:recovery')));
+  const key = await crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`));
+  return b64(new Uint8Array(sig));
+}
+
+async function recoveryUpload(id: { priv: Uint8Array; pkB64: string; ownerHash: string }, recovery: unknown, ip: string) {
+  const body = JSON.stringify({
+    data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
+    tags: [
+      { name: 'App-Name', value: 'EternalNotes' },
+      { name: 'App-Version', value: '2' },
+      { name: 'Content-Type', value: 'application/json' },
+      { name: 'Owner-Hash', value: id.ownerHash },
+      { name: 'Note-Id', value: NOTE_ID },
+    ],
+    ownerHash: id.ownerHash,
+    timestamp: Date.now(),
+    recheck: true,
+    recovery,
+  });
+  const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), id.priv));
+  return SELF.fetch('https://proxy.example.com/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Public-Key': id.pkB64, 'X-Signature': sig, 'CF-Connecting-IP': ip },
+    body,
+  });
+}
+
 describe('recheck reconciliation (server-authoritative posted state)', () => {
   it('commits an ALIVE posted TX without re-posting', async () => {
     const id = await makeIdentity();
@@ -108,5 +140,32 @@ describe('recheck reconciliation (server-authoritative posted state)', () => {
 
     const r = await recheckUpload(id, `rc-${crypto.randomUUID().slice(0, 6)}`);
     expect(r.status).toBe(503); // too recent to re-post
+  });
+});
+
+describe('recovery token (triple-failure reconciliation)', () => {
+  it('reconciles an alive TX from a VALID signed recovery token (no re-post)', async () => {
+    const id = await makeIdentity(); // DO has NO record for NOTE_ID
+    const postedAt = Date.now() - 60_000;
+    const token = await signRecovery(NOTE_ID, 'TX-REC', postedAt);
+    mockStatus('TX-REC', 200, JSON.stringify({ block_height: 1, number_of_confirmations: 3 }));
+
+    const r = await recoveryUpload(id, { txId: 'TX-REC', postedAt, token }, `rc-${crypto.randomUUID().slice(0, 6)}`);
+    expect(r.status).toBe(200);
+    const body = await r.json() as { txId: string; committed: boolean };
+    expect(body.committed).toBe(true);
+    expect(body.txId).toBe('TX-REC');
+  });
+
+  it('ignores a FORGED recovery token and does not commit it', async () => {
+    const id = await makeIdentity();
+    // Wrong signature → verifyRecovery fails → falls through to a normal post,
+    // which hits the stubbed Arweave and 502s (never commits TX-FORGED).
+    const r = await recoveryUpload(
+      id,
+      { txId: 'TX-FORGED', postedAt: Date.now() - 60_000, token: 'Zm9yZ2Vk' },
+      `rc-${crypto.randomUUID().slice(0, 6)}`,
+    );
+    expect(r.status).toBe(502);
   });
 });

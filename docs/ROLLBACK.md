@@ -23,11 +23,18 @@ Only after R is deployed **everywhere and stable** flip the client to writing v2
 
 - **Never roll back below the reader release R** once v2 writes are enabled: an
   older client/worker cannot read v2 notes. R (reads v1+v2, writes v1) is the
-  lowest safe rollback target.
-- **Worker:** `wrangler rollback` (or redeploy the previous tag). Cloudflare warns
-  that rolling back after a Durable Object storage/format change is risky — the DO
-  migrations here are additive (new classes / new record fields), so rolling the
-  worker back to R is safe; rolling below R is not.
+  lowest safe rollback target for the DATA format.
+- **Worker — hard floor at the `posted`-aware version.** This Worker adds a new
+  RateLimiter state-machine state `posted` (not just fields). A pre-`posted`
+  Worker only knows `reserved | committed`; it would treat a `posted` record as
+  absent/stale, overwrite it with a new reservation, and **lose the server txId →
+  duplicate paid TX**. Therefore:
+  - Record the exact **minimum Worker SHA/tag that understands `posted`** here on
+    first deploy of this Worker:  `MIN_WORKER_SHA = <fill on first deploy>`.
+  - **Never roll the Worker below `MIN_WORKER_SHA`** once it has been deployed
+    even once — independent of whether the v2 writer is enabled. Rolling back to
+    any SHA ≥ `MIN_WORKER_SHA` (and ≥ R) is safe.
+  - Use `wrangler rollback` / redeploy of an allowed tag only.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.

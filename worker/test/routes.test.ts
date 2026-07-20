@@ -25,6 +25,21 @@ function get(path: string, ip: string) {
 // Unique IPs per run so watch-mode reuse never carries counters over.
 const RUN = crypto.randomUUID().slice(0, 6);
 
+describe('CORS allowlist', () => {
+  it('returns ACAO only for an origin in ALLOWED_ORIGINS', async () => {
+    // localhost:5173 is in wrangler.toml ALLOWED_ORIGINS; a stranger is not.
+    const allowed = await SELF.fetch('https://proxy.example.com/health', {
+      headers: { Origin: 'http://localhost:5173' },
+    });
+    expect(allowed.headers.get('Access-Control-Allow-Origin')).toBe('http://localhost:5173');
+
+    const stranger = await SELF.fetch('https://proxy.example.com/health', {
+      headers: { Origin: 'https://evil.example' },
+    });
+    expect(stranger.headers.get('Access-Control-Allow-Origin')).toBeNull();
+  });
+});
+
 describe('protected routes: per-IP limiter (D-baseline)', () => {
   it('runs the limiter before auth on /upload, then 429s once exhausted', async () => {
     const ip = `up-${RUN}`;

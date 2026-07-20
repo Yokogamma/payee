@@ -484,8 +484,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     // Build payload — serialized per the note's own version (v1 or v2), so a
     // restored v2 ciphertext can never be re-published under v1 tags. Recheck
-    // reconciliation is server-authoritative (no client txId is sent).
-    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck);
+    // reconciliation is server-authoritative; the only client-echoed value is a
+    // server-SIGNED recovery hint (if any) from a prior triple-failure.
+    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck, prev?.recovery);
 
     const bodyText = JSON.stringify(payload);
     const signature = await signPayload(signingKeyRef.current, bodyText);
@@ -503,6 +504,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Clear the flag ONLY when the server confirmed the commit; if the TX
         // posted but the DO commit didn't stick, keep rechecking to reconcile.
         needsRecheck: !result.committed,
+        // Persist a recovery hint until committed; carry the previous one forward
+        // if the server didn't return a fresh one.
+        recovery: result.committed ? undefined : (result.recovery ?? prev?.recovery),
       });
       // Auto-discovery
       const pkB64 = bufferToBase64(publicKeyRef.current!);
@@ -535,6 +539,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         updatedAt: Date.now(),
         needsRecheck: true,
         lastError: errText,
+        recovery: prev.recovery, // keep the hint across a transient failure
       });
     } else {
       await setSyncRecord({

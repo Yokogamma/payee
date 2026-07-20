@@ -282,13 +282,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
     return error('Invalid body: must be a JSON object', 400);
   }
-  const { data, tags, ownerHash, timestamp, recheck } = parsedBody as {
-    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown;
+  const { data, tags, ownerHash, timestamp, recheck, recovery } = parsedBody as {
+    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown; recovery?: unknown;
   };
   if (typeof data !== 'string' || typeof ownerHash !== 'string' || !Array.isArray(tags)) {
     return error('Missing/invalid required fields', 400);
   }
   const wantsRecheck = recheck === true;
+  // Optional server-signed recovery hint (validated by HMAC below, never trusted raw).
+  const recoveryHint = (recovery && typeof recovery === 'object'
+    && typeof (recovery as { txId?: unknown }).txId === 'string'
+    && typeof (recovery as { postedAt?: unknown }).postedAt === 'number'
+    && typeof (recovery as { token?: unknown }).token === 'string')
+    ? (recovery as { txId: string; postedAt: number; token: string })
+    : undefined;
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
   if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
@@ -460,10 +467,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     const live = await getTxStatusWorker(checkResult.txId!);
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (live === 'alive') {
-      const commitResp = await doCall('/commit', { noteId, txId: checkResult.txId, token: checkResult.token });
-      const commit: { ok: boolean } = await commitResp.json();
-      if (commit.ok) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
-      return error('Recheck deferred', 503); // raced — retry
+      try {
+        const commitResp = await doCall('/commit', { noteId, txId: checkResult.txId, token: checkResult.token });
+        const commit: { ok: boolean } = await commitResp.json();
+        if (commitResp.ok && commit.ok) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
+      } catch { /* fall through to retryable 503 */ }
+      return error('Recheck deferred', 503); // raced / DO error — retry
     }
     if (Date.now() - (checkResult.postedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
       return error('Recheck deferred: posted too recently', 503);
@@ -478,6 +487,30 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Rate limit exceeded', 429);
   } else {
     reserveToken = checkResult.token!;
+
+    // Triple-failure recovery: the DO has no record, but the client holds a
+    // server-signed recovery token for a previously-posted txId. Verify the HMAC,
+    // then reconcile like the posted path — never re-post an alive TX.
+    if (wantsRecheck && recoveryHint
+        && await verifyRecovery(env, noteId, recoveryHint.txId, recoveryHint.postedAt, recoveryHint.token)) {
+      const live = await getTxStatusWorker(recoveryHint.txId);
+      if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
+      if (live === 'alive') {
+        try {
+          const commitResp = await doCall('/commit', { noteId, txId: recoveryHint.txId, token: reserveToken });
+          const commit: { ok: boolean } = await commitResp.json();
+          if (commitResp.ok && commit.ok) return json({ txId: recoveryHint.txId, status: 'accepted', committed: true });
+        } catch { /* fall through */ }
+        await safeRelease(reserveToken);
+        return error('Recheck deferred', 503);
+      }
+      // dead — only re-post once past the age guard (uses signed postedAt).
+      if (Date.now() - recoveryHint.postedAt <= MIN_COMMITTED_AGE_MS) {
+        await safeRelease(reserveToken);
+        return error('Recheck deferred: posted too recently', 503);
+      }
+      // dead & old enough → fall through to re-post under reserveToken.
+    }
   }
 
   // 11. Create + sign + post the Arweave TX. Any failure releases the reservation
@@ -501,15 +534,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Arweave upload failed', 502);
   }
 
-  // 12a. Record the POST in the DO BEFORE commit (retry). This is the
-  //      server-authoritative anchor that makes a lost commit reconcilable
-  //      without trusting any client-supplied txId.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // 12a. Anchor the POST in the DO BEFORE commit (retry). This is the
+  //      server-authoritative record that makes a lost commit reconcilable.
+  //      Checked on resp.ok AND body.ok (a stale body must not count as anchored).
+  const postedAt = Date.now();
+  let anchored = false;
+  for (let attempt = 0; attempt < 3 && !anchored; attempt++) {
     try {
       const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken });
-      if (resp.ok) break;
-    } catch { /* fall through to retry */ }
-    if (attempt < 2) await new Promise(r => setTimeout(r, 100 * Math.pow(3, attempt)));
+      const body: { ok: boolean } = await resp.json();
+      if (resp.ok && body.ok) anchored = true;
+    } catch { /* retry */ }
+    if (!anchored && attempt < 2) await new Promise(r => setTimeout(r, 100 * Math.pow(3, attempt)));
   }
 
   // 12b. Commit noteId → txId — retry, checking resp.ok / stale (L7).
@@ -524,11 +560,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       if (attempt < 2) await new Promise(r => setTimeout(r, 100 * Math.pow(3, attempt)));
     }
   }
-  if (!committed) console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
-  // The TX is on-chain, but if the DO didn't record the commit the note isn't
-  // idempotency-safe yet — report committed:false so the client keeps
-  // needsRecheck and reconciles server state on a later cycle.
-  return json({ txId, status: 'accepted', committed });
+
+  if (committed) return json({ txId, status: 'accepted', committed: true });
+
+  // Not committed. If it's ANCHORED, the DO holds a `posted` record → the client
+  // just keeps needsRecheck and reconciles server-side. If NOT anchored, the DO
+  // has no record at all — hand out a signed recovery token so the client can
+  // prove this txId later instead of triggering a duplicate re-post.
+  if (anchored) {
+    console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
+    return json({ txId, status: 'accepted', committed: false });
+  }
+  console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
+  const recoveryToken = await signRecovery(env, noteId, txId, postedAt);
+  return json({ txId, status: 'accepted', committed: false, recovery: { txId, postedAt, token: recoveryToken } });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -580,7 +625,45 @@ function isFreshTimestamp(ts: unknown): boolean {
 function parsePositiveInt(v: string | undefined): number | null {
   if (typeof v !== 'string' || v.trim() === '') return null;
   const n = Number(v);
-  return Number.isInteger(n) && n > 0 ? n : null;
+  // Safe-integer + sane upper bound so a huge/garbage value can't wrap or DoS.
+  return Number.isSafeInteger(n) && n > 0 && n <= 100_000_000 ? n : null;
+}
+
+// ─── Recovery token (HMAC) ──────────────────────────────────────────
+// Covers the rare triple-failure: POST ok, but mark-posted AND commit both fail,
+// so the DO has no record of the txId. We hand the client a SERVER-SIGNED token
+// binding {noteId, txId, postedAt}; on reconciliation the client returns it and
+// we verify the HMAC — so it can prove which TX is ours WITHOUT us trusting an
+// arbitrary client-supplied txId.
+let recoveryKeyPromise: Promise<CryptoKey> | null = null;
+function getRecoveryKey(env: Env): Promise<CryptoKey> {
+  if (!recoveryKeyPromise) {
+    recoveryKeyPromise = (async () => {
+      const material = new Uint8Array(
+        await crypto.subtle.digest('SHA-256', new TextEncoder().encode(env.ARWEAVE_JWK + ':recovery')),
+      );
+      return crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    })();
+  }
+  return recoveryKeyPromise;
+}
+async function signRecovery(env: Env, noteId: string, txId: string, postedAt: number): Promise<string> {
+  const key = await getRecoveryKey(env);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`));
+  return bytesToBase64(new Uint8Array(sig));
+}
+async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: number, token: string): Promise<boolean> {
+  try {
+    const key = await getRecoveryKey(env);
+    const expected = new Uint8Array(
+      await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`)),
+    );
+    const provided = base64ToBytes(token);
+    if (provided.length !== expected.length) return false;
+    return crypto.subtle.timingSafeEqual(expected, provided);
+  } catch {
+    return false;
+  }
 }
 
 /**

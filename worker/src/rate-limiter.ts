@@ -116,6 +116,11 @@ export class RateLimiter implements DurableObject {
   private async handleMarkPosted(request: Request): Promise<Response> {
     const { noteId, txId, token } = await request.json<MarkPostedRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
+    // Idempotent: a retried mark-posted (lost response) for the same token+txId
+    // that already landed must succeed, not report stale.
+    if (record && record.status === 'posted' && record.token === token && record.txId === txId) {
+      return Response.json({ ok: true });
+    }
     if (!record || record.status !== 'reserved' || record.token !== token) {
       return Response.json({ ok: false, stale: true });
     }
@@ -190,8 +195,14 @@ export class RateLimiter implements DurableObject {
       if (baseCount + w.inFlight >= limit) return Response.json({ ok: false, rateLimited: true });
       if (sameGen) await this.state.storage.put('count', baseCount);
       await this.state.storage.put('inFlight', w.inFlight + 1);
+    } else if (record.gen === w.resetAt) {
+      // posted, same window → its inFlight slot is still counted; no change.
+    } else {
+      // posted from a PREVIOUS window → window() already reset inFlight to 0, so
+      // the slot no longer exists. Re-acquire it under the current window's quota.
+      if (w.count + w.inFlight >= limit) return Response.json({ ok: false, rateLimited: true });
+      await this.state.storage.put('inFlight', w.inFlight + 1);
     }
-    // posted: the slot is already inFlight → no quota/count change needed.
     await this.state.storage.put('attempts', w.attempts + 1);
 
     const token = crypto.randomUUID();

@@ -29,6 +29,12 @@ export interface SyncRecord {
    * if the TX is truly gone. Cleared once accepted afresh or confirmed.
    */
   needsRecheck?: boolean;
+  /**
+   * Server-signed recovery hint from a triple-failure upload (POST ok, but the
+   * server couldn't record it). Echoed back on recheck so the server reconciles
+   * without a duplicate re-post. Cleared once committed.
+   */
+  recovery?: { txId: string; postedAt: number; token: string };
 }
 
 // ─── Database ────────────────────────────────────────────────────────

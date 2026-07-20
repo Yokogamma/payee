@@ -86,6 +86,14 @@ describe('RateLimiter reserve/commit', () => {
     expect((await markPosted(s, 'n', 'tx', 'wrong')).ok).toBe(false);
   });
 
+  it('mark-posted is idempotent for the same token + txId (retry safety)', async () => {
+    const s = stubFor('pk-Idem');
+    const r = await reserve(s, 'n');
+    expect((await markPosted(s, 'n', 'tx', r.token!)).ok).toBe(true);
+    // A retried mark-posted (lost response) must still succeed, not report stale.
+    expect((await markPosted(s, 'n', 'tx', r.token!)).ok).toBe(true);
+  });
+
   it('rejects a commit with a stale token (CAS)', async () => {
     const s = stubFor('pk-C');
     await reserve(s, 'n3');

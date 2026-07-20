@@ -38,6 +38,7 @@ export function buildUploadPayload(
   ownerHash: string,
   now: number,
   recheck = false,
+  recovery?: RecoveryHint,
 ): ProxyUploadPayload {
   const isV2 = note.v === 2;
   const data = isV2
@@ -55,10 +56,18 @@ export function buildUploadPayload(
 
   const payload: ProxyUploadPayload = { data, tags, ownerHash, timestamp: now };
   if (recheck) payload.recheck = true;
+  if (recheck && recovery) payload.recovery = recovery;
   return payload;
 }
 
 // ─── Types ───────────────────────────────────────────────────────────
+
+/** Opaque, server-HMAC-signed recovery hint for a lost-anchor upload. */
+export interface RecoveryHint {
+  txId: string;
+  postedAt: number;
+  token: string;
+}
 
 export interface ProxyUploadPayload {
   data: string;
@@ -67,12 +76,15 @@ export interface ProxyUploadPayload {
   timestamp: number;
   /** Ask the server to re-verify a committed TX and re-post if it was dropped.
    *  Reconciliation is server-authoritative (the DO records the posted txId), so
-   *  the client never supplies a txId here. */
+   *  the client never supplies a raw txId here. */
   recheck?: boolean;
+  /** Server-signed recovery hint from a prior triple-failure upload (echoed back
+   *  on recheck so the server can reconcile without a duplicate re-post). */
+  recovery?: RecoveryHint;
 }
 
 export type UploadResult =
-  | { kind: 'accepted'; txId: string; committed: boolean }
+  | { kind: 'accepted'; txId: string; committed: boolean; recovery?: RecoveryHint }
   | { kind: 'rate_limited'; error: string }
   | { kind: 'not_registered'; error: string }
   | { kind: 'in_progress'; error: string }
@@ -243,7 +255,12 @@ export async function uploadViaProxy(
       const data = await response.json();
       // committed:false means the TX posted but the server's idempotency record
       // isn't confirmed yet → caller keeps needsRecheck.
-      return { kind: 'accepted', txId: data.txId, committed: data.committed !== false };
+      return {
+        kind: 'accepted',
+        txId: data.txId,
+        committed: data.committed !== false,
+        recovery: data.recovery,
+      };
     }
 
     // Structured error classification by HTTP status (not text)
