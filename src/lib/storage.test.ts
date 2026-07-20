@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach } from 'vitest';
+import { openDB } from 'idb';
 import {
   initStorage,
   resetAll,
   recoverStorage,
+  StorageBlockedError,
   saveNoteWithSync,
   saveNote,
   getNoteById,
@@ -73,6 +75,18 @@ describe('recoverStorage', () => {
     expect(await getNoteById('keep')).toBeUndefined();
     await saveNote({ noteId: 'fresh', ciphertext: 'c', iv: 'iv', createdAt: 2 });
     expect(await getNoteById('fresh')).toBeDefined();
+  });
+
+  it('rejects with StorageBlockedError when another tab blocks deletion (no hang), then succeeds after it closes', async () => {
+    // Simulate another tab: an independent connection that ignores versionchange.
+    const otherTab = await openDB('eternal-notes', 1);
+    await expect(recoverStorage()).rejects.toBeInstanceOf(StorageBlockedError);
+
+    // The "other tab" closes → retry must fully recover to a working DB.
+    otherTab.close();
+    await recoverStorage();
+    await saveNote({ noteId: 'after-block', ciphertext: 'c', iv: 'iv', createdAt: 1 });
+    expect(await getNoteById('after-block')).toBeDefined();
   });
 });
 

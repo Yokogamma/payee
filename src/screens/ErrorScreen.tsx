@@ -12,7 +12,14 @@ export function ErrorScreen() {
       return;
     }
     setResetting(true);
-    await resetBrokenStorage();
+    try {
+      await resetBrokenStorage(); // reloads the page on success
+    } catch {
+      // Failure details are already surfaced via bootError by the store —
+      // re-enable the button so the user can retry after closing other tabs.
+      setResetting(false);
+      setConfirmReset(false);
+    }
   }
 
   return (
