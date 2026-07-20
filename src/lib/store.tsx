@@ -144,6 +144,9 @@ interface NotesStore {
   setupPin: (pin: string) => Promise<void>;
   removePin: () => Promise<void>;
   unlockWithPin: (pin: string) => Promise<void>;
+  /** Current PIN lockout/attempt state — read on PinUnlock mount so a reload
+   *  doesn't bypass the visible lockout timer. */
+  getPinLockState: () => Promise<{ lockedSeconds: number; attempts: number }>;
   resetBrokenStorage: () => Promise<void>;
   retryRestore: () => Promise<void>;
   clearRestoreStatus: () => void;
@@ -984,6 +987,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const getPinLockState = useCallback(async (): Promise<{ lockedSeconds: number; attempts: number }> => {
+    const lockedUntil = await getMeta<number>('pin-locked-until');
+    const attempts = (await getMeta<number>('pin-attempts')) ?? 0;
+    const lockedSeconds = lockedUntil && Date.now() < lockedUntil
+      ? Math.ceil((lockedUntil - Date.now()) / 1000)
+      : 0;
+    return { lockedSeconds, attempts };
+  }, []);
+
   // ─── Search ─────────────────────────────────────────────────────────
 
   const filteredNotes = searchQuery.trim()
@@ -1028,6 +1040,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setupPin: setupPinAction,
     removePin: removePinAction,
     unlockWithPin: unlockWithPinAction,
+    getPinLockState,
     resetBrokenStorage,
     retryRestore,
     clearRestoreStatus,

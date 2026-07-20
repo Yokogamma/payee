@@ -210,6 +210,94 @@ h1 {
   width: 100%;
 }
 
+/* Neutral informational variant (PIN threat model, trade-off notes) */
+.seed-warning.info {
+  background: var(--bg-input);
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+
+/* ─── Onboarding: seed cover + verification ─────────────────── */
+
+.seed-cover {
+  width: 100%;
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--bg-input);
+  border: 1px dashed var(--border-focus);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 20px;
+}
+
+.seed-cover:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.seed-cover-icon {
+  font-size: 28px;
+}
+
+.seed-cover-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.verify-words {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.verify-word-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.verify-word-row .seed-num {
+  flex-shrink: 0;
+  min-width: 78px;
+  text-align: left;
+}
+
+.verify-word-row input {
+  flex: 1;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 15px;
+  padding: 10px 12px;
+  outline: none;
+  min-width: 0;
+}
+
+.verify-word-row input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.pin-attempts {
+  font-size: 12px;
+  color: var(--yellow);
+  background: rgba(251, 191, 36, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  width: 100%;
+  line-height: 1.5;
+}
+
 .seed-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

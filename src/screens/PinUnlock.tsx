@@ -2,15 +2,29 @@ import { useState, useRef, useEffect } from 'react';
 import { useNotes, PinLockedError, PinWipedError } from '../lib/store';
 
 export function PinUnlock() {
-  const { unlockWithPin, goToRestore } = useNotes();
+  const { unlockWithPin, getPinLockState, goToRestore } = useNotes();
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [lockedSeconds, setLockedSeconds] = useState(0);
+  const [attempts, setAttempts] = useState(0);
+  const [wiped, setWiped] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
+  }, []);
+
+  // A reload must not hide an active lockout — read persisted state on mount.
+  useEffect(() => {
+    let cancelled = false;
+    void getPinLockState().then(st => {
+      if (cancelled) return;
+      setAttempts(st.attempts);
+      if (st.lockedSeconds > 0) setLockedSeconds(st.lockedSeconds);
+    }).catch(() => { /* storage unavailable — normal unlock flow still applies */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Countdown timer for lockout
@@ -41,11 +55,13 @@ export function PinUnlock() {
         setLockedSeconds(err.secondsLeft);
         setError(`Слишком много попыток. Подождите ${formatLockTime(err.secondsLeft)}`);
       } else if (err instanceof PinWipedError) {
-        setError(err.message);
-        // Will redirect to restore after user clicks the button
+        setWiped(true);
+        setError('');
       } else {
         setError('Неверный PIN-код');
       }
+      // Refresh the persisted attempt counter for the warning line.
+      void getPinLockState().then(st => setAttempts(st.attempts)).catch(() => {});
       setPin('');
       inputRef.current?.focus();
     } finally {
@@ -66,6 +82,24 @@ export function PinUnlock() {
   }
 
   const isLocked = lockedSeconds > 0;
+
+  if (wiped) {
+    return (
+      <div className="screen-center">
+        <div className="card onboarding">
+          <div className="logo-icon">∞</div>
+          <h1>PIN удалён</h1>
+          <p className="subtitle">
+            После 10 неудачных попыток PIN-код был удалён. Заметки не пострадали —
+            войдите по seed-фразе и при желании установите новый PIN в настройках.
+          </p>
+          <button className="btn btn-primary" onClick={goToRestore}>
+            Восстановить по seed-фразе
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="screen-center">
@@ -90,6 +124,13 @@ export function PinUnlock() {
         />
 
         {error && <div className="error-msg">{error}</div>}
+
+        {attempts >= 3 && !isLocked && (
+          <div className="pin-attempts">
+            Попытка {attempts} из 10 — после 10-й PIN будет удалён,
+            вход останется только по seed-фразе.
+          </div>
+        )}
 
         <button
           className="btn btn-primary"

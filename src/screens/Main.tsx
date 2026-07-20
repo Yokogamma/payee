@@ -344,6 +344,8 @@ export function Main() {
                 <div className="seed-reveal">
                   <div className="seed-warning">
                     ⚠️ Никому не показывайте! Кто знает фразу — имеет доступ ко всем заметкам.
+                    На время сессии фраза хранится в памяти вкладки (sessionStorage) и
+                    очищается при закрытии браузера.
                   </div>
                   <div className="seed-grid compact">
                     {mnemonic.split(' ').map((word, i) => (
@@ -367,6 +369,12 @@ export function Main() {
 
             {/* PIN Section */}
             <div className="settings-section">
+              <div className="seed-warning info">
+                PIN — быстрый вход на этом устройстве. Мастер-ключ — seed-фраза:
+                при физическом доступе к разблокированному устройству PIN не
+                заменяет её надёжное хранение. После 10 неверных попыток PIN
+                удаляется, вход — только по seed-фразе.
+              </div>
               {!hasPin ? (
                 !showPinSetup ? (
                   <button
