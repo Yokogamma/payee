@@ -483,8 +483,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     });
 
     // Build payload — serialized per the note's own version (v1 or v2), so a
-    // restored v2 ciphertext can never be re-published under v1 tags.
-    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck);
+    // restored v2 ciphertext can never be re-published under v1 tags. On a
+    // recheck, pass the known txId so the server can reconcile a lost commit
+    // instead of re-posting a duplicate.
+    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck, prev?.txId);
 
     const bodyText = JSON.stringify(payload);
     const signature = await signPayload(signingKeyRef.current, bodyText);
@@ -593,7 +595,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
 
     const accepted = await getRecordsByStatus('accepted');
-    if (accepted.length === 0) return;
 
     const now = Date.now();
     let changed = false;

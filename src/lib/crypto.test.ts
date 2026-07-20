@@ -136,4 +136,16 @@ describe('PIN wrapping', () => {
     expect(isPinKdfLegacy(legacy)).toBe(true);
     expect(await decryptWithPin(legacy, '1234')).toBe(mn);
   });
+
+  it('rejects an unknown kdf instead of silently falling back to PBKDF2', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    const hostile = { ...blob, kdf: 'scrypt' as unknown as PinEncryptedSeed['kdf'] };
+    await expect(decryptWithPin(hostile, '123456')).rejects.toThrow(/Unknown PIN kdf/);
+  });
+
+  it('rejects out-of-range Argon2 params (OOM guard)', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    const hostile = { ...blob, argon2: { ...blob.argon2!, memorySize: 4_000_000_000 } };
+    await expect(decryptWithPin(hostile, '123456')).rejects.toThrow(/out of allowed range/);
+  });
 });

@@ -277,13 +277,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
     return error('Invalid body: must be a JSON object', 400);
   }
-  const { data, tags, ownerHash, timestamp, recheck } = parsedBody as {
-    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown;
+  const { data, tags, ownerHash, timestamp, recheck, knownTxId } = parsedBody as {
+    data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown; knownTxId?: unknown;
   };
   if (typeof data !== 'string' || typeof ownerHash !== 'string' || !Array.isArray(tags)) {
     return error('Missing/invalid required fields', 400);
   }
   const wantsRecheck = recheck === true;
+  const priorTxId = typeof knownTxId === 'string' ? knownTxId : undefined;
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
   if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
@@ -453,6 +454,26 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Rate limit exceeded', 429);
   } else {
     reserveToken = checkResult.token!;
+
+    // Reconciliation (fixes committed:false without duplicate posts): we got a
+    // FRESH reservation, but if this is a recheck with a known txId, don't blindly
+    // re-post — an alive TX just needs its commit re-recorded.
+    if (wantsRecheck && priorTxId) {
+      const live = await getTxStatusWorker(priorTxId);
+      if (live === 'alive') {
+        const commitResp = await doCall('/commit', { noteId, txId: priorTxId, token: reserveToken });
+        const commit: { ok: boolean } = await commitResp.json();
+        if (commit.ok) return json({ txId: priorTxId, status: 'accepted', committed: true });
+        // commit failed (raced) → release and let the client retry.
+        await safeRelease(reserveToken);
+        return error('Recheck deferred', 503);
+      }
+      if (live === 'unavailable') {
+        await safeRelease(reserveToken);
+        return error('Arweave status unavailable', 503);
+      }
+      // live === 'dead' → fall through to re-post under this reservation.
+    }
   }
 
   // 11. Create + sign + post the Arweave TX. Any failure releases the reservation

@@ -354,6 +354,34 @@ export function isPinKdfLegacy(encrypted: PinEncryptedSeed): boolean {
   return encrypted.kdf !== 'argon2id';
 }
 
+/**
+ * Validate a stored PIN blob BEFORE running the KDF. A corrupted/hostile blob
+ * must not be able to drive Argon2 into an OOM/hang via huge params, and an
+ * unknown kdf must fail loudly (not silently fall back to PBKDF2).
+ */
+function assertValidPinBlob(e: PinEncryptedSeed): void {
+  if (typeof e.ciphertext !== 'string' || e.ciphertext.length === 0 ||
+      typeof e.iv !== 'string' || typeof e.salt !== 'string') {
+    throw new Error('Malformed PIN blob');
+  }
+  if (base64ToBuffer(e.iv).length !== 12) throw new Error('Malformed PIN blob: iv');
+  if (base64ToBuffer(e.salt).length !== 16) throw new Error('Malformed PIN blob: salt');
+
+  if (e.kdf !== undefined && e.kdf !== 'pbkdf2' && e.kdf !== 'argon2id') {
+    throw new Error(`Unknown PIN kdf: ${e.kdf}`);
+  }
+  if (e.kdf === 'argon2id') {
+    const p = e.argon2;
+    if (!p ||
+        !(p.iterations >= 1 && p.iterations <= 10) ||
+        !(p.memorySize >= 8_192 && p.memorySize <= 262_144) ||   // 8 MiB … 256 MiB
+        !(p.parallelism >= 1 && p.parallelism <= 4) ||
+        p.hashLength !== 32) {
+      throw new Error('Argon2 params out of allowed range');
+    }
+  }
+}
+
 /** Encrypt mnemonic with PIN using Argon2id (current KDF). */
 export async function encryptWithPin(mnemonic: string, pin: string): Promise<PinEncryptedSeed> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -379,6 +407,8 @@ export async function encryptWithPin(mnemonic: string, pin: string): Promise<Pin
  * (GCM auth failure). A missing `kdf` field means a legacy PBKDF2-600k blob.
  */
 export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<string> {
+  assertValidPinBlob(encrypted);
+
   const salt = base64ToBuffer(encrypted.salt);
   const iv = base64ToBuffer(encrypted.iv);
   const ciphertext = base64ToBuffer(encrypted.ciphertext);

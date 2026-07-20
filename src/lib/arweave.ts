@@ -38,6 +38,7 @@ export function buildUploadPayload(
   ownerHash: string,
   now: number,
   recheck = false,
+  knownTxId?: string,
 ): ProxyUploadPayload {
   const isV2 = note.v === 2;
   const data = isV2
@@ -55,6 +56,7 @@ export function buildUploadPayload(
 
   const payload: ProxyUploadPayload = { data, tags, ownerHash, timestamp: now };
   if (recheck) payload.recheck = true;
+  if (recheck && knownTxId) payload.knownTxId = knownTxId;
   return payload;
 }
 
@@ -67,6 +69,9 @@ export interface ProxyUploadPayload {
   timestamp: number;
   /** Ask the server to re-verify a committed TX and re-post if it was dropped. */
   recheck?: boolean;
+  /** The txId the client believes exists — lets the server reconcile a lost
+   *  commit (re-record an alive TX) instead of blindly re-posting a duplicate. */
+  knownTxId?: string;
 }
 
 export type UploadResult =
