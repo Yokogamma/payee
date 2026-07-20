@@ -6,7 +6,7 @@ type Step = 'start' | 'seed' | 'verify' | 'pin';
 const VERIFY_WORDS = 3;
 
 export function Onboarding() {
-  const { createNewWallet, confirmMnemonic, setupPin, goToRestore, goToLanding, resetApp } = useNotes();
+  const { createNewWallet, confirmMnemonic, setupPin, removePin, goToRestore, goToLanding, resetApp } = useNotes();
   const [step, setStep] = useState<Step>('start');
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [seedRevealed, setSeedRevealed] = useState(false);
@@ -73,18 +73,29 @@ export function Onboarding() {
     }
     setFinishing(true);
     setError('');
+
+    // PIN FIRST: after confirmMnemonic the app leaves this screen, so a PIN
+    // failure there would be invisible and the user would believe a PIN is set.
+    // Here a failure keeps the user on the PIN step with an explicit choice:
+    // retry or continue without PIN.
+    if (withPin) {
+      try {
+        await setupPin(pinInput);
+      } catch (err) {
+        console.error('PIN setup failed:', err);
+        setError('Не удалось установить PIN. Попробуйте ещё раз или нажмите «Пропустить», чтобы войти без PIN.');
+        setFinishing(false);
+        return;
+      }
+    }
+
     try {
       await confirmMnemonic(mnemonic);
-      // After confirm the app switches to main; a PIN failure here must not
-      // block onboarding — PIN can always be set later in settings.
-      if (withPin) {
-        try {
-          await setupPin(pinInput);
-        } catch (err) {
-          console.error('PIN setup during onboarding failed (can be set in settings):', err);
-        }
-      }
     } catch (err) {
+      // Don't leave a pin-seed for a vault that failed to initialize.
+      if (withPin) {
+        try { await removePin(); } catch { /* best effort */ }
+      }
       if (err instanceof VaultMismatchError) {
         setError(err.message);
         setShowReset(true);

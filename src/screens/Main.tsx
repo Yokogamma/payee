@@ -132,12 +132,26 @@ export function Main() {
   async function handleSetupPin() {
     if (pinInput.length < 6) { setPinError('Минимум 6 цифр'); return; }
     if (pinInput !== pinConfirm) { setPinError('PIN-коды не совпадают'); return; }
-    await setupPin(pinInput);
+    try {
+      await setupPin(pinInput);
+    } catch (err) {
+      // Keep the form open — closing it would imply the PIN was set.
+      console.error('setupPin failed:', err);
+      setPinError('Не удалось установить PIN. Попробуйте ещё раз.');
+      return;
+    }
     setPinInput(''); setPinConfirm(''); setPinError(''); setShowPinSetup(false);
   }
 
   async function handleRemovePin() {
-    await removePin();
+    try {
+      await removePin();
+    } catch (err) {
+      console.error('removePin failed:', err);
+      setPinError('Не удалось удалить PIN. Попробуйте ещё раз.');
+      return;
+    }
+    setPinError('');
     setShowPinSetup(false);
   }
 
@@ -415,9 +429,12 @@ export function Main() {
                   </div>
                 )
               ) : (
-                <button className="btn btn-outline full-width" onClick={handleRemovePin}>
-                  Удалить PIN-код
-                </button>
+                <>
+                  {pinError && <div className="error-msg">{pinError}</div>}
+                  <button className="btn btn-outline full-width" onClick={handleRemovePin}>
+                    Удалить PIN-код
+                  </button>
+                </>
               )}
             </div>
 
