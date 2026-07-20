@@ -510,8 +510,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const prev = await getSyncRecord(note.noteId);
     const recheck = prev?.needsRecheck === true;
 
-    // Mark uploading (preserve the prior txId + recheck intent so a crash or a
-    // retryable failure mid-recheck doesn't lose the accepted TX).
+    // Mark uploading (preserve the prior txId + recheck intent + recovery hint
+    // so a crash, an aborted request, or a retryable failure mid-recheck doesn't
+    // lose the accepted TX or the server-signed recovery proof).
     await setSyncRecord({
       noteId: note.noteId,
       txId: prev?.txId,
@@ -519,6 +520,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       transport: 'proxy',
       updatedAt: Date.now(),
       needsRecheck: recheck,
+      recovery: prev?.recovery,
     });
 
     // Build payload — serialized per the note's own version (v1 or v2), so a
@@ -559,7 +561,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
 
     if (result.kind === 'in_progress') {
-      // 409: reservation alive — don't mark as error
+      // 409: a reservation is alive on the server (e.g. the pre-triple-failure
+      // reserved slot still within its TTL). Restore the prior accepted state —
+      // leaving the record 'uploading' here would drop txId/recovery on the
+      // floor if the app closes before the next attempt.
+      if (prev?.txId) {
+        await setSyncRecord({
+          noteId: note.noteId,
+          txId: prev.txId,
+          status: 'accepted',
+          transport: 'proxy',
+          updatedAt: Date.now(),
+          needsRecheck: true,
+          recovery: prev.recovery,
+        });
+      }
       await refreshSyncCounts();
       return 'in_progress';
     }
@@ -639,8 +655,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const status = await getTxStatus(record.txId);
 
       if (status.kind === 'confirmed' && status.confirmations >= TX_CONFIRM_THRESHOLD) {
-        await setSyncRecord({ ...record, status: 'confirmed', needsRecheck: false, updatedAt: now });
-        changed = true;
+        // Terminal ONLY when server reconciliation is finished. A needsRecheck
+        // record (committed:false) still owes the server a commit/quota fix —
+        // confirming it here would drop it from the queue with the DO stuck in
+        // `posted` (or no anchor at all) forever.
+        if (!record.needsRecheck) {
+          await setSyncRecord({ ...record, status: 'confirmed', needsRecheck: false, updatedAt: now });
+          changed = true;
+        }
       } else if (status.kind === 'dropped' || status.kind === 'invalid') {
         // TX is gone → flag for server-side re-verify + re-post (keep 'accepted').
         if (!record.needsRecheck) {
