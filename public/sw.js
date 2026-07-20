@@ -1,5 +1,5 @@
 const CACHE_NAME = 'eternal-notes-__BUILD_HASH__';
-const BASE = '/payee/';
+const BASE = '__BASE__'; // replaced at build (scripts/postbuild.mjs)
 
 // App shell — cached on install
 const SHELL = [

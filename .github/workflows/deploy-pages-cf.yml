@@ -1,0 +1,46 @@
+name: Deploy to Cloudflare Pages
+
+# Migration target (Phase 3 runbook). Unlike GitHub Pages, Cloudflare Pages
+# parses dist/_headers, so the generated CSP + security headers are actually
+# applied to responses. Builds at root base (VITE_BASE=/).
+#
+# Manual trigger to preserve reader-before-writer ordering:
+#   1. run "Deploy Worker (proxy)" and smoke-test it,
+#   2. then run THIS workflow to publish the client,
+#   3. then run the header smoke-test (scripts/smoke-headers.mjs) against the URL.
+#
+# Requires repo secrets:
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+#   VITE_PROXY_URL (https), VITE_TRUSTED_OWNERS,
+#   CF_PAGES_PROJECT (the Pages project name).
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # ── Quality gates ──
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm --prefix worker ci
+      - run: npm --prefix worker run typecheck
+      - run: npm --prefix worker test
+      # ── Build at ROOT base for Cloudflare Pages ──
+      - run: npm run build
+        env:
+          VITE_BASE: "/"
+          VITE_PROXY_URL: ${{ secrets.VITE_PROXY_URL }}
+          VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
+          BUILD_SHA: ${{ github.sha }}
+      # ── Deploy ──
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ secrets.CF_PAGES_PROJECT }}

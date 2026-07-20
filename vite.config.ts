@@ -20,7 +20,8 @@ export default defineConfig(({ command, mode }) => {
 
   return {
     plugins: [react()],
-    base: "/payee/", // ← имя репозитория на GitHub
+    // '/payee/' for GitHub Pages (default); set VITE_BASE=/ for Cloudflare Pages.
+    base: process.env.VITE_BASE || "/payee/",
     build: {
       outDir: "dist",
       sourcemap: false,

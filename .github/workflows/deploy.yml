@@ -1,11 +1,9 @@
-name: Deploy to GitHub Pages
+name: Deploy to GitHub Pages (legacy)
 
-# Manual trigger so the client (Pages) is NEVER auto-published ahead of the
-# Worker. Reader-before-writer rollout is operator-driven:
-#   1. merge to main (nothing deploys),
-#   2. run "Deploy Worker (proxy)" and smoke-test it,
-#   3. then run this workflow to publish the client.
-# (Phase 3 migrates this to Cloudflare Pages and finalizes the runbook.)
+# LEGACY target. Cloudflare Pages (deploy-pages-cf.yml) is the migration target
+# because GitHub Pages ignores _headers, so the generated CSP is NOT applied here.
+# Kept working (base=/payee/) until the operator completes the CF Pages cutover.
+# Manual trigger so the client is NEVER auto-published ahead of the Worker.
 on:
   workflow_dispatch:
 
@@ -29,13 +27,14 @@ jobs:
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck
       - run: npm --prefix worker test
-      # ── Build ──
+      # ── Build (base=/payee/ default; postbuild stamps SW hash + writes _headers) ──
       - run: npm run build
         env:
           VITE_PROXY_URL: ${{ secrets.VITE_PROXY_URL }}
           VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
+          BUILD_SHA: ${{ github.sha }}
+      # GitHub Pages has no _redirects support → SPA fallback via 404.html.
       - run: cp dist/index.html dist/404.html
-      - run: sed -i "s/__BUILD_HASH__/$(git rev-parse --short HEAD)/" dist/sw.js
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
