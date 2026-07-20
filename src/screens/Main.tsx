@@ -1,5 +1,17 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNotes } from '../lib/store';
+import { useNotes, type NoteSyncStatus } from '../lib/store';
+
+// Draft survives an accidental tab close / PWA eviction (same lifetime model as
+// the session seed: sessionStorage, never persisted to disk unencrypted forever).
+const DRAFT_KEY = 'eternal-notes-draft';
+
+const SYNC_BADGE: Record<NoteSyncStatus, { icon: string; label: string; className: string }> = {
+  queued:    { icon: '○',  label: 'Ожидает загрузки',            className: 'sync-badge--queued' },
+  uploading: { icon: '⏳', label: 'Загружается...',              className: 'sync-badge--uploading' },
+  accepted:  { icon: '⏳', label: 'Ожидает подтверждения в сети', className: 'sync-badge--accepted' },
+  confirmed: { icon: '✓',  label: 'Сохранена в блокчейне',       className: 'sync-badge--confirmed' },
+  error:     { icon: '⚠️', label: 'Ошибка загрузки — повторить', className: 'sync-badge--error' },
+};
 
 export function Main() {
   const {
@@ -24,9 +36,11 @@ export function Main() {
     hasPin,
     setupPin,
     removePin,
+    syncStatuses,
+    dismissError,
   } = useNotes();
 
-  const [text, setText] = useState('');
+  const [text, setText] = useState(() => sessionStorage.getItem(DRAFT_KEY) ?? '');
   const [showSearch, setShowSearch] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showSeed, setShowSeed] = useState(false);
@@ -56,6 +70,15 @@ export function Main() {
     inputRef.current?.focus();
   }, []);
 
+  // Mirror the draft to sessionStorage (debounced) so it survives a reload.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (text) sessionStorage.setItem(DRAFT_KEY, text);
+      else sessionStorage.removeItem(DRAFT_KEY);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [text]);
+
   async function handleSave() {
     if (!text.trim() || isEncrypting) return;
     setSaveError('');
@@ -69,6 +92,7 @@ export function Main() {
       return;
     }
     setText('');
+    sessionStorage.removeItem(DRAFT_KEY); // don't wait out the debounce
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 1500);
     inputRef.current?.focus();
@@ -259,17 +283,48 @@ export function Main() {
             <p>Ничего не найдено по «{searchQuery}»</p>
           </div>
         ) : (
-          filteredNotes.map(note => (
-            <div className="note-card" key={note.id + note.createdAt}>
-              <div className="note-text">{note.text}</div>
-              <div className="note-meta">
-                <span className="note-time">{formatDate(note.createdAt)}</span>
-                <span className="note-lock">🔒</span>
+          filteredNotes.map(note => {
+            const status = arweave.enabled ? (syncStatuses[note.id] ?? 'queued') : null;
+            const badge = status ? SYNC_BADGE[status] : null;
+            return (
+              <div className="note-card" key={note.id + note.createdAt}>
+                <div className="note-text">{note.text}</div>
+                <div className="note-meta">
+                  <span className="note-time">{formatDate(note.createdAt)}</span>
+                  {badge && (
+                    status === 'error' ? (
+                      <button
+                        className={`sync-badge ${badge.className}`}
+                        onClick={retrySync}
+                        title={badge.label}
+                        aria-label={badge.label}
+                      >
+                        {badge.icon} повторить
+                      </button>
+                    ) : (
+                      <span className={`sync-badge ${badge.className}`} title={badge.label} aria-label={badge.label}>
+                        {badge.icon}
+                      </span>
+                    )
+                  )}
+                  <span className="note-lock">🔒</span>
+                </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
+
+      {/* Global sync-error toast (visible outside the settings modal) */}
+      {arweave.enabled && arweave.lastError && !showSettings && (
+        <div className="toast toast--error" role="status">
+          <span>⚠️ {arweave.lastError}</span>
+          <button className="banner-btn" onClick={retrySync} disabled={arweave.syncing}>
+            {arweave.syncing ? '...' : 'Повторить'}
+          </button>
+          <button className="banner-btn banner-close" onClick={dismissError} title="Скрыть">✕</button>
+        </div>
+      )}
 
       {/* Settings Modal */}
       {showSettings && (

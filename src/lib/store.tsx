@@ -54,6 +54,10 @@ import {
 
 export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main' | 'error';
 
+/** Per-note sync state for the card indicator: SyncRecord.status, or 'queued'
+ *  when the note has no record yet (never attempted). */
+export type NoteSyncStatus = 'queued' | 'uploading' | 'accepted' | 'confirmed' | 'error';
+
 export interface ArweaveState {
   enabled: boolean;
   online: boolean;
@@ -112,6 +116,8 @@ interface NotesStore {
   searchQuery: string;
   filteredNotes: NoteData[];
   arweave: ArweaveState;
+  /** noteId → sync status, refreshed together with the aggregate counters. */
+  syncStatuses: Record<string, NoteSyncStatus>;
   restoring: boolean;
   restoreError: string | null;
   /** How many notes the last completed restore recovered (null = no restore yet). */
@@ -141,6 +147,7 @@ interface NotesStore {
   resetBrokenStorage: () => Promise<void>;
   retryRestore: () => Promise<void>;
   clearRestoreStatus: () => void;
+  dismissError: () => void;
 }
 
 const StoreContext = createContext<NotesStore | null>(null);
@@ -193,6 +200,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     arweaveRef.current = next;
     setArweaveReactState(next);
   }
+
+  // Per-note sync status (joined notes + syncRecords) for the card indicators
+  const [syncStatuses, setSyncStatuses] = useState<Record<string, NoteSyncStatus>>({});
 
   // Upload queue refs
   const uploadQueueRef = useRef<EncryptedNote[]>([]);
@@ -393,6 +403,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
 
     const unsynced = allNotes.length - accepted - confirmed;
+
+    // Join notes ↔ sync records for the per-card indicator.
+    const byId = new Map(allSync.map(r => [r.noteId, r.status]));
+    const statuses: Record<string, NoteSyncStatus> = {};
+    for (const n of allNotes) {
+      statuses[n.noteId] = byId.get(n.noteId) ?? 'queued';
+    }
+    setSyncStatuses(statuses);
 
     setArweave(prev => ({
       ...prev,
@@ -754,6 +772,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setRestoredCount(null);
   }, []);
 
+  const dismissError = useCallback(() => {
+    setArweave(prev => ({ ...prev, lastError: null }));
+  }, []);
+
   const addNote = useCallback(async (text: string) => {
     if (!readyRef.current || !cryptoKeyRef.current || !text.trim()) return;
 
@@ -981,6 +1003,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     searchQuery,
     filteredNotes,
     arweave: arweaveState,
+    syncStatuses,
     restoring,
     restoreError,
     restoredCount,
@@ -1008,6 +1031,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     resetBrokenStorage,
     retryRestore,
     clearRestoreStatus,
+    dismissError,
   };
 
   return (
