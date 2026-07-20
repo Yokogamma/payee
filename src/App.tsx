@@ -4,6 +4,7 @@ import { Onboarding } from './screens/Onboarding';
 import { Restore } from './screens/Restore';
 import { PinUnlock } from './screens/PinUnlock';
 import { Main } from './screens/Main';
+import { ErrorScreen } from './screens/ErrorScreen';
 import './index.css';
 
 function AppRouter() {
@@ -21,6 +22,8 @@ function AppRouter() {
       return <PinUnlock />;
     case 'main':
       return <Main />;
+    case 'error':
+      return <ErrorScreen />;
   }
 }
 

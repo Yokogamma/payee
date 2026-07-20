@@ -47,11 +47,12 @@ import {
   setMeta,
   deleteMeta,
   resetAll,
+  recoverStorage,
 } from './storage';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
-export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main';
+export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main' | 'error';
 
 export interface ArweaveState {
   enabled: boolean;
@@ -114,6 +115,7 @@ interface NotesStore {
   restoring: boolean;
   vaultError: string | null;
   hasPin: boolean;
+  bootError: string | null;
 
   // Actions
   createNewWallet: () => Promise<string>;
@@ -133,6 +135,7 @@ interface NotesStore {
   setupPin: (pin: string) => Promise<void>;
   removePin: () => Promise<void>;
   unlockWithPin: (pin: string) => Promise<void>;
+  resetBrokenStorage: () => Promise<void>;
 }
 
 const StoreContext = createContext<NotesStore | null>(null);
@@ -161,6 +164,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [restoring, setRestoring] = useState(false);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [hasPin, setHasPin] = useState(false);
+  const [bootError, setBootError] = useState<string | null>(null);
 
   // Crypto refs (not React state — needed synchronously in async flows)
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
@@ -273,6 +277,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         }
         setScreen('restore');
       }
+    } catch (err) {
+      // Storage init/read failed (corrupted IndexedDB, quota, private-mode
+      // restrictions). Without this catch the app would spin forever.
+      console.error('bootstrap failed:', err);
+      setBootError(err instanceof Error ? err.message : String(err));
+      setScreen('error');
     } finally {
       readyRef.current = true;
       setReady(true);
@@ -813,6 +823,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setScreen('landing');
   }, []);
 
+  /**
+   * Recovery from a database that cannot even be OPENED: deletes the DB via
+   * idb's deleteDB (no open handle required, unlike resetAll) and reloads the
+   * app for a guaranteed-clean boot. Destroys local data — the error screen
+   * warns before calling this.
+   */
+  const resetBrokenStorage = useCallback(async () => {
+    try {
+      await recoverStorage();
+    } catch (err) {
+      console.error('recoverStorage failed:', err);
+    } finally {
+      sessionStorage.removeItem('eternal-notes-session');
+      window.location.reload();
+    }
+  }, []);
+
   // ─── PIN Actions ────────────────────────────────────────────────────
 
   const setupPinAction = useCallback(async (pin: string) => {
@@ -919,6 +946,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     restoring,
     vaultError,
     hasPin,
+    bootError,
 
     createNewWallet,
     confirmMnemonic,
@@ -937,6 +965,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setupPin: setupPinAction,
     removePin: removePinAction,
     unlockWithPin: unlockWithPinAction,
+    resetBrokenStorage,
   };
 
   return (

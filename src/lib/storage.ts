@@ -10,7 +10,7 @@
  *   - meta:  { key (PK), value }
  */
 
-import { openDB, type IDBPDatabase } from 'idb';
+import { openDB, deleteDB, type IDBPDatabase } from 'idb';
 import type { EncryptedNote } from './crypto';
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -43,11 +43,22 @@ const DB_NAME = 'eternal-notes';
 const DB_VERSION = 1;
 
 let db: IDBPDatabase | null = null;
+let initPromise: Promise<void> | null = null;
 
 export async function initStorage(): Promise<void> {
+  // Single-flight guard. On rejection the promise is cleared so the NEXT call
+  // retries a clean init instead of sticking to the rejected promise forever.
+  initPromise ??= doInit().catch(err => {
+    initPromise = null;
+    throw err;
+  });
+  return initPromise;
+}
+
+async function doInit(): Promise<void> {
   if (db) return;
 
-  db = await openDB(DB_NAME, DB_VERSION, {
+  const database = await openDB(DB_NAME, DB_VERSION, {
     upgrade(database) {
       // Notes store
       const notesStore = database.createObjectStore('notes', { keyPath: 'noteId' });
@@ -62,8 +73,15 @@ export async function initStorage(): Promise<void> {
     },
   });
 
-  // Run migration from localStorage (idempotent)
-  await migrateFromLocalStorage();
+  // Run migration from localStorage (idempotent). `db` is published only after
+  // the migration settles, so a failed init never leaves a half-ready handle.
+  try {
+    await migrateFromLocalStorage(database);
+  } catch (err) {
+    database.close();
+    throw err;
+  }
+  db = database;
 }
 
 export function closeStorage(): void {
@@ -71,6 +89,26 @@ export function closeStorage(): void {
     db.close();
     db = null;
   }
+  initPromise = null;
+}
+
+/**
+ * Last-resort recovery from a broken/corrupted database: close any open handle
+ * and DELETE the database entirely, then re-initialize from scratch. Works even
+ * when the DB cannot be opened (unlike resetAll, which needs an open DB).
+ * Destroys all local data — the caller must warn the user first.
+ */
+export async function recoverStorage(): Promise<void> {
+  try { db?.close(); } catch { /* already closed */ }
+  db = null;
+  initPromise = null;
+  await deleteDB(DB_NAME, {
+    blocked() {
+      // Another tab holds the DB open; deletion completes once it closes.
+      console.warn('recoverStorage: deleteDB blocked by another open tab');
+    },
+  });
+  await initStorage();
 }
 
 function getDB(): IDBPDatabase {
@@ -175,9 +213,7 @@ export async function deleteMeta(key: string): Promise<void> {
  * Sync state is NOT migrated (see comments below for rationale).
  * All migrated notes get new noteIds (crypto.randomUUID).
  */
-async function migrateFromLocalStorage(): Promise<{ notesMigrated: number }> {
-  const database = getDB();
-
+async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesMigrated: number }> {
   // 1. Check migration marker
   const migrated = await database.get('meta', 'migration-v1-done');
   if (migrated) return { notesMigrated: 0 };
@@ -201,6 +237,20 @@ async function migrateFromLocalStorage(): Promise<{ notesMigrated: number }> {
     // Do NOT mark migration as done — will retry on next launch.
     // localStorage data preserved for future retry.
     console.error('Migration: failed to parse localStorage data, will retry next launch', err);
+    return { notesMigrated: 0 };
+  }
+
+  // Validate the SHAPE, not just "is an array": a corrupted record migrated
+  // as-is would be undecryptable forever while the marker claims success.
+  // On any invalid record: keep localStorage intact, don't set the marker.
+  const isValidRecord = (n: unknown): n is { ciphertext: string; iv: string; createdAt: number } =>
+    typeof n === 'object' && n !== null &&
+    typeof (n as Record<string, unknown>).ciphertext === 'string' &&
+    typeof (n as Record<string, unknown>).iv === 'string' &&
+    typeof (n as Record<string, unknown>).createdAt === 'number';
+
+  if (!Array.isArray(oldNotes) || !oldNotes.every(isValidRecord)) {
+    console.error('Migration: localStorage data has invalid shape, preserved for manual recovery');
     return { notesMigrated: 0 };
   }
 
