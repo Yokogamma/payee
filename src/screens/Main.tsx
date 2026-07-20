@@ -15,6 +15,10 @@ export function Main() {
     toggleArweave,
     retrySync,
     restoring,
+    restoreError,
+    restoredCount,
+    retryRestore,
+    clearRestoreStatus,
     registerWithInvite,
     checkAccess,
     hasPin,
@@ -27,6 +31,7 @@ export function Main() {
   const [showSettings, setShowSettings] = useState(false);
   const [showSeed, setShowSeed] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
   const [inviteCode, setInviteCode] = useState('');
   const [inviteError, setInviteError] = useState('');
   const [inviteLoading, setInviteLoading] = useState(false);
@@ -53,7 +58,16 @@ export function Main() {
 
   async function handleSave() {
     if (!text.trim() || isEncrypting) return;
-    await addNote(text);
+    setSaveError('');
+    try {
+      await addNote(text);
+    } catch (err) {
+      // Persistence failed (quota/broken DB) — the note is still in the input,
+      // never let it silently vanish.
+      console.error('save failed:', err);
+      setSaveError('Не удалось сохранить заметку. Попробуйте ещё раз.');
+      return;
+    }
     setText('');
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 1500);
@@ -131,6 +145,23 @@ export function Main() {
         </div>
       )}
 
+      {/* Restore failed / partial (M1): distinguish "error" from "nothing to restore" */}
+      {!restoring && restoreError && (
+        <div className="error-banner">
+          <span>⚠️ {restoreError}</span>
+          <button className="banner-btn" onClick={retryRestore}>Повторить</button>
+          <button className="banner-btn banner-close" onClick={clearRestoreStatus} title="Скрыть">✕</button>
+        </div>
+      )}
+
+      {/* Restore succeeded — show what actually came back */}
+      {!restoring && !restoreError && restoredCount !== null && restoredCount > 0 && (
+        <div className="success-banner">
+          <span>✓ Восстановлено заметок: {restoredCount}</span>
+          <button className="banner-btn banner-close" onClick={clearRestoreStatus} title="Скрыть">✕</button>
+        </div>
+      )}
+
       {/* Offline Banner */}
       {arweave.enabled && !arweave.online && (
         <div className="offline-banner">
@@ -200,6 +231,7 @@ export function Main() {
           onKeyDown={handleKeyDown}
           rows={Math.min(text.split('\n').length + 1, 8)}
         />
+        {saveError && <div className="error-msg">{saveError}</div>}
         <div className="input-footer">
           <span className="input-hint">
             {justSaved ? '✓ Сохранено и зашифровано' : 'Ctrl+Enter — сохранить'}

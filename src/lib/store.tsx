@@ -113,6 +113,9 @@ interface NotesStore {
   filteredNotes: NoteData[];
   arweave: ArweaveState;
   restoring: boolean;
+  restoreError: string | null;
+  /** How many notes the last completed restore recovered (null = no restore yet). */
+  restoredCount: number | null;
   vaultError: string | null;
   hasPin: boolean;
   bootError: string | null;
@@ -136,6 +139,8 @@ interface NotesStore {
   removePin: () => Promise<void>;
   unlockWithPin: (pin: string) => Promise<void>;
   resetBrokenStorage: () => Promise<void>;
+  retryRestore: () => Promise<void>;
+  clearRestoreStatus: () => void;
 }
 
 const StoreContext = createContext<NotesStore | null>(null);
@@ -162,6 +167,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [isEncrypting, setIsEncrypting] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [restoring, setRestoring] = useState(false);
+  const restoringRef = useRef(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [restoredCount, setRestoredCount] = useState<number | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [hasPin, setHasPin] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -664,10 +672,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setScreen('main');
 
     // Auto-restore from Arweave
+    restoringRef.current = true;
     setRestoring(true);
     try {
       await restoreFromArweaveInternal();
     } finally {
+      restoringRef.current = false;
       setRestoring(false);
     }
 
@@ -682,10 +692,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const key = cryptoKeyRef.current;
     if (!key || !ownerHashRef.current) return;
 
+    setRestoreError(null);
+    setRestoredCount(null);
     try {
       // fetchAllNotes decrypts + validates (v1/v2) and drops any TX not signed
       // by a trusted owner or that fails to decrypt.
-      const remoteNotes = await fetchAllNotes(ownerHashRef.current, key);
+      const { notes: remoteNotes, incomplete } = await fetchAllNotes(ownerHashRef.current, key);
       let restoredCount = 0;
 
       for (const remote of remoteNotes) {
@@ -711,10 +723,36 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (restoredCount > 0) {
         await refreshSyncCounts();
       }
+      setRestoredCount(restoredCount);
+      if (incomplete) {
+        // Some pages/payloads were unreachable — a "quiet partial restore" must
+        // not look like a full one (the user could believe notes are lost).
+        setRestoreError('Восстановление прошло не полностью — часть заметок могла не загрузиться.');
+      }
     } catch (err) {
       console.error('restoreFromArweave failed:', err);
+      setRestoreError('Не удалось восстановить заметки из Arweave.');
     }
   }
+
+  /** Re-run the Arweave restore sweep (banner button after an error/partial). */
+  const retryRestore = useCallback(async () => {
+    if (restoringRef.current) return;
+    restoringRef.current = true;
+    setRestoring(true);
+    try {
+      await restoreFromArweaveInternal();
+    } finally {
+      restoringRef.current = false;
+      setRestoring(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearRestoreStatus = useCallback(() => {
+    setRestoreError(null);
+    setRestoredCount(null);
+  }, []);
 
   const addNote = useCallback(async (text: string) => {
     if (!readyRef.current || !cryptoKeyRef.current || !text.trim()) return;
@@ -944,6 +982,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     filteredNotes,
     arweave: arweaveState,
     restoring,
+    restoreError,
+    restoredCount,
     vaultError,
     hasPin,
     bootError,
@@ -966,6 +1006,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     removePin: removePinAction,
     unlockWithPin: unlockWithPinAction,
     resetBrokenStorage,
+    retryRestore,
+    clearRestoreStatus,
   };
 
   return (

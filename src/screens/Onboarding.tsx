@@ -1,11 +1,13 @@
 import { useState } from 'react';
-import { useNotes } from '../lib/store';
+import { useNotes, VaultMismatchError } from '../lib/store';
 
 export function Onboarding() {
-  const { createNewWallet, confirmMnemonic, goToRestore, goToLanding } = useNotes();
+  const { createNewWallet, confirmMnemonic, goToRestore, goToLanding, resetApp } = useNotes();
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
+  const [error, setError] = useState('');
+  const [showReset, setShowReset] = useState(false);
 
   async function handleGenerate() {
     const mn = await createNewWallet();
@@ -13,8 +15,20 @@ export function Onboarding() {
   }
 
   async function handleConfirm() {
-    if (mnemonic) {
+    if (!mnemonic) return;
+    setError('');
+    try {
       await confirmMnemonic(mnemonic);
+    } catch (err) {
+      // Without this catch a failure here (device already bound to another
+      // vault, broken storage) left the user stuck with a dead button.
+      if (err instanceof VaultMismatchError) {
+        setError(err.message);
+        setShowReset(true);
+      } else {
+        console.error('confirmMnemonic failed:', err);
+        setError('Не удалось создать хранилище. Попробуйте ещё раз.');
+      }
     }
   }
 
@@ -75,6 +89,17 @@ export function Onboarding() {
               />
               <span>Я записал(а) seed-фразу в надёжное место</span>
             </label>
+
+            {error && <div className="error-msg">{error}</div>}
+
+            {showReset && (
+              <button
+                className="btn btn-danger full-width"
+                onClick={() => { if (confirm('Удалить все локальные данные? Это действие необратимо.')) resetApp(); }}
+              >
+                Сбросить приложение
+              </button>
+            )}
 
             <button
               className="btn btn-primary"

@@ -351,6 +351,15 @@ async function fetchPage(
   };
 }
 
+/** Result of a restore sweep. `incomplete` = some pages or note payloads could
+ *  not be FETCHED (network/gateway) — real notes may be missing, tell the user.
+ *  Garbage/replay candidates that fail validation or decryption are intentional
+ *  skips and do NOT set the flag. */
+export interface FetchAllNotesResult {
+  notes: RestoredNote[];
+  incomplete: boolean;
+}
+
 /**
  * Fetch all encrypted notes from Arweave for a given owner hash.
  * Paginated, deduplicated by Note-Id, version-gated.
@@ -358,12 +367,13 @@ async function fetchPage(
 export async function fetchAllNotes(
   ownerHash: string,
   key: CryptoKey,
-): Promise<RestoredNote[]> {
+): Promise<FetchAllNotesResult> {
   assertTrustedOwners(); // fail-closed: never trust arbitrary on-chain TX
 
   const restored: RestoredNote[] = [];
   const seenNoteIds = new Set<string>();
   let cursor: string | null = null;
+  let incomplete = false;
 
   while (true) {
     let edges: ArweaveEdge[];
@@ -374,7 +384,8 @@ export async function fetchAllNotes(
       edges = page.edges;
       hasNextPage = page.hasNextPage;
     } catch {
-      break; // Stop pagination on error
+      incomplete = true; // pagination failed — remaining pages unreachable
+      break;
     }
 
     if (edges.length === 0) break;
@@ -393,9 +404,19 @@ export async function fetchAllNotes(
       // decrypted (replay/garbage) must not shadow the real note.
       if (seenNoteIds.has(noteIdTag.value)) continue;
 
+      let dataResponse: Response;
       try {
-        const dataResponse = await fetch(`https://arweave.net/${edge.node.id}`);
-        if (!dataResponse.ok) continue;
+        dataResponse = await fetch(`https://arweave.net/${edge.node.id}`);
+      } catch {
+        incomplete = true; // network — a legit note may be unreachable right now
+        continue;
+      }
+      if (!dataResponse.ok) {
+        incomplete = true;
+        continue;
+      }
+
+      try {
         const raw = await dataResponse.json();
 
         const built = await buildRestoredNote(key, versionTag.value, noteIdTag.value, raw, edge.node.id);
@@ -413,7 +434,7 @@ export async function fetchAllNotes(
   }
 
   restored.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);
-  return restored;
+  return { notes: restored, incomplete };
 }
 
 /**

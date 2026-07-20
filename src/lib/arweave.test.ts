@@ -172,8 +172,9 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const res = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
 
+    expect(incomplete).toBe(false);
     expect(res).toHaveLength(1);
     expect(res[0].text).toBe('секрет v2');
     expect(res[0].encrypted.v).toBe(2);
@@ -209,7 +210,110 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const res = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    expect(res).toHaveLength(0);
+    // A decrypt-failure is an intentional skip, NOT a partial restore.
+    expect(incomplete).toBe(false);
+  });
+
+  it('restores notes posted under BOTH owners after a wallet rotation', async () => {
+    // Rotation runbook: the old owner stays in TRUSTED_OWNERS, so notes signed
+    // by either wallet must come back in one sweep.
+    vi.stubEnv('VITE_TRUSTED_OWNERS', `${OWNER_A},${OWNER_B}`);
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const oldNote = await encryptEnvelope(key, 'под старым кошельком');
+    const newNote = await encryptEnvelope(key, 'под новым кошельком');
+
+    const byId: Record<string, { id: string; c: string; iv: string }> = {
+      TXOLD: { id: oldNote.noteId, c: oldNote.ciphertext, iv: oldNote.iv },
+      TXNEW: { id: newNote.noteId, c: newNote.ciphertext, iv: newNote.iv },
+    };
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: ['TXOLD', 'TXNEW'].map(txId => ({ cursor: txId, node: { id: txId, tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '2' },
+            { name: 'Note-Id', value: byId[txId].id },
+          ] } })),
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      const txId = url.split('/').pop()!;
+      return new Response(JSON.stringify(byId[txId]), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+
+    expect(incomplete).toBe(false);
+    expect(res.map(r => r.text).sort()).toEqual(['под новым кошельком', 'под старым кошельком']);
+    // The GraphQL query itself must have asked for both owners.
+    const gqlBody = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(gqlBody.variables.owners).toEqual([OWNER_A, OWNER_B]);
+  });
+});
+
+describe('fetchAllNotes partial-restore flag (M1)', () => {
+  it('flags incomplete when a later page fails, keeping page-1 notes', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'страница 1');
+
+    let gqlCalls = 0;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        gqlCalls++;
+        if (gqlCalls > 1) return new Response('gateway down', { status: 502 });
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '2' },
+            { name: 'Note-Id', value: note.noteId },
+          ] } }],
+          pageInfo: { hasNextPage: true }, // → second page will be requested
+        } } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+
+    expect(incomplete).toBe(true);   // user must see "partial", not silence
+    expect(res).toHaveLength(1);     // what DID load is kept
+    expect(res[0].text).toBe('страница 1');
+  });
+
+  it('flags incomplete when a note payload cannot be fetched (network)', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const { deriveKey, generateMnemonic } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '2' },
+            { name: 'Note-Id', value: 'nid' },
+          ] } }],
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      throw new Error('network reset');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    expect(incomplete).toBe(true);
     expect(res).toHaveLength(0);
   });
 });
