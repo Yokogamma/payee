@@ -44,6 +44,7 @@ export function Main() {
   const [saveError, setSaveError] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
   const [theme, setTheme] = useTheme();
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -122,6 +123,21 @@ export function Main() {
   function closeSearch() {
     setShowSearch(false);
     setSearchQuery('');
+  }
+
+  /** Clipboard write with visible success/error feedback — a rejected promise
+   *  must not look identical to a successful copy. On failure the menu stays
+   *  open so the text can still be selected manually. */
+  async function handleCopyNote(noteText: string) {
+    try {
+      await navigator.clipboard.writeText(noteText);
+      setOpenMenuId(null);
+      setCopyFeedback('ok');
+    } catch (err) {
+      console.error('clipboard write failed:', err);
+      setCopyFeedback('fail');
+    }
+    setTimeout(() => setCopyFeedback(null), 2000);
   }
 
   /** Wrap query matches in <mark> (8.1) — case-insensitive, plain text only. */
@@ -277,8 +293,11 @@ export function Main() {
           </div>
         ) : (
           filteredNotes.map(note => {
-            const info = arweave.enabled ? (syncStatuses[note.id] ?? { status: 'queued' as const }) : null;
-            const badge = info ? SYNC_BADGE[info.status] : null;
+            // Sync info is derived UNCONDITIONALLY — a confirmed TX stays
+            // linkable from the menu even with auto-sync switched off; the
+            // enabled flag gates only the live status badge.
+            const info = syncStatuses[note.id] ?? { status: 'queued' as const };
+            const badge = arweave.enabled ? SYNC_BADGE[info.status] : null;
             return (
               <div className="note-card" key={note.id + note.createdAt}>
                 <div className="note-text">{highlight(note.text, searchQuery)}</div>
@@ -315,7 +334,7 @@ export function Main() {
                   <div className="note-menu">
                     <button
                       className="note-menu-item"
-                      onClick={() => { navigator.clipboard.writeText(note.text); setOpenMenuId(null); }}
+                      onClick={() => void handleCopyNote(note.text)}
                     >
                       📋 Копировать текст
                     </button>
@@ -346,6 +365,16 @@ export function Main() {
       {justSaved && (
         <div className="toast toast--success" role="status">
           ✓ Сохранено и зашифровано
+        </div>
+      )}
+
+      {/* Clipboard feedback — success and failure must look different */}
+      {copyFeedback === 'ok' && (
+        <div className="toast toast--success" role="status">✓ Скопировано</div>
+      )}
+      {copyFeedback === 'fail' && (
+        <div className="toast toast--error" role="status">
+          Не удалось скопировать — выделите текст вручную
         </div>
       )}
 

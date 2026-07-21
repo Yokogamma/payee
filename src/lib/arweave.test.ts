@@ -257,6 +257,40 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
   });
 });
 
+describe('checkRegistration structured result (RegistrationCheck)', () => {
+  const proxyEnv = () => vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+
+  it('maps 200 to allowed/denied without a message', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ allowed: true }), { status: 200 })));
+    const { checkRegistration } = await import('./arweave');
+    expect(await checkRegistration('pk', 'sig', '{}')).toEqual({ status: 'allowed' });
+  });
+
+  it('preserves the server text on a 401 (L13 clock-skew hint reaches the UI)', async () => {
+    proxyEnv();
+    const skewText = 'Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(skewText, { status: 401 })));
+    const { checkRegistration } = await import('./arweave');
+    const r = await checkRegistration('pk', 'sig', '{}');
+    expect(r.status).toBe('invalid_request');
+    expect(r.message).toMatch(/clock skew/);
+  });
+
+  it('maps 5xx/429 to unavailable and a network error to unavailable', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('busy', { status: 503 })));
+    const { checkRegistration } = await import('./arweave');
+    expect((await checkRegistration('pk', 'sig', '{}')).status).toBe('unavailable');
+
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
+    vi.resetModules();
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    const { checkRegistration: check2 } = await import('./arweave');
+    expect((await check2('pk', 'sig', '{}')).status).toBe('unavailable');
+  });
+});
+
 describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => {
   it('reports progress per settled payload and restores everything', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
@@ -294,6 +328,47 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
     expect(progress).toHaveLength(7);
     expect(progress.every(([, t]) => t === 7)).toBe(true);
     expect(progress[progress.length - 1]).toEqual([7, 7]);
+  });
+
+  it('never runs more than 5 payload fetches in flight (bounded pool)', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const notes = await Promise.all(
+      Array.from({ length: 12 }, (_, i) => encryptEnvelope(key, `n${i}`)),
+    );
+    const byTx = new Map(notes.map((n, i) => [`TX${i}`, n]));
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [...byTx.entries()].map(([txId, n]) => ({ cursor: txId, node: { id: txId, tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '2' },
+            { name: 'Note-Id', value: n.noteId },
+          ] } })),
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Yield so the pool actually overlaps requests before any completes.
+      await new Promise(r => setTimeout(r, 5));
+      inFlight--;
+      const n = byTx.get(url.split('/').pop()!)!;
+      return new Response(JSON.stringify({ id: n.noteId, c: n.ciphertext, iv: n.iv }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res } = await fetchAllNotes('oh', key);
+
+    expect(res).toHaveLength(12);
+    expect(maxInFlight).toBeGreaterThan(1); // the pool really parallelizes...
+    expect(maxInFlight).toBeLessThanOrEqual(5); // ...but never beyond the cap
   });
 });
 
