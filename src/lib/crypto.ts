@@ -386,6 +386,9 @@ function assertValidPinBlob(e: PinEncryptedSeed): void {
   }
   if (base64ToBuffer(e.iv).length !== 12) throw new Error('Malformed PIN blob: iv');
   if (base64ToBuffer(e.salt).length !== 16) throw new Error('Malformed PIN blob: salt');
+  // AES-GCM output is plaintext + 16-byte tag; anything shorter is structurally
+  // broken and must be reported as a storage problem, never as a wrong PIN.
+  if (base64ToBuffer(e.ciphertext).length < 16) throw new Error('Malformed PIN blob: ciphertext too short');
 
   if (e.kdf !== undefined && e.kdf !== 'pbkdf2' && e.kdf !== 'argon2id') {
     throw new Error(`Unknown PIN kdf: ${e.kdf}`);
@@ -461,8 +464,17 @@ export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): 
       { name: 'AES-GCM', iv: iv as BufferSource }, key, ciphertext as BufferSource,
     );
     return new TextDecoder().decode(decrypted);
-  } catch {
-    // The KDF succeeded and authentication failed → wrong PIN.
-    throw new WrongPinError();
+  } catch (e) {
+    // GCM authentication failure surfaces as OperationError. It means either a
+    // wrong PIN or a corrupted GCM tag — the two are cryptographically
+    // indistinguishable (documented limitation), so OperationError is counted
+    // as a wrong PIN. Any OTHER WebCrypto failure is an environment problem
+    // and must never spend an attempt.
+    if (e instanceof DOMException && e.name === 'OperationError') {
+      throw new WrongPinError();
+    }
+    throw new PinUnlockUnavailableError(
+      `decrypt failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 }

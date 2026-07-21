@@ -139,6 +139,12 @@ describe('PIN wrapping', () => {
     await expect(decryptWithPin(corrupt, '123456')).rejects.toBeInstanceOf(PinUnlockUnavailableError);
   });
 
+  it('classifies a ciphertext shorter than the GCM tag as unavailable, not a wrong PIN', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    const truncated = { ...blob, ciphertext: bufferToBase64(new Uint8Array(8)) }; // < 16-byte tag
+    await expect(decryptWithPin(truncated, '123456')).rejects.toBeInstanceOf(PinUnlockUnavailableError);
+  });
+
   it('classifies unknown kdf / bad profile / bad version as PinUnlockUnavailableError', async () => {
     const blob = await encryptWithPin(generateMnemonic(), '123456');
     await expect(decryptWithPin({ ...blob, kdf: 'scrypt' as never }, '123456'))

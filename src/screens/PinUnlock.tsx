@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNotes, PinLockedError, PinWipedError } from '../lib/store';
+import { useNotes, PinLockedError, PinWipedError, VaultMismatchError } from '../lib/store';
 import { PinUnlockUnavailableError } from '../lib/crypto';
 
 export function PinUnlock() {
@@ -62,8 +62,14 @@ export function PinUnlock() {
         // Not a wrong PIN and not attempt-counted: the blob or the KDF runtime
         // failed (corrupt data, WASM/memory). Point at the seed path.
         setError('Не удалось открыть PIN-хранилище (ошибка данных или устройства). Войдите по seed-фразе — заметки не пострадали.');
-      } else {
+      } else if (err instanceof VaultMismatchError) {
+        setError(err.message);
+      } else if (err instanceof Error && err.message === 'wrong_pin') {
         setError('Неверный PIN-код');
+      } else {
+        // Post-decrypt failure (session setup / IndexedDB): the PIN was CORRECT
+        // and no attempt was spent — don't mislabel it as a wrong PIN.
+        setError('PIN принят, но вход не удался (ошибка хранилища). Попробуйте ещё раз или войдите по seed-фразе.');
       }
       // Refresh the persisted attempt counter for the warning line.
       void getPinLockState().then(st => setAttempts(st.attempts)).catch(() => {});
