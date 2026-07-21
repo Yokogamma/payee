@@ -48,7 +48,6 @@ import {
   deleteMeta,
   resetAll,
   recoverStorage,
-  StorageBlockedError,
 } from './storage';
 import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll, claimRestoredForUi } from './sync-transitions';
 
@@ -860,14 +859,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    */
   const resetBrokenStorage = useCallback(async () => {
     try {
-      await recoverStorage();
+      // A blocked deletion cannot be cancelled — it fires whenever the last
+      // other tab closes. So we WAIT for real completion (telling the user what
+      // to do) instead of pretending the reset was aborted; the page reloads
+      // only after the database is truly gone and re-initialized.
+      await recoverStorage({
+        onBlocked: () => setBootError(
+          'Хранилище открыто в другой вкладке приложения. Закройте остальные ' +
+          'вкладки — сброс продолжится и завершится автоматически.'
+        ),
+      });
     } catch (err) {
       // Do NOT reload on failure — the user would land on the same error screen
       // with no idea the reset never happened. Show what to do instead.
       console.error('recoverStorage failed:', err);
-      setBootError(err instanceof StorageBlockedError
-        ? 'Хранилище открыто в другой вкладке — сброс заблокирован. Закройте остальные вкладки приложения и нажмите «Сбросить данные» ещё раз.'
-        : `Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
+      setBootError(`Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
       throw err;
     }
     // Success: clean boot from scratch.

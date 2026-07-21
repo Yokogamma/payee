@@ -6,7 +6,6 @@ import {
   initStorage,
   resetAll,
   recoverStorage,
-  StorageBlockedError,
   saveNoteWithSync,
   mergeRestoredNote,
   saveNote,
@@ -125,14 +124,22 @@ describe('recoverStorage', () => {
     expect(await getNoteById('fresh')).toBeDefined();
   });
 
-  it('rejects with StorageBlockedError when another tab blocks deletion (no hang), then succeeds after it closes', async () => {
+  it('waits out a blocking tab (onBlocked fires) and completes once it closes — never pretends cancelled', async () => {
     // Simulate another tab: an independent connection that ignores versionchange.
     const otherTab = await openDB('eternal-notes', 1);
-    await expect(recoverStorage()).rejects.toBeInstanceOf(StorageBlockedError);
 
-    // The "other tab" closes → retry must fully recover to a working DB.
+    let blockedSignalled = false;
+    const recovery = recoverStorage({ onBlocked: () => { blockedSignalled = true; } });
+
+    // The user is told to close other tabs; the deletion is PENDING, not
+    // cancelled (deleteDatabase cannot be aborted once requested).
+    await new Promise(r => setTimeout(r, 50));
+    expect(blockedSignalled).toBe(true);
+
+    // The blocking "tab" closes → the pending deletion completes and recovery
+    // resolves with a fresh, working database.
     otherTab.close();
-    await recoverStorage();
+    await recovery;
     await saveNote({ noteId: 'after-block', ciphertext: 'c', iv: 'iv', createdAt: 1 });
     expect(await getNoteById('after-block')).toBeDefined();
   });

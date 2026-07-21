@@ -92,45 +92,27 @@ export function closeStorage(): void {
   initPromise = null;
 }
 
-/** Deletion is blocked by another open tab — the user can act on this. */
-export class StorageBlockedError extends Error {
-  constructor() {
-    super('База данных открыта в другой вкладке — удаление заблокировано.');
-    this.name = 'StorageBlockedError';
-  }
-}
-
-/** How long a blocked deleteDB may wait for the other tab before giving up. */
-const DELETE_BLOCKED_GRACE_MS = 1500;
-
 /**
  * Last-resort recovery from a broken/corrupted database: close any open handle
  * and DELETE the database entirely, then re-initialize from scratch. Works even
  * when the DB cannot be opened (unlike resetAll, which needs an open DB).
  * Destroys all local data — the caller must warn the user first.
  *
- * Rejects with StorageBlockedError if another tab keeps the DB open past a
- * short grace period — otherwise the returned promise would hang forever and
- * the UI would show an eternal "resetting" state.
+ * A blocked deletion CANNOT be cancelled: once `deleteDatabase` is requested it
+ * WILL complete whenever the last other connection closes. So this function
+ * never pretends the reset was aborted — on `blocked` it notifies the caller
+ * (show "close the other tabs") and keeps WAITING; the promise resolves only
+ * after the database was actually deleted and re-initialized.
  */
-export async function recoverStorage(): Promise<void> {
+export async function recoverStorage(opts: { onBlocked?: () => void } = {}): Promise<void> {
   try { db?.close(); } catch { /* already closed */ }
   db = null;
   initPromise = null;
 
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
-    deleteDB(DB_NAME, {
-      blocked() {
-        // Give the other tab a moment to close on versionchange; if deletion
-        // still hasn't completed, surface an actionable error.
-        setTimeout(() => settle(() => reject(new StorageBlockedError())), DELETE_BLOCKED_GRACE_MS);
-      },
-    }).then(
-      () => settle(resolve),
-      err => settle(() => reject(err)),
-    );
+  await deleteDB(DB_NAME, {
+    blocked() {
+      opts.onBlocked?.();
+    },
   });
 
   await initStorage();
