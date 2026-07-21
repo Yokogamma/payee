@@ -5,6 +5,20 @@
  * through this map. Clock skew is detected from the server's timestamp
  * message (L13) and explained as a device-clock problem, not a generic failure.
  */
+/** Registration/invite errors → Russian, with the clock-skew hint first. */
+export function userFacingRegistrationError(raw: string): string {
+  if (/timestamp|clock|skew/i.test(raw)) {
+    return 'Часы устройства расходятся с сервером. Проверьте дату и время и повторите.';
+  }
+  if (/invalid or used invite/i.test(raw)) {
+    return 'Неверный или уже использованный invite-код.';
+  }
+  if (/too many attempts/i.test(raw)) {
+    return 'Слишком много попыток. Подождите и попробуйте снова.';
+  }
+  return 'Не удалось активировать invite-код. Проверьте код и попробуйте ещё раз.';
+}
+
 export function userFacingUploadError(kind: string, errText?: string): string {
   if (errText && /timestamp|clock|skew/i.test(errText)) {
     return 'Часы устройства расходятся с сервером. Проверьте дату и время и повторите.';

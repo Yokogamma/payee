@@ -52,6 +52,20 @@ export function Main() {
     inputRef.current?.focus();
   }, []);
 
+  // Global search hotkey (8.1): Ctrl/Cmd+K toggles the search bar.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        if (showSearch) closeSearch();
+        else setShowSearch(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSearch]);
+
   // Mirror the draft to sessionStorage (debounced) so it survives a reload.
   useEffect(() => {
     const t = setTimeout(() => {
@@ -76,7 +90,7 @@ export function Main() {
     setText('');
     sessionStorage.removeItem(DRAFT_KEY); // don't wait out the debounce
     setJustSaved(true);
-    setTimeout(() => setJustSaved(false), 1500);
+    setTimeout(() => setJustSaved(false), 2000);
     inputRef.current?.focus();
   }
 
@@ -181,8 +195,9 @@ export function Main() {
           <button
             className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
             onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
-            title="Поиск"
+            title="Поиск (Ctrl+K)"
             aria-pressed={showSearch}
+            aria-keyshortcuts="Control+K"
           >
             🔍
           </button>
@@ -326,6 +341,13 @@ export function Main() {
           })
         )}
       </div>
+
+      {/* Prominent save confirmation (2.5) */}
+      {justSaved && (
+        <div className="toast toast--success" role="status">
+          ✓ Сохранено и зашифровано
+        </div>
+      )}
 
       {/* Global sync-error toast (visible outside the settings modal) */}
       {arweave.enabled && arweave.lastError && !showSettings && (

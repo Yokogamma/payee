@@ -50,7 +50,7 @@ import {
   recoverStorage,
 } from './storage';
 import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll, claimRestoredForUi } from './sync-transitions';
-import { userFacingUploadError } from './errors';
+import { userFacingUploadError, userFacingRegistrationError } from './errors';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -458,13 +458,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     } else {
       const checkPayload = JSON.stringify({ publicKey: publicKeyB64, timestamp: Date.now() });
       const checkSig = await signPayload(signingKey, checkPayload);
-      const status = await checkRegistration(publicKeyB64, checkSig, checkPayload);
+      const { status, message } = await checkRegistration(publicKeyB64, checkSig, checkPayload);
 
       if (status === 'allowed') {
         await setMeta(`registered:${publicKeyB64}`, true);
         setArweave(prev => ({ ...prev, registered: true }));
       } else if (status === 'invalid_request') {
-        console.error('checkRegistration returned invalid_request — possible client bug');
+        console.error('checkRegistration returned invalid_request:', message);
+        // L13: a clock-skew 401 is user-actionable — surface the hint instead
+        // of failing silently on a freshly-restored device.
+        if (message && /timestamp|clock|skew/i.test(message)) {
+          setArweave(prev => ({ ...prev, lastError: userFacingUploadError('error', message) }));
+        }
       }
       // 'denied' → registered = false → show invite UI
       // 'unavailable' → don't change registered, user can retry
@@ -832,7 +837,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // Auto-resume uploads after successful registration
       void retryAllPending().catch(err => console.error('post-register retryAllPending:', err));
     } else {
-      throw new Error(result.error);
+      // The raw server text is English/technical — surface the RU mapping
+      // (invalid invite / rate limit / clock skew) in the invite form.
+      throw new Error(userFacingRegistrationError(result.error));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

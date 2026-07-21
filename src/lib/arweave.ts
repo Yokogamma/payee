@@ -105,6 +105,14 @@ export type UploadResult =
 
 export type RegistrationStatus = 'allowed' | 'denied' | 'unavailable' | 'invalid_request';
 
+/** Registration check verdict + the raw server text for non-ok answers, so the
+ *  UI can surface actionable hints (e.g. the L13 clock-skew message) instead of
+ *  a silent generic failure. */
+export interface RegistrationCheck {
+  status: RegistrationStatus;
+  message?: string;
+}
+
 // ─── Network Status ──────────────────────────────────────────────────
 
 /** Check if Arweave gateway is reachable */
@@ -174,8 +182,8 @@ export async function checkRegistration(
   publicKeyB64: string,
   signature: string,
   bodyText: string,
-): Promise<RegistrationStatus> {
-  if (!PROXY_URL) return 'unavailable';
+): Promise<RegistrationCheck> {
+  if (!PROXY_URL) return { status: 'unavailable' };
 
   try {
     const response = await fetch(`${PROXY_URL}/check-registration`, {
@@ -190,19 +198,22 @@ export async function checkRegistration(
 
     if (response.ok) {
       const data = await response.json();
-      return data.allowed ? 'allowed' : 'denied';
+      return { status: data.allowed ? 'allowed' : 'denied' };
     }
 
-    // 4xx (except 429) = client bug
+    const text = await response.text().catch(() => '');
+
+    // 4xx (except 429) = client-side problem — keep the server text: a
+    // "timestamp expired / clock skew" 401 is user-actionable (L13).
     if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-      console.error(`checkRegistration: client error ${response.status}`);
-      return 'invalid_request';
+      console.error(`checkRegistration: client error ${response.status}: ${text}`);
+      return { status: 'invalid_request', message: text };
     }
 
     // 429 or 5xx = transient server issue
-    return 'unavailable';
+    return { status: 'unavailable', message: text };
   } catch {
-    return 'unavailable';
+    return { status: 'unavailable' };
   }
 }
 

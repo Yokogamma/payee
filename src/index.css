@@ -1066,6 +1066,11 @@ mark {
   color: var(--red);
 }
 
+.toast--success {
+  border-color: rgba(45, 212, 168, 0.4);
+  color: var(--green);
+}
+
 /* ─── Invite Section ───────────────────────────────────────── */
 
 .invite-section {
