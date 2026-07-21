@@ -43,6 +43,7 @@ export function Main() {
   const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [theme, setTheme] = useTheme();
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -104,6 +105,29 @@ export function Main() {
     return `${day} ${month} ${d.getFullYear()}`;
   }
 
+  function closeSearch() {
+    setShowSearch(false);
+    setSearchQuery('');
+  }
+
+  /** Wrap query matches in <mark> (8.1) — case-insensitive, plain text only. */
+  function highlight(noteText: string, query: string): React.ReactNode {
+    const q = query.trim();
+    if (!q) return noteText;
+    const lower = noteText.toLowerCase();
+    const ql = q.toLowerCase();
+    const parts: React.ReactNode[] = [];
+    let i = 0;
+    let idx: number;
+    while ((idx = lower.indexOf(ql, i)) !== -1) {
+      if (idx > i) parts.push(noteText.slice(i, idx));
+      parts.push(<mark key={idx}>{noteText.slice(idx, idx + q.length)}</mark>);
+      i = idx + q.length;
+    }
+    parts.push(noteText.slice(i));
+    return parts;
+  }
+
   return (
     <div className="main-screen">
       {/* Restoring Banner */}
@@ -155,9 +179,10 @@ export function Main() {
         </div>
         <div className="header-right">
           <button
-            className="icon-btn"
-            onClick={() => { setShowSearch(!showSearch); setSearchQuery(''); }}
+            className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
+            onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
             title="Поиск"
+            aria-pressed={showSearch}
           >
             🔍
           </button>
@@ -179,12 +204,18 @@ export function Main() {
             placeholder="Найти заметку..."
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Escape') closeSearch(); }}
             autoFocus
           />
           {searchQuery && (
-            <span className="search-count">
-              {filteredNotes.length} из {notes.length}
-            </span>
+            <>
+              <span className="search-count">
+                {filteredNotes.length} из {notes.length}
+              </span>
+              <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
+                ✕
+              </button>
+            </>
           )}
         </div>
       )}
@@ -203,7 +234,9 @@ export function Main() {
         {saveError && <div className="error-msg">{saveError}</div>}
         <div className="input-footer">
           <span className="input-hint">
-            {justSaved ? '✓ Сохранено и зашифровано' : 'Ctrl+Enter — сохранить'}
+            {justSaved
+              ? '✓ Сохранено и зашифровано'
+              : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
           </span>
           <button
             className="btn btn-save"
@@ -229,15 +262,15 @@ export function Main() {
           </div>
         ) : (
           filteredNotes.map(note => {
-            const status = arweave.enabled ? (syncStatuses[note.id] ?? 'queued') : null;
-            const badge = status ? SYNC_BADGE[status] : null;
+            const info = arweave.enabled ? (syncStatuses[note.id] ?? { status: 'queued' as const }) : null;
+            const badge = info ? SYNC_BADGE[info.status] : null;
             return (
               <div className="note-card" key={note.id + note.createdAt}>
-                <div className="note-text">{note.text}</div>
+                <div className="note-text">{highlight(note.text, searchQuery)}</div>
                 <div className="note-meta">
                   <span className="note-time">{formatDate(note.createdAt)}</span>
-                  {badge && (
-                    status === 'error' ? (
+                  {badge && info && (
+                    info.status === 'error' ? (
                       <button
                         className={`sync-badge ${badge.className}`}
                         onClick={retrySync}
@@ -253,7 +286,41 @@ export function Main() {
                     )
                   )}
                   <span className="note-lock">🔒</span>
+                  <button
+                    className="icon-btn note-menu-btn"
+                    onClick={() => setOpenMenuId(openMenuId === note.id ? null : note.id)}
+                    title="Меню заметки"
+                    aria-label="Меню заметки"
+                    aria-expanded={openMenuId === note.id}
+                  >
+                    ⋯
+                  </button>
                 </div>
+                {openMenuId === note.id && (
+                  <div className="note-menu">
+                    <button
+                      className="note-menu-item"
+                      onClick={() => { navigator.clipboard.writeText(note.text); setOpenMenuId(null); }}
+                    >
+                      📋 Копировать текст
+                    </button>
+                    {info?.status === 'confirmed' && info.txId && (
+                      <a
+                        className="note-menu-item"
+                        href={`https://viewblock.io/arweave/tx/${info.txId}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => setOpenMenuId(null)}
+                      >
+                        🔗 Транзакция в блокчейне
+                      </a>
+                    )}
+                    <div className="note-menu-hint">
+                      Опубликованная в блокчейне копия неизменяема: её нельзя
+                      отредактировать или удалить.
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })

@@ -891,6 +891,99 @@ h1 {
   background: rgba(240, 83, 101, 0.08);
 }
 
+/* ─── Search / textarea / card-menu polish (Phase 6) ────────── */
+
+.icon-btn--active {
+  background: var(--accent-glow);
+  border-radius: var(--radius-sm);
+}
+
+.search-clear {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 6px 8px;
+  min-height: 32px;
+}
+
+.search-clear:hover { color: var(--text); }
+
+mark {
+  background: var(--accent-glow);
+  color: var(--accent);
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+/* Auto-grow with content where supported; rows attr stays as fallback */
+.note-input {
+  field-sizing: content;
+  min-height: 64px;
+  max-height: 40vh;
+}
+
+/* No physical keyboard → the Ctrl+Enter hint is noise */
+@media (hover: none) {
+  .kbd-hint { visibility: hidden; }
+}
+
+.note-card { position: relative; }
+
+.note-menu-btn {
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 8px;
+  min-height: 24px;
+}
+
+.note-menu {
+  position: absolute;
+  right: 10px;
+  bottom: 38px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.note-menu-item {
+  font-family: var(--font);
+  font-size: 13px;
+  text-align: left;
+  padding: 10px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.note-menu-item:hover { background: var(--bg-hover); }
+
+.note-menu-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  line-height: 1.4;
+}
+
+/* Invalid BIP39 word (Restore on-blur validation) */
+.seed-word-input input.invalid {
+  border-color: var(--red);
+}
+
 /* ─── Theme picker (3-way, settings) ────────────────────────── */
 
 .theme-picker {

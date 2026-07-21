@@ -60,6 +60,12 @@ export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin'
  *  when the note has no record yet (never attempted). */
 export type NoteSyncStatus = 'queued' | 'uploading' | 'accepted' | 'confirmed' | 'error';
 
+/** Card-level sync info: status + txId (for the "open TX" menu action). */
+export interface NoteSyncInfo {
+  status: NoteSyncStatus;
+  txId?: string;
+}
+
 export interface ArweaveState {
   enabled: boolean;
   online: boolean;
@@ -118,8 +124,8 @@ interface NotesStore {
   searchQuery: string;
   filteredNotes: NoteData[];
   arweave: ArweaveState;
-  /** noteId → sync status, refreshed together with the aggregate counters. */
-  syncStatuses: Record<string, NoteSyncStatus>;
+  /** noteId → sync info, refreshed together with the aggregate counters. */
+  syncStatuses: Record<string, NoteSyncInfo>;
   restoring: boolean;
   /** Live progress of the current restore sweep (payloads settled / total). */
   restoreProgress: { done: number; total: number } | null;
@@ -213,8 +219,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setArweaveReactState(next);
   }
 
-  // Per-note sync status (joined notes + syncRecords) for the card indicators
-  const [syncStatuses, setSyncStatuses] = useState<Record<string, NoteSyncStatus>>({});
+  // Per-note sync info (joined notes + syncRecords) for the card indicators
+  const [syncStatuses, setSyncStatuses] = useState<Record<string, NoteSyncInfo>>({});
 
   // Upload queue refs
   const uploadQueueRef = useRef<EncryptedNote[]>([]);
@@ -419,11 +425,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     const unsynced = allNotes.length - accepted - confirmed;
 
-    // Join notes ↔ sync records for the per-card indicator.
-    const byId = new Map(allSync.map(r => [r.noteId, r.status]));
-    const statuses: Record<string, NoteSyncStatus> = {};
+    // Join notes ↔ sync records for the per-card indicator (+ txId for menus).
+    const byId = new Map(allSync.map(r => [r.noteId, r]));
+    const statuses: Record<string, NoteSyncInfo> = {};
     for (const n of allNotes) {
-      statuses[n.noteId] = byId.get(n.noteId) ?? 'queued';
+      const rec = byId.get(n.noteId);
+      statuses[n.noteId] = rec ? { status: rec.status, txId: rec.txId } : { status: 'queued' };
     }
     setSyncStatuses(statuses);
 
