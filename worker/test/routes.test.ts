@@ -101,5 +101,5 @@ describe('protected routes: per-IP limiter (D-baseline)', () => {
     // (401 missing auth headers — i.e. it got past the rate limit).
     const up = await post('/upload', ip);
     expect(up.status).not.toBe(429);
-  });
+  }, 20_000); // 60+ sequential requests — needs headroom under full-suite load
 });

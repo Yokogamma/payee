@@ -61,3 +61,27 @@ export async function writeAllowCache(
   const ttl = status === 'allowed' ? ALLOW_CACHE_TTL_SECONDS : DENY_CACHE_TTL_SECONDS;
   await kv.put(keyFor(publicKeyB64), JSON.stringify({ status }), { expirationTtl: ttl });
 }
+
+/**
+ * DENY-WINS guarded positive write — the only way callers may cache 'allowed'.
+ *
+ * Race hardening: the caller's "this key is allowed" verdict came from a DO
+ * round-trip that takes milliseconds; a revoke may have written its `denied`
+ * in that window, and a blind positive write would RESURRECT access for the
+ * full positive TTL while the DO (source of truth) already dropped the key.
+ * Re-reading immediately before the put and refusing to overwrite a 'denied'
+ * shrinks the exposed window to the sub-millisecond get→put gap; a lost race
+ * there is healed at ALLOW_CACHE_TTL_SECONDS (the documented SLO), because
+ * expiry falls back to the DO which no longer holds the key.
+ *
+ * Returns false when the write was suppressed by an existing deny.
+ */
+export async function writeAllowCacheGuarded(
+  kv: KVNamespace,
+  publicKeyB64: string,
+): Promise<boolean> {
+  const current = await readAllowCache(kv, publicKeyB64);
+  if (current === 'denied') return false;
+  await writeAllowCache(kv, publicKeyB64, 'allowed');
+  return true;
+}

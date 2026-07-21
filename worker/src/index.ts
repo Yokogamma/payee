@@ -7,7 +7,7 @@
 
 import Arweave from 'arweave';
 import * as ed25519 from '@noble/ed25519';
-import { readAllowCache, writeAllowCache } from './allowlist';
+import { readAllowCache, writeAllowCache, writeAllowCacheGuarded } from './allowlist';
 
 export { RateLimiter } from './rate-limiter';
 export { InviteManager } from './invite-manager';
@@ -273,7 +273,9 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
     allowed = checkResult.allowed;
-    if (allowed) await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
+    // Guarded: a revoke's `denied` that landed during the DO round-trip must
+    // not be resurrected by this stale positive result.
+    if (allowed) await writeAllowCacheGuarded(env.ALLOWLIST, publicKeyB64);
   }
 
   return json({ allowed });
@@ -329,9 +331,16 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     const body: { error?: string } = await doResp.json();
     return error(body.error || 'Registration failed', doResp.status);
   }
+  const doResult: { ok: boolean; alreadyRegistered?: boolean } = await doResp.json();
 
-  // 5. Cache allowlist entry in KV (typed model, D3)
-  await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
+  // 5. Cache allowlist entry in KV (typed model, D3) — but NEVER for
+  // alreadyRegistered: that branch validates no invite, so an attacker racing
+  // a revoke could spam signed /register with garbage codes to resurrect the
+  // freshly-written `denied` (review finding). Only a FRESH registration
+  // (a real invite consumed) writes, and even then deny-wins guarded.
+  if (!doResult.alreadyRegistered) {
+    await writeAllowCacheGuarded(env.ALLOWLIST, publicKeyB64);
+  }
 
   return json({ ok: true });
 }
@@ -420,7 +429,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
     if (!checkResult.allowed) return error('Not registered', 403);
-    await writeAllowCache(env.ALLOWLIST, publicKeyB64, 'allowed');
+    // Guarded (deny-wins): don't resurrect a revoke that raced this round-trip.
+    await writeAllowCacheGuarded(env.ALLOWLIST, publicKeyB64);
   }
 
   // 7. Validate tags — STRICT, version-specific (reader-before-writer: accept both).

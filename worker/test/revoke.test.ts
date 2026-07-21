@@ -150,6 +150,44 @@ describe('M11 revoke-flow: allowed → revoke → denied', () => {
   });
 });
 
+describe('revoke ↔ register race hardening (allowed resurrection)', () => {
+  async function selfRegister(priv: Uint8Array, pkB64: string, inviteCode: string) {
+    const payload = JSON.stringify({ inviteCode, publicKey: pkB64, timestamp: Date.now() });
+    const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(payload)), priv));
+    return SELF.fetch('https://proxy.example.com/register', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Public-Key': pkB64,
+        'X-Signature': sig,
+        'CF-Connecting-IP': `race-${crypto.randomUUID().slice(0, 6)}`,
+      },
+      body: payload,
+    });
+  }
+
+  it('an alreadyRegistered /register writes NOTHING to KV — a mid-revoke denied survives', async () => {
+    const priv = ed.utils.randomPrivateKey();
+    const pkB64 = b64(await ed.getPublicKeyAsync(priv));
+    const code = `RACE-${crypto.randomUUID().slice(0, 8)}`;
+    await seedInvite(code);
+
+    // Fresh registration (real invite consumed) → allowed cached. Legit.
+    expect((await selfRegister(priv, pkB64, code)).status).toBe(200);
+    expect(JSON.parse((await ALLOWLIST.get(`pk:${pkB64}`))!)).toEqual({ status: 'allowed' });
+
+    // Revoke step 1 just landed: KV says denied (DO delete may still be in flight).
+    await ALLOWLIST.put(`pk:${pkB64}`, JSON.stringify({ status: 'denied' }));
+
+    // The attack: signed /register spam with a garbage invite. The DO answers
+    // alreadyRegistered WITHOUT validating the invite — that response must not
+    // touch the cache, or the deny would be resurrected for the positive TTL.
+    const r = await selfRegister(priv, pkB64, 'garbage-invite-code');
+    expect(r.status).toBe(200); // idempotent OK is fine...
+    expect(JSON.parse((await ALLOWLIST.get(`pk:${pkB64}`))!)).toEqual({ status: 'denied' }); // ...but deny stays
+  });
+});
+
 describe('L12 constant-time admin auth', () => {
   it('rejects wrong secrets of ANY length with 401 (no crash on length mismatch)', async () => {
     for (const bad of ['Bearer x', `Bearer ${'a'.repeat(500)}`, 'Basic abc']) {
