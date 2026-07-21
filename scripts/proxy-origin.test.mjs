@@ -5,14 +5,31 @@ import { resolveProxyOrigin } from './proxy-origin.mjs';
 // http proxy — a mistyped production secret would ship a broken client.
 
 describe('resolveProxyOrigin', () => {
-  it('accepts https anywhere and returns only the origin', () => {
-    expect(resolveProxyOrigin('https://proxy.example.workers.dev/path?q=1', { ci: true }))
+  it('accepts a bare https origin (trailing slash tolerated, origin returned)', () => {
+    expect(resolveProxyOrigin('https://proxy.example.workers.dev', { ci: true }))
+      .toBe('https://proxy.example.workers.dev');
+    expect(resolveProxyOrigin('https://proxy.example.workers.dev/', { ci: true }))
       .toBe('https://proxy.example.workers.dev');
   });
 
   it('rejects empty/invalid URLs', () => {
     expect(() => resolveProxyOrigin('', { ci: false })).toThrow();
     expect(() => resolveProxyOrigin('not a url', { ci: true })).toThrow();
+  });
+
+  it('rejects a URL with path/query/hash — the client concatenates onto the origin', () => {
+    expect(() => resolveProxyOrigin('https://proxy.example.com/path', { ci: true })).toThrow(/bare origin/);
+    expect(() => resolveProxyOrigin('https://proxy.example.com/?q=1', { ci: true })).toThrow(/bare origin/);
+    expect(() => resolveProxyOrigin('https://proxy.example.com/#x', { ci: true })).toThrow(/bare origin/);
+  });
+
+  it('rejects embedded credentials', () => {
+    expect(() => resolveProxyOrigin('https://user:pass@proxy.example.com', { ci: true })).toThrow(/credentials/);
+  });
+
+  it('rejects non-http(s) protocols even for localhost', () => {
+    expect(() => resolveProxyOrigin('ftp://localhost:21', { ci: false })).toThrow(/https/);
+    expect(() => resolveProxyOrigin('ws://localhost:8787', { ci: false })).toThrow(/https/);
   });
 
   it('rejects non-localhost http regardless of mode', () => {

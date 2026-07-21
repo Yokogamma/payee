@@ -13,7 +13,19 @@ import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
 
 // ─── Config ──────────────────────────────────────────────────────────
 
-const PROXY_URL = import.meta.env.VITE_PROXY_URL || '';
+// Normalized to the bare origin: paths are concatenated onto this value and the
+// CSP pins only the origin, so a trailing slash / path / credentials in the env
+// var would produce requests the CSP (or fetch) rejects. The build validates the
+// same rule (scripts/proxy-origin.mjs); this is the runtime belt-and-braces.
+const PROXY_URL = (() => {
+  const raw = import.meta.env.VITE_PROXY_URL || '';
+  if (!raw) return '';
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return ''; // unusable value → behaves as "proxy not configured"
+  }
+})();
 export const APP_NAME = 'EternalNotes';
 export const APP_VERSION = '1';
 
