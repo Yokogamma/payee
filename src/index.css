@@ -866,6 +866,32 @@ h1 {
   background: rgba(240, 83, 101, 0.08);
 }
 
+/* ─── Confirm dialog (in-app confirm() replacement) ─────────── */
+
+.confirm-overlay {
+  z-index: 60; /* above the settings modal */
+}
+
+.confirm-dialog {
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.confirm-message {
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 /* ─── Global toast ──────────────────────────────────────────── */
 
 .toast {

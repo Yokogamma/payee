@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useNotes, VaultMismatchError } from '../lib/store';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 type Step = 'start' | 'seed' | 'verify' | 'pin';
 
@@ -18,6 +19,7 @@ export function Onboarding() {
   const [pinConfirm, setPinConfirm] = useState('');
   const [error, setError] = useState('');
   const [showReset, setShowReset] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
   const [finishing, setFinishing] = useState(false);
 
   async function handleGenerate() {
@@ -260,11 +262,22 @@ export function Onboarding() {
             {showReset && (
               <button
                 className="btn btn-danger full-width"
-                onClick={() => { if (confirm('Удалить все локальные данные? Это действие необратимо.')) resetApp(); }}
+                onClick={() => setConfirmReset(true)}
               >
                 Сбросить приложение
               </button>
             )}
+
+            <ConfirmDialog
+              open={confirmReset}
+              title="Сбросить приложение?"
+              message="Все локальные данные будут удалены. Это действие необратимо."
+              confirmLabel="Удалить всё"
+              danger
+              onConfirm={() => { setConfirmReset(false); resetApp(); }}
+              onCancel={() => setConfirmReset(false)}
+            />
+
 
             <button
               className="btn btn-primary"

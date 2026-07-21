@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNotes } from '../lib/store';
 import { VaultMismatchError } from '../lib/store';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 export function Restore() {
   const { restoreFromMnemonic, goToOnboarding, resetApp, vaultError } = useNotes();
@@ -8,6 +9,7 @@ export function Restore() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showReset, setShowReset] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // Show vault error from bootstrap if present
   const displayError = error || vaultError;
@@ -52,9 +54,8 @@ export function Restore() {
   }
 
   async function handleReset() {
-    if (confirm('Удалить все локальные данные? Это действие необратимо.')) {
-      await resetApp();
-    }
+    setConfirmReset(false);
+    await resetApp();
   }
 
   return (
@@ -85,10 +86,21 @@ export function Restore() {
         {displayError && <div className="error-msg">{displayError}</div>}
 
         {displayShowReset && (
-          <button className="btn btn-danger full-width" onClick={handleReset}>
+          <button className="btn btn-danger full-width" onClick={() => setConfirmReset(true)}>
             Сбросить приложение
           </button>
         )}
+
+        <ConfirmDialog
+          open={confirmReset}
+          title="Сбросить приложение?"
+          message="Все локальные данные будут удалены. Это действие необратимо; заметки из блокчейна можно будет восстановить по seed-фразе."
+          confirmLabel="Удалить всё"
+          danger
+          onConfirm={handleReset}
+          onCancel={() => setConfirmReset(false)}
+        />
+
 
         <button
           className="btn btn-primary"

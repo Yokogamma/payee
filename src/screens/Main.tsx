@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useNotes, type NoteSyncStatus } from '../lib/store';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 // Draft survives an accidental tab close / PWA eviction (same lifetime model as
 // the session seed: sessionStorage, never persisted to disk unencrypted forever).
@@ -55,6 +56,7 @@ export function Main() {
   const [pinConfirm, setPinConfirm] = useState('');
   const [pinError, setPinError] = useState('');
   const [showPinSetup, setShowPinSetup] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     return (localStorage.getItem('theme') as 'dark' | 'light') || 'dark';
   });
@@ -542,13 +544,7 @@ export function Main() {
             </div>
 
             <div className="settings-section">
-              <button className="btn btn-danger full-width" onClick={() => {
-                const hasUnsynced = arweave.unsyncedCount > 0;
-                const msg = hasUnsynced
-                  ? `⚠️ ${arweave.unsyncedCount} заметок НЕ синхронизированы и будут потеряны!\n\nУдалить все локальные данные?`
-                  : 'Удалить все локальные данные? Заметки в блокчейне сохранятся.';
-                if (confirm(msg)) resetApp();
-              }}>
+              <button className="btn btn-danger full-width" onClick={() => setShowResetConfirm(true)}>
                 Сбросить приложение
               </button>
             </div>
@@ -562,6 +558,18 @@ export function Main() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={showResetConfirm}
+        title="Сбросить приложение?"
+        message={arweave.unsyncedCount > 0
+          ? `⚠️ ${arweave.unsyncedCount} заметок ещё НЕ синхронизированы и будут потеряны безвозвратно.\nЗаметки, сохранённые в блокчейне, можно вернуть по seed-фразе.`
+          : 'Все локальные данные будут удалены. Заметки, сохранённые в блокчейне, можно вернуть по seed-фразе.'}
+        confirmLabel="Удалить всё"
+        danger
+        onConfirm={() => { setShowResetConfirm(false); resetApp(); }}
+        onCancel={() => setShowResetConfirm(false)}
+      />
     </div>
   );
 }
