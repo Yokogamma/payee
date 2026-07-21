@@ -8,6 +8,7 @@ import {
   recoverStorage,
   StorageBlockedError,
   saveNoteWithSync,
+  mergeRestoredNote,
   saveNote,
   getNoteById,
   getAllNotes,
@@ -63,6 +64,52 @@ describe('saveNoteWithSync', () => {
     expect(await getNoteById('n3')).toBeUndefined(); // note rolled back
     const all = await getAllSyncRecords();
     expect(all.find(r => r.noteId === 'n3')).toBeUndefined();
+  });
+});
+
+describe('mergeRestoredNote (restore repair)', () => {
+  const NOTE = { noteId: 'm1', ciphertext: 'c', iv: 'iv', createdAt: 1 };
+
+  it('repairs an EXISTING note that has no SyncRecord: writes confirmed, not counted as new', async () => {
+    // The old-version-restore scenario: note present, sync state missing.
+    await saveNote(NOTE);
+    const res = await mergeRestoredNote(NOTE, 'tx-m1', 100);
+    expect(res).toEqual({ isNew: false, wrote: true });
+
+    // Now confirmed → syncPendingNotes' skip-set covers it (no re-upload).
+    const confirmed = await getRecordsByStatus('confirmed');
+    const rec = confirmed.find(r => r.noteId === 'm1');
+    expect(rec?.txId).toBe('tx-m1');
+
+    const allNotes = await getAllNotes();
+    const unsynced = allNotes.filter(n =>
+      !confirmed.some(r => r.noteId === n.noteId));
+    expect(unsynced.find(n => n.noteId === 'm1')).toBeUndefined(); // pending set empty for m1
+  });
+
+  it('writes a brand-new note atomically and reports isNew', async () => {
+    const res = await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100);
+    expect(res).toEqual({ isNew: true, wrote: true });
+    expect(await getNoteById('m2')).toBeDefined();
+    expect((await getRecordsByStatus('confirmed')).some(r => r.noteId === 'm2')).toBe(true);
+  });
+
+  it('skips a note that is already confirmed locally (no redundant write)', async () => {
+    await saveNoteWithSync({ ...NOTE, noteId: 'm3' },
+      { noteId: 'm3', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
+    const res = await mergeRestoredNote({ ...NOTE, noteId: 'm3' }, 'tx-new', 100);
+    expect(res).toEqual({ isNew: false, wrote: false });
+    // Untouched original record:
+    const rec = (await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm3');
+    expect(rec?.txId).toBe('tx-old');
+  });
+
+  it('upgrades a non-terminal sync record (e.g. error) to confirmed', async () => {
+    await saveNoteWithSync({ ...NOTE, noteId: 'm4' },
+      { noteId: 'm4', status: 'error', transport: 'proxy', updatedAt: 1 });
+    const res = await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100);
+    expect(res).toEqual({ isNew: false, wrote: true });
+    expect((await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm4')?.txId).toBe('tx-m4');
   });
 });
 

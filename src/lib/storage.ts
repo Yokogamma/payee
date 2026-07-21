@@ -172,6 +172,38 @@ export async function saveNoteWithSync(
   }
 }
 
+/**
+ * Merge one successfully-decrypted on-chain note into local storage during
+ * restore. ALWAYS records the confirmed SyncRecord — even when the note itself
+ * already exists locally (e.g. restored by an older app version that wrote no
+ * sync state): otherwise syncPendingNotes would treat it as unsynced and
+ * re-upload an already-on-chain note (duplicate paid TX if the server's old
+ * idempotency record is gone). Skips the write only when the note is already
+ * confirmed locally.
+ *
+ * Returns { isNew } so the caller updates UI/restoredCount only for notes the
+ * user hasn't seen, and { wrote } so it knows whether counters need a refresh.
+ */
+export async function mergeRestoredNote(
+  note: EncryptedNote,
+  txId: string,
+  now: number,
+): Promise<{ isNew: boolean; wrote: boolean }> {
+  const existing = await getNoteById(note.noteId);
+  const sync = await getSyncRecord(note.noteId);
+  if (existing && sync?.status === 'confirmed') {
+    return { isNew: false, wrote: false };
+  }
+  await saveNoteWithSync(note, {
+    noteId: note.noteId,
+    txId,
+    status: 'confirmed',
+    transport: 'proxy',
+    updatedAt: now,
+  });
+  return { isNew: !existing, wrote: true };
+}
+
 export async function saveNotes(notes: EncryptedNote[]): Promise<void> {
   const tx = getDB().transaction('notes', 'readwrite');
   for (const note of notes) {

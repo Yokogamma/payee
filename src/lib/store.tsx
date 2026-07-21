@@ -19,6 +19,7 @@ import {
   encryptWithPin,
   decryptWithPin,
   isPinKdfLegacy,
+  WrongPinError,
   bufferToBase64,
   type EncryptedNote,
   type NoteData,
@@ -36,9 +37,8 @@ import {
 import {
   initStorage,
   getAllNotes,
-  getNoteById,
   saveNote,
-  saveNoteWithSync,
+  mergeRestoredNote,
   getAllSyncRecords,
   getRecordsByStatus,
   getSyncRecord,
@@ -679,19 +679,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const { notes: remoteNotes, incomplete } = await fetchAllNotes(ownerHashRef.current, key);
       let restoredCount = 0;
 
+      let wroteAny = false;
       for (const remote of remoteNotes) {
-        const existing = await getNoteById(remote.encrypted.noteId);
-        if (existing) continue;
+        // ALWAYS record the confirmed sync state (atomic with the note) — even
+        // for a note that already exists locally without a SyncRecord (restored
+        // by an older app version): otherwise it would be re-queued and could
+        // re-upload an already-on-chain note. UI updates only for NEW notes.
+        const { isNew, wrote } = await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
+        if (wrote) wroteAny = true;
+        if (!isNew) continue;
 
-        // Persist the note AND a confirmed sync record atomically: the TX is
-        // already on-chain, so it must never be re-queued/re-uploaded.
-        await saveNoteWithSync(remote.encrypted, {
-          noteId: remote.encrypted.noteId,
-          txId: remote.txId,
-          status: 'confirmed',
-          transport: 'proxy',
-          updatedAt: Date.now(),
-        });
         setNotes(prev =>
           [...prev, { id: remote.encrypted.noteId, text: remote.text, createdAt: remote.encrypted.createdAt }]
             .sort((a, b) => b.createdAt - a.createdAt)
@@ -699,7 +696,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         restoredCount++;
       }
 
-      if (restoredCount > 0) {
+      if (wroteAny) {
         await refreshSyncCounts();
       }
       setRestoredCount(restoredCount);
@@ -896,7 +893,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     let mn: string;
     try {
       mn = await decryptWithPin(pinData, pin);
-    } catch {
+    } catch (err) {
+      if (!(err instanceof WrongPinError)) {
+        // Blob/KDF/runtime failure (PinUnlockUnavailableError) — the PIN was
+        // never actually checked. Spending attempts here would wipe a CORRECT
+        // PIN after 10 environment hiccups. Surface it without metering.
+        throw err;
+      }
       // Wrong PIN — increment attempts
       const attempts = ((await getMeta<number>('pin-attempts')) ?? 0) + 1;
       await setMeta('pin-attempts', attempts);
