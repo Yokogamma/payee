@@ -176,6 +176,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // Core state
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [notes, setNotes] = useState<NoteData[]>([]);
+  // Mirror of `notes` for async flows (restore) that outlive the closure they
+  // were created in — state captured there is stale.
+  const notesRef = useRef<NoteData[]>([]);
+  useEffect(() => { notesRef.current = notes; }, [notes]);
   const [isEncrypting, setIsEncrypting] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [restoring, setRestoring] = useState(false);
@@ -679,24 +683,26 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const { notes: remoteNotes, incomplete } = await fetchAllNotes(ownerHashRef.current, key);
       let restoredCount = 0;
 
-      let wroteAny = false;
       for (const remote of remoteNotes) {
-        // ALWAYS record the confirmed sync state (atomic with the note) — even
-        // for a note that already exists locally without a SyncRecord (restored
-        // by an older app version): otherwise it would be re-queued and could
-        // re-upload an already-on-chain note. UI updates only for NEW notes.
-        const { isNew, wrote } = await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
-        if (wrote) wroteAny = true;
-        if (!isNew) continue;
+        // Upsert the note payload + confirmed sync state atomically. The
+        // payload write matters even for an already-confirmed note: the local
+        // ciphertext may be corrupted while the on-chain copy just decrypted.
+        await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
 
+        // UI visibility is judged by what the user can SEE (decrypted notes),
+        // not by DB presence — a corrupted local note exists in the DB but is
+        // invisible in the UI, and must reappear after this repair.
+        if (notesRef.current.some(n => n.id === remote.encrypted.noteId)) continue;
         setNotes(prev =>
-          [...prev, { id: remote.encrypted.noteId, text: remote.text, createdAt: remote.encrypted.createdAt }]
-            .sort((a, b) => b.createdAt - a.createdAt)
+          prev.some(n => n.id === remote.encrypted.noteId)
+            ? prev
+            : [...prev, { id: remote.encrypted.noteId, text: remote.text, createdAt: remote.encrypted.createdAt }]
+                .sort((a, b) => b.createdAt - a.createdAt)
         );
         restoredCount++;
       }
 
-      if (wroteAny) {
+      if (remoteNotes.length > 0) {
         await refreshSyncCounts();
       }
       setRestoredCount(restoredCount);

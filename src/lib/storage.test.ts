@@ -70,11 +70,10 @@ describe('saveNoteWithSync', () => {
 describe('mergeRestoredNote (restore repair)', () => {
   const NOTE = { noteId: 'm1', ciphertext: 'c', iv: 'iv', createdAt: 1 };
 
-  it('repairs an EXISTING note that has no SyncRecord: writes confirmed, not counted as new', async () => {
+  it('repairs an EXISTING note that has no SyncRecord: writes confirmed', async () => {
     // The old-version-restore scenario: note present, sync state missing.
     await saveNote(NOTE);
-    const res = await mergeRestoredNote(NOTE, 'tx-m1', 100);
-    expect(res).toEqual({ isNew: false, wrote: true });
+    await mergeRestoredNote(NOTE, 'tx-m1', 100);
 
     // Now confirmed → syncPendingNotes' skip-set covers it (no re-upload).
     const confirmed = await getRecordsByStatus('confirmed');
@@ -87,28 +86,30 @@ describe('mergeRestoredNote (restore repair)', () => {
     expect(unsynced.find(n => n.noteId === 'm1')).toBeUndefined(); // pending set empty for m1
   });
 
-  it('writes a brand-new note atomically and reports isNew', async () => {
-    const res = await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100);
-    expect(res).toEqual({ isNew: true, wrote: true });
+  it('writes a brand-new note atomically with its confirmed record', async () => {
+    await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100);
     expect(await getNoteById('m2')).toBeDefined();
     expect((await getRecordsByStatus('confirmed')).some(r => r.noteId === 'm2')).toBe(true);
   });
 
-  it('skips a note that is already confirmed locally (no redundant write)', async () => {
-    await saveNoteWithSync({ ...NOTE, noteId: 'm3' },
+  it('REPAIRS a corrupted local payload even when the sync record is already confirmed', async () => {
+    // Local ciphertext rotted (undecryptable) but sync says confirmed — restore
+    // must replace the payload with the known-good on-chain copy while keeping
+    // the ORIGINAL confirmed record (txId untouched).
+    await saveNoteWithSync({ noteId: 'm3', ciphertext: 'CORRUPTED', iv: 'iv', createdAt: 1 },
       { noteId: 'm3', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
-    const res = await mergeRestoredNote({ ...NOTE, noteId: 'm3' }, 'tx-new', 100);
-    expect(res).toEqual({ isNew: false, wrote: false });
-    // Untouched original record:
+
+    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100);
+
+    expect((await getNoteById('m3'))?.ciphertext).toBe('GOOD-ONCHAIN'); // payload repaired
     const rec = (await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm3');
-    expect(rec?.txId).toBe('tx-old');
+    expect(rec?.txId).toBe('tx-old'); // original confirmed record preserved
   });
 
   it('upgrades a non-terminal sync record (e.g. error) to confirmed', async () => {
     await saveNoteWithSync({ ...NOTE, noteId: 'm4' },
       { noteId: 'm4', status: 'error', transport: 'proxy', updatedAt: 1 });
-    const res = await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100);
-    expect(res).toEqual({ isNew: false, wrote: true });
+    await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100);
     expect((await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm4')?.txId).toBe('tx-m4');
   });
 });

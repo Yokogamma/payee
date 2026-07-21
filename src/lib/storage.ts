@@ -174,34 +174,29 @@ export async function saveNoteWithSync(
 
 /**
  * Merge one successfully-decrypted on-chain note into local storage during
- * restore. ALWAYS records the confirmed SyncRecord — even when the note itself
- * already exists locally (e.g. restored by an older app version that wrote no
- * sync state): otherwise syncPendingNotes would treat it as unsynced and
- * re-upload an already-on-chain note (duplicate paid TX if the server's old
- * idempotency record is gone). Skips the write only when the note is already
- * confirmed locally.
+ * restore. ALWAYS upserts BOTH pieces atomically:
+ *  - the note payload: the on-chain copy is known-good (it just decrypted),
+ *    while the local ciphertext may be corrupted even when the sync record says
+ *    'confirmed' — skipping the write would make restore unable to repair it;
+ *  - the sync state: a note without a confirmed record (older app versions
+ *    wrote none) would be re-queued and could re-upload an already-on-chain
+ *    note (duplicate paid TX if the server's old idempotency record is gone).
+ * An existing CONFIRMED record is preserved as-is (original txId/updatedAt);
+ * anything else is upgraded to confirmed with the on-chain txId.
  *
- * Returns { isNew } so the caller updates UI/restoredCount only for notes the
- * user hasn't seen, and { wrote } so it knows whether counters need a refresh.
+ * UI visibility is the CALLER's decision (against the currently-decrypted note
+ * list, not DB presence — a corrupted-but-present note is invisible in the UI).
  */
 export async function mergeRestoredNote(
   note: EncryptedNote,
   txId: string,
   now: number,
-): Promise<{ isNew: boolean; wrote: boolean }> {
-  const existing = await getNoteById(note.noteId);
+): Promise<void> {
   const sync = await getSyncRecord(note.noteId);
-  if (existing && sync?.status === 'confirmed') {
-    return { isNew: false, wrote: false };
-  }
-  await saveNoteWithSync(note, {
-    noteId: note.noteId,
-    txId,
-    status: 'confirmed',
-    transport: 'proxy',
-    updatedAt: now,
-  });
-  return { isNew: !existing, wrote: true };
+  const record: SyncRecord = sync?.status === 'confirmed'
+    ? sync
+    : { noteId: note.noteId, txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+  await saveNoteWithSync(note, record);
 }
 
 export async function saveNotes(notes: EncryptedNote[]): Promise<void> {
