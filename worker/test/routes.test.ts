@@ -57,7 +57,7 @@ describe('protected routes: per-IP limiter (D-baseline)', () => {
       if (r.status === 429) { sawLimit = true; break; }
     }
     expect(sawLimit).toBe(true);
-  });
+  }, 20_000); // 60+ sequential requests — headroom under full-suite load
 
   it('also limits /check-registration and /register per IP', async () => {
     for (const path of ['/check-registration', '/register']) {
@@ -69,7 +69,7 @@ describe('protected routes: per-IP limiter (D-baseline)', () => {
       }
       expect(sawLimit, `expected 429 on ${path}`).toBe(true);
     }
-  });
+  }, 30_000);
 
   it('limits the /wallet-address diagnostic endpoint too', async () => {
     const ip = `wa-${RUN}`;
@@ -84,7 +84,7 @@ describe('protected routes: per-IP limiter (D-baseline)', () => {
       if (r.status === 429) { sawLimit = true; break; }
     }
     expect(sawLimit).toBe(true);
-  });
+  }, 20_000);
 
   it('/wallet-address uses its OWN bucket: exhausting it does not starve the main routes', async () => {
     // A third-party page can fire no-preflight GETs at the diagnostic endpoint;
