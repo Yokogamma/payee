@@ -12,6 +12,7 @@
  * For Cloudflare Pages set VITE_BASE=/ ; for GitHub Pages leave the default.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
+import { resolveProxyOrigin } from './proxy-origin.mjs';
 
 const base = process.env.VITE_BASE || '/payee/';
 const sha = process.env.BUILD_SHA || 'dev';
@@ -19,10 +20,12 @@ const rawProxy = process.env.VITE_PROXY_URL || '';
 
 let origin;
 try {
-  const u = new URL(rawProxy);
-  const local = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
-  if (!local && u.protocol !== 'https:') throw new Error('a non-localhost proxy origin must use https');
-  origin = u.origin;
+  origin = resolveProxyOrigin(rawProxy, {
+    // Any CI marker means "this artifact may ship" → http://localhost is banned
+    // there even though it stays convenient for local dev builds.
+    ci: process.env.CI === 'true' || process.env.CI === '1' || !!process.env.GITHUB_ACTIONS,
+    allowHttp: process.env.ALLOW_HTTP_PROXY === '1',
+  });
 } catch (e) {
   throw new Error(`postbuild: invalid VITE_PROXY_URL "${rawProxy}": ${e.message}`);
 }
