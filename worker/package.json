@@ -6,7 +6,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "seed-invite": "wrangler dev --test-scheduled",
-    "test": "vitest run",
+    "test": "vitest run && vitest run -c vitest.direct.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },

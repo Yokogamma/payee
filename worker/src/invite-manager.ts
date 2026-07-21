@@ -10,6 +10,18 @@ interface InviteRecord {
   used: boolean;
   publicKey?: string;
   usedAt?: number;
+  /** Set when the key admitted by this invite was revoked (audit trail). A
+   *  revoked invite is also `used`, so it can never admit another key. */
+  revoked?: boolean;
+  revokedAt?: number;
+}
+
+/** Allowlist record for a registered key. Legacy entries are the literal
+ *  `true` (pre-revoke releases); new entries carry the reverse index to the
+ *  admitting invite so revoke can mark it without scanning. */
+interface PkRecord {
+  invitedBy: string;
+  registeredAt: number;
 }
 
 interface FailedAttempt {
@@ -25,6 +37,10 @@ interface RegisterRequest {
 }
 
 interface CheckAllowedRequest {
+  publicKey: string;
+}
+
+interface RevokeRequest {
   publicKey: string;
 }
 
@@ -44,6 +60,7 @@ export class InviteManager implements DurableObject {
     if (url.pathname === '/register') return this.handleRegister(request);
     if (url.pathname === '/check-allowed') return this.handleCheckAllowed(request);
     if (url.pathname === '/seed-invite') return this.handleSeedInvite(request);
+    if (url.pathname === '/revoke') return this.handleRevoke(request);
     return new Response('Not found', { status: 404 });
   }
 
@@ -104,7 +121,13 @@ export class InviteManager implements DurableObject {
       publicKey,
       usedAt: Date.now(),
     });
-    await this.state.storage.put(`pk:${publicKey}`, true);
+    // Reverse index (invitedBy) lets /revoke mark the admitting invite without
+    // a storage scan. Legacy `true` records from older releases still validate
+    // (checkAllowed is truthiness-based) and are handled by revoke's fallback.
+    await this.state.storage.put<PkRecord>(`pk:${publicKey}`, {
+      invitedBy: inviteCode,
+      registeredAt: Date.now(),
+    });
 
     return Response.json({ ok: true });
   }
@@ -116,6 +139,57 @@ export class InviteManager implements DurableObject {
     const { publicKey } = await request.json<CheckAllowedRequest>();
     const exists = await this.state.storage.get(`pk:${publicKey}`);
     return Response.json({ allowed: !!exists });
+  }
+
+  /**
+   * Revoke a registered key (M11). Idempotent: revoking an unknown/already-
+   * revoked key succeeds. Removes the key from the allowlist (source of truth)
+   * and marks the admitting invite as revoked — via the reverse index for new
+   * records, or a prefix scan for legacy `true` records.
+   * The caller (Worker /admin/revoke) also writes the KV `denied` entry so a
+   * stale cached `allowed` cannot outlive the revoke beyond its TTL.
+   */
+  private async handleRevoke(request: Request): Promise<Response> {
+    const { publicKey } = await request.json<RevokeRequest>();
+    if (typeof publicKey !== 'string' || publicKey.length === 0) {
+      return Response.json({ error: 'publicKey required' }, { status: 400 });
+    }
+
+    const pkKey = `pk:${publicKey}`;
+    const existing = await this.state.storage.get<true | PkRecord>(pkKey);
+
+    // Locate the admitting invite: new records carry invitedBy; legacy `true`
+    // records fall back to a scan (registrations are invite-bounded → small).
+    let inviteCode: string | undefined =
+      typeof existing === 'object' && existing !== null ? existing.invitedBy : undefined;
+    if (!inviteCode) {
+      const invites = await this.state.storage.list<InviteRecord>({ prefix: 'invite:' });
+      for (const [key, rec] of invites) {
+        if (rec.publicKey === publicKey) {
+          inviteCode = key.slice('invite:'.length);
+          break;
+        }
+      }
+    }
+
+    let inviteRevoked = false;
+    if (inviteCode) {
+      const invite = await this.state.storage.get<InviteRecord>(`invite:${inviteCode}`);
+      if (invite) {
+        if (!invite.revoked) {
+          await this.state.storage.put<InviteRecord>(`invite:${inviteCode}`, {
+            ...invite,
+            used: true, // a revoked invite must never admit another key
+            revoked: true,
+            revokedAt: Date.now(),
+          });
+        }
+        inviteRevoked = true;
+      }
+    }
+
+    await this.state.storage.delete(pkKey);
+    return Response.json({ ok: true, wasAllowed: !!existing, inviteRevoked });
   }
 
   /**

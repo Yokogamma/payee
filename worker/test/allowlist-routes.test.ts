@@ -1,6 +1,9 @@
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
+import { warmUpInviteManager } from './warmup';
+
+beforeAll(() => warmUpInviteManager());
 
 // D3 route-level: the /upload handler honours the typed allowlist model end to
 // end — denied → 403, missing → 403, and a legacy 'true' KV value is re-derived

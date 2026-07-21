@@ -1,5 +1,8 @@
 import { SELF } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
+import { warmUpInviteManager } from './warmup';
+
+beforeAll(() => warmUpInviteManager());
 
 // Integration: the default Worker fetch handler must run the sharded per-IP
 // limiter at the START of protected routes (before body/auth/KV/DO), and

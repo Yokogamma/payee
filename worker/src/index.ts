@@ -90,6 +90,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (url.pathname === '/admin/seed-invite' && request.method === 'POST') {
     return handleAdminSeedInvite(request, env);
   }
+  if (url.pathname === '/admin/revoke' && request.method === 'POST') {
+    return handleAdminRevoke(request, env);
+  }
 
   return new Response('Not found', { status: 404 });
 }
@@ -125,12 +128,28 @@ async function handleWalletAddress(request: Request, env: Env): Promise<Response
   }
 }
 
+// ─── Admin auth (L12) ───────────────────────────────────────────────
+
+/**
+ * Constant-time admin auth: SHA-256 both sides to a fixed 32 bytes, then
+ * timingSafeEqual — no early exit on length mismatch and no crash on it
+ * (timingSafeEqual itself throws on unequal input lengths; digests never are).
+ */
+async function verifyAdminSecret(env: Env, authHeader: string | null): Promise<boolean> {
+  if (!env.ADMIN_SECRET || !authHeader) return false;
+  const enc = new TextEncoder();
+  const [given, expected] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(authHeader)),
+    crypto.subtle.digest('SHA-256', enc.encode(`Bearer ${env.ADMIN_SECRET}`)),
+  ]);
+  return crypto.subtle.timingSafeEqual(new Uint8Array(given), new Uint8Array(expected));
+}
+
 // ─── /admin/seed-invite ─────────────────────────────────────────────
 
 async function handleAdminSeedInvite(request: Request, env: Env): Promise<Response> {
   if (!env.ADMIN_SECRET) return error('Admin endpoint not configured', 503);
-  const authHeader = request.headers.get('Authorization');
-  if (authHeader !== `Bearer ${env.ADMIN_SECRET}`) {
+  if (!(await verifyAdminSecret(env, request.headers.get('Authorization')))) {
     return error('Unauthorized', 401);
   }
 
@@ -149,6 +168,49 @@ async function handleAdminSeedInvite(request: Request, env: Env): Promise<Respon
     body: JSON.stringify({ codes }),
   }));
   const result = await resp.json();
+  return json(result);
+}
+
+// ─── /admin/revoke (M11) ────────────────────────────────────────────
+
+/**
+ * Revoke a registered key: DO removes it from the allowlist (source of truth)
+ * and marks its admitting invite revoked; then the KV cache is OVERWRITTEN with
+ * a short-TTL `denied` so any stale cached `allowed` cannot outlive the revoke.
+ * Idempotent — safe to retry.
+ */
+async function handleAdminRevoke(request: Request, env: Env): Promise<Response> {
+  if (!env.ADMIN_SECRET) return error('Admin endpoint not configured', 503);
+  if (!(await verifyAdminSecret(env, request.headers.get('Authorization')))) {
+    return error('Unauthorized', 401);
+  }
+
+  let publicKey: unknown;
+  try {
+    ({ publicKey } = await request.json<{ publicKey?: unknown }>());
+  } catch {
+    return error('Invalid JSON', 400);
+  }
+  if (typeof publicKey !== 'string' || publicKey.length === 0) {
+    return error('publicKey required', 400);
+  }
+
+  const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
+  const resp = await inviteMgr.fetch(new Request('http://internal/revoke', {
+    method: 'POST',
+    body: JSON.stringify({ publicKey }),
+  }));
+  if (!resp.ok) {
+    const body: { error?: string } = await resp.json();
+    return error(body.error || 'Revoke failed', resp.status);
+  }
+  const result = await resp.json();
+
+  // KV write AFTER the DO succeeded: cache must never say 'denied' while the
+  // DO still says allowed (the opposite — stale 'allowed' — is bounded by TTL,
+  // and this overwrite closes it immediately).
+  await writeAllowCache(env.ALLOWLIST, publicKey, 'denied');
+
   return json(result);
 }
 
