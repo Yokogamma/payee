@@ -3,7 +3,11 @@ name: Deploy to GitHub Pages (legacy)
 # LEGACY target. Cloudflare Pages (deploy-pages-cf.yml) is the migration target
 # because GitHub Pages ignores _headers, so the generated CSP is NOT applied here.
 # Kept working (base=/payee/) until the operator completes the CF Pages cutover.
-# Manual trigger so the client is NEVER auto-published ahead of the Worker.
+# Manual trigger — ordering is operator-driven (authoritative: docs/ROLLBACK.md).
+# NOTE: for the FIRST rollout of the recovery protocol THIS legacy client deploy
+# goes FIRST — before the new Worker — because the recovery-aware client is
+# backward-compatible with the old Worker, while the new Worker paired with old
+# clients opens the duplicate-paid-TX window. Later releases: Worker first.
 on:
   workflow_dispatch:
 

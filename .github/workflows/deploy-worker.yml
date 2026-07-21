@@ -1,11 +1,17 @@
 name: Deploy Worker (proxy)
 
-# Manual trigger, intentionally decoupled from the Pages deploy so the operator
-# controls the reader-before-writer sequence:  Worker → smoke → Pages.
+# Manual trigger, intentionally decoupled from the client deploys so the
+# operator controls the sequence (authoritative order: docs/ROLLBACK.md).
+#   FIRST rollout of the recovery protocol:  recovery-aware CLIENT on the legacy
+#   GitHub Pages origin → THEN this Worker → smoke → Cloudflare Pages. Running
+#   this Worker against pre-recovery clients opens the duplicate-paid-TX window.
+#   Subsequent compatible releases: Worker → smoke → Pages (reader-before-writer).
 # NOTE: a workflow_dispatch workflow must already exist on the default branch
 # before it can be run from the Actions UI, so land this file in main FIRST
 # (both deploys here are manual, so merging does not auto-publish anything).
 # Requires repo secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
+# Worker secrets must be set beforehand (wrangler secret put), incl. the
+# MANDATORY RECOVERY_HMAC_SECRET — without it /upload returns 503.
 on:
   workflow_dispatch:
 

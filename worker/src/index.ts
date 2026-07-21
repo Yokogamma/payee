@@ -25,9 +25,11 @@ interface Env {
   RATE_LIMIT_PER_HOUR: string;
   ARWEAVE_JWK: string;
   ADMIN_SECRET: string;
-  /** Dedicated stable secret for recovery-token HMACs. Deliberately NOT derived
-   *  from ARWEAVE_JWK: wallet rotation must not invalidate outstanding tokens
-   *  (an unverifiable token fails closed and blocks reconciliation). */
+  /** Dedicated stable secret (≥16 chars; e.g. `openssl rand -base64 32`) for
+   *  recovery-token HMACs. MANDATORY: /upload 503s while it is unset — posting
+   *  without it would make a triple-failure unrecoverable (duplicate paid TX).
+   *  Deliberately NOT derived from ARWEAVE_JWK: wallet rotation must not
+   *  invalidate outstanding tokens (they'd fail closed, blocking recovery). */
   RECOVERY_HMAC_SECRET: string;
 }
 

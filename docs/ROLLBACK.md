@@ -85,5 +85,9 @@ GitHub Actions: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
 `CF_PAGES_PROJECT`, `VITE_PROXY_URL` (https), `VITE_TRUSTED_OWNERS`.
 
 Worker (`wrangler secret put`): `ARWEAVE_JWK`, `ADMIN_SECRET`,
-`RECOVERY_HMAC_SECRET` (stable — do NOT rotate together with `ARWEAVE_JWK`;
-without it recovery tokens are not issued and presented ones fail closed).
+`RECOVERY_HMAC_SECRET` — **MANDATORY for uploads**: the Worker refuses every
+`/upload` with `503 Server misconfigured` while the secret is missing or
+shorter than 16 characters (enforced in code). Generate once with
+`openssl rand -base64 32` and keep it STABLE — never rotate it together with
+`ARWEAVE_JWK` (outstanding recovery tokens would stop verifying and fail
+closed, blocking reconciliation until operator intervention).
