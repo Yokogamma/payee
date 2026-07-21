@@ -188,6 +188,54 @@ describe('revoke ↔ register race hardening (allowed resurrection)', () => {
   });
 });
 
+describe('serialized cache ownership (round 9: deny wins in EVERY interleaving)', () => {
+  it('refresh-allowed after a revoke returns false and leaves the denied entry intact', async () => {
+    const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const code = `SER-${crypto.randomUUID().slice(0, 8)}`;
+    await seedInvite(code);
+    expect((await registerViaDO(code, pk)).status).toBe(200);
+
+    expect((await adminRevoke(pk)).status).toBe(200);
+
+    const r = await mgrFetch('/refresh-allowed', { publicKey: pk });
+    const body = await r.json() as { allowed: boolean };
+    expect(body.allowed).toBe(false); // FINAL verdict honors the revoke
+    expect(JSON.parse((await ALLOWLIST.get(`pk:${pk}`))!)).toEqual({ status: 'denied' });
+  });
+
+  it('a FRESH registration caches allowed from INSIDE the DO critical section', async () => {
+    const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const code = `SER2-${crypto.randomUUID().slice(0, 8)}`;
+    await seedInvite(code);
+    expect((await registerViaDO(code, pk)).status).toBe(200);
+    // The worker wrote nothing — this entry came from the DO's serialized write.
+    expect(JSON.parse((await ALLOWLIST.get(`pk:${pk}`))!)).toEqual({ status: 'allowed' });
+  });
+
+  it('CONCURRENT refresh-allowed × revoke always ends with denied cached', async () => {
+    // Both operations run under the DO's blockConcurrencyWhile, so whatever
+    // the interleaving, the final KV state must be `denied`: refresh-after-
+    // revoke sees the key deleted (writes nothing), revoke-after-refresh
+    // overwrites `allowed`. Repeat to exercise both orders.
+    for (let round = 0; round < 5; round++) {
+      const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
+      const code = `RACE9-${crypto.randomUUID().slice(0, 6)}`;
+      await seedInvite(code);
+      expect((await registerViaDO(code, pk)).status).toBe(200);
+
+      const [refreshResp, revokeResp] = await Promise.all([
+        mgrFetch('/refresh-allowed', { publicKey: pk }),
+        adminRevoke(pk),
+      ]);
+      expect(refreshResp.status).toBe(200);
+      expect(revokeResp.status).toBe(200);
+
+      expect(await checkAllowedDO(pk)).toBe(false);
+      expect(JSON.parse((await ALLOWLIST.get(`pk:${pk}`))!)).toEqual({ status: 'denied' });
+    }
+  }, 20_000);
+});
+
 describe('L12 constant-time admin auth', () => {
   it('rejects wrong secrets of ANY length with 401 (no crash on length mismatch)', async () => {
     for (const bad of ['Bearer x', `Bearer ${'a'.repeat(500)}`, 'Basic abc']) {

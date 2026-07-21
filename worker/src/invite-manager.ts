@@ -4,7 +4,23 @@
  * One GLOBAL instance (idFromName = "global").
  * All registrations go through it → single-threaded → no race conditions.
  * DO = source of truth for allowlist. KV = read-through cache.
+ *
+ * SERIALIZED CACHE OWNERSHIP: every KV write for `pk:*` access entries happens
+ * HERE, inside blockConcurrencyWhile — register (fresh grant), /refresh-allowed
+ * (read-through refresh) and /revoke (deny) are totally ordered. A worker-side
+ * get→put can interleave with a revoke and resurrect a denied key; a single
+ * serialized owner cannot: a refresh that runs after a revoke sees the key
+ * already deleted (same critical section as its own KV write) and writes
+ * nothing, while a revoke that runs later overwrites `allowed` with `denied`.
+ * Deny wins in every interleaving.
  */
+
+import { writeAllowCache } from './allowlist';
+
+/** The only binding the DO needs — the allowlist cache it owns writes for. */
+interface InviteManagerEnv {
+  ALLOWLIST: KVNamespace;
+}
 
 interface InviteRecord {
   used: boolean;
@@ -62,15 +78,18 @@ function isCanonical32ByteB64(s: string): boolean {
 
 export class InviteManager implements DurableObject {
   private state: DurableObjectState;
+  private env: InviteManagerEnv;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env: InviteManagerEnv) {
     this.state = state;
+    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/register') return this.handleRegister(request);
     if (url.pathname === '/check-allowed') return this.handleCheckAllowed(request);
+    if (url.pathname === '/refresh-allowed') return this.handleRefreshAllowed(request);
     if (url.pathname === '/seed-invite') return this.handleSeedInvite(request);
     if (url.pathname === '/revoke') return this.handleRevoke(request);
     return new Response('Not found', { status: 404 });
@@ -79,69 +98,119 @@ export class InviteManager implements DurableObject {
   private async handleRegister(request: Request): Promise<Response> {
     const { inviteCode, publicKey, clientIP } = await request.json<RegisterRequest>();
 
-    // 1. Brute-force protection per IP
-    const ipKey = `ip:${clientIP}`;
-    const now = Date.now();
-    const attempts: FailedAttempt = (await this.state.storage.get<FailedAttempt>(ipKey))
-      ?? { count: 0, windowEnd: 0, blockedUntil: 0 };
+    // The whole decision + mutation + cache write runs as ONE serialized
+    // critical section (see the file header): no revoke can interleave between
+    // "invite consumed" and "allowed cached".
+    let response!: Response;
+    await this.state.blockConcurrencyWhile(async () => {
+      // 1. Brute-force protection per IP
+      const ipKey = `ip:${clientIP}`;
+      const now = Date.now();
+      const attempts: FailedAttempt = (await this.state.storage.get<FailedAttempt>(ipKey))
+        ?? { count: 0, windowEnd: 0, blockedUntil: 0 };
 
-    // Hourly block active?
-    if (now < attempts.blockedUntil) {
-      return Response.json(
-        { error: 'Too many attempts. Try again later.' },
-        { status: 429 },
-      );
-    }
-
-    // Window expired → reset
-    if (now >= attempts.windowEnd) {
-      attempts.count = 0;
-      attempts.windowEnd = 0;
-      attempts.blockedUntil = 0;
-    }
-
-    // 2. Check publicKey not already registered — idempotent
-    const existingPK = await this.state.storage.get(`pk:${publicKey}`);
-    if (existingPK) {
-      return Response.json({ ok: true, alreadyRegistered: true });
-    }
-
-    // 3. Check invite code — ATOMIC read + write
-    const invite = await this.state.storage.get<InviteRecord>(`invite:${inviteCode}`);
-    if (!invite || invite.used) {
-      attempts.count++;
-      if (!attempts.windowEnd) attempts.windowEnd = now + 600_000; // 10-min window
-      if (attempts.count >= 10) {
-        attempts.blockedUntil = now + 3_600_000; // ≥10 fails → 1 hour block
-        await this.state.storage.put(ipKey, attempts);
-        return Response.json(
+      // Hourly block active?
+      if (now < attempts.blockedUntil) {
+        response = Response.json(
           { error: 'Too many attempts. Try again later.' },
           { status: 429 },
         );
+        return;
       }
-      await this.state.storage.put(ipKey, attempts);
-      return Response.json(
-        { error: 'Invalid or used invite code' },
-        { status: 401 },
-      );
+
+      // Window expired → reset
+      if (now >= attempts.windowEnd) {
+        attempts.count = 0;
+        attempts.windowEnd = 0;
+        attempts.blockedUntil = 0;
+      }
+
+      // 2. Check publicKey not already registered — idempotent. NO cache write
+      // here: this branch validates no invite, so it must never be able to
+      // resurrect a racing revoke's `denied` (round-8 finding).
+      const existingPK = await this.state.storage.get(`pk:${publicKey}`);
+      if (existingPK) {
+        response = Response.json({ ok: true, alreadyRegistered: true });
+        return;
+      }
+
+      // 3. Check invite code — ATOMIC read + write
+      const invite = await this.state.storage.get<InviteRecord>(`invite:${inviteCode}`);
+      if (!invite || invite.used) {
+        attempts.count++;
+        if (!attempts.windowEnd) attempts.windowEnd = now + 600_000; // 10-min window
+        if (attempts.count >= 10) {
+          attempts.blockedUntil = now + 3_600_000; // ≥10 fails → 1 hour block
+          await this.state.storage.put(ipKey, attempts);
+          response = Response.json(
+            { error: 'Too many attempts. Try again later.' },
+            { status: 429 },
+          );
+          return;
+        }
+        await this.state.storage.put(ipKey, attempts);
+        response = Response.json(
+          { error: 'Invalid or used invite code' },
+          { status: 401 },
+        );
+        return;
+      }
+
+      // 4. Mark invite used + add publicKey to allowlist — atomic single-threaded
+      await this.state.storage.put<InviteRecord>(`invite:${inviteCode}`, {
+        ...invite,
+        used: true,
+        publicKey,
+        usedAt: Date.now(),
+      });
+      // Reverse index (invitedBy) lets /revoke mark the admitting invite without
+      // a storage scan. Legacy `true` records from older releases still validate
+      // (checkAllowed is truthiness-based) and are handled by revoke's fallback.
+      await this.state.storage.put<PkRecord>(`pk:${publicKey}`, {
+        invitedBy: inviteCode,
+        registeredAt: Date.now(),
+      });
+
+      // 5. Fresh grant → cache `allowed`, serialized with any revoke. A cache
+      // failure is non-fatal: access is granted in the DO; the next request
+      // re-derives on the KV miss.
+      try {
+        await writeAllowCache(this.env.ALLOWLIST, publicKey, 'allowed');
+      } catch (e) {
+        console.error('REGISTER_CACHE_WRITE_FAILED', e);
+      }
+
+      response = Response.json({ ok: true });
+    });
+    return response;
+  }
+
+  /**
+   * Read-through refresh (serialized cache owner): re-derives the verdict from
+   * DO storage and writes the `allowed` cache entry INSIDE the same critical
+   * section. The returned verdict is FINAL — a worker must honor `allowed:false`
+   * even if its own earlier KV read said otherwise (a revoke won the race).
+   */
+  private async handleRefreshAllowed(request: Request): Promise<Response> {
+    const { publicKey } = await request.json<CheckAllowedRequest>();
+    if (typeof publicKey !== 'string' || publicKey.length === 0) {
+      return Response.json({ error: 'publicKey required' }, { status: 400 });
     }
-
-    // 4. Mark invite used + add publicKey to allowlist — atomic single-threaded
-    await this.state.storage.put<InviteRecord>(`invite:${inviteCode}`, {
-      ...invite,
-      used: true,
-      publicKey,
-      usedAt: Date.now(),
+    let allowed = false;
+    await this.state.blockConcurrencyWhile(async () => {
+      allowed = !!(await this.state.storage.get(`pk:${publicKey}`));
+      if (allowed) {
+        try {
+          await writeAllowCache(this.env.ALLOWLIST, publicKey, 'allowed');
+        } catch (e) {
+          console.error('REFRESH_CACHE_WRITE_FAILED', e); // verdict still stands
+        }
+      }
+      // Not allowed → write NOTHING: a revoke's `denied` (written in ITS
+      // critical section) must not be touched, and negative caching is not
+      // this endpoint's job.
     });
-    // Reverse index (invitedBy) lets /revoke mark the admitting invite without
-    // a storage scan. Legacy `true` records from older releases still validate
-    // (checkAllowed is truthiness-based) and are handled by revoke's fallback.
-    await this.state.storage.put<PkRecord>(`pk:${publicKey}`, {
-      invitedBy: inviteCode,
-      registeredAt: Date.now(),
-    });
-
-    return Response.json({ ok: true });
+    return Response.json({ allowed });
   }
 
   /**
@@ -173,41 +242,57 @@ export class InviteManager implements DurableObject {
       );
     }
 
-    const pkKey = `pk:${publicKey}`;
-    const existing = await this.state.storage.get<true | PkRecord>(pkKey);
+    let response!: Response;
+    await this.state.blockConcurrencyWhile(async () => {
+      // FAIL-CLOSED inside the critical section too: the serialized `denied`
+      // goes FIRST. If it fails, nothing has changed — 503, retry. Being inside
+      // the section, no register/refresh can interleave between this write and
+      // the storage delete below (the round-9 race).
+      try {
+        await writeAllowCache(this.env.ALLOWLIST, publicKey, 'denied');
+      } catch (e) {
+        console.error('REVOKE_CACHE_DENY_FAILED', e);
+        response = Response.json({ error: 'Revoke failed (cache write) — retry' }, { status: 503 });
+        return;
+      }
 
-    // Locate the admitting invite: new records carry invitedBy; legacy `true`
-    // records fall back to a scan (registrations are invite-bounded → small).
-    let inviteCode: string | undefined =
-      typeof existing === 'object' && existing !== null ? existing.invitedBy : undefined;
-    if (!inviteCode) {
-      const invites = await this.state.storage.list<InviteRecord>({ prefix: 'invite:' });
-      for (const [key, rec] of invites) {
-        if (rec.publicKey === publicKey) {
-          inviteCode = key.slice('invite:'.length);
-          break;
+      const pkKey = `pk:${publicKey}`;
+      const existing = await this.state.storage.get<true | PkRecord>(pkKey);
+
+      // Locate the admitting invite: new records carry invitedBy; legacy `true`
+      // records fall back to a scan (registrations are invite-bounded → small).
+      let inviteCode: string | undefined =
+        typeof existing === 'object' && existing !== null ? existing.invitedBy : undefined;
+      if (!inviteCode) {
+        const invites = await this.state.storage.list<InviteRecord>({ prefix: 'invite:' });
+        for (const [key, rec] of invites) {
+          if (rec.publicKey === publicKey) {
+            inviteCode = key.slice('invite:'.length);
+            break;
+          }
         }
       }
-    }
 
-    let inviteRevoked = false;
-    if (inviteCode) {
-      const invite = await this.state.storage.get<InviteRecord>(`invite:${inviteCode}`);
-      if (invite) {
-        if (!invite.revoked) {
-          await this.state.storage.put<InviteRecord>(`invite:${inviteCode}`, {
-            ...invite,
-            used: true, // a revoked invite must never admit another key
-            revoked: true,
-            revokedAt: Date.now(),
-          });
+      let inviteRevoked = false;
+      if (inviteCode) {
+        const invite = await this.state.storage.get<InviteRecord>(`invite:${inviteCode}`);
+        if (invite) {
+          if (!invite.revoked) {
+            await this.state.storage.put<InviteRecord>(`invite:${inviteCode}`, {
+              ...invite,
+              used: true, // a revoked invite must never admit another key
+              revoked: true,
+              revokedAt: Date.now(),
+            });
+          }
+          inviteRevoked = true;
         }
-        inviteRevoked = true;
       }
-    }
 
-    await this.state.storage.delete(pkKey);
-    return Response.json({ ok: true, wasAllowed: !!existing, inviteRevoked });
+      await this.state.storage.delete(pkKey);
+      response = Response.json({ ok: true, wasAllowed: !!existing, inviteRevoked });
+    });
+    return response;
   }
 
   /**

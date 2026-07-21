@@ -7,7 +7,7 @@
 
 import Arweave from 'arweave';
 import * as ed25519 from '@noble/ed25519';
-import { readAllowCache, writeAllowCache, writeAllowCacheGuarded } from './allowlist';
+import { readAllowCache, writeAllowCache } from './allowlist';
 
 export { RateLimiter } from './rate-limiter';
 export { InviteManager } from './invite-manager';
@@ -265,17 +265,16 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
   } else if (cached === 'denied') {
     allowed = false;
   } else {
-    // miss (absent / legacy 'true' / invalid) → re-derive from DO, rewrite cache
+    // miss (absent / legacy 'true' / invalid) → serialized re-derive + cache
+    // write INSIDE the DO (single cache owner). The verdict is FINAL: if a
+    // revoke won the race, this returns allowed:false — never resurrect it.
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
-    const checkResp = await inviteMgr.fetch(new Request('http://internal/check-allowed', {
+    const checkResp = await inviteMgr.fetch(new Request('http://internal/refresh-allowed', {
       method: 'POST',
       body: JSON.stringify({ publicKey: publicKeyB64 }),
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
     allowed = checkResult.allowed;
-    // Guarded: a revoke's `denied` that landed during the DO round-trip must
-    // not be resurrected by this stale positive result.
-    if (allowed) await writeAllowCacheGuarded(env.ALLOWLIST, publicKeyB64);
   }
 
   return json({ allowed });
@@ -331,16 +330,11 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     const body: { error?: string } = await doResp.json();
     return error(body.error || 'Registration failed', doResp.status);
   }
-  const doResult: { ok: boolean; alreadyRegistered?: boolean } = await doResp.json();
-
-  // 5. Cache allowlist entry in KV (typed model, D3) — but NEVER for
-  // alreadyRegistered: that branch validates no invite, so an attacker racing
-  // a revoke could spam signed /register with garbage codes to resurrect the
-  // freshly-written `denied` (review finding). Only a FRESH registration
-  // (a real invite consumed) writes, and even then deny-wins guarded.
-  if (!doResult.alreadyRegistered) {
-    await writeAllowCacheGuarded(env.ALLOWLIST, publicKeyB64);
-  }
+  // 5. The cache write happens INSIDE the DO's serialized register section
+  // (fresh registrations only — alreadyRegistered writes nothing, so garbage-
+  // invite spam can never resurrect a racing revoke's `denied`). Nothing to
+  // write here: the worker must not own unserialized positive cache writes.
+  await doResp.json(); // drain
 
   return json({ ok: true });
 }
@@ -418,19 +412,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   );
   if (ownerHash !== expectedOwnerHash) return error('ownerHash/publicKey mismatch', 400);
 
-  // 6. Validate publicKey in allowlist (anti-sybil, R6) — typed model (D3)
+  // 6. Validate publicKey in allowlist (anti-sybil, R6) — typed model (D3).
+  // On a miss, /refresh-allowed re-derives AND caches inside the DO's critical
+  // section; its verdict is FINAL (a mid-flight revoke yields allowed:false).
   const cachedAccess = await readAllowCache(env.ALLOWLIST, publicKeyB64);
   if (cachedAccess === 'denied') return error('Not registered', 403);
   if (cachedAccess === 'miss') {
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
-    const checkResp = await inviteMgr.fetch(new Request('http://internal/check-allowed', {
+    const checkResp = await inviteMgr.fetch(new Request('http://internal/refresh-allowed', {
       method: 'POST',
       body: JSON.stringify({ publicKey: publicKeyB64 }),
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
     if (!checkResult.allowed) return error('Not registered', 403);
-    // Guarded (deny-wins): don't resurrect a revoke that raced this round-trip.
-    await writeAllowCacheGuarded(env.ALLOWLIST, publicKeyB64);
   }
 
   // 7. Validate tags — STRICT, version-specific (reader-before-writer: accept both).
