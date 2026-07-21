@@ -120,6 +120,8 @@ interface NotesStore {
   /** noteId → sync status, refreshed together with the aggregate counters. */
   syncStatuses: Record<string, NoteSyncStatus>;
   restoring: boolean;
+  /** Live progress of the current restore sweep (payloads settled / total). */
+  restoreProgress: { done: number; total: number } | null;
   restoreError: string | null;
   /** How many notes the last completed restore recovered (null = no restore yet). */
   restoredCount: number | null;
@@ -183,6 +185,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [restoring, setRestoring] = useState(false);
   const restoringRef = useRef(false);
+  const [restoreProgress, setRestoreProgress] = useState<{ done: number; total: number } | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoredCount, setRestoredCount] = useState<number | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
@@ -679,10 +682,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     setRestoreError(null);
     setRestoredCount(null);
+    setRestoreProgress(null);
     try {
       // fetchAllNotes decrypts + validates (v1/v2) and drops any TX not signed
       // by a trusted owner or that fails to decrypt.
-      const { notes: remoteNotes, incomplete } = await fetchAllNotes(ownerHashRef.current, key);
+      const { notes: remoteNotes, incomplete } = await fetchAllNotes(
+        ownerHashRef.current,
+        key,
+        (done, total) => setRestoreProgress({ done, total }),
+      );
       let restoredCount = 0;
 
       // Snapshot of what the user can currently SEE (decrypted notes; the DB
@@ -718,6 +726,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       console.error('restoreFromArweave failed:', err);
       setRestoreError('Не удалось восстановить заметки из Arweave.');
+    } finally {
+      setRestoreProgress(null);
     }
   }
 
@@ -1001,6 +1011,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     arweave: arweaveState,
     syncStatuses,
     restoring,
+    restoreProgress,
     restoreError,
     restoredCount,
     vaultError,

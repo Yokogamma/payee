@@ -372,21 +372,36 @@ export interface FetchAllNotesResult {
   incomplete: boolean;
 }
 
+/** How many note payloads are fetched+decrypted concurrently during restore.
+ *  Bounded pool: fast enough to kill the old N+1 sequential latency, small
+ *  enough not to hammer the gateway from a mobile connection. */
+const RESTORE_CONCURRENCY = 5;
+
+interface RestoreCandidate {
+  txId: string;
+  version: string;
+  noteId: string;
+}
+
 /**
  * Fetch all encrypted notes from Arweave for a given owner hash.
- * Paginated, deduplicated by Note-Id, version-gated.
+ * Pagination is sequential (cursors), payload download + decryption runs in a
+ * bounded-parallel pool. Deduplicated by Note-Id, version-gated.
+ * `onProgress(done, total)` fires as each candidate settles — the UI shows
+ * «Восстановлено N/M».
  */
 export async function fetchAllNotes(
   ownerHash: string,
   key: CryptoKey,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<FetchAllNotesResult> {
   assertTrustedOwners(); // fail-closed: never trust arbitrary on-chain TX
 
-  const restored: RestoredNote[] = [];
-  const seenNoteIds = new Set<string>();
-  let cursor: string | null = null;
   let incomplete = false;
 
+  // Phase 1: sequential cursor pagination — collect candidate TXs.
+  const candidates: RestoreCandidate[] = [];
+  let cursor: string | null = null;
   while (true) {
     let edges: ArweaveEdge[];
     let hasNextPage: boolean;
@@ -411,38 +426,62 @@ export async function fetchAllNotes(
       if (!appNameTag || appNameTag.value !== APP_NAME) continue;
       if (!versionTag || !SUPPORTED_VERSIONS.has(versionTag.value)) continue;
       if (!noteIdTag) continue;
-      // Dedup is checked here but the Note-Id is CLAIMED only after a successful
-      // decrypt below (truth after decryption) — a candidate that can't be
-      // decrypted (replay/garbage) must not shadow the real note.
-      if (seenNoteIds.has(noteIdTag.value)) continue;
-
-      let dataResponse: Response;
-      try {
-        dataResponse = await fetch(`https://arweave.net/${edge.node.id}`);
-      } catch {
-        incomplete = true; // network — a legit note may be unreachable right now
-        continue;
-      }
-      if (!dataResponse.ok) {
-        incomplete = true;
-        continue;
-      }
-
-      try {
-        const raw = await dataResponse.json();
-
-        const built = await buildRestoredNote(key, versionTag.value, noteIdTag.value, raw, edge.node.id);
-        if (!built) continue; // wrong shape or not ours (decrypt failed)
-
-        seenNoteIds.add(noteIdTag.value); // claim only after success
-        restored.push(built);
-      } catch {
-        continue; // Skip malformed entries
-      }
+      // NOTE: duplicates by Note-Id are NOT dropped here — the id is CLAIMED
+      // only after a successful decrypt (truth after decryption), so a
+      // replay/garbage candidate can't shadow the real note.
+      candidates.push({ txId: edge.node.id, version: versionTag.value, noteId: noteIdTag.value });
     }
 
     if (!hasNextPage) break;
     cursor = edges[edges.length - 1].cursor;
+  }
+
+  // Phase 2: bounded-parallel payload fetch + decrypt. Results keep the
+  // original slot so claiming stays deterministic (HEIGHT_DESC order).
+  const results: (RestoredNote | null)[] = new Array(candidates.length).fill(null);
+  let nextIndex = 0;
+  let done = 0;
+  const runWorker = async () => {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= candidates.length) return;
+      const cand = candidates[i];
+
+      let dataResponse: Response | null = null;
+      try {
+        dataResponse = await fetch(`https://arweave.net/${cand.txId}`);
+      } catch {
+        incomplete = true; // network — a legit note may be unreachable right now
+      }
+      if (dataResponse) {
+        if (!dataResponse.ok) {
+          incomplete = true;
+        } else {
+          try {
+            const raw = await dataResponse.json();
+            results[i] = await buildRestoredNote(key, cand.version, cand.noteId, raw, cand.txId);
+          } catch {
+            // malformed entry — intentional skip, not a partial restore
+          }
+        }
+      }
+      done++;
+      onProgress?.(done, candidates.length);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(RESTORE_CONCURRENCY, candidates.length) }, runWorker),
+  );
+
+  // Phase 3: claim Note-Ids in the original chain order (newest block first) —
+  // parallel completion order must not decide which duplicate wins.
+  const restored: RestoredNote[] = [];
+  const seenNoteIds = new Set<string>();
+  for (const built of results) {
+    if (!built) continue;
+    if (seenNoteIds.has(built.encrypted.noteId)) continue;
+    seenNoteIds.add(built.encrypted.noteId);
+    restored.push(built);
   }
 
   restored.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);

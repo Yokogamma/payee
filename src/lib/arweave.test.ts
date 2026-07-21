@@ -257,6 +257,46 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
   });
 });
 
+describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => {
+  it('reports progress per settled payload and restores everything', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const notes = await Promise.all(
+      Array.from({ length: 7 }, (_, i) => encryptEnvelope(key, `заметка ${i}`)),
+    );
+    const byTx = new Map(notes.map((n, i) => [`TX${i}`, n]));
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [...byTx.entries()].map(([txId, n]) => ({ cursor: txId, node: { id: txId, tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '2' },
+            { name: 'Note-Id', value: n.noteId },
+          ] } })),
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      const n = byTx.get(url.split('/').pop()!)!;
+      return new Response(JSON.stringify({ id: n.noteId, c: n.ciphertext, iv: n.iv }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const progress: Array<[number, number]> = [];
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key, (d, t) => progress.push([d, t]));
+
+    expect(incomplete).toBe(false);
+    expect(res).toHaveLength(7);
+    // Every candidate settled exactly once, ending at total/total.
+    expect(progress).toHaveLength(7);
+    expect(progress.every(([, t]) => t === 7)).toBe(true);
+    expect(progress[progress.length - 1]).toEqual([7, 7]);
+  });
+});
+
 describe('fetchAllNotes partial-restore flag (M1)', () => {
   it('flags incomplete when a later page fails, keeping page-1 notes', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);

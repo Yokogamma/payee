@@ -27,6 +27,7 @@ export function Main() {
     toggleArweave,
     retrySync,
     restoring,
+    restoreProgress,
     restoreError,
     restoredCount,
     retryRestore,
@@ -180,6 +181,7 @@ export function Main() {
       {restoring && (
         <div className="restoring-banner">
           ⏳ Восстанавливаем заметки из Arweave...
+          {restoreProgress && restoreProgress.total > 0 && ` ${restoreProgress.done}/${restoreProgress.total}`}
         </div>
       )}
 
