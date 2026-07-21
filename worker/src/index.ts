@@ -251,7 +251,7 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
     return error('Invalid JSON', 400);
   }
   if (bodyPK !== publicKeyB64) return error('publicKey mismatch (body vs header)', 400);
-  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
+  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time', 401);
 
   // 2. Verify Ed25519 signature — BEFORE any lookup
   const verifyResult = await verifySignature(publicKeyB64, signatureB64, bodyText);
@@ -317,7 +317,7 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   }
   if (!inviteCode || !bodyPK) return error('Missing inviteCode or publicKey', 400);
   if (bodyPK !== publicKeyB64) return error('publicKey mismatch', 400);
-  if (!isFreshTimestamp(regTimestamp)) return error('Timestamp expired', 401);
+  if (!isFreshTimestamp(regTimestamp)) return error('Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time', 401);
 
   // 4. Delegate to InviteManager DO — ATOMIC check + use
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -405,7 +405,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
-  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired', 401);
+  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time', 401);
 
   // 4. Verify Ed25519 signature FIRST — before any KV/DO lookups
   const verifyResult = await verifySignature(publicKeyB64, signatureB64, bodyText);

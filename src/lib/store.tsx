@@ -50,6 +50,7 @@ import {
   recoverStorage,
 } from './storage';
 import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll, claimRestoredForUi } from './sync-transitions';
+import { userFacingUploadError } from './errors';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -491,11 +492,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         const result = await uploadSingleNote(note);
 
         if (result === 'rate_limited') {
-          setArweave(prev => ({ ...prev, lastError: 'Rate limit. Retry через 1 час.' }));
+          setArweave(prev => ({ ...prev, lastError: userFacingUploadError('rate_limited') }));
           break;
         }
         if (result === 'not_registered') {
-          setArweave(prev => ({ ...prev, lastError: 'Invite required' }));
+          setArweave(prev => ({ ...prev, lastError: userFacingUploadError('not_registered') }));
           break;
         }
 
@@ -565,6 +566,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // An already-accepted note keeps 'accepted' + txId + recovery and stays in
     // the recheck loop; only a never-accepted note becomes a hard 'error'.
     const errText = 'error' in result ? result.error : undefined;
+    // L13: a clock-skew rejection looks like a permanent mystery to the user —
+    // surface the actionable «проверьте время» toast instead of staying silent.
+    if (errText && /timestamp|clock|skew/i.test(errText)) {
+      setArweave(prev2 => ({ ...prev2, lastError: userFacingUploadError(result.kind, errText) }));
+    }
     await setSyncRecord(afterFailure(note.noteId, prev, recheck, errText, Date.now()));
     await refreshSyncCounts();
     return result.kind;
