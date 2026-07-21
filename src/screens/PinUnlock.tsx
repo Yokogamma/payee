@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useNotes, PinLockedError, PinWipedError } from '../lib/store';
+import { PinUnlockUnavailableError } from '../lib/crypto';
 
 export function PinUnlock() {
   const { unlockWithPin, getPinLockState, goToRestore } = useNotes();
@@ -57,6 +58,10 @@ export function PinUnlock() {
       } else if (err instanceof PinWipedError) {
         setWiped(true);
         setError('');
+      } else if (err instanceof PinUnlockUnavailableError) {
+        // Not a wrong PIN and not attempt-counted: the blob or the KDF runtime
+        // failed (corrupt data, WASM/memory). Point at the seed path.
+        setError('Не удалось открыть PIN-хранилище (ошибка данных или устройства). Войдите по seed-фразе — заметки не пострадали.');
       } else {
         setError('Неверный PIN-код');
       }

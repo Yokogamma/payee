@@ -354,6 +354,26 @@ export function isPinKdfLegacy(encrypted: PinEncryptedSeed): boolean {
   return encrypted.kdf !== 'argon2id';
 }
 
+/** The KDF ran and AES-GCM authentication failed → the PIN itself is wrong.
+ *  ONLY this error may count against the attempt limit / trigger the wipe. */
+export class WrongPinError extends Error {
+  constructor() {
+    super('Wrong PIN');
+    this.name = 'WrongPinError';
+  }
+}
+
+/** The PIN blob or the KDF runtime is unusable: corrupted/unknown blob, Argon2
+ *  WASM load failure, out-of-memory on a weak device, WebCrypto hiccup. NOT the
+ *  user's fault — callers must not spend unlock attempts on it (a correct PIN
+ *  would otherwise be wiped after 10 environment failures). Seed entry works. */
+export class PinUnlockUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PinUnlockUnavailableError';
+  }
+}
+
 /**
  * Validate a stored PIN blob BEFORE running the KDF. A corrupted/hostile blob
  * must not be able to drive Argon2 into an OOM/hang via huge params, and an
@@ -406,23 +426,43 @@ export async function encryptWithPin(mnemonic: string, pin: string): Promise<Pin
 }
 
 /**
- * Decrypt mnemonic with PIN, dispatching on the blob's KDF. Throws on wrong PIN
- * (GCM auth failure). A missing `kdf` field means a legacy PBKDF2-600k blob.
+ * Decrypt mnemonic with PIN, dispatching on the blob's KDF. A missing `kdf`
+ * field means a legacy PBKDF2-600k blob.
+ *
+ * Errors are TYPED so callers can meter the attempt limit correctly:
+ *  - WrongPinError — GCM auth failure after a successful KDF (a wrong PIN);
+ *  - PinUnlockUnavailableError — anything else (corrupt blob, unknown
+ *    kdf/version/profile, KDF/WASM/memory failure). Never attempt-countable.
  */
 export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<string> {
-  assertValidPinBlob(encrypted);
+  let salt: Uint8Array, iv: Uint8Array, ciphertext: Uint8Array;
+  try {
+    assertValidPinBlob(encrypted);
+    salt = base64ToBuffer(encrypted.salt);
+    iv = base64ToBuffer(encrypted.iv);
+    ciphertext = base64ToBuffer(encrypted.ciphertext);
+  } catch (e) {
+    throw new PinUnlockUnavailableError(e instanceof Error ? e.message : String(e));
+  }
 
-  const salt = base64ToBuffer(encrypted.salt);
-  const iv = base64ToBuffer(encrypted.iv);
-  const ciphertext = base64ToBuffer(encrypted.ciphertext);
+  let key: CryptoKey;
+  try {
+    key = encrypted.kdf === 'argon2id'
+      ? await derivePinKeyArgon2(pin, salt, encrypted.argon2 ?? ARGON2_PARAMS)
+      : await derivePinKeyPbkdf2(pin, salt);
+  } catch (e) {
+    // Argon2 WASM failed to load / ran out of memory / WebCrypto error — the
+    // PIN was never actually checked.
+    throw new PinUnlockUnavailableError(`KDF failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
-  const key = encrypted.kdf === 'argon2id'
-    ? await derivePinKeyArgon2(pin, salt, encrypted.argon2 ?? ARGON2_PARAMS)
-    : await derivePinKeyPbkdf2(pin, salt);
-
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource }, key, ciphertext as BufferSource,
-  );
-
-  return new TextDecoder().decode(decrypted);
+  try {
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv as BufferSource }, key, ciphertext as BufferSource,
+    );
+    return new TextDecoder().decode(decrypted);
+  } catch {
+    // The KDF succeeded and authentication failed → wrong PIN.
+    throw new WrongPinError();
+  }
 }

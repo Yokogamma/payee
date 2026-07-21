@@ -12,6 +12,8 @@ import {
   encryptWithPin,
   decryptWithPin,
   isPinKdfLegacy,
+  WrongPinError,
+  PinUnlockUnavailableError,
   bufferToBase64,
   type PinEncryptedSeed,
 } from './crypto';
@@ -125,9 +127,24 @@ describe('PIN wrapping', () => {
     expect(await decryptWithPin(blob, '123456')).toBe(mn);
   });
 
-  it('fails to unwrap with the wrong PIN', async () => {
+  it('fails to unwrap with the wrong PIN — typed WrongPinError (attempt-countable)', async () => {
     const blob = await encryptWithPin(generateMnemonic(), '123456');
-    await expect(decryptWithPin(blob, '999999')).rejects.toBeDefined();
+    await expect(decryptWithPin(blob, '999999')).rejects.toBeInstanceOf(WrongPinError);
+  });
+
+  it('classifies a corrupted blob as PinUnlockUnavailableError (NOT attempt-countable)', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    // Correct PIN + broken salt: the environment failed, not the user.
+    const corrupt = { ...blob, salt: '###not-base64###' };
+    await expect(decryptWithPin(corrupt, '123456')).rejects.toBeInstanceOf(PinUnlockUnavailableError);
+  });
+
+  it('classifies unknown kdf / bad profile / bad version as PinUnlockUnavailableError', async () => {
+    const blob = await encryptWithPin(generateMnemonic(), '123456');
+    await expect(decryptWithPin({ ...blob, kdf: 'scrypt' as never }, '123456'))
+      .rejects.toBeInstanceOf(PinUnlockUnavailableError);
+    await expect(decryptWithPin({ ...blob, v: 99 }, '123456'))
+      .rejects.toBeInstanceOf(PinUnlockUnavailableError);
   });
 
   it('still reads a legacy PBKDF2 blob (no kdf field) and flags it for rewrap', async () => {
