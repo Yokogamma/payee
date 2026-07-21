@@ -79,6 +79,22 @@ Only after R is deployed **everywhere and stable** flip the client to writing v2
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
   the new origin is allowed while a stranger origin is rejected.
 
+## Wallet (owner) rotation — TRUSTED_OWNERS runbook
+
+Restore trusts ONLY transactions signed by the wallets pinned in the client's
+`VITE_TRUSTED_OWNERS`. Rotating the server wallet in the wrong order makes old
+notes unrecoverable for every client built without the old owner. Order:
+
+1. **Add** the NEW wallet's address to `VITE_TRUSTED_OWNERS` (comma-separated,
+   old + new) in the deploy secrets.
+2. **Deploy the client** with both owners and VERIFY restore returns notes
+   posted under the old wallet.
+3. **Only then** replace `ARWEAVE_JWK` on the Worker with the new wallet.
+4. **Never remove old owners** from `VITE_TRUSTED_OWNERS` — notes posted under
+   them stop restoring the moment the address is dropped.
+5. **Do NOT rotate `RECOVERY_HMAC_SECRET` together with the JWK** — outstanding
+   recovery tokens would stop verifying and fail closed (see Required secrets).
+
 ## Required secrets
 
 GitHub Actions: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,

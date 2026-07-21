@@ -686,7 +686,9 @@ function getRecoveryKey(env: Env): Promise<CryptoKey> | null {
   }
   return recoveryKeyPromise;
 }
-/** Returns null when RECOVERY_HMAC_SECRET is not configured (feature disabled). */
+/** Returns null when RECOVERY_HMAC_SECRET is unset. NOT a supported mode —
+ *  the /upload step-0 gate 503s before anything can be posted without the
+ *  secret; this null path exists purely as defense in depth. */
 async function signRecovery(env: Env, noteId: string, txId: string, postedAt: number): Promise<string | null> {
   const keyPromise = getRecoveryKey(env);
   if (!keyPromise) return null;
