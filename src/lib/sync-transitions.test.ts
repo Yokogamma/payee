@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll } from './sync-transitions';
+import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll, claimRestoredForUi } from './sync-transitions';
 import type { SyncRecord } from './storage';
 
 // Regression tests for the client half of the recovery protocol — the exact
@@ -112,6 +112,26 @@ describe('afterPoll', () => {
     const stale: SyncRecord = { ...clean, updatedAt: NOW - TX_TIMEOUT_MS - 1 };
     expect(afterPoll(stale, { kind: 'pending' }, NOW, CONFIRM_THRESHOLD, TX_TIMEOUT_MS)?.needsRecheck).toBe(true);
     expect(afterPoll(clean, { kind: 'unavailable' }, NOW, CONFIRM_THRESHOLD, TX_TIMEOUT_MS)).toBeNull();
+  });
+});
+
+describe('claimRestoredForUi (restoredCount accuracy)', () => {
+  it('does NOT count a repaired note that is already visible', () => {
+    // The storage repair still happens, but «Восстановлено N» must not include
+    // a note the user could already see.
+    const visible = new Set(['n-visible']);
+    expect(claimRestoredForUi(visible, 'n-visible')).toBe(false);
+  });
+
+  it('counts an invisible (new or corrupted-local) note exactly once', () => {
+    const visible = new Set(['n-visible']);
+    let restoredCount = 0;
+    // Same restore sweep sees the id twice (defensive — fetch dedups already).
+    for (const id of ['n-repaired', 'n-repaired', 'n-new']) {
+      if (claimRestoredForUi(visible, id)) restoredCount++;
+    }
+    expect(restoredCount).toBe(2); // n-repaired once + n-new once
+    expect(visible.has('n-repaired')).toBe(true); // claimed for later sweeps
   });
 });
 

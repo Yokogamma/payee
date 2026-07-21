@@ -120,6 +120,38 @@ describe('mandatory RECOVERY_HMAC_SECRET (upload gate)', () => {
   });
 });
 
+describe('IpRateLimiter DO failure injection (baseline anti-abuse must fail CLOSED)', () => {
+  const request = (path: string) => new Request(`https://proxy.example.com${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': `ipf-${crypto.randomUUID().slice(0, 6)}` },
+    body: '{}',
+  });
+
+  it('503s protected routes when the limiter DO is UNREACHABLE (throws)', async () => {
+    const failingLimiter = {
+      idFromName: () => ({}),
+      get: () => ({ fetch: async () => { throw new Error('DO unreachable'); } }),
+    } as unknown as DurableObjectNamespace;
+
+    for (const path of ['/upload', '/check-registration', '/register']) {
+      const r = await worker.fetch(request(path), { ...baseEnv, IP_RATE_LIMITER: failingLimiter });
+      expect(r.status).toBe(503);
+      expect(await r.text()).toMatch(/rate limiter/i);
+    }
+  });
+
+  it('503s when the limiter DO responds non-ok (internal error, not 429)', async () => {
+    const erroringLimiter = {
+      idFromName: () => ({}),
+      get: () => ({ fetch: async () => new Response('boom', { status: 500 }) }),
+    } as unknown as DurableObjectNamespace;
+
+    const r = await worker.fetch(request('/upload'), { ...baseEnv, IP_RATE_LIMITER: erroringLimiter });
+    expect(r.status).toBe(503);
+    expect(await r.text()).toMatch(/rate limiter/i);
+  });
+});
+
 describe('e2e: lost commit → posted anchor → TTL → redrop → successful re-post', () => {
   it('re-posts a dropped, aged posted TX and commits under a NEW txId', async () => {
     const id = await makeIdentity();

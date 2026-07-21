@@ -50,7 +50,7 @@ import {
   recoverStorage,
   StorageBlockedError,
 } from './storage';
-import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll } from './sync-transitions';
+import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll, claimRestoredForUi } from './sync-transitions';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -384,6 +384,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     decrypted.sort((a, b) => b.createdAt - a.createdAt);
     setNotes(decrypted);
+    // Mirror synchronously: a restore may start before React flushes the state
+    // update above, and its visibility decisions must see THIS list.
+    notesRef.current = decrypted;
     return count;
   }
 
@@ -683,16 +686,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const { notes: remoteNotes, incomplete } = await fetchAllNotes(ownerHashRef.current, key);
       let restoredCount = 0;
 
+      // Snapshot of what the user can currently SEE (decrypted notes; the DB
+      // may hold corrupted-invisible ones). A LOCAL set — extended as we add —
+      // keeps restoredCount exact even though notesRef only catches up after a
+      // render, and «Восстановлено N» never counts an already-visible note.
+      const visibleIds = new Set(notesRef.current.map(n => n.id));
       for (const remote of remoteNotes) {
         // Upsert the note payload + confirmed sync state atomically. The
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
         await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
 
-        // UI visibility is judged by what the user can SEE (decrypted notes),
-        // not by DB presence — a corrupted local note exists in the DB but is
-        // invisible in the UI, and must reappear after this repair.
-        if (notesRef.current.some(n => n.id === remote.encrypted.noteId)) continue;
+        if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
         setNotes(prev =>
           prev.some(n => n.id === remote.encrypted.noteId)
             ? prev

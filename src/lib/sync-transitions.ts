@@ -97,6 +97,16 @@ export function afterFailure(
   };
 }
 
+/** Restore-UI decision: should this restored note be ADDED to the visible list
+ *  (and counted in «Восстановлено N»)? Claims the id in `visibleIds` on true,
+ *  so a repair of an already-visible note — or a second occurrence of the same
+ *  id — never inflates the counter. */
+export function claimRestoredForUi(visibleIds: Set<string>, noteId: string): boolean {
+  if (visibleIds.has(noteId)) return false;
+  visibleIds.add(noteId);
+  return true;
+}
+
 /** Polling transition for an 'accepted' record. Returns the next record, or
  *  null when nothing must change ('unavailable' gateway, fresh pending, or a
  *  confirmation that must wait for server reconciliation). */
