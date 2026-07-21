@@ -15,7 +15,6 @@ import worker from '../src/index';
 
 const ALLOWLIST = (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST;
 const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }).RATE_LIMITER;
-const INVITE_MANAGER = (env as unknown as { INVITE_MANAGER: DurableObjectNamespace }).INVITE_MANAGER;
 
 type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
@@ -121,32 +120,17 @@ describe('mandatory RECOVERY_HMAC_SECRET (upload gate)', () => {
   });
 });
 
-describe('fail-closed revoke ordering (KV/DO failure injection)', () => {
+describe('revoke DO-failure injection (single-writer semantics, round 10)', () => {
   const revokeRequest = (publicKey: string) => new Request('https://proxy.example.com/admin/revoke', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-admin-secret' },
     body: JSON.stringify({ publicKey }),
   });
 
-  it('KV deny-write failure → 503 with the DO UNTOUCHED (retry-safe, nothing half-done)', async () => {
-    const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
-    const stub = INVITE_MANAGER.get(INVITE_MANAGER.idFromName('global'));
-    await runInDurableObject(stub, (_i, state) => state.storage.put(`pk:${pk}`, true));
-
-    const failingKV = {
-      put: async () => { throw new Error('kv down'); },
-    } as unknown as KVNamespace;
-
-    const r = await worker.fetch(revokeRequest(pk), { ...baseEnv, ALLOWLIST: failingKV });
-    expect(r.status).toBe(503);
-
-    // The DO still holds the key — the revoke did NOT partially apply; a retry
-    // (with KV back) performs the full deny-then-delete sequence.
-    const rec = await runInDurableObject(stub, (_i, state) => state.storage.get(`pk:${pk}`));
-    expect(rec).toBeTruthy();
-  });
-
-  it('DO failure AFTER the KV deny → 503, temporary denied is already cached (fail closed)', async () => {
+  it('unreachable DO → 503 with NOTHING written anywhere (retry-safe)', async () => {
+    // The worker performs no KV writes of its own (a duplicate write to the
+    // same key could trip KV's ~1-write/sec/key limit); a DO failure therefore
+    // leaves both KV and DO storage untouched — pure retry.
     const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
     const failingMgr = {
       idFromName: () => ({}),
@@ -155,11 +139,7 @@ describe('fail-closed revoke ordering (KV/DO failure injection)', () => {
 
     const r = await worker.fetch(revokeRequest(pk), { ...baseEnv, INVITE_MANAGER: failingMgr });
     expect(r.status).toBe(503);
-
-    // The deny was written FIRST — even though the DO call failed, the key is
-    // blocked for the deny-TTL window while the operator retries.
-    const cached = await ALLOWLIST.get(`pk:${pk}`);
-    expect(JSON.parse(cached!)).toEqual({ status: 'denied' });
+    expect(await ALLOWLIST.get(`pk:${pk}`)).toBeNull(); // no stray writes
   });
 });
 

@@ -7,7 +7,7 @@
 
 import Arweave from 'arweave';
 import * as ed25519 from '@noble/ed25519';
-import { readAllowCache, writeAllowCache } from './allowlist';
+import { readAllowCache } from './allowlist';
 
 export { RateLimiter } from './rate-limiter';
 export { InviteManager } from './invite-manager';
@@ -175,15 +175,13 @@ async function handleAdminSeedInvite(request: Request, env: Env): Promise<Respon
 // ─── /admin/revoke (M11) ────────────────────────────────────────────
 
 /**
- * Revoke a registered key — FAIL CLOSED ordering:
- *   1. overwrite the KV cache with a short-TTL `denied` FIRST (kills any stale
- *      cached `allowed` immediately);
- *   2. only then remove the key from the DO (source of truth) and mark its
- *      admitting invite revoked.
- * If the KV write fails, nothing has changed → 503, retry. If the DO call
- * fails, the temporary deny is already in place (bounded by its TTL) → 503,
- * retry idempotently. The reverse order would leave a revoked key usable for
- * up to the positive-cache TTL whenever the KV write was lost.
+ * Revoke a registered key. The Worker only validates and forwards: the SINGLE
+ * `denied` KV write happens inside the DO's serialized critical section,
+ * BEFORE its storage mutations (deny-first, fail-closed). No worker-side
+ * pre-deny: KV allows roughly one write per second per key, so a second write
+ * to the same key could be rate-limited — making the DO's (authoritative)
+ * write the one that fails, and the revoke stably unable to complete.
+ * If the DO's KV write fails: DO state unchanged → retryable 503.
  */
 async function handleAdminRevoke(request: Request, env: Env): Promise<Response> {
   if (!env.ADMIN_SECRET) return error('Admin endpoint not configured', 503);
@@ -204,13 +202,6 @@ async function handleAdminRevoke(request: Request, env: Env): Promise<Response> 
     return error('publicKey must be canonical base64 of a 32-byte key', 400);
   }
 
-  try {
-    await writeAllowCache(env.ALLOWLIST, publicKey, 'denied');
-  } catch (e) {
-    console.error('REVOKE_KV_DENY_FAILED', e);
-    return error('Revoke failed (cache write) — retry', 503);
-  }
-
   let resp: Response;
   try {
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
@@ -219,9 +210,8 @@ async function handleAdminRevoke(request: Request, env: Env): Promise<Response> 
       body: JSON.stringify({ publicKey }),
     }));
   } catch (e) {
-    // Temporary deny is already active (short TTL) — the retry window is safe.
     console.error('REVOKE_DO_FAILED', e);
-    return error('Revoke failed (allowlist) — temporary deny active, retry', 503);
+    return error('Revoke failed — retry', 503);
   }
   if (!resp.ok) {
     const body: { error?: string } = await resp.json();

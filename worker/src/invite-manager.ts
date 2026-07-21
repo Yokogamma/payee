@@ -227,8 +227,9 @@ export class InviteManager implements DurableObject {
    * revoked key succeeds. Removes the key from the allowlist (source of truth)
    * and marks the admitting invite as revoked — via the reverse index for new
    * records, or a prefix scan for legacy `true` records.
-   * The caller (Worker /admin/revoke) also writes the KV `denied` entry so a
-   * stale cached `allowed` cannot outlive the revoke beyond its TTL.
+   * The SINGLE `denied` KV write happens here (deny-first, serialized) — the
+   * Worker never pre-writes it: a duplicate write to the same key could trip
+   * KV's ~1-write/sec/key limit and make the authoritative write fail.
    */
   private async handleRevoke(request: Request): Promise<Response> {
     const { publicKey } = await request.json<RevokeRequest>();

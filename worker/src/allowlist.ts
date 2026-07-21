@@ -62,9 +62,10 @@ export async function writeAllowCache(
   await kv.put(keyFor(publicKeyB64), JSON.stringify({ status }), { expirationTtl: ttl });
 }
 
-// NOTE: positive ('allowed') cache writes are intentionally NOT exposed as a
-// worker-side helper. A worker-level get→put cannot be atomic against a
-// concurrent revoke (review round 9) — every pk-access KV write is owned and
-// SERIALIZED by the InviteManager DO (register / refresh-allowed / revoke run
-// under blockConcurrencyWhile). Workers only READ the cache and write the
-// fail-closed pre-deny in /admin/revoke.
+// NOTE: pk-access KV WRITES are intentionally not performed by workers at all.
+// A worker-level get→put cannot be atomic against a concurrent revoke (round
+// 9), and a duplicate write to the same key can trip KV's ~1-write/sec/key
+// limit (round 10) — so every write is owned and SERIALIZED by the
+// InviteManager DO (register / refresh-allowed / revoke run under
+// blockConcurrencyWhile, each key written exactly once per operation).
+// Workers only READ the cache.

@@ -188,6 +188,44 @@ describe('revoke ↔ register race hardening (allowed resurrection)', () => {
   });
 });
 
+describe('single denied write (round 10: no duplicate KV writes per revoke)', () => {
+  it('KV failure on the DO denied write (≈rate limit) → 503, key stays, retry completes', async () => {
+    const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const code = `KVL-${crypto.randomUUID().slice(0, 8)}`;
+    await seedInvite(code);
+    expect((await registerViaDO(code, pk)).status).toBe(200);
+
+    // Simulate KV's ~1-write/sec/key limit hitting the DO's authoritative
+    // denied write: patch the instance's env with a failing KV binding.
+    let originalKV: KVNamespace | undefined;
+    await runInDurableObject(mgr(), (instance) => {
+      const inst = instance as unknown as { env: { ALLOWLIST: KVNamespace } };
+      originalKV = inst.env.ALLOWLIST;
+      inst.env = {
+        ALLOWLIST: {
+          put: async () => { throw new Error('KV PUT rate-limited'); },
+        } as unknown as KVNamespace,
+      };
+    });
+
+    try {
+      const r = await adminRevoke(pk);
+      expect(r.status).toBe(503); // retryable, nothing half-applied
+      // DO state unchanged — the storage mutation never ran.
+      expect(await checkAllowedDO(pk)).toBe(true);
+    } finally {
+      await runInDurableObject(mgr(), (instance) => {
+        (instance as unknown as { env: { ALLOWLIST: KVNamespace } }).env = { ALLOWLIST: originalKV! };
+      });
+    }
+
+    // KV recovers → the retry performs the FULL deny-then-delete sequence.
+    expect((await adminRevoke(pk)).status).toBe(200);
+    expect(await checkAllowedDO(pk)).toBe(false);
+    expect(JSON.parse((await ALLOWLIST.get(`pk:${pk}`))!)).toEqual({ status: 'denied' });
+  });
+});
+
 describe('serialized cache ownership (round 9: deny wins in EVERY interleaving)', () => {
   it('refresh-allowed after a revoke returns false and leaves the denied entry intact', async () => {
     const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
