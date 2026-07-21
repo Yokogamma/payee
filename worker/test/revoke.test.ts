@@ -105,7 +105,7 @@ describe('M11 revoke-flow: allowed → revoke → denied', () => {
   });
 
   it('revokes a LEGACY `true` allowlist record via the invite scan fallback', async () => {
-    const pk = `LEGACY-${crypto.randomUUID().slice(0, 8)}`;
+    const pk = b64(crypto.getRandomValues(new Uint8Array(32))); // canonical 32-byte key
     const code = `LEGINV-${crypto.randomUUID().slice(0, 8)}`;
     await inMgrStorage(async storage => {
       await storage.put(`invite:${code}`, { used: true, publicKey: pk, usedAt: 1 });
@@ -123,18 +123,30 @@ describe('M11 revoke-flow: allowed → revoke → denied', () => {
     expect(invite?.revoked).toBe(true);
   });
 
-  it('is idempotent: revoking an unknown key still succeeds', async () => {
-    const r = await adminRevoke(`never-registered-${crypto.randomUUID().slice(0, 8)}`);
+  it('is idempotent: revoking an unknown (but well-formed) key still succeeds', async () => {
+    const r = await adminRevoke(b64(crypto.getRandomValues(new Uint8Array(32))));
     expect(r.status).toBe(200);
     const body = await r.json() as { ok: boolean; wasAllowed: boolean };
     expect(body.ok).toBe(true);
     expect(body.wasAllowed).toBe(false);
   });
 
-  it('rejects a missing/invalid publicKey with 400', async () => {
+  it('rejects anything that is not a canonical 32-byte base64 key with 400', async () => {
     expect((await adminRevoke(undefined)).status).toBe(400);
     expect((await adminRevoke(42)).status).toBe(400);
     expect((await adminRevoke('')).status).toBe(400);
+    // Malformed base64 — a typo'd key must NOT get a "successful" idempotent
+    // response while the real key stays allowed.
+    expect((await adminRevoke('!!!not-base64!!!')).status).toBe(400);
+    // Valid base64, wrong length (16 bytes ≠ Ed25519).
+    expect((await adminRevoke(b64(crypto.getRandomValues(new Uint8Array(16))))).status).toBe(400);
+    // Overlong value (hard length bound).
+    expect((await adminRevoke('A'.repeat(100))).status).toBe(400);
+  });
+
+  it('DO itself rejects a non-canonical key (defense in depth)', async () => {
+    const r = await mgrFetch('/revoke', { publicKey: 'not-a-key' });
+    expect(r.status).toBe(400);
   });
 });
 

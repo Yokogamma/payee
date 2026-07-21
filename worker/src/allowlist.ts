@@ -14,8 +14,14 @@
 
 export type CachedAccess = 'allowed' | 'denied' | 'miss';
 
-/** Short TTL on positive cache entries (M3) — bounds staleness of revocations. */
-export const ALLOW_CACHE_TTL_SECONDS = 24 * 60 * 60; // 24h
+/**
+ * Short TTL on positive cache entries (M3) — bounds staleness of revocations.
+ * SECURITY SLO: even in the worst case (the revoke's KV `denied` write is lost
+ * AFTER the DO already dropped the key), a revoked key can keep uploading for
+ * AT MOST this long before the cached `allowed` expires and the DO (source of
+ * truth) is consulted again. Keep it at 1 hour or lower.
+ */
+export const ALLOW_CACHE_TTL_SECONDS = 60 * 60; // 1h
 
 /**
  * Even shorter TTL on negative (denied) entries. A deny is a soft, revocable

@@ -48,6 +48,18 @@ interface SeedInviteRequest {
   codes: string[];
 }
 
+/** Canonical base64 of exactly 32 bytes (Ed25519 public key). */
+function isCanonical32ByteB64(s: string): boolean {
+  if (s.length === 0 || s.length > 64) return false; // 32 bytes → 44 chars
+  try {
+    const bin = atob(s);
+    if (bin.length !== 32) return false;
+    return btoa(bin) === s;
+  } catch {
+    return false;
+  }
+}
+
 export class InviteManager implements DurableObject {
   private state: DurableObjectState;
 
@@ -151,8 +163,14 @@ export class InviteManager implements DurableObject {
    */
   private async handleRevoke(request: Request): Promise<Response> {
     const { publicKey } = await request.json<RevokeRequest>();
-    if (typeof publicKey !== 'string' || publicKey.length === 0) {
-      return Response.json({ error: 'publicKey required' }, { status: 400 });
+    // Defense in depth: the Worker validates too, but the DO must never accept
+    // a non-canonical value — a typo'd key would get a successful idempotent
+    // response while the REAL key stayed allowed.
+    if (typeof publicKey !== 'string' || !isCanonical32ByteB64(publicKey)) {
+      return Response.json(
+        { error: 'publicKey must be canonical base64 of a 32-byte key' },
+        { status: 400 },
+      );
     }
 
     const pkKey = `pk:${publicKey}`;

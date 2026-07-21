@@ -116,8 +116,9 @@ function getWalletAddress(env: Env): Promise<string> {
 
 async function handleWalletAddress(request: Request, env: Env): Promise<Response> {
   // Rate-limit even this diagnostic endpoint (it is public and otherwise
-  // unauthenticated) so it can't be hammered.
-  const ipBlock = await enforceIpLimit(request, env);
+  // unauthenticated) — but on its OWN bucket, so hammering it cannot starve
+  // the main upload/register budget of the same IP.
+  const ipBlock = await enforceIpLimit(request, env, 'diag');
   if (ipBlock) return ipBlock;
 
   try {
@@ -174,10 +175,15 @@ async function handleAdminSeedInvite(request: Request, env: Env): Promise<Respon
 // ─── /admin/revoke (M11) ────────────────────────────────────────────
 
 /**
- * Revoke a registered key: DO removes it from the allowlist (source of truth)
- * and marks its admitting invite revoked; then the KV cache is OVERWRITTEN with
- * a short-TTL `denied` so any stale cached `allowed` cannot outlive the revoke.
- * Idempotent — safe to retry.
+ * Revoke a registered key — FAIL CLOSED ordering:
+ *   1. overwrite the KV cache with a short-TTL `denied` FIRST (kills any stale
+ *      cached `allowed` immediately);
+ *   2. only then remove the key from the DO (source of truth) and mark its
+ *      admitting invite revoked.
+ * If the KV write fails, nothing has changed → 503, retry. If the DO call
+ * fails, the temporary deny is already in place (bounded by its TTL) → 503,
+ * retry idempotently. The reverse order would leave a revoked key usable for
+ * up to the positive-cache TTL whenever the KV write was lost.
  */
 async function handleAdminRevoke(request: Request, env: Env): Promise<Response> {
   if (!env.ADMIN_SECRET) return error('Admin endpoint not configured', 503);
@@ -191,27 +197,37 @@ async function handleAdminRevoke(request: Request, env: Env): Promise<Response> 
   } catch {
     return error('Invalid JSON', 400);
   }
-  if (typeof publicKey !== 'string' || publicKey.length === 0) {
-    return error('publicKey required', 400);
+  // Reject anything that is not a canonical base64 Ed25519 key BEFORE any
+  // state change: a typo'd value would otherwise get a successful idempotent
+  // response while the real key stayed allowed.
+  if (typeof publicKey !== 'string' || !isValidPublicKeyB64(publicKey)) {
+    return error('publicKey must be canonical base64 of a 32-byte key', 400);
   }
 
-  const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
-  const resp = await inviteMgr.fetch(new Request('http://internal/revoke', {
-    method: 'POST',
-    body: JSON.stringify({ publicKey }),
-  }));
+  try {
+    await writeAllowCache(env.ALLOWLIST, publicKey, 'denied');
+  } catch (e) {
+    console.error('REVOKE_KV_DENY_FAILED', e);
+    return error('Revoke failed (cache write) — retry', 503);
+  }
+
+  let resp: Response;
+  try {
+    const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
+    resp = await inviteMgr.fetch(new Request('http://internal/revoke', {
+      method: 'POST',
+      body: JSON.stringify({ publicKey }),
+    }));
+  } catch (e) {
+    // Temporary deny is already active (short TTL) — the retry window is safe.
+    console.error('REVOKE_DO_FAILED', e);
+    return error('Revoke failed (allowlist) — temporary deny active, retry', 503);
+  }
   if (!resp.ok) {
     const body: { error?: string } = await resp.json();
     return error(body.error || 'Revoke failed', resp.status);
   }
-  const result = await resp.json();
-
-  // KV write AFTER the DO succeeded: cache must never say 'denied' while the
-  // DO still says allowed (the opposite — stale 'allowed' — is bounded by TTL,
-  // and this overwrite closes it immediately).
-  await writeAllowCache(env.ALLOWLIST, publicKey, 'denied');
-
-  return json(result);
+  return json(await resp.json());
 }
 
 // ─── /check-registration ────────────────────────────────────────────
@@ -799,12 +815,16 @@ async function getTxStatusWorker(txId: string): Promise<'alive' | 'dead' | 'unav
  * Free this is the primary anti-abuse layer.
  * Returns a Response to short-circuit, or null to continue.
  */
-async function enforceIpLimit(request: Request, env: Env): Promise<Response | null> {
+async function enforceIpLimit(request: Request, env: Env, bucket: 'main' | 'diag' = 'main'): Promise<Response | null> {
   // CF-Connecting-IP is set by Cloudflare at the edge and cannot be spoofed by
   // the client. Absent only in local dev → shared 'unknown' bucket (still limited).
+  // `bucket` shards the limiter per purpose: the public GET /wallet-address uses
+  // 'diag' so a third-party page firing no-preflight GETs cannot exhaust the
+  // SAME budget the user's upload/register traffic depends on.
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const shard = bucket === 'main' ? ip : `${bucket}:${ip}`;
   try {
-    const stub = env.IP_RATE_LIMITER.get(env.IP_RATE_LIMITER.idFromName(ip));
+    const stub = env.IP_RATE_LIMITER.get(env.IP_RATE_LIMITER.idFromName(shard));
     const resp = await stub.fetch('http://ip-limiter/check', {
       method: 'POST',
       body: JSON.stringify({ limit: IP_RATE_LIMIT, windowMs: IP_RATE_WINDOW_MS }),
@@ -842,6 +862,20 @@ async function verifySignature(
   if (!valid) return error('Invalid signature', 401);
 
   return null; // success
+}
+
+/** Canonical base64 of exactly 32 bytes (an Ed25519 public key): decodes,
+ *  length-checks, and round-trips back to the identical string — so padding
+ *  tricks or noncanonical encodings of the same key can't slip past. */
+function isValidPublicKeyB64(s: string): boolean {
+  if (s.length === 0 || s.length > 64) return false; // 32 bytes → 44 chars
+  try {
+    const bytes = base64ToBytes(s);
+    if (bytes.length !== 32) return false;
+    return bytesToBase64(bytes) === s;
+  } catch {
+    return false;
+  }
 }
 
 function base64ToBytes(b64: string): Uint8Array {
