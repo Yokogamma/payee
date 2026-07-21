@@ -85,4 +85,21 @@ describe('protected routes: per-IP limiter (D-baseline)', () => {
     }
     expect(sawLimit).toBe(true);
   });
+
+  it('/wallet-address uses its OWN bucket: exhausting it does not starve the main routes', async () => {
+    // A third-party page can fire no-preflight GETs at the diagnostic endpoint;
+    // that must burn only the 'diag' shard, never the user's upload budget.
+    const ip = `diagsep-${RUN}`;
+    let sawDiagLimit = false;
+    for (let i = 0; i < IP_RATE_LIMIT + 5; i++) {
+      const r = await get('/wallet-address', ip);
+      if (r.status === 429) { sawDiagLimit = true; break; }
+    }
+    expect(sawDiagLimit).toBe(true); // diag bucket exhausted...
+
+    // ...while the SAME IP still passes the main limiter on a protected route
+    // (401 missing auth headers — i.e. it got past the rate limit).
+    const up = await post('/upload', ip);
+    expect(up.status).not.toBe(429);
+  });
 });
