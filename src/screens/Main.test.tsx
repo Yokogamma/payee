@@ -96,6 +96,27 @@ describe('Main — note card menu', () => {
   });
 });
 
+describe('Main — modal exclusivity + live badge (round 12)', () => {
+  it('Settings → Reset closes the settings dialog: only ONE aria-modal at a time', () => {
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    expect(screen.getAllByRole('dialog')).toHaveLength(1); // settings open
+
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+    const dialogs = screen.getAllByRole('dialog');
+    expect(dialogs).toHaveLength(1); // confirm replaced settings, not stacked
+    expect(dialogs[0].getAttribute('aria-label')).toBe('Сбросить приложение?');
+  });
+
+  it('per-note sync badge is a live role=status region', () => {
+    (h.store as ReturnType<typeof baseStore>).arweave.enabled = true;
+    render(<Main />);
+    const badge = document.querySelector('.sync-badge');
+    expect(badge?.getAttribute('role')).toBe('status');
+    expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне');
+  });
+});
+
 describe('Main — search UX', () => {
   it('Ctrl+K opens the search bar, Escape closes it and clears the query', () => {
     render(<Main />);

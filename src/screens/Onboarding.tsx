@@ -164,17 +164,18 @@ export function Onboarding() {
                   ))}
                 </div>
 
+                {/* The risk must be visible BEFORE the copy happens — clipboard
+                    history / cloud clipboard sync may retain the master key. */}
+                <div className="seed-warning info">
+                  Копирование поместит мастер-ключ в системный буфер обмена: он
+                  может сохраниться в истории буфера и в облачной синхронизации.
+                  Надёжнее записать фразу на бумаге; если копируете — после
+                  вставки очистите историю буфера средствами ОС.
+                </div>
                 <button className="btn btn-outline" onClick={handleCopy}>
                   {copied ? '✓ Скопировано' : 'Копировать'}
                 </button>
-                {copyError && <div className="error-msg">{copyError}</div>}
-                {copied && (
-                  <div className="seed-warning info">
-                    В буфере обмена теперь лежит мастер-ключ ко всем заметкам.
-                    Вставьте его в надёжное место и скопируйте что-нибудь другое,
-                    чтобы очистить буфер.
-                  </div>
-                )}
+                {copyError && <div className="error-msg" role="alert">{copyError}</div>}
 
                 <label className="checkbox-label">
                   <input

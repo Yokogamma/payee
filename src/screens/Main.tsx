@@ -317,7 +317,12 @@ export function Main() {
                         {badge.icon} повторить
                       </button>
                     ) : (
-                      <span className={`sync-badge ${badge.className}`} title={badge.label} aria-label={badge.label}>
+                      <span
+                        className={`sync-badge ${badge.className}`}
+                        title={badge.label}
+                        role="status"
+                        aria-label={badge.label}
+                      >
                         {badge.icon}
                       </span>
                     )
@@ -398,7 +403,12 @@ export function Main() {
         onClose={() => setShowSettings(false)}
         theme={theme}
         onThemeChange={setTheme}
-        onRequestReset={() => setShowResetConfirm(true)}
+        onRequestReset={() => {
+          // Never two aria-modal dialogs at once: their Escape handlers and
+          // focus traps would compete. Settings closes before the confirm opens.
+          setShowSettings(false);
+          setShowResetConfirm(true);
+        }}
       />
 
       <ConfirmDialog

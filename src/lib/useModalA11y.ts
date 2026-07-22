@@ -40,12 +40,16 @@ export function useModalA11y<T extends HTMLElement>(open: boolean, onClose: () =
       const last = els[els.length - 1];
       const active = document.activeElement as HTMLElement | null;
       const inside = active !== null && container.contains(active);
+      // The container itself (tabIndex=-1 initial focus) is a BOUNDARY, not an
+      // interior position: without this, Shift+Tab right after opening would
+      // let the browser move focus to whatever sits behind the dialog.
+      const atBoundary = !inside || active === container;
       if (e.shiftKey) {
-        if (!inside || active === first) {
+        if (atBoundary || active === first) {
           e.preventDefault();
           last.focus();
         }
-      } else if (!inside || active === last) {
+      } else if (atBoundary || active === last) {
         e.preventDefault();
         first.focus();
       }

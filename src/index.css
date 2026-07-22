@@ -886,8 +886,11 @@ h1 {
   cursor: pointer;
   border: 1px solid rgba(240, 83, 101, 0.4);
   border-radius: var(--radius-sm);
-  padding: 2px 8px;
+  padding: 2px 10px;
   font-family: var(--font);
+  /* a11y: it's a retry BUTTON — full touch target */
+  min-height: 44px;
+  min-width: 44px;
 }
 
 .sync-badge--error:hover {
@@ -936,7 +939,9 @@ h1 {
   cursor: pointer;
   font-size: 14px;
   padding: 6px 8px;
-  min-height: 32px;
+  /* a11y: this rule comes AFTER the Phase-7 block — keep ≥44px here too */
+  min-height: 44px;
+  min-width: 44px;
 }
 
 .search-clear:hover { color: var(--text); }
@@ -966,7 +971,8 @@ mark {
   font-size: 14px;
   line-height: 1;
   padding: 2px 8px;
-  min-height: 24px;
+  min-height: 44px; /* a11y: later rule must not undercut the Phase-7 target */
+  min-width: 44px;
 }
 
 .note-menu {
@@ -994,7 +1000,7 @@ mark {
   color: var(--text);
   cursor: pointer;
   text-decoration: none;
-  min-height: 40px;
+  min-height: 44px; /* a11y touch target */
   display: flex;
   align-items: center;
   gap: 6px;

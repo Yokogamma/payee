@@ -56,6 +56,19 @@ describe('SettingsModal a11y (Phase 7)', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('Shift+Tab right after opening stays INSIDE the dialog (container is a boundary)', () => {
+    renderModal();
+    // Initial focus is the dialog container itself (tabIndex=-1).
+    const dialog = screen.getByRole('dialog', { name: 'Настройки' });
+    expect(document.activeElement).toBe(dialog);
+
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
+    const active = document.activeElement as HTMLElement;
+    expect(dialog.contains(active)).toBe(true);      // never escapes behind the modal
+    expect(active).not.toBe(dialog);                 // wrapped to a real control
+    expect(active.textContent).toBe('Закрыть');      // the LAST focusable inside
+  });
+
   it('theme picker exposes the active option via aria-pressed', () => {
     renderModal();
     const system = screen.getByText('Системная');

@@ -45,7 +45,15 @@ async function revealSeed() {
 }
 
 describe('Onboarding — seed copy honesty', () => {
-  it('rejected clipboard write → error message, NO «Скопировано», no master-key note', async () => {
+  it('warns about clipboard history/cloud sync BEFORE any copy happens', async () => {
+    stubClipboard(vi.fn(async () => {}));
+    await revealSeed();
+    // The risk disclosure must not be post-factum (round-12 LOW).
+    expect(screen.getByText(/истории буфера/)).toBeTruthy();
+    expect(screen.getByText(/мастер-ключ/)).toBeTruthy();
+  });
+
+  it('rejected clipboard write → error message, NO «Скопировано»', async () => {
     stubClipboard(vi.fn(async () => { throw new Error('NotAllowedError'); }));
     await revealSeed();
 
@@ -53,10 +61,9 @@ describe('Onboarding — seed copy honesty', () => {
 
     expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
     expect(screen.queryByText('✓ Скопировано')).toBeNull();
-    expect(screen.queryByText(/мастер-ключ/)).toBeNull();
   });
 
-  it('resolved clipboard write → «Скопировано» + clipboard-holds-master-key warning', async () => {
+  it('resolved clipboard write → «Скопировано» (warning already shown pre-copy)', async () => {
     const writeText = vi.fn(async () => {});
     stubClipboard(writeText);
     await revealSeed();
