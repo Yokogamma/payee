@@ -42,6 +42,14 @@ const IP_RATE_WINDOW_MS = 60_000;      // 1 minute
 // (guards against re-posting a TX that just hasn't propagated yet).
 const MIN_COMMITTED_AGE_MS = 30 * 60_000; // 30 min
 
+// Body cap for the auth endpoints (/check-registration, /register). They carry
+// a tiny JSON envelope; MAX_BODY_BYTES only ever guarded /upload, so an
+// unauthenticated caller could stream megabytes into memory before the
+// signature was even checked.
+const AUTH_BODY_MAX_BYTES = 4096;
+/** Longest invite code we will even look at (DO lookup key). */
+const MAX_INVITE_CODE_LENGTH = 128;
+
 // ─── Entry ──────────────────────────────────────────────────────────
 
 export default {
@@ -226,10 +234,19 @@ async function handleCheckRegistration(request: Request, env: Env): Promise<Resp
   const ipBlock = await enforceIpLimit(request, env);
   if (ipBlock) return ipBlock;
 
-  const bodyText = await request.text();
+  const body = await readLimitedBody(request, AUTH_BODY_MAX_BYTES);
+  if ('tooLarge' in body) return body.tooLarge;
+  const bodyText = body.text;
   const publicKeyB64 = request.headers.get('X-Public-Key');
   const signatureB64 = request.headers.get('X-Signature');
   if (!publicKeyB64 || !signatureB64) return error('Missing auth headers', 401);
+  // CANONICAL form only (see handleRegister): the allowlist is keyed by this
+  // exact string, so alternative encodings of the same key must never be
+  // addressable — otherwise a key could be registered under a spelling that
+  // /admin/revoke (canonical-only) can never reach.
+  if (!isValidPublicKeyB64(publicKeyB64)) {
+    return error('publicKey must be canonical base64 of a 32-byte key', 400);
+  }
 
   // 1. Parse body and validate consistency
   let bodyPK: string, timestamp: number;
@@ -276,18 +293,20 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   const ipBlock = await enforceIpLimit(request, env);
   if (ipBlock) return ipBlock;
 
-  const bodyText = await request.text();
+  const body = await readLimitedBody(request, AUTH_BODY_MAX_BYTES);
+  if ('tooLarge' in body) return body.tooLarge;
+  const bodyText = body.text;
   const publicKeyB64 = request.headers.get('X-Public-Key');
   const signatureB64 = request.headers.get('X-Signature');
   if (!publicKeyB64 || !signatureB64) return error('Missing auth headers', 401);
 
-  // 1. Validate publicKey format
-  let publicKey: Uint8Array;
-  try {
-    publicKey = base64ToBytes(publicKeyB64);
-    if (publicKey.length !== 32) return error('Invalid publicKey length', 400);
-  } catch {
-    return error('Invalid publicKey format', 400);
+  // 1. Validate publicKey format — CANONICAL base64 of 32 bytes only.
+  //    A non-canonical spelling (e.g. the unpadded 43-char form) decodes to the
+  //    same key and would pass signature verification, but it would be stored
+  //    under a DIFFERENT `pk:` entry than the canonical one — leaving a
+  //    registered key that /admin/revoke can never address. Reject up front.
+  if (!isValidPublicKeyB64(publicKeyB64)) {
+    return error('publicKey must be canonical base64 of a 32-byte key', 400);
   }
 
   // 2. Verify Ed25519 signature
@@ -305,6 +324,9 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
     return error('Invalid JSON', 400);
   }
   if (!inviteCode || !bodyPK) return error('Missing inviteCode or publicKey', 400);
+  if (typeof inviteCode !== 'string' || inviteCode.length > MAX_INVITE_CODE_LENGTH) {
+    return error('Invalid inviteCode', 400);
+  }
   if (bodyPK !== publicKeyB64) return error('publicKey mismatch', 400);
   if (!isFreshTimestamp(regTimestamp)) return error('Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time', 401);
 
@@ -347,15 +369,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Server misconfigured', 503);
   }
 
-  // 1. Read body and check actual size
-  const bodyText = await request.text();
-  const actualBytes = new TextEncoder().encode(bodyText).byteLength;
-  if (actualBytes > maxBytes) return error('Body too large', 413);
+  // 1. Read body under the configured cap (Content-Length pre-check included)
+  const body = await readLimitedBody(request, maxBytes);
+  if ('tooLarge' in body) return body.tooLarge;
+  const bodyText = body.text;
 
   // 2. Parse headers + body
   const publicKeyB64 = request.headers.get('X-Public-Key');
   const signatureB64 = request.headers.get('X-Signature');
   if (!publicKeyB64 || !signatureB64) return error('Missing auth headers', 401);
+  // Canonical spelling only — the allowlist/quota keys are derived from this
+  // exact string (see handleRegister).
+  if (!isValidPublicKeyB64(publicKeyB64)) {
+    return error('publicKey must be canonical base64 of a 32-byte key', 400);
+  }
 
   let parsedBody: unknown;
   try {
@@ -856,6 +883,27 @@ async function verifySignature(
   if (!valid) return error('Invalid signature', 401);
 
   return null; // success
+}
+
+/**
+ * Read a request body with a HARD size cap, refusing before the whole payload
+ * is materialised where possible: the declared Content-Length is checked
+ * first, then the actual decoded byte length (a lying/absent header can't slip
+ * through). Returns the text, or the 413 Response to return as-is.
+ */
+async function readLimitedBody(
+  request: Request,
+  maxBytes: number,
+): Promise<{ text: string } | { tooLarge: Response }> {
+  const declared = Number(request.headers.get('Content-Length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { tooLarge: error('Body too large', 413) };
+  }
+  const text = await request.text();
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    return { tooLarge: error('Body too large', 413) };
+  }
+  return { text };
 }
 
 /** Canonical base64 of exactly 32 bytes (an Ed25519 public key): decodes,

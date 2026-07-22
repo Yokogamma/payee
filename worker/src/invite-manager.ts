@@ -234,13 +234,23 @@ export class InviteManager implements DurableObject {
   private async handleRevoke(request: Request): Promise<Response> {
     const { publicKey } = await request.json<RevokeRequest>();
     // Defense in depth: the Worker validates too, but the DO must never accept
-    // a non-canonical value — a typo'd key would get a successful idempotent
-    // response while the REAL key stayed allowed.
-    if (typeof publicKey !== 'string' || !isCanonical32ByteB64(publicKey)) {
-      return Response.json(
-        { error: 'publicKey must be canonical base64 of a 32-byte key' },
-        { status: 400 },
-      );
+    // a typo'd value — it would get a successful idempotent response while the
+    // REAL key stayed allowed. Canonical form is required, EXCEPT for an exact
+    // match on a stored legacy entry: /register only started rejecting
+    // non-canonical spellings later, so any key admitted before that must stay
+    // revocable under the literal string it was stored as.
+    if (typeof publicKey !== 'string') {
+      return Response.json({ error: 'publicKey must be a string' }, { status: 400 });
+    }
+    if (!isCanonical32ByteB64(publicKey)) {
+      const legacyEntry = await this.state.storage.get(`pk:${publicKey}`);
+      if (!legacyEntry) {
+        return Response.json(
+          { error: 'publicKey must be canonical base64 of a 32-byte key' },
+          { status: 400 },
+        );
+      }
+      console.warn('REVOKE_LEGACY_NONCANONICAL_KEY');
     }
 
     let response!: Response;
