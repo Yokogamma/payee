@@ -11,17 +11,18 @@ name: Deploy to GitHub Pages (legacy)
 on:
   workflow_dispatch:
 
+# Least privilege: the write scopes live on the deploy job only — the build
+# job (which runs project code and third-party actions) gets read-only.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
       # ── Quality gates (must pass before build/deploy) ──
@@ -40,16 +41,20 @@ jobs:
           # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
       # GitHub Pages has no _redirects support → SPA fallback via 404.html.
       - run: cp dist/index.html dist/404.html
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: dist
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Only this job may publish; it runs nothing but the Pages deploy action.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

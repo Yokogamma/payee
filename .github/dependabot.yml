@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Actions are pinned to immutable commit SHAs; without this they would never
+  # receive security fixes. Dependabot bumps the SHA and rewrites the trailing
+  # version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Dev-toolchain CVEs (Vite/Wrangler/Miniflare chains) reached us via manual
+  # audits twice — keep both manifests watched.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: /worker
+    schedule:
+      interval: weekly

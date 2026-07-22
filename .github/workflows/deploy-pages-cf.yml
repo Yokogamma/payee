@@ -20,12 +20,18 @@ name: Deploy to Cloudflare Pages
 on:
   workflow_dispatch:
 
+# Least privilege for GITHUB_TOKEN (repo defaults may be write-all); the
+# Cloudflare deploy uses its own scoped API token, not this one.
+permissions:
+  contents: read
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
       # ── Quality gates ──
@@ -45,7 +51,7 @@ jobs:
           # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
       # ── Deploy ──
       - id: deploy
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
