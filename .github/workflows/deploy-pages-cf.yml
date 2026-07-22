@@ -41,7 +41,8 @@ jobs:
           VITE_BASE: "/"
           VITE_PROXY_URL: ${{ secrets.VITE_PROXY_URL }}
           VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
-          BUILD_SHA: ${{ github.sha }}
+          # SW updates are driven by Workbox content-hash revisions — no
+          # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
       # ── Deploy ──
       - id: deploy
         uses: cloudflare/wrangler-action@v3

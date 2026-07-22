@@ -33,7 +33,9 @@ export default defineConfig(({ command, mode }) => {
         // user accepts the «Доступна новая версия» toast (src/lib/pwa.ts),
         // which calls updateSW(true) → SKIP_WAITING + reload.
         registerType: "prompt",
-        includeAssets: ["icons.svg", "apple-touch-icon.png"],
+        // NOTE: no includeAssets — public/ svg+png are already matched by the
+        // workbox globPatterns below; listing them twice duplicated precache
+        // manifest entries (round-15 LOW).
         manifest: {
           name: "Eternal Notes",
           short_name: "EternalNotes",
@@ -55,6 +57,9 @@ export default defineConfig(({ command, mode }) => {
         },
         workbox: {
           globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
+          // The manifest icons are auto-added by the plugin — excluding them
+          // from the glob keeps every precache URL unique (round-15 LOW).
+          globIgnores: ["**/icon-*.png"],
           // SPA offline navigation falls back to the precached shell.
           navigateFallback: `${base}index.html`,
           // No runtimeCaching entries: proxy/Arweave requests stay network-only.

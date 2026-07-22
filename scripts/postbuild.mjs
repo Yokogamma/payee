@@ -14,7 +14,6 @@ import { writeFileSync } from 'node:fs';
 import { resolveProxyOrigin } from './proxy-origin.mjs';
 
 const base = process.env.VITE_BASE || '/payee/';
-const sha = process.env.BUILD_SHA || 'dev';
 const rawProxy = process.env.VITE_PROXY_URL || '';
 
 let origin;
@@ -55,4 +54,5 @@ writeFileSync('dist/_headers', `/*
   Cache-Control: public, max-age=31536000, immutable
 `);
 
-console.log(`postbuild: base=${base} sha=${sha} connect-src proxy=${origin}`);
+// SW versioning is content-hash based (Workbox revisions) — no SHA stamping.
+console.log(`postbuild: base=${base} connect-src proxy=${origin}`);

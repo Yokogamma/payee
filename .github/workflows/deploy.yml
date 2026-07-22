@@ -36,7 +36,8 @@ jobs:
         env:
           VITE_PROXY_URL: ${{ secrets.VITE_PROXY_URL }}
           VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
-          BUILD_SHA: ${{ github.sha }}
+          # SW updates are driven by Workbox content-hash revisions — no
+          # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
       # GitHub Pages has no _redirects support → SPA fallback via 404.html.
       - run: cp dist/index.html dist/404.html
       - uses: actions/upload-pages-artifact@v3
