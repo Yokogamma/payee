@@ -134,7 +134,7 @@ export function PinUnlock() {
           disabled={isLocked}
         />
 
-        {error && <div className="error-msg">{error}</div>}
+        {error && <div className="error-msg" role="alert">{error}</div>}
 
         {attempts >= 3 && !isLocked && (
           <div className="pin-attempts">

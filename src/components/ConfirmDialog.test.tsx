@@ -57,4 +57,32 @@ describe('ConfirmDialog', () => {
     renderDialog();
     expect(document.activeElement?.textContent).toBe('Отмена');
   });
+
+  it('traps Tab inside the dialog (wraps last → first and first → last)', () => {
+    renderDialog();
+    // Focus starts on «Отмена» (first); the confirm button is last.
+    screen.getByText('Удалить всё').focus();
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(document.activeElement?.textContent).toBe('Отмена'); // wrapped forward
+
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement?.textContent).toBe('Удалить всё'); // wrapped back
+  });
+
+  it('returns focus to the previously-focused element on close', () => {
+    const outside = document.createElement('button');
+    outside.textContent = 'trigger';
+    document.body.appendChild(outside);
+    outside.focus();
+
+    const onCancel = vi.fn();
+    const { rerender } = render(
+      <ConfirmDialog open title="t" message="m" onConfirm={vi.fn()} onCancel={onCancel} />,
+    );
+    expect(document.activeElement?.textContent).toBe('Отмена');
+
+    rerender(<ConfirmDialog open={false} title="t" message="m" onConfirm={vi.fn()} onCancel={onCancel} />);
+    expect(document.activeElement).toBe(outside); // focus returned
+    outside.remove();
+  });
 });

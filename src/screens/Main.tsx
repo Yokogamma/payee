@@ -161,7 +161,7 @@ export function Main() {
     <div className="main-screen">
       {/* Restoring Banner */}
       {restoring && (
-        <div className="restoring-banner">
+        <div className="restoring-banner" role="status" aria-live="polite">
           ⏳ Восстанавливаем заметки из Arweave...
           {restoreProgress && restoreProgress.total > 0 && ` ${restoreProgress.done}/${restoreProgress.total}`}
         </div>
@@ -169,7 +169,7 @@ export function Main() {
 
       {/* Restore failed / partial (M1): distinguish "error" from "nothing to restore" */}
       {!restoring && restoreError && (
-        <div className="error-banner">
+        <div className="error-banner" role="alert">
           <span>⚠️ {restoreError}</span>
           <button className="banner-btn" onClick={retryRestore}>Повторить</button>
           <button className="banner-btn banner-close" onClick={clearRestoreStatus} title="Скрыть">✕</button>
@@ -178,7 +178,7 @@ export function Main() {
 
       {/* Restore succeeded — show what actually came back */}
       {!restoring && !restoreError && restoredCount !== null && restoredCount > 0 && (
-        <div className="success-banner">
+        <div className="success-banner" role="status">
           <span>✓ Восстановлено заметок: {restoredCount}</span>
           <button className="banner-btn banner-close" onClick={clearRestoreStatus} title="Скрыть">✕</button>
         </div>
@@ -201,6 +201,8 @@ export function Main() {
             <span
               className={`ar-badge ${arweave.online ? 'text-green' : 'text-red'}`}
               title={arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
+              role="status"
+              aria-label={arweave.syncing ? 'Arweave: синхронизация' : arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
             >
               {arweave.syncing ? '⏳' : arweave.online ? '♾️' : '⚠️'}
             </span>
@@ -211,6 +213,7 @@ export function Main() {
             className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
             onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
             title="Поиск (Ctrl+K)"
+            aria-label="Поиск"
             aria-pressed={showSearch}
             aria-keyshortcuts="Control+K"
           >
@@ -220,6 +223,7 @@ export function Main() {
             className="icon-btn"
             onClick={() => setShowSettings(true)}
             title="Настройки"
+            aria-label="Настройки"
           >
             ⚙️
           </button>
@@ -318,7 +322,7 @@ export function Main() {
                       </span>
                     )
                   )}
-                  <span className="note-lock">🔒</span>
+                  <span className="note-lock" aria-hidden="true">🔒</span>
                   <button
                     className="icon-btn note-menu-btn"
                     onClick={() => setOpenMenuId(openMenuId === note.id ? null : note.id)}
@@ -372,14 +376,14 @@ export function Main() {
         <div className="toast toast--success" role="status">✓ Скопировано</div>
       )}
       {copyFeedback === 'fail' && (
-        <div className="toast toast--error" role="status">
+        <div className="toast toast--error" role="alert">
           Не удалось скопировать — выделите текст вручную
         </div>
       )}
 
       {/* Global sync-error toast (visible outside the settings modal) */}
       {arweave.enabled && arweave.lastError && !showSettings && (
-        <div className="toast toast--error" role="status">
+        <div className="toast toast--error" role="alert">
           <span>⚠️ {arweave.lastError}</span>
           <button className="banner-btn" onClick={retrySync} disabled={arweave.syncing}>
             {arweave.syncing ? '...' : 'Повторить'}

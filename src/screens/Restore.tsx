@@ -97,13 +97,14 @@ export function Restore() {
                 autoComplete="off"
                 autoCapitalize="none"
                 spellCheck={false}
+                aria-label={`Слово ${i + 1} из 12`}
                 aria-invalid={invalidWords[i] || undefined}
               />
             </div>
           ))}
         </div>
 
-        {displayError && <div className="error-msg">{displayError}</div>}
+        {displayError && <div className="error-msg" role="alert">{displayError}</div>}
 
         {displayShowReset && (
           <button className="btn btn-danger full-width" onClick={() => setConfirmReset(true)}>

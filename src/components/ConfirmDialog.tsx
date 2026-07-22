@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { useModalA11y } from '../lib/useModalA11y';
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -13,8 +14,8 @@ interface ConfirmDialogProps {
 
 /**
  * In-app replacement for window.confirm() (Phase 6 / 4.4): styled, keyboard-
- * accessible (Escape cancels, initial focus on the SAFE action for danger
- * dialogs), backdrop click cancels.
+ * accessible (Escape cancels, Tab trapped, focus returned on close — Phase 7),
+ * initial focus on the SAFE action for danger dialogs, backdrop click cancels.
  */
 export function ConfirmDialog({
   open,
@@ -27,25 +28,18 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const containerRef = useModalA11y<HTMLDivElement>(open, onCancel);
 
   useEffect(() => {
-    if (!open) return;
-    cancelRef.current?.focus(); // safe default — Enter must not destroy data
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onCancel();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, onCancel]);
+    if (open) cancelRef.current?.focus(); // safe default — Enter must not destroy data
+  }, [open]);
 
   if (!open) return null;
 
   return (
     <div className="modal-overlay confirm-overlay" onClick={onCancel}>
       <div
+        ref={containerRef}
         className="modal confirm-dialog"
         role="dialog"
         aria-modal="true"

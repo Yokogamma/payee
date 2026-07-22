@@ -11,7 +11,11 @@ function AppRouter() {
   const { screen } = useNotes();
   switch (screen) {
     case 'loading':
-      return <div className="screen-center"><div className="loader" /></div>;
+      return (
+        <div className="screen-center">
+          <div className="loader" role="status" aria-label="Загрузка" />
+        </div>
+      );
     case 'landing':
       return <Landing />;
     case 'onboarding':

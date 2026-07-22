@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNotes } from '../lib/store';
 import type { ThemePref } from '../lib/theme';
+import { useModalA11y } from '../lib/useModalA11y';
 
 /** Settings modal (7.3/L8) — extracted from the 500-line Main screen.
  *  Local UI state (seed reveal, PIN form, invite form) lives here; the reset
@@ -40,12 +41,27 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     onClose();
   }
 
+  // Phase 7: Escape closes, Tab trapped inside, focus returned to the trigger.
+  const containerRef = useModalA11y<HTMLDivElement>(open, close);
+  useEffect(() => {
+    if (open) containerRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
   if (!open) return null;
   const mnemonic = showSeed ? showMnemonic() : null;
 
   return (
     <div className="modal-overlay" onClick={close}>
-      <div className="modal" onClick={e => e.stopPropagation()}>
+      <div
+        ref={containerRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Настройки"
+        tabIndex={-1}
+        onClick={e => e.stopPropagation()}
+      >
         <h2>Настройки</h2>
 
         <div className="settings-section">
