@@ -5,6 +5,7 @@ import { Restore } from './screens/Restore';
 import { PinUnlock } from './screens/PinUnlock';
 import { Main } from './screens/Main';
 import { ErrorScreen } from './screens/ErrorScreen';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import './index.css';
 
 function AppRouter() {
@@ -33,10 +34,12 @@ function AppRouter() {
 
 export default function App() {
   return (
-    <NotesProvider>
-      <div className="app">
-        <AppRouter />
-      </div>
-    </NotesProvider>
+    <ErrorBoundary>
+      <NotesProvider>
+        <div className="app">
+          <AppRouter />
+        </div>
+      </NotesProvider>
+    </ErrorBoundary>
   );
 }

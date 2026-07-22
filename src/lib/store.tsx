@@ -6,7 +6,7 @@
  * All persistence through IndexedDB (storage.ts). No localStorage.
  */
 
-import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import {
   generateMnemonic,
   isValidMnemonic,
@@ -1020,7 +1020,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   // ─── Context Value ──────────────────────────────────────────────────
 
-  const value: NotesStore = {
+  // L4: memoized — otherwise every provider render handed consumers a fresh
+  // object and re-rendered the whole tree. All actions are useCallback'd, so
+  // the deps below are the actual invalidation set.
+  const value: NotesStore = useMemo(() => ({
     screen,
     isReady,
     mnemonic,
@@ -1060,7 +1063,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     retryRestore,
     clearRestoreStatus,
     dismissError,
-  };
+  }), [
+    screen, isReady, mnemonic, notes, isEncrypting, searchQuery, filteredNotes,
+    arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
+    restoredCount, vaultError, hasPin, bootError,
+    createNewWallet, confirmMnemonic, restoreFromMnemonic, addNote,
+    goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
+    toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
+    setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
+    resetBrokenStorage, retryRestore, clearRestoreStatus, dismissError,
+  ]);
 
   return (
     <StoreContext.Provider value={value}>

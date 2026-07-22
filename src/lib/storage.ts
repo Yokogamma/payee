@@ -181,14 +181,6 @@ export async function mergeRestoredNote(
   await saveNoteWithSync(note, record);
 }
 
-export async function saveNotes(notes: EncryptedNote[]): Promise<void> {
-  const tx = getDB().transaction('notes', 'readwrite');
-  for (const note of notes) {
-    await tx.store.put(note);
-  }
-  await tx.done;
-}
-
 /** Get all notes sorted by createdAt DESC (newest first) */
 export async function getAllNotes(): Promise<EncryptedNote[]> {
   const all = await getDB().getAllFromIndex('notes', 'by-timestamp');
@@ -197,10 +189,6 @@ export async function getAllNotes(): Promise<EncryptedNote[]> {
 
 export async function getNoteById(noteId: string): Promise<EncryptedNote | undefined> {
   return getDB().get('notes', noteId) as Promise<EncryptedNote | undefined>;
-}
-
-export async function clearNotes(): Promise<void> {
-  await getDB().clear('notes');
 }
 
 // ─── Sync Records ────────────────────────────────────────────────────
@@ -219,10 +207,6 @@ export async function getRecordsByStatus(status: SyncRecord['status']): Promise<
 
 export async function getAllSyncRecords(): Promise<SyncRecord[]> {
   return getDB().getAll('sync') as Promise<SyncRecord[]>;
-}
-
-export async function clearSyncRecords(): Promise<void> {
-  await getDB().clear('sync');
 }
 
 // ─── Meta ────────────────────────────────────────────────────────────
