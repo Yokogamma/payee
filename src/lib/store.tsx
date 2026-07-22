@@ -56,6 +56,11 @@ import { userFacingUploadError, userFacingRegistrationError } from './errors';
 
 export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main' | 'error';
 
+/** sessionStorage key of the in-progress note draft (plaintext). Defined here
+ *  because every vault-destroying path must clear it — a draft left behind
+ *  would surface inside the NEXT vault opened in the same tab. */
+export const DRAFT_STORAGE_KEY = 'eternal-notes-draft';
+
 /** Per-note sync state for the card indicator: SyncRecord.status, or 'queued'
  *  when the note has no record yet (never attempted). */
 export type NoteSyncStatus = 'queued' | 'uploading' | 'accepted' | 'confirmed' | 'error';
@@ -72,6 +77,10 @@ export interface ArweaveState {
   syncing: boolean;
   registered: boolean;
   unsyncedCount: number;
+  /** Notes NOT yet confirmed on-chain (includes `accepted`: a pending TX can
+   *  still be dropped). Only `confirmed` notes survive a local wipe, so this —
+   *  not unsyncedCount — is what a destructive reset must warn about. */
+  unconfirmedCount: number;
   errorCount: number;
   acceptedCount: number;
   confirmedCount: number;
@@ -85,6 +94,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   syncing: false,
   registered: false,
   unsyncedCount: 0,
+  unconfirmedCount: 0,
   errorCount: 0,
   acceptedCount: 0,
   confirmedCount: 0,
@@ -439,19 +449,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       acceptedCount: accepted,
       confirmedCount: confirmed,
       unsyncedCount: unsynced,
+      // Everything that is not CONFIRMED on-chain is at risk on a local wipe.
+      unconfirmedCount: allNotes.length - confirmed,
       errorCount: errors,
     }));
   }
 
   // ─── Registration ───────────────────────────────────────────────────
 
-  async function checkAndSetRegistration() {
+  /** @param force skip the local marker and always ask the server — used by the
+   *  manual «Проверить доступ», which must be able to DISCOVER a revocation. */
+  async function checkAndSetRegistration(force = false) {
     const publicKey = publicKeyRef.current;
     const signingKey = signingKeyRef.current;
     if (!publicKey || !signingKey) return;
 
     const publicKeyB64 = bufferToBase64(publicKey);
-    const localRegistered = await getMeta<boolean>(`registered:${publicKeyB64}`);
+    const localRegistered = force ? false : await getMeta<boolean>(`registered:${publicKeyB64}`);
 
     if (localRegistered) {
       setArweave(prev => ({ ...prev, registered: true }));
@@ -470,10 +484,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (message && /timestamp|clock|skew/i.test(message)) {
           setArweave(prev => ({ ...prev, lastError: userFacingUploadError('error', message) }));
         }
+      } else if (status === 'denied') {
+        // Access was revoked (or never granted): drop the local marker so the
+        // invite form comes back instead of a permanently "registered" client
+        // that only ever gets 403s.
+        await deleteMeta(`registered:${publicKeyB64}`);
+        setArweave(prev => ({ ...prev, registered: false }));
       }
-      // 'denied' → registered = false → show invite UI
       // 'unavailable' → don't change registered, user can retry
     }
+  }
+
+  /** Server said 403 for this key — the local `registered` marker is stale
+   *  (revoked server-side). Clear it so the UI offers a new invite. */
+  async function markUnregistered() {
+    const publicKey = publicKeyRef.current;
+    if (publicKey) await deleteMeta(`registered:${bufferToBase64(publicKey)}`);
+    setArweave(prev => ({ ...prev, registered: false }));
   }
 
   // ─── Upload Queue ───────────────────────────────────────────────────
@@ -508,6 +535,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           break;
         }
         if (result === 'not_registered') {
+          // 403 = the server no longer allows this key (revoked / never
+          // registered). Invalidate the local marker so the invite form
+          // reappears; otherwise every future upload silently 403s.
+          await markUnregistered();
           setArweave(prev => ({ ...prev, lastError: userFacingUploadError('not_registered') }));
           break;
         }
@@ -787,12 +818,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       };
       setNotes(prev => [note, ...prev]);
 
-      // Enqueue upload if sync enabled
-      if (arweaveRef.current.enabled) {
-        enqueueUpload(encrypted);
+      // ── The note is SAVED from here on. Nothing below may reject: a failing
+      //    secondary read would otherwise make the UI report «не удалось
+      //    сохранить» for a note that is already on disk, and a retry would
+      //    create a duplicate.
+      try {
+        if (arweaveRef.current.enabled) {
+          enqueueUpload(encrypted); // sync is best-effort; the note is safe
+        }
+        await refreshSyncCounts();
+      } catch (err) {
+        console.error('post-save bookkeeping failed (note IS saved):', err);
       }
-
-      await refreshSyncCounts();
     } finally {
       setIsEncrypting(false);
     }
@@ -845,7 +882,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const checkAccessAction = useCallback(async () => {
-    await checkAndSetRegistration();
+    await checkAndSetRegistration(true); // manual check must reach the server
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -858,8 +895,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // 1. IndexedDB — all stores
     await resetAll();
 
-    // 2. sessionStorage — prevent bootstrap mnemonic loop
+    // 2. sessionStorage — prevent bootstrap mnemonic loop AND drop the
+    //    plaintext draft: it belonged to the vault being destroyed and would
+    //    otherwise resurface inside the NEXT vault opened in this tab.
     sessionStorage.removeItem('eternal-notes-session');
+    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
 
     // 3. In-memory refs and state
     cryptoKeyRef.current = null;
@@ -906,8 +946,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       setBootError(`Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
       throw err;
     }
-    // Success: clean boot from scratch.
+    // Success: clean boot from scratch (draft belonged to the destroyed vault).
     sessionStorage.removeItem('eternal-notes-session');
+    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
     window.location.reload();
   }, []);
 

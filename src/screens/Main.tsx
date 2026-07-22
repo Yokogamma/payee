@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNotes, type NoteSyncStatus } from '../lib/store';
+import { useNotes, DRAFT_STORAGE_KEY, type NoteSyncStatus } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsModal } from '../components/SettingsModal';
 import { useTheme } from '../lib/theme';
@@ -8,7 +8,17 @@ import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
 
 // Draft survives an accidental tab close / PWA eviction (same lifetime model as
 // the session seed: sessionStorage, never persisted to disk unencrypted forever).
-const DRAFT_KEY = 'eternal-notes-draft';
+// The key lives in the store so every reset path can clear it.
+const DRAFT_KEY = DRAFT_STORAGE_KEY;
+
+/** Shown when sync is off / not set up: the note exists ONLY on this device.
+ *  Never leave the card blank — a user must not mistake a local note for an
+ *  eternal one and lose it by clearing the browser. */
+const LOCAL_ONLY_BADGE = {
+  icon: '📱',
+  label: 'Только на этом устройстве — не сохранена в блокчейне',
+  className: 'sync-badge--local',
+} as const;
 
 const SYNC_BADGE: Record<NoteSyncStatus, { icon: string; label: string; className: string }> = {
   queued:    { icon: '○',  label: 'Ожидает загрузки',            className: 'sync-badge--queued' },
@@ -189,10 +199,15 @@ export function Main() {
         </div>
       )}
 
-      {/* Restore succeeded — show what actually came back */}
-      {!restoring && !restoreError && restoredCount !== null && restoredCount > 0 && (
+      {/* Restore succeeded — show what actually came back (0 included: a
+          completed empty sweep must be distinguishable from «не запускалось») */}
+      {!restoring && !restoreError && restoredCount !== null && (
         <div className="success-banner" role="status">
-          <span>✓ Восстановлено заметок: {restoredCount}</span>
+          <span>
+            {restoredCount > 0
+              ? `✓ Восстановлено заметок: ${restoredCount}`
+              : '✓ Восстановление завершено: новых заметок не найдено'}
+          </span>
           <button
             className="banner-btn banner-close"
             onClick={clearRestoreStatus}
@@ -320,14 +335,18 @@ export function Main() {
             // linkable from the menu even with auto-sync switched off; the
             // enabled flag gates only the live status badge.
             const info = syncStatuses[note.id] ?? { status: 'queued' as const };
-            const badge = arweave.enabled ? SYNC_BADGE[info.status] : null;
+            // With sync off (or no invite yet) the note lives only here — say so
+            // instead of showing nothing.
+            const badge = arweave.enabled && arweave.registered
+              ? SYNC_BADGE[info.status]
+              : (info.status === 'confirmed' ? SYNC_BADGE.confirmed : LOCAL_ONLY_BADGE);
             return (
               <div className="note-card" key={note.id + note.createdAt}>
                 <div className="note-text">{highlight(note.text, searchQuery)}</div>
                 <div className="note-meta">
                   <span className="note-time">{formatDate(note.createdAt)}</span>
                   {badge && info && (
-                    info.status === 'error' ? (
+                    info.status === 'error' && arweave.enabled && arweave.registered ? (
                       <button
                         className={`sync-badge ${badge.className}`}
                         onClick={retrySync}
@@ -457,9 +476,14 @@ export function Main() {
       <ConfirmDialog
         open={showResetConfirm}
         title="Сбросить приложение?"
-        message={arweave.unsyncedCount > 0
-          ? `⚠️ ${arweave.unsyncedCount} заметок ещё НЕ синхронизированы и будут потеряны безвозвратно.\nЗаметки, сохранённые в блокчейне, можно вернуть по seed-фразе.`
-          : 'Все локальные данные будут удалены. Заметки, сохранённые в блокчейне, можно вернуть по seed-фразе.'}
+        message={arweave.unconfirmedCount > 0
+          // Only CONFIRMED notes are recoverable: an `accepted` transaction can
+          // still be dropped by the network, and after a wipe there is no local
+          // ciphertext left to re-upload.
+          ? `⚠️ ${arweave.unconfirmedCount} заметок ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+            + '(в том числе загруженные, но ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
+            + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
+          : 'Все локальные данные будут удалены. Все заметки подтверждены в блокчейне — их можно вернуть по seed-фразе.'}
         confirmLabel="Удалить всё"
         danger
         onConfirm={() => { setShowResetConfirm(false); resetApp(); }}

@@ -361,6 +361,9 @@ async function fetchPage(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
+    // A hung gateway must not pin the UI in «Восстанавливаем…» forever; the
+    // caller treats an aborted page as a partial restore (incomplete=true).
+    signal: AbortSignal.timeout(GRAPHQL_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -387,6 +390,11 @@ export interface FetchAllNotesResult {
  *  Bounded pool: fast enough to kill the old N+1 sequential latency, small
  *  enough not to hammer the gateway from a mobile connection. */
 const RESTORE_CONCURRENCY = 5;
+
+/** Per-request deadlines for the restore sweep — without them a stalled
+ *  connection leaves the restore banner spinning indefinitely. */
+const GRAPHQL_TIMEOUT_MS = 20_000;
+const PAYLOAD_TIMEOUT_MS = 20_000;
 
 interface RestoreCandidate {
   txId: string;
@@ -460,7 +468,9 @@ export async function fetchAllNotes(
 
       let dataResponse: Response | null = null;
       try {
-        dataResponse = await fetch(`https://arweave.net/${cand.txId}`);
+        dataResponse = await fetch(`https://arweave.net/${cand.txId}`, {
+          signal: AbortSignal.timeout(PAYLOAD_TIMEOUT_MS),
+        });
       } catch {
         incomplete = true; // network — a legit note may be unreachable right now
       }

@@ -6,7 +6,10 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 // TX link with auto-sync off, clipboard success/failure, search hotkey/Escape.
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
-vi.mock('../lib/store', () => ({ useNotes: () => h.store }));
+vi.mock('../lib/store', () => ({
+  useNotes: () => h.store,
+  DRAFT_STORAGE_KEY: 'eternal-notes-draft',
+}));
 vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
 
 import { Main } from './Main';
@@ -28,6 +31,7 @@ function baseStore() {
       acceptedCount: 0,
       confirmedCount: 1,
       unsyncedCount: 0,
+      unconfirmedCount: 0,
       errorCount: 0,
       lastSync: null,
       lastError: null,
@@ -66,9 +70,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('Main — note card menu', () => {
-  it('shows the confirmed-TX link even with auto-sync disabled (no live badge)', () => {
+  it('shows the confirmed-TX link even with auto-sync disabled', () => {
     render(<Main />);
-    expect(document.querySelector('.sync-badge')).toBeNull(); // badge is gated
+    // A CONFIRMED note keeps its honest badge even with sync switched off —
+    // it really is on-chain (unlike a merely local one, which says so).
+    expect(document.querySelector('.sync-badge')?.getAttribute('aria-label'))
+      .toBe('Сохранена в блокчейне');
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     const link = screen.getByText('🔗 Транзакция в блокчейне') as HTMLAnchorElement;
     expect(link.getAttribute('href')).toContain('TX123'); // link is NOT gated
@@ -125,6 +132,32 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     fireEvent.click(screen.getByLabelText('Настройки'));
     expect(screen.queryByText('секретное')).toBeNull();
     expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
+  });
+
+  it('reset warns about ACCEPTED-but-unconfirmed notes (they can still drop)', () => {
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.enabled = true;
+    s.arweave.confirmedCount = 0;
+    s.arweave.acceptedCount = 1;
+    s.arweave.unsyncedCount = 0;   // "synced" by the old (wrong) definition
+    s.arweave.unconfirmedCount = 1; // but NOT confirmed on-chain
+    render(<Main />);
+
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
+    expect(dialog.textContent).toMatch(/НЕ подтверждены/);
+    expect(dialog.textContent).not.toMatch(/Все заметки подтверждены/);
+  });
+
+  it('note shows «Только на этом устройстве» when sync is off', () => {
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.enabled = false;
+    s.syncStatuses = { n1: { status: 'queued' as const } };
+    render(<Main />);
+    const badge = document.querySelector('.sync-badge');
+    expect(badge?.getAttribute('aria-label')).toMatch(/Только на этом устройстве/);
   });
 
   it('per-note sync badge is a live role=status region', () => {

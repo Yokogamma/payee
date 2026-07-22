@@ -880,6 +880,7 @@ h1 {
 }
 
 .sync-badge--queued { color: var(--text-muted); }
+.sync-badge--local { color: var(--text-dim); }
 .sync-badge--uploading,
 .sync-badge--accepted { color: var(--yellow); }
 .sync-badge--confirmed { color: var(--green); }

@@ -10,7 +10,7 @@ export function Landing() {
           <div className="logo-icon landing-logo">∞</div>
           <h1>Eternal Notes</h1>
           <p className="subtitle">
-            Заметки, которые живут вечно. Зашифрованы на устройстве. Хранятся в блокчейне.
+            Зашифрованы на устройстве. По желанию — навсегда в блокчейне.
           </p>
         </div>
 
@@ -26,8 +26,11 @@ export function Landing() {
           <div className="feature">
             <span className="feature-icon">♾️</span>
             <div>
-              <div className="feature-title">Вечное хранение</div>
-              <div className="feature-desc">Arweave blockchain. Заметки невозможно удалить или потерять.</div>
+              <div className="feature-title">Вечное хранение — по желанию</div>
+              <div className="feature-desc">
+                Arweave blockchain: включается в настройках по invite-коду. Пока
+                синхронизация выключена, заметки живут только на этом устройстве.
+              </div>
             </div>
           </div>
 
