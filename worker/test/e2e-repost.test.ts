@@ -1,5 +1,5 @@
-import { env, fetchMock, runInDurableObject } from 'cloudflare:test';
-import { beforeAll, afterEach, describe, it, expect } from 'vitest';
+import { env, runInDurableObject } from 'cloudflare:test';
+import { beforeAll, afterAll, describe, it, expect, vi } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 
@@ -19,11 +19,31 @@ const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }
 type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
 
+// Outbound Arweave HTTP is mocked by stubbing the isolate's GLOBAL fetch
+// (vitest-pool-workers ≥0.18 dropped `fetchMock`). Routes are registered per
+// test via mockRoute(); anything unmocked throws (net-connect disabled).
+type OutboundRoute = {
+  method: string;
+  url: RegExp;
+  reply: () => Response;
+};
+const outboundRoutes: OutboundRoute[] = [];
+
+function mockRoute(method: string, url: RegExp, status: number, body: string) {
+  outboundRoutes.push({ method, url, reply: () => new Response(body, { status }) });
+}
+
 beforeAll(() => {
-  fetchMock.activate();
-  fetchMock.disableNetConnect();
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const method = ((input instanceof Request ? input.method : init?.method) ?? 'GET').toUpperCase();
+    for (const r of outboundRoutes) {
+      if (r.method === method && r.url.test(url)) return r.reply();
+    }
+    throw new Error(`unmocked outbound fetch: ${method} ${url}`);
+  });
 });
-afterEach(() => fetchMock.assertNoPendingInterceptors());
+afterAll(() => vi.unstubAllGlobals());
 
 function b64(bytes: Uint8Array): string {
   let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s);
@@ -197,11 +217,11 @@ describe('e2e: lost commit → posted anchor → TTL → redrop → successful r
 
     // Arweave HTTP surface for the re-post: dead status, then anchor/price/post.
     // (arweave-js requires a ≥43-char base64url tx anchor.)
-    const gw = fetchMock.get('https://arweave.net');
-    gw.intercept({ path: `/tx/TX-DEAD/status`, method: 'GET' }).reply(404, 'not found');
-    gw.intercept({ path: '/tx_anchor', method: 'GET' }).reply(200, 'A'.repeat(43));
-    gw.intercept({ path: /^\/price\/\d+$/, method: 'GET' }).reply(200, '0');
-    gw.intercept({ path: '/tx', method: 'POST' }).reply(200, 'OK');
+    // arweave-js builds explicit host:443 URLs → the port is optional here.
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx\/TX-DEAD\/status$/, 404, 'not found');
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
+    mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
 
     const r = await worker.fetch(
       await recheckRequest(id, `e2e-${crypto.randomUUID().slice(0, 6)}`),

@@ -1,19 +1,30 @@
-import { env, SELF, fetchMock, runInDurableObject } from 'cloudflare:test';
-import { beforeAll, afterEach, describe, it, expect } from 'vitest';
+import { env, SELF, runInDurableObject } from 'cloudflare:test';
+import { beforeAll, afterAll, describe, it, expect, vi } from 'vitest';
 import * as ed from '@noble/ed25519';
 
 // Integration: server-authoritative reconciliation of a lost commit. The DO holds
 // a `posted {txId, postedAt}` record; on recheck the worker reconciles using that
-// SERVER txId (never a client-supplied one). Arweave status is mocked.
+// SERVER txId (never a client-supplied one). Arweave status is mocked by stubbing
+// the isolate's GLOBAL fetch (vitest-pool-workers ≥0.18 dropped `fetchMock`;
+// with singleWorker the SELF handler shares this isolate, so the stub applies).
 
 const ALLOWLIST = (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST;
 const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }).RATE_LIMITER;
 
+const statusRoutes = new Map<string, { status: number; body: string }>();
+
 beforeAll(() => {
-  fetchMock.activate();
-  fetchMock.disableNetConnect();
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const m = url.match(/^https:\/\/arweave\.net\/tx\/([^/]+)\/status$/);
+    if (m && statusRoutes.has(m[1])) {
+      const r = statusRoutes.get(m[1])!;
+      return new Response(r.body, { status: r.status });
+    }
+    throw new Error(`unmocked outbound fetch: ${url}`); // net-connect disabled
+  });
 });
-afterEach(() => fetchMock.assertNoPendingInterceptors());
+afterAll(() => vi.unstubAllGlobals());
 
 function b64(bytes: Uint8Array): string {
   let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s);
@@ -72,7 +83,7 @@ async function readNote(pkB64: string) {
 }
 
 function mockStatus(txId: string, status: number, bodyText = 'x') {
-  fetchMock.get('https://arweave.net').intercept({ path: `/tx/${txId}/status`, method: 'GET' }).reply(status, bodyText);
+  statusRoutes.set(txId, { status, body: bodyText });
 }
 
 // Recompute the server's recovery HMAC (key = SHA-256(RECOVERY_HMAC_SECRET +
