@@ -4,6 +4,7 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsModal } from '../components/SettingsModal';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
+import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
 
 // Draft survives an accidental tab close / PWA eviction (same lifetime model as
 // the session seed: sessionStorage, never persisted to disk unencrypted forever).
@@ -46,6 +47,11 @@ export function Main() {
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
+  const [updateReady, setUpdateReady] = useState(false);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+
+  // PWA update toast (Phase 8): the waiting SW activates only on user consent.
+  useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
   const [theme, setTheme] = useTheme();
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -382,6 +388,22 @@ export function Main() {
           })
         )}
       </div>
+
+      {/* PWA update toast (Phase 8): controlled activation, never silent */}
+      {updateReady && !updateDismissed && (
+        <div className="toast toast--update" role="status">
+          <span>Доступна новая версия приложения</span>
+          <button className="banner-btn" onClick={applyPwaUpdate}>Обновить</button>
+          <button
+            className="banner-btn banner-close"
+            onClick={() => setUpdateDismissed(true)}
+            title="Позже"
+            aria-label="Отложить обновление"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Prominent save confirmation (2.5) */}
       {justSaved && (

@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { fileURLToPath } from 'node:url';
 
 // Test config kept separate from vite.config.ts (build) to avoid coupling.
 // Pure crypto/logic runs in Node (Web Crypto is global in Node 20+).
@@ -7,6 +8,12 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   // Component tests (*.test.tsx) rely on the automatic JSX runtime.
   esbuild: { jsx: 'automatic' },
+  resolve: {
+    alias: {
+      // Vite-only virtual module (vite-plugin-pwa) — stubbed under vitest.
+      'virtual:pwa-register': fileURLToPath(new URL('./src/test-stubs/pwa-register.ts', import.meta.url)),
+    },
+  },
   test: {
     environment: 'node',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.mjs'],

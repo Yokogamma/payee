@@ -1111,6 +1111,11 @@ mark {
   color: var(--green);
 }
 
+.toast--update {
+  border-color: rgba(108, 99, 255, 0.4);
+  color: var(--accent);
+}
+
 /* ─── Invite Section ───────────────────────────────────────── */
 
 .invite-section {

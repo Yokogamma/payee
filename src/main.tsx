@@ -12,6 +12,7 @@ import '@fontsource/jetbrains-mono/500.css'
 import '@fontsource/jetbrains-mono/600.css'
 import './index.css'
 import App from './App.tsx'
+import { initPwaUpdater } from './lib/pwa'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -19,9 +20,7 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 
-// Register Service Worker
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register(import.meta.env.BASE_URL + 'sw.js').catch(() => {});
-  });
-}
+// Workbox-generated SW (vite-plugin-pwa): precached hashed assets + a
+// controlled update flow — the new version activates only after the user
+// accepts the update toast (src/lib/pwa.ts).
+initPwaUpdater()
