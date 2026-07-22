@@ -32,6 +32,7 @@ function baseStore() {
       confirmedCount: 1,
       unsyncedCount: 0,
       unconfirmedCount: 0,
+      countsReady: true,
       errorCount: 0,
       lastSync: null,
       lastError: null,
@@ -148,6 +149,20 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
 
     const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
     expect(dialog.textContent).toMatch(/НЕ подтверждены/);
+    expect(dialog.textContent).not.toMatch(/Все заметки подтверждены/);
+  });
+
+  it('reset NEVER claims safety while sync counts are still loading', () => {
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.countsReady = false;   // placeholder zeros right after bootstrap
+    s.arweave.unconfirmedCount = 0;
+    render(<Main />);
+
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
+    expect(dialog.textContent).toMatch(/ещё загружается/);
     expect(dialog.textContent).not.toMatch(/Все заметки подтверждены/);
   });
 

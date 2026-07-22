@@ -79,8 +79,12 @@ export interface ArweaveState {
   unsyncedCount: number;
   /** Notes NOT yet confirmed on-chain (includes `accepted`: a pending TX can
    *  still be dropped). Only `confirmed` notes survive a local wipe, so this —
-   *  not unsyncedCount — is what a destructive reset must warn about. */
+   *  not unsyncedCount — is what a destructive reset must warn about.
+   *  Meaningless until `countsReady`. */
   unconfirmedCount: number;
+  /** False until the first refreshSyncCounts() has run. While false the counts
+   *  are placeholder zeros and MUST NOT be used to claim anything is safe. */
+  countsReady: boolean;
   errorCount: number;
   acceptedCount: number;
   confirmedCount: number;
@@ -95,6 +99,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   registered: false,
   unsyncedCount: 0,
   unconfirmedCount: 0,
+  countsReady: false,
   errorCount: 0,
   acceptedCount: 0,
   confirmedCount: 0,
@@ -378,7 +383,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const savedEnabled = !!(await getMeta<boolean>('ar-enabled'));
     setArweave({ enabled: savedEnabled });
 
-    // Background: check Arweave + count sync state
+    // Sync counts come from local IndexedDB and are CHEAP — read them before
+    // the UI can be interacted with. The destructive-reset dialog decides what
+    // is recoverable from unconfirmedCount, so it must never render against
+    // the zero-initialised default (round-21 P1).
+    await refreshSyncCounts();
+
+    // Background: network-dependent parts only (online probe + queue kick).
     void initArweaveState().catch(err => console.error('initArweaveState:', err));
   }
 
@@ -412,6 +423,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // ─── Arweave State ──────────────────────────────────────────────────
 
   async function initArweaveState() {
+    // Counts were already loaded synchronously during bootstrap; refresh them
+    // again after the (slow) probe so a queue kick sees fresh numbers.
     const online = await isArweaveOnline();
     await refreshSyncCounts();
     setArweave(prev => ({ ...prev, online }));
@@ -451,6 +464,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       unsyncedCount: unsynced,
       // Everything that is not CONFIRMED on-chain is at risk on a local wipe.
       unconfirmedCount: allNotes.length - confirmed,
+      countsReady: true,
       errorCount: errors,
     }));
   }

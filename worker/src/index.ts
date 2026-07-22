@@ -203,11 +203,14 @@ async function handleAdminRevoke(request: Request, env: Env): Promise<Response> 
   } catch {
     return error('Invalid JSON', 400);
   }
-  // Reject anything that is not a canonical base64 Ed25519 key BEFORE any
-  // state change: a typo'd value would otherwise get a successful idempotent
-  // response while the real key stayed allowed.
-  if (typeof publicKey !== 'string' || !isValidPublicKeyB64(publicKey)) {
-    return error('publicKey must be canonical base64 of a 32-byte key', 400);
+  // Shape guard only. The CANONICAL requirement is enforced by the DO, which
+  // can additionally honour an EXACT match on a legacy entry admitted before
+  // the canonical gate existed — rejecting non-canonical keys here would leave
+  // those unreachable through the admin API (operators would need direct DO
+  // access). A typo'd value still gets a 400 from the DO because no such entry
+  // exists, so it can never masquerade as a successful revoke.
+  if (typeof publicKey !== 'string' || publicKey.length === 0 || publicKey.length > 64) {
+    return error('publicKey required', 400);
   }
 
   let resp: Response;
@@ -886,10 +889,11 @@ async function verifySignature(
 }
 
 /**
- * Read a request body with a HARD size cap, refusing before the whole payload
- * is materialised where possible: the declared Content-Length is checked
- * first, then the actual decoded byte length (a lying/absent header can't slip
- * through). Returns the text, or the 413 Response to return as-is.
+ * Read a request body with a HARD size cap that never buffers the whole
+ * payload. The declared Content-Length is a fast-reject; then the body is
+ * consumed CHUNK BY CHUNK and the stream is cancel()led the instant the running
+ * total exceeds maxBytes — a request with no Content-Length or a lying one
+ * cannot exhaust Worker memory. Returns the decoded text or the 413 Response.
  */
 async function readLimitedBody(
   request: Request,
@@ -899,11 +903,33 @@ async function readLimitedBody(
   if (Number.isFinite(declared) && declared > maxBytes) {
     return { tooLarge: error('Body too large', 413) };
   }
-  const text = await request.text();
-  if (new TextEncoder().encode(text).byteLength > maxBytes) {
-    return { tooLarge: error('Body too large', 413) };
+
+  if (!request.body) {
+    return { text: await request.text() }; // no stream (e.g. empty body)
   }
-  return { text };
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel(); // stop pulling — don't materialise the rest
+        return { tooLarge: error('Body too large', 413) };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { buf.set(c, offset); offset += c.byteLength; }
+  return { text: new TextDecoder().decode(buf) };
 }
 
 /** Canonical base64 of exactly 32 bytes (an Ed25519 public key): decodes,

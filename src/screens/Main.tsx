@@ -476,14 +476,21 @@ export function Main() {
       <ConfirmDialog
         open={showResetConfirm}
         title="Сбросить приложение?"
-        message={arweave.unconfirmedCount > 0
-          // Only CONFIRMED notes are recoverable: an `accepted` transaction can
-          // still be dropped by the network, and after a wipe there is no local
-          // ciphertext left to re-upload.
-          ? `⚠️ ${arweave.unconfirmedCount} заметок ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
-            + '(в том числе загруженные, но ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
-            + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
-          : 'Все локальные данные будут удалены. Все заметки подтверждены в блокчейне — их можно вернуть по seed-фразе.'}
+        message={
+          // Never claim safety on placeholder counts: until the first sync-count
+          // read completes we cannot know what is recoverable (round-21 P1).
+          !arweave.countsReady
+            ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
+              + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
+              + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
+            : arweave.unconfirmedCount > 0
+              // Only CONFIRMED notes are recoverable: an `accepted` transaction
+              // can still be dropped, and after a wipe there is no local
+              // ciphertext left to re-upload.
+              ? `⚠️ ${arweave.unconfirmedCount} заметок ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+                + '(в том числе загруженные, но ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
+                + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
+              : 'Все локальные данные будут удалены. Все заметки подтверждены в блокчейне — их можно вернуть по seed-фразе.'}
         confirmLabel="Удалить всё"
         danger
         onConfirm={() => { setShowResetConfirm(false); resetApp(); }}

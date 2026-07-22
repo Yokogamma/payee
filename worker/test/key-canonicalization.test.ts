@@ -92,8 +92,8 @@ describe('canonical public-key enforcement', () => {
     expect(r.status).toBe(400);
   });
 
-  it('/admin/revoke still reaches a LEGACY non-canonical entry stored before the gate', async () => {
-    // Simulate a key admitted by an older worker build.
+  it('/admin/revoke reaches a LEGACY non-canonical entry through the PUBLIC API', async () => {
+    // Simulate a key admitted by an older worker build (before the gate).
     const { nonCanonical } = await makeKeys();
     const stub = INVITE_MANAGER.get(INVITE_MANAGER.idFromName('global'));
     await runInDurableObject(stub, (_i, state) => state.storage.put(`pk:${nonCanonical}`, true));
@@ -103,32 +103,52 @@ describe('canonical public-key enforcement', () => {
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-admin-secret' },
       body: JSON.stringify({ publicKey: nonCanonical }),
     });
-    // The worker-level canonical check rejects it, so the operator escape hatch
-    // lives in the DO: call it directly the way an admin tool would.
-    expect(r.status).toBe(400);
+    // No direct DO access needed: the worker forwards, the DO honours the exact
+    // legacy match (round-21 P2).
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ ok: true, wasAllowed: true });
 
-    const doResp = await stub.fetch('http://internal/revoke', {
-      method: 'POST',
-      body: JSON.stringify({ publicKey: nonCanonical }),
-    });
-    expect(doResp.status).toBe(200);
     const stored = await runInDurableObject(stub, (_i, state) => state.storage.get(`pk:${nonCanonical}`));
     expect(stored).toBeUndefined(); // legacy entry actually removed
   });
 
-  it('DO revoke still rejects a non-canonical key that was never stored', async () => {
+  it('/admin/revoke still 400s a non-canonical key that was NEVER stored (typo guard)', async () => {
     const { nonCanonical } = await makeKeys();
-    const stub = INVITE_MANAGER.get(INVITE_MANAGER.idFromName('global'));
-    const doResp = await stub.fetch('http://internal/revoke', {
+    const r = await SELF.fetch('https://proxy.example.com/admin/revoke', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-admin-secret' },
       body: JSON.stringify({ publicKey: nonCanonical }),
     });
-    expect(doResp.status).toBe(400);
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/canonical/i);
   });
 });
 
 describe('body-size guards on the auth routes', () => {
   const oversized = 'x'.repeat(5000); // > AUTH_BODY_MAX_BYTES (4096)
+
+  it('413s an oversized body sent WITHOUT Content-Length (streamed cap)', async () => {
+    // A chunked/streamed body has no Content-Length to pre-check: the reader
+    // must stop and cancel mid-stream instead of buffering everything.
+    const big = JSON.stringify({ pad: 'y'.repeat(200_000) });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const bytes = new TextEncoder().encode(big);
+        for (let i = 0; i < bytes.length; i += 4096) {
+          controller.enqueue(bytes.subarray(i, i + 4096));
+        }
+        controller.close();
+      },
+    });
+    const r = await SELF.fetch('https://proxy.example.com/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': `stream-${crypto.randomUUID().slice(0, 6)}` },
+      body: stream,
+      // @ts-expect-error — required by undici/workerd for a streaming body
+      duplex: 'half',
+    });
+    expect(r.status).toBe(413);
+  });
 
   it('413s an oversized /register body before signature work', async () => {
     const r = await SELF.fetch('https://proxy.example.com/register', {
