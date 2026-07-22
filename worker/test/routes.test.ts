@@ -41,6 +41,32 @@ describe('CORS allowlist', () => {
     });
     expect(stranger.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
+
+  it('allows the PRODUCTION origin (notes.matamata.dev), incl. preflight', async () => {
+    const prod = await SELF.fetch('https://proxy.example.com/health', {
+      headers: { Origin: 'https://notes.matamata.dev' },
+    });
+    expect(prod.headers.get('Access-Control-Allow-Origin')).toBe('https://notes.matamata.dev');
+
+    const preflight = await SELF.fetch('https://proxy.example.com/upload', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://notes.matamata.dev',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'Content-Type, X-Public-Key, X-Signature',
+      },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://notes.matamata.dev');
+    expect(preflight.headers.get('Access-Control-Allow-Headers')).toContain('X-Signature');
+  });
+
+  it('does NOT allow arbitrary *.pages.dev preview origins', async () => {
+    const preview = await SELF.fetch('https://proxy.example.com/health', {
+      headers: { Origin: 'https://random-preview.eternal-notes.pages.dev' },
+    });
+    expect(preview.headers.get('Access-Control-Allow-Origin')).toBeNull();
+  });
 });
 
 describe('protected routes: per-IP limiter (D-baseline)', () => {

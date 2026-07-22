@@ -22,7 +22,9 @@ commit, then a duplicate paid POST after the reservation TTL. Order:
    (`GET /health`, a signed `/upload` round-trip on staging). Tag + record the
    floor (see below).
 5. **Cloudflare Pages:** deploy the same client build to Pages
-   (`deploy-pages-cf.yml`) once `ALLOWED_ORIGINS` contains the Pages origin. The
+   (`deploy-pages-cf.yml`). The production origin `https://notes.matamata.dev`
+   is already in `ALLOWED_ORIGINS` (wrangler.toml); attach it as the Pages
+   custom domain. The
    workflow runs `scripts/smoke-headers.mjs` against the deployment URL and
    **fails** if the CSP / `X-Frame-Options` / `nosniff` / `Referrer-Policy`
    headers are not applied.

@@ -24,11 +24,13 @@ new_sqlite_classes = ["IpRateLimiter"]
 binding = "ALLOWLIST"
 id = "8d9e7ee08bff44f793933d69718600ef"
 
-# CF Pages cutover: add the real "https://<project>.pages.dev" (or custom domain)
-# and drop the github.io origin once migrated. Do NOT wildcard preview domains
-# (*.pages.dev change per deploy) — they must not reach the prod CORS allowlist.
+# Production origin: https://notes.matamata.dev (Cloudflare Pages custom
+# domain). The github.io origin stays until the legacy deployment is retired
+# (the FIRST recovery rollout deploys the client there first — see
+# docs/ROLLBACK.md). Do NOT wildcard preview domains (*.pages.dev change per
+# deploy) — they must not reach the prod CORS allowlist.
 [vars]
-ALLOWED_ORIGINS = "https://yokogamma.github.io,http://localhost:5173"
+ALLOWED_ORIGINS = "https://notes.matamata.dev,https://yokogamma.github.io,http://localhost:5173"
 MAX_BODY_BYTES = "51200"
 RATE_LIMIT_PER_HOUR = "20"
 
