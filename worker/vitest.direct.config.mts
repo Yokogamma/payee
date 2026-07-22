@@ -5,7 +5,7 @@ import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 // directly (env-override dispatch: config gates, secret gate, e2e re-post,
 // binding failure injection). Kept apart from the SELF-based integration run —
 // mixing both import styles in one run re-bundles the worker mid-run and
-// invalidates Durable Objects under other test files (see vitest.config.ts).
+// invalidates Durable Objects under other test files (see vitest.config.mts).
 export default defineConfig({
   plugins: [
     cloudflareTest({
