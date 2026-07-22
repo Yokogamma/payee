@@ -97,6 +97,23 @@ notes unrecoverable for every client built without the old owner. Order:
 5. **Do NOT rotate `RECOVERY_HMAC_SECRET` together with the JWK** — outstanding
    recovery tokens would stop verifying and fail closed (see Required secrets).
 
+## Revocation SLO (accepted residual risk)
+
+`/admin/revoke` is **not** an instant global kill switch. The DO (source of
+truth) drops the key synchronously and writes the short-TTL `denied` entry in
+the same critical section, but Workers KV is eventually consistent: an edge
+that already cached `{status:'allowed'}` keeps honouring it until its TTL
+expires.
+
+- **Worst-case propagation: `ALLOW_CACHE_TTL_SECONDS` (currently 1 hour)** —
+  the deliberate ceiling on how long a revoked key can still upload. Lowering
+  it shortens the window at the cost of more DO round-trips on cache misses.
+- The negative entry is far shorter-lived (`DENY_CACHE_TTL_SECONDS`, 10 min) so
+  a later re-grant is not masked.
+- Anything needing an immediate stop (compromised wallet, abuse in progress)
+  must ALSO take a coarse action: rotate `ADMIN_SECRET`/`ARWEAVE_JWK`, or
+  disable the Worker route — do not rely on revoke alone.
+
 ## Required secrets
 
 GitHub Actions: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
