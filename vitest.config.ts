@@ -5,6 +5,8 @@ import { defineConfig } from 'vitest/config';
 // Suites needing DOM/IndexedDB opt in via a per-file `// @vitest-environment jsdom`
 // pragma plus the fake-indexeddb import.
 export default defineConfig({
+  // Component tests (*.test.tsx) rely on the automatic JSX runtime.
+  esbuild: { jsx: 'automatic' },
   test: {
     environment: 'node',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.mjs'],

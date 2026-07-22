@@ -3,6 +3,7 @@ import { useNotes, type NoteSyncStatus } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsModal } from '../components/SettingsModal';
 import { useTheme } from '../lib/theme';
+import { copyTextToClipboard } from '../lib/clipboard';
 
 // Draft survives an accidental tab close / PWA eviction (same lifetime model as
 // the session seed: sessionStorage, never persisted to disk unencrypted forever).
@@ -129,12 +130,10 @@ export function Main() {
    *  must not look identical to a successful copy. On failure the menu stays
    *  open so the text can still be selected manually. */
   async function handleCopyNote(noteText: string) {
-    try {
-      await navigator.clipboard.writeText(noteText);
+    if (await copyTextToClipboard(noteText)) {
       setOpenMenuId(null);
       setCopyFeedback('ok');
-    } catch (err) {
-      console.error('clipboard write failed:', err);
+    } else {
       setCopyFeedback('fail');
     }
     setTimeout(() => setCopyFeedback(null), 2000);

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNotes, VaultMismatchError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { copyTextToClipboard } from '../lib/clipboard';
 
 type Step = 'start' | 'seed' | 'verify' | 'pin';
 
@@ -12,6 +13,7 @@ export function Onboarding() {
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [seedRevealed, setSeedRevealed] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const [verifyIdx, setVerifyIdx] = useState<number[]>([]);
   const [verifyInputs, setVerifyInputs] = useState<string[]>([]);
@@ -30,11 +32,16 @@ export function Onboarding() {
     setStep('seed');
   }
 
-  function handleCopy() {
-    if (mnemonic) {
-      navigator.clipboard.writeText(mnemonic);
+  async function handleCopy() {
+    if (!mnemonic) return;
+    setCopyError('');
+    // For the SEED a false «copied» is dangerous: the user may believe a
+    // backup exists that was never made. Only a resolved write counts.
+    if (await copyTextToClipboard(mnemonic)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+    } else {
+      setCopyError('Не удалось скопировать. Запишите фразу вручную или выделите слова и скопируйте сами.');
     }
   }
 
@@ -160,6 +167,14 @@ export function Onboarding() {
                 <button className="btn btn-outline" onClick={handleCopy}>
                   {copied ? '✓ Скопировано' : 'Копировать'}
                 </button>
+                {copyError && <div className="error-msg">{copyError}</div>}
+                {copied && (
+                  <div className="seed-warning info">
+                    В буфере обмена теперь лежит мастер-ключ ко всем заметкам.
+                    Вставьте его в надёжное место и скопируйте что-нибудь другое,
+                    чтобы очистить буфер.
+                  </div>
+                )}
 
                 <label className="checkbox-label">
                   <input

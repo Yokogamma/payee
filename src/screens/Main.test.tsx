@@ -1,0 +1,117 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+
+// Component tests for the Phase-6 Main-screen behaviors the review called out:
+// TX link with auto-sync off, clipboard success/failure, search hotkey/Escape.
+
+const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
+vi.mock('../lib/store', () => ({ useNotes: () => h.store }));
+vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
+
+import { Main } from './Main';
+
+function baseStore() {
+  return {
+    filteredNotes: [{ id: 'n1', text: 'привет мир', createdAt: Date.now() - 60_000 }],
+    isEncrypting: false,
+    searchQuery: '',
+    addNote: vi.fn(),
+    setSearchQuery: vi.fn(),
+    resetApp: vi.fn(),
+    notes: [{ id: 'n1', text: 'привет мир', createdAt: Date.now() - 60_000 }],
+    arweave: {
+      enabled: false, // ← auto-sync OFF: the TX link must still work
+      online: true,
+      syncing: false,
+      registered: true,
+      acceptedCount: 0,
+      confirmedCount: 1,
+      unsyncedCount: 0,
+      errorCount: 0,
+      lastSync: null,
+      lastError: null,
+    },
+    retrySync: vi.fn(),
+    restoring: false,
+    restoreProgress: null,
+    restoreError: null,
+    restoredCount: null,
+    retryRestore: vi.fn(),
+    clearRestoreStatus: vi.fn(),
+    syncStatuses: { n1: { status: 'confirmed' as const, txId: 'TX123' } },
+    dismissError: vi.fn(),
+    // consumed by the (closed) SettingsModal
+    toggleArweave: vi.fn(),
+    registerWithInvite: vi.fn(),
+    checkAccess: vi.fn(),
+    hasPin: false,
+    setupPin: vi.fn(),
+    removePin: vi.fn(),
+    showMnemonic: vi.fn(() => 'a b c'),
+  };
+}
+
+function stubClipboard(writeText: (t: string) => Promise<void>) {
+  Object.defineProperty(navigator, 'clipboard', {
+    value: { writeText },
+    configurable: true,
+  });
+}
+
+beforeEach(() => {
+  h.store = baseStore();
+  sessionStorage.clear();
+});
+afterEach(cleanup);
+
+describe('Main — note card menu', () => {
+  it('shows the confirmed-TX link even with auto-sync disabled (no live badge)', () => {
+    render(<Main />);
+    expect(document.querySelector('.sync-badge')).toBeNull(); // badge is gated
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    const link = screen.getByText('🔗 Транзакция в блокчейне') as HTMLAnchorElement;
+    expect(link.getAttribute('href')).toContain('TX123'); // link is NOT gated
+  });
+
+  it('clipboard success: copied-toast shown, menu closed', async () => {
+    stubClipboard(vi.fn(async () => {}));
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('📋 Копировать текст'));
+
+    expect(await screen.findByText('✓ Скопировано')).toBeTruthy();
+    expect(screen.queryByText('📋 Копировать текст')).toBeNull(); // menu closed
+  });
+
+  it('clipboard REJECTION: error toast shown, menu stays open (no false success)', async () => {
+    stubClipboard(vi.fn(async () => { throw new Error('NotAllowedError'); }));
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('📋 Копировать текст'));
+
+    expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
+    expect(screen.queryByText('✓ Скопировано')).toBeNull();
+    expect(screen.getByText('📋 Копировать текст')).toBeTruthy(); // still open
+  });
+});
+
+describe('Main — search UX', () => {
+  it('Ctrl+K opens the search bar, Escape closes it and clears the query', () => {
+    render(<Main />);
+    expect(screen.queryByPlaceholderText('Найти заметку...')).toBeNull();
+
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const input = screen.getByPlaceholderText('Найти заметку...');
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(screen.queryByPlaceholderText('Найти заметку...')).toBeNull();
+    expect((h.store as ReturnType<typeof baseStore>).setSearchQuery).toHaveBeenCalledWith('');
+  });
+
+  it('Cmd+K works too (macOS)', () => {
+    render(<Main />);
+    fireEvent.keyDown(window, { key: 'k', metaKey: true });
+    expect(screen.getByPlaceholderText('Найти заметку...')).toBeTruthy();
+  });
+});

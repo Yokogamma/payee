@@ -33,8 +33,9 @@ export interface EncryptedNote {
   /**
    * Data format version. Absent/1 = v1: ciphertext is the raw note text and
    * noteId/createdAt live in plaintext (Arweave tags / outer JSON). 2 = v2:
-   * ciphertext is an encrypted envelope {v,id,t,text}, so id/date are
-   * authenticated by the GCM tag and never exposed on-chain.
+   * ciphertext is an encrypted envelope {v,id,t,text}: the DATE is hidden
+   * on-chain (no Timestamp tag), while the noteId stays public as the outer
+   * Note-Id tag but is GCM-bound to the envelope (mismatch → rejected).
    */
   v?: 1 | 2;
   // No hash field. GCM auth tag inside ciphertext ensures integrity.
@@ -193,10 +194,14 @@ export async function encrypt(
 }
 
 /**
- * Encrypt a note as a v2 envelope: the whole {v,id,t,text} object is encrypted,
- * so the note id and timestamp are authenticated by the GCM tag and never appear
- * in cleartext on-chain. Not yet wired into the write path (reader-before-writer
- * rollout) — v2 is accepted for reading first, then writes flip over.
+ * Encrypt a note as a v2 envelope: the whole {v,id,t,text} object is encrypted.
+ * Privacy gain vs v1: the TIMESTAMP is hidden (it lives only inside the
+ * envelope; v2 uploads carry no Timestamp tag). The note id, however, is still
+ * PUBLIC on-chain — the outer Note-Id tag stays for dedup/GraphQL — but it is
+ * cryptographically bound to the envelope: restore rejects any TX whose outer
+ * Note-Id doesn't match the GCM-authenticated inner id.
+ * Not yet wired into the write path (reader-before-writer rollout) — v2 is
+ * accepted for reading first, then writes flip over.
  */
 export async function encryptEnvelope(
   key: CryptoKey,
