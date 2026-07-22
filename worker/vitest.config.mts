@@ -6,7 +6,7 @@ import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 // (vitest-pool-workers ≥0.18 / vitest 4: the pool is configured via the
 // cloudflareTest() plugin instead of defineWorkersConfig/poolOptions.)
 //
-// e2e-repost.test.ts is EXCLUDED here and runs via vitest.direct.config.ts in a
+// e2e-repost.test.ts is EXCLUDED here and runs via vitest.direct.config.mts in a
 // separate process (`npm test` runs both): it imports src/index directly for
 // env-override dispatch, and mixing that import with SELF-based files in ONE
 // run makes the pool re-bundle the worker mid-run — "index.ts changed,

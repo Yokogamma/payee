@@ -1,5 +1,5 @@
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
-import { beforeAll, afterAll, describe, it, expect, vi } from 'vitest';
+import { beforeAll, afterAll, afterEach, describe, it, expect, vi } from 'vitest';
 import * as ed from '@noble/ed25519';
 
 // Integration: server-authoritative reconciliation of a lost commit. The DO holds
@@ -7,24 +7,35 @@ import * as ed from '@noble/ed25519';
 // SERVER txId (never a client-supplied one). Arweave status is mocked by stubbing
 // the isolate's GLOBAL fetch (vitest-pool-workers ≥0.18 dropped `fetchMock`;
 // with singleWorker the SELF handler shares this isolate, so the stub applies).
+// Mocks are SINGLE-USE and afterEach asserts full consumption — the old
+// undici-interceptor semantics (assertNoPendingInterceptors) are preserved.
 
 const ALLOWLIST = (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST;
 const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }).RATE_LIMITER;
 
-const statusRoutes = new Map<string, { status: number; body: string }>();
+const statusRoutes = new Map<string, { status: number; body: string; calls: number }>();
 
 beforeAll(() => {
   vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
     const url = input instanceof Request ? input.url : String(input);
     const m = url.match(/^https:\/\/arweave\.net\/tx\/([^/]+)\/status$/);
-    if (m && statusRoutes.has(m[1])) {
-      const r = statusRoutes.get(m[1])!;
-      return new Response(r.body, { status: r.status });
+    const route = m ? statusRoutes.get(m[1]) : undefined;
+    if (route && route.calls === 0) {
+      route.calls++;
+      return new Response(route.body, { status: route.status });
     }
-    throw new Error(`unmocked outbound fetch: ${url}`); // net-connect disabled
+    throw new Error(`unmocked or exhausted outbound fetch: ${url}`); // net-connect disabled
   });
 });
 afterAll(() => vi.unstubAllGlobals());
+
+afterEach(() => {
+  const pending = [...statusRoutes.entries()]
+    .filter(([, r]) => r.calls === 0)
+    .map(([txId]) => txId);
+  statusRoutes.clear(); // clean slate either way
+  expect(pending, `unconsumed status mocks for: ${pending.join(', ')}`).toEqual([]);
+});
 
 function b64(bytes: Uint8Array): string {
   let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s);
@@ -83,7 +94,7 @@ async function readNote(pkB64: string) {
 }
 
 function mockStatus(txId: string, status: number, bodyText = 'x') {
-  statusRoutes.set(txId, { status, body: bodyText });
+  statusRoutes.set(txId, { status, body: bodyText, calls: 0 });
 }
 
 // Recompute the server's recovery HMAC (key = SHA-256(RECOVERY_HMAC_SECRET +

@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { beforeAll, afterAll, describe, it, expect, vi } from 'vitest';
+import { beforeAll, afterAll, afterEach, describe, it, expect, vi } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 
@@ -20,30 +20,47 @@ type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
 
 // Outbound Arweave HTTP is mocked by stubbing the isolate's GLOBAL fetch
-// (vitest-pool-workers ≥0.18 dropped `fetchMock`). Routes are registered per
-// test via mockRoute(); anything unmocked throws (net-connect disabled).
-type OutboundRoute = {
+// (vitest-pool-workers ≥0.18 dropped `fetchMock`). Routes are SINGLE-USE by
+// default (undici-interceptor semantics preserved): an exhausted or unmocked
+// request throws, and afterEach asserts every registered route was fully
+// consumed — an expected-but-never-sent request fails the test, and a
+// regression that fires the same paid request twice cannot pass.
+interface OutboundRoute {
   method: string;
   url: RegExp;
-  reply: () => Response;
-};
+  status: number;
+  body: string;
+  times: number;
+  calls: number;
+}
 const outboundRoutes: OutboundRoute[] = [];
 
-function mockRoute(method: string, url: RegExp, status: number, body: string) {
-  outboundRoutes.push({ method, url, reply: () => new Response(body, { status }) });
+function mockRoute(method: string, url: RegExp, status: number, body: string, times = 1): OutboundRoute {
+  const route: OutboundRoute = { method, url, status, body, times, calls: 0 };
+  outboundRoutes.push(route);
+  return route;
 }
 
 beforeAll(() => {
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : String(input);
     const method = ((input instanceof Request ? input.method : init?.method) ?? 'GET').toUpperCase();
-    for (const r of outboundRoutes) {
-      if (r.method === method && r.url.test(url)) return r.reply();
-    }
-    throw new Error(`unmocked outbound fetch: ${method} ${url}`);
+    const route = outboundRoutes.find(r => r.method === method && r.url.test(url) && r.calls < r.times);
+    if (!route) throw new Error(`unmocked or exhausted outbound fetch: ${method} ${url}`);
+    route.calls++;
+    return new Response(route.body, { status: route.status });
   });
 });
 afterAll(() => vi.unstubAllGlobals());
+
+afterEach(() => {
+  // assertNoPendingInterceptors() equivalent: every route fully consumed.
+  const pending = outboundRoutes
+    .filter(r => r.calls !== r.times)
+    .map(r => `${r.method} ${r.url} (${r.calls}/${r.times})`);
+  outboundRoutes.length = 0; // clean slate for the next test either way
+  expect(pending, `unconsumed outbound mocks: ${pending.join('; ')}`).toEqual([]);
+});
 
 function b64(bytes: Uint8Array): string {
   let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s);
@@ -117,9 +134,9 @@ describe('invalid env config fails closed on the real route (L6)', () => {
 describe('mandatory RECOVERY_HMAC_SECRET (upload gate)', () => {
   // Without the secret a triple-failure has NO provable recovery hint: after the
   // reservation TTL the recheck degrades into a duplicate paid POST. So /upload
-  // must refuse to post at all. fetchMock has net-connect disabled and NO
-  // interceptors registered here — had the request reached the Arweave post
-  // path it would have errored as 502, so a 503 proves no outbound call.
+  // must refuse to post at all. The global-fetch stub has NO routes registered
+  // here (any outbound call throws → 502) — a 503 proves the request never
+  // reached the Arweave post path.
   it('503s a valid signed upload when the secret is missing', async () => {
     const id = await makeIdentity();
     const r = await worker.fetch(
@@ -218,10 +235,12 @@ describe('e2e: lost commit → posted anchor → TTL → redrop → successful r
     // Arweave HTTP surface for the re-post: dead status, then anchor/price/post.
     // (arweave-js requires a ≥43-char base64url tx anchor.)
     // arweave-js builds explicit host:443 URLs → the port is optional here.
+    // All routes are single-use; postTx.calls is asserted below — the whole
+    // point of this test is that the recovery performs EXACTLY ONE paid POST.
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx\/TX-DEAD\/status$/, 404, 'not found');
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
-    mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
+    const postTx = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
 
     const r = await worker.fetch(
       await recheckRequest(id, `e2e-${crypto.randomUUID().slice(0, 6)}`),
@@ -238,5 +257,8 @@ describe('e2e: lost commit → posted anchor → TTL → redrop → successful r
       state.storage.get<{ status: string; txId?: string }>(`note:${NOTE_ID}`));
     expect(rec?.status).toBe('committed');
     expect(rec?.txId).toBe(body.txId);
+
+    // The invariant this whole file exists for: exactly ONE paid Arweave POST.
+    expect(postTx.calls).toBe(1);
   });
 });
