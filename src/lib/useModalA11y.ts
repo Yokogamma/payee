@@ -13,9 +13,12 @@ const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabi
 export function useModalA11y<T extends HTMLElement>(open: boolean, onClose: () => void) {
   const containerRef = useRef<T | null>(null);
   // Ref'd so an inline onClose doesn't re-run the effect (its cleanup would
-  // return focus to the trigger while the dialog is still open).
+  // return focus to the trigger while the dialog is still open). Synced in an
+  // effect — refs must not be written during render.
   const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) return;
