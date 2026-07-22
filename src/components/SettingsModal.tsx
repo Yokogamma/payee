@@ -45,6 +45,11 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
   const containerRef = useModalA11y<HTMLDivElement>(open, close);
   useEffect(() => {
     if (open) containerRef.current?.focus();
+    // The revealed seed must NEVER survive a close, however the modal was
+    // closed — incl. the reset flow, where Main flips `open` directly and the
+    // internal close() is bypassed (round-13 finding: Settings → показать seed
+    // → Reset → отмена → Settings снова показывал фразу без запроса).
+    else setShowSeed(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 

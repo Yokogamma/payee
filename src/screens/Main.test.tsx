@@ -108,6 +108,25 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     expect(dialogs[0].getAttribute('aria-label')).toBe('Сбросить приложение?');
   });
 
+  it('revealed seed does NOT survive the Reset→Cancel round-trip (round 13)', () => {
+    (h.store as ReturnType<typeof baseStore>).showMnemonic = vi.fn(() => 'секретное слово фраза');
+    render(<Main />);
+
+    // 1. Open Settings, reveal the seed.
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Показать seed-фразу'));
+    expect(screen.getByText('секретное')).toBeTruthy();
+
+    // 2-3. Reset (closes settings, opens confirm) → cancel the confirm.
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+    fireEvent.click(screen.getByText('Отмена'));
+
+    // 4. Reopen Settings — the seed must be hidden again, behind the toggle.
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    expect(screen.queryByText('секретное')).toBeNull();
+    expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
+  });
+
   it('per-note sync badge is a live role=status region', () => {
     (h.store as ReturnType<typeof baseStore>).arweave.enabled = true;
     render(<Main />);

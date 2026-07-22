@@ -171,6 +171,9 @@ h1 {
   cursor: pointer;
   transition: all 0.15s;
   width: 100%;
+  /* a11y (Phase 7): every button is a ≥44px touch target — variants with
+     smaller padding (btn-save, invite-btn) inherit this floor. */
+  min-height: 44px;
 }
 
 .btn:disabled {
