@@ -172,7 +172,14 @@ export function Main() {
         <div className="error-banner" role="alert">
           <span>⚠️ {restoreError}</span>
           <button className="banner-btn" onClick={retryRestore}>Повторить</button>
-          <button className="banner-btn banner-close" onClick={clearRestoreStatus} title="Скрыть">✕</button>
+          <button
+            className="banner-btn banner-close"
+            onClick={clearRestoreStatus}
+            title="Скрыть"
+            aria-label="Скрыть сообщение об ошибке восстановления"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -180,7 +187,14 @@ export function Main() {
       {!restoring && !restoreError && restoredCount !== null && restoredCount > 0 && (
         <div className="success-banner" role="status">
           <span>✓ Восстановлено заметок: {restoredCount}</span>
-          <button className="banner-btn banner-close" onClick={clearRestoreStatus} title="Скрыть">✕</button>
+          <button
+            className="banner-btn banner-close"
+            onClick={clearRestoreStatus}
+            title="Скрыть"
+            aria-label="Скрыть уведомление о восстановлении"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -393,7 +407,14 @@ export function Main() {
           <button className="banner-btn" onClick={retrySync} disabled={arweave.syncing}>
             {arweave.syncing ? '...' : 'Повторить'}
           </button>
-          <button className="banner-btn banner-close" onClick={dismissError} title="Скрыть">✕</button>
+          <button
+            className="banner-btn banner-close"
+            onClick={dismissError}
+            title="Скрыть"
+            aria-label="Скрыть сообщение об ошибке синхронизации"
+          >
+            ✕
+          </button>
         </div>
       )}
 
