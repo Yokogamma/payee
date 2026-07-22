@@ -81,6 +81,11 @@ function v2Tags(): Tag[] {
 let ipCounter = 0;
 const nextIp = () => `uv-${crypto.randomUUID().slice(0, 6)}-${ipCounter++}`;
 
+/** A syntactically valid (canonical, 32-byte) key for unsigned probes: the
+ *  canonical-spelling gate runs before body parsing, so a dummy like 'x' would
+ *  now be rejected as a malformed key instead of reaching the shape checks. */
+const DUMMY_PK = b64(crypto.getRandomValues(new Uint8Array(32)));
+
 /** Send a raw (unsigned) body — the top-level shape/timestamp checks run BEFORE
  * signature verification, so dummy auth headers are enough to reach them. */
 function rawUpload(body: string, ip: string): Promise<Response> {
@@ -88,7 +93,7 @@ function rawUpload(body: string, ip: string): Promise<Response> {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Public-Key': 'x',
+      'X-Public-Key': DUMMY_PK,
       'X-Signature': 'y',
       'CF-Connecting-IP': ip,
     },
