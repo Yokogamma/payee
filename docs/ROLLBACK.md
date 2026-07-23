@@ -83,13 +83,14 @@ Only after R is deployed **everywhere and stable** flip the client to writing v2
      must be rolled back **as a compatible pair**, never the Worker alone below
      the recovery protocol.
   - On the first production deploy, tag it (e.g. `worker-r1`) and record it here:
-    `WORKER_FLOOR_TAG = <fill on first deploy: tag + full SHA>`.
+    `WORKER_FLOOR_TAG = worker-r1 (15b87d4cacbc19a3371a19b9141f1562b63781d8)`.
   - **Allowed rollback targets = tags in this list that are descendants of
     `WORKER_FLOOR_TAG`** (verify with `git merge-base --is-ancestor`). Never
     deploy anything else once the floor Worker has run even once.
   - Use `wrangler rollback` / redeploy of an allowed tag only.
   - Allowed release tags (append on each deploy):
-    - _none yet — first deploy pending_
+    - worker-r1 — 15b87d4cacbc19a3371a19b9141f1562b63781d8 (2026-07-23, first
+      production worker deploy; recovery-protocol writer)
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
