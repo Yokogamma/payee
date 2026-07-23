@@ -1,0 +1,29 @@
+{
+  "patterns": [
+    {
+      "rule_name": "secret_in_log",
+      "regex": "console\\.(log|error|warn|info|debug)\\s*\\([^)]*(mnemonic|privateKey|seedPhrase|ARWEAVE_JWK|ADMIN_SECRET|RECOVERY_HMAC_SECRET)",
+      "paths": ["**/src/**"],
+      "exclude_paths": ["**/*.test.ts", "**/test/**"],
+      "reminder": "Possible secret/key material in a log call. Never log a mnemonic, private key, seed, PIN, or a *_SECRET/JWK env value — logs can leave the device. Log an opaque id or a fixed marker instead."
+    },
+    {
+      "rule_name": "worker_writes_allowlist_cache",
+      "regex": "writeAllowCache",
+      "paths": ["**/worker/src/index.ts"],
+      "reminder": "The Worker must never write the pk allowlist cache. Every pk:* / writeAllowCache write belongs inside InviteManager under blockConcurrencyWhile (serialized owner) — an unserialized worker get→put can resurrect a revoked key."
+    },
+    {
+      "rule_name": "cors_wildcard_origin",
+      "regex": "Allow-Origin['\"]?\\]?\\s*[=:]\\s*['\"]\\*",
+      "paths": ["**/src/**", "**/worker/**"],
+      "reminder": "Access-Control-Allow-Origin set to '*'. CORS must reflect an origin only when it is in ALLOWED_ORIGINS — never wildcard, and never add *.pages.dev preview domains to the prod allowlist."
+    },
+    {
+      "rule_name": "arweave_plaintext_http",
+      "substrings": ["http://arweave.net"],
+      "paths": ["**/src/**", "**/worker/**"],
+      "reminder": "Arweave calls must use https. A plaintext http:// endpoint exposes upload traffic to tampering."
+    }
+  ]
+}
