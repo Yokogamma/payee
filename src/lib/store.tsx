@@ -77,13 +77,10 @@ export interface ArweaveState {
   syncing: boolean;
   registered: boolean;
   unsyncedCount: number;
-  /** Notes NOT yet confirmed on-chain (includes `accepted`: a pending TX can
-   *  still be dropped). Only `confirmed` notes survive a local wipe, so this —
-   *  not unsyncedCount — is what a destructive reset must warn about.
-   *  Meaningless until `countsReady`. */
-  unconfirmedCount: number;
-  /** False until the first refreshSyncCounts() has run. While false the counts
-   *  are placeholder zeros and MUST NOT be used to claim anything is safe. */
+  /** False until the first refreshSyncCounts() has run. While false the per-note
+   *  statuses are not yet populated and MUST NOT be used to claim anything is
+   *  safe to delete. (Reset safety is derived in Main from notes+syncStatuses,
+   *  which are always consistent with the visible UI — not from an aggregate.) */
   countsReady: boolean;
   errorCount: number;
   acceptedCount: number;
@@ -98,7 +95,6 @@ const INITIAL_ARWEAVE: ArweaveState = {
   syncing: false,
   registered: false,
   unsyncedCount: 0,
-  unconfirmedCount: 0,
   countsReady: false,
   errorCount: 0,
   acceptedCount: 0,
@@ -383,10 +379,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const savedEnabled = !!(await getMeta<boolean>('ar-enabled'));
     setArweave({ enabled: savedEnabled });
 
-    // Sync counts come from local IndexedDB and are CHEAP — read them before
-    // the UI can be interacted with. The destructive-reset dialog decides what
-    // is recoverable from unconfirmedCount, so it must never render against
-    // the zero-initialised default (round-21 P1).
+    // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
+    // populate them (and flip countsReady) before the UI is interactive, so the
+    // destructive-reset dialog never renders against empty placeholder state
+    // (round-21 P1).
     await refreshSyncCounts();
 
     // Background: network-dependent parts only (online probe + queue kick).
@@ -462,8 +458,6 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       acceptedCount: accepted,
       confirmedCount: confirmed,
       unsyncedCount: unsynced,
-      // Everything that is not CONFIRMED on-chain is at risk on a local wipe.
-      unconfirmedCount: allNotes.length - confirmed,
       countsReady: true,
       errorCount: errors,
     }));

@@ -31,7 +31,6 @@ function baseStore() {
       acceptedCount: 0,
       confirmedCount: 1,
       unsyncedCount: 0,
-      unconfirmedCount: 0,
       countsReady: true,
       errorCount: 0,
       lastSync: null,
@@ -138,10 +137,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
   it('reset warns about ACCEPTED-but-unconfirmed notes (they can still drop)', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
-    s.arweave.confirmedCount = 0;
-    s.arweave.acceptedCount = 1;
-    s.arweave.unsyncedCount = 0;   // "synced" by the old (wrong) definition
-    s.arweave.unconfirmedCount = 1; // but NOT confirmed on-chain
+    s.syncStatuses = { n1: { status: 'accepted' as const } }; // uploaded, NOT confirmed
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
@@ -152,10 +148,41 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     expect(dialog.textContent).not.toMatch(/Все заметки подтверждены/);
   });
 
+  it('reset warns even if the aggregate looks clean but a note has no sync record', () => {
+    // The round-22 case: countsReady=true and the aggregate says 0 unconfirmed
+    // (a post-save refreshSyncCounts was swallowed), but the just-added note is
+    // in `notes` with no syncStatuses entry. Derived-from-UI must still warn.
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.enabled = true;
+    s.arweave.countsReady = true;
+    s.syncStatuses = {}; // n1 present in notes, absent here
+    render(<Main />);
+
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
+    expect(dialog.textContent).toMatch(/НЕ подтверждены/);
+    expect(dialog.textContent).not.toMatch(/Все заметки подтверждены/);
+  });
+
+  it('reset says everything is safe only when EVERY visible note is confirmed', () => {
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.enabled = true;
+    s.arweave.countsReady = true;
+    s.syncStatuses = { n1: { status: 'confirmed' as const, txId: 'TX123' } };
+    render(<Main />);
+
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
+    expect(dialog.textContent).toMatch(/Все заметки подтверждены/);
+  });
+
   it('reset NEVER claims safety while sync counts are still loading', () => {
     const s = h.store as ReturnType<typeof baseStore>;
-    s.arweave.countsReady = false;   // placeholder zeros right after bootstrap
-    s.arweave.unconfirmedCount = 0;
+    s.arweave.countsReady = false;   // placeholder state right after bootstrap
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));

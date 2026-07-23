@@ -173,6 +173,27 @@ export function Main() {
     return parts;
   }
 
+  // Reset-safety text is derived from what the user can SEE (notes) joined with
+  // the current per-note statuses — NOT from arweave's aggregate counter. The
+  // aggregate can be stale: a note is added to `notes` before refreshSyncCounts
+  // runs, and that refresh is best-effort (its failure is swallowed). A note
+  // absent from syncStatuses, or not 'confirmed', is unrecoverable after a wipe.
+  const unconfirmedVisible = notes.filter(
+    n => syncStatuses[n.id]?.status !== 'confirmed',
+  ).length;
+  const resetWarningMessage = !arweave.countsReady
+    // Until the first sync-count read completes we cannot know what is safe.
+    ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
+      + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
+      + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
+    : unconfirmedVisible > 0
+      // Only CONFIRMED notes are recoverable: an `accepted` transaction can
+      // still be dropped, and after a wipe there is no local ciphertext left.
+      ? `⚠️ ${unconfirmedVisible} заметок ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+        + '(в том числе загруженные, но ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
+        + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
+      : 'Все локальные данные будут удалены. Все заметки подтверждены в блокчейне — их можно вернуть по seed-фразе.';
+
   return (
     <div className="main-screen">
       {/* Restoring Banner */}
@@ -476,21 +497,7 @@ export function Main() {
       <ConfirmDialog
         open={showResetConfirm}
         title="Сбросить приложение?"
-        message={
-          // Never claim safety on placeholder counts: until the first sync-count
-          // read completes we cannot know what is recoverable (round-21 P1).
-          !arweave.countsReady
-            ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
-              + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
-              + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
-            : arweave.unconfirmedCount > 0
-              // Only CONFIRMED notes are recoverable: an `accepted` transaction
-              // can still be dropped, and after a wipe there is no local
-              // ciphertext left to re-upload.
-              ? `⚠️ ${arweave.unconfirmedCount} заметок ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
-                + '(в том числе загруженные, но ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
-                + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
-              : 'Все локальные данные будут удалены. Все заметки подтверждены в блокчейне — их можно вернуть по seed-фразе.'}
+        message={resetWarningMessage}
         confirmLabel="Удалить всё"
         danger
         onConfirm={() => { setShowResetConfirm(false); resetApp(); }}
