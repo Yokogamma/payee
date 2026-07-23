@@ -176,8 +176,13 @@ async function handleAdminSeedInvite(request: Request, env: Env): Promise<Respon
     method: 'POST',
     body: JSON.stringify({ codes }),
   }));
-  const result = await resp.json();
-  return json(result);
+  // Propagate the DO's status: it enforces the batch/shape caps and returns 400
+  // on a bad request, which must not surface to the operator as a 200.
+  if (!resp.ok) {
+    const body: { error?: string } = await resp.json();
+    return error(body.error || 'seed-invite failed', resp.status);
+  }
+  return json(await resp.json());
 }
 
 // ─── /admin/revoke (M11) ────────────────────────────────────────────

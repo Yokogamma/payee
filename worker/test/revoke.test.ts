@@ -298,3 +298,61 @@ describe('L12 constant-time admin auth', () => {
     expect(r.status).toBe(200);
   });
 });
+
+describe('seed-invite is create-only (round-23: no resurrection of used/revoked)', () => {
+  async function seedViaAdmin(codes: unknown) {
+    return SELF.fetch('https://proxy.example.com/admin/seed-invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...AUTH },
+      body: JSON.stringify({ codes }),
+    });
+  }
+
+  it('re-seeding a USED code does NOT make it reusable', async () => {
+    const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const code = `USED-${crypto.randomUUID().slice(0, 8)}`;
+    await seedInvite(code);
+    expect((await registerViaDO(code, pk)).status).toBe(200); // consumes it
+
+    // The operator accidentally re-runs the seed for the same code.
+    const r = await seedViaAdmin([code]);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ seeded: 0, skipped: [code] });
+
+    // The invite is still used → a second key cannot register with it.
+    const other = b64(crypto.getRandomValues(new Uint8Array(32)));
+    expect((await registerViaDO(code, other)).status).toBe(401);
+    const invite = await inMgrStorage(s => s.get<{ used: boolean }>(`invite:${code}`));
+    expect(invite?.used).toBe(true);
+  });
+
+  it('re-seeding a REVOKED code leaves it revoked', async () => {
+    const pk = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const code = `REVK-${crypto.randomUUID().slice(0, 8)}`;
+    await seedInvite(code);
+    await registerViaDO(code, pk);
+    await adminRevoke(pk);
+
+    const r = await seedViaAdmin([code]);
+    expect(await r.json()).toMatchObject({ seeded: 0, skipped: [code] });
+
+    const invite = await inMgrStorage(s => s.get<{ revoked?: boolean; used: boolean }>(`invite:${code}`));
+    expect(invite?.revoked).toBe(true);
+    expect(invite?.used).toBe(true);
+  });
+
+  it('creates only the codes that do not exist yet', async () => {
+    const existing = `MIX-A-${crypto.randomUUID().slice(0, 6)}`;
+    const fresh = `MIX-B-${crypto.randomUUID().slice(0, 6)}`;
+    await seedInvite(existing);
+
+    const r = await seedViaAdmin([existing, fresh]);
+    expect(await r.json()).toMatchObject({ seeded: 1, skipped: [existing] });
+  });
+
+  it('rejects an oversized batch and malformed codes', async () => {
+    expect((await seedViaAdmin(Array.from({ length: 1001 }, (_, i) => `c${i}`))).status).toBe(400);
+    expect((await seedViaAdmin(['ok', 123])).status).toBe(400);
+    expect((await seedViaAdmin(['x'.repeat(200)])).status).toBe(400);
+  });
+});

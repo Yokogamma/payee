@@ -125,7 +125,8 @@ export function Onboarding() {
           <>
             <h1>Eternal Notes</h1>
             <p className="subtitle">
-              Заметки, которые живут вечно. Зашифрованы. Неудаляемы.
+              Зашифрованы на устройстве. По желанию — навсегда в блокчейне
+              (синхронизация включается позже по invite-коду).
             </p>
             <button className="btn btn-primary" onClick={handleGenerate}>
               Создать хранилище

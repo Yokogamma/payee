@@ -64,6 +64,10 @@ interface SeedInviteRequest {
   codes: string[];
 }
 
+/** Bounds for /seed-invite input (defense against oversized/garbage batches). */
+const MAX_INVITE_CODE_LENGTH = 128;
+const MAX_SEED_BATCH = 1000;
+
 /** Canonical base64 of exactly 32 bytes (Ed25519 public key). */
 function isCanonical32ByteB64(s: string): boolean {
   if (s.length === 0 || s.length > 64) return false; // 32 bytes → 44 chars
@@ -308,12 +312,42 @@ export class InviteManager implements DurableObject {
 
   /**
    * Admin: seed invite codes (called via wrangler or admin secret).
+   *
+   * CREATE-ONLY, serialized: an existing code is NEVER overwritten. Re-seeding a
+   * code that was already used (or revoked) must not resurrect it — otherwise an
+   * operator accidentally re-running the seed makes a one-time invite reusable
+   * or un-revokes a key (round-23 access-control finding). Existing codes are
+   * reported as `skipped`, not reset.
    */
   private async handleSeedInvite(request: Request): Promise<Response> {
     const { codes } = await request.json<SeedInviteRequest>();
-    for (const code of codes) {
-      await this.state.storage.put<InviteRecord>(`invite:${code}`, { used: false });
+    if (!Array.isArray(codes) || codes.length === 0) {
+      return Response.json({ error: 'codes[] required' }, { status: 400 });
     }
-    return Response.json({ seeded: codes.length });
+    if (codes.length > MAX_SEED_BATCH) {
+      return Response.json({ error: `at most ${MAX_SEED_BATCH} codes per call` }, { status: 400 });
+    }
+    for (const code of codes) {
+      if (typeof code !== 'string' || code.length === 0 || code.length > MAX_INVITE_CODE_LENGTH) {
+        return Response.json({ error: 'each code must be a 1..128-char string' }, { status: 400 });
+      }
+    }
+
+    let seeded = 0;
+    const skipped: string[] = [];
+    await this.state.blockConcurrencyWhile(async () => {
+      for (const code of codes) {
+        // Read-before-write inside the critical section: no register/revoke can
+        // interleave between the existence check and the create.
+        const existing = await this.state.storage.get(`invite:${code}`);
+        if (existing) {
+          skipped.push(code);
+          continue;
+        }
+        await this.state.storage.put<InviteRecord>(`invite:${code}`, { used: false });
+        seeded++;
+      }
+    });
+    return Response.json({ seeded, skipped });
   }
 }
