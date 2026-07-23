@@ -5,6 +5,22 @@ merge. Reader-before-writer ordering is operator-driven.
 
 ## FIRST rollout of the recovery protocol — CLIENT BEFORE WORKER
 
+> **Operator override (decided 2026-07-22, executed 2026-07-23): WORKER-FIRST for
+> THIS deployment.** The client-before-worker rule below exists solely to protect
+> *legacy clients on `yokogamma.github.io`*. The operator confirmed there are **no
+> such clients**, so the rule does not apply. Two facts made worker-first the safer
+> choice here:
+> 1. No legacy client is loaded or cached anywhere, so the recovery-protocol
+>    incompatibility that motivates client-first cannot occur.
+> 2. The currently-deployed (old) Worker does **not** allow the new production
+>    origin `https://notes.matamata.dev` (preflight returns 204 without ACAO), so a
+>    client deployed *before* the new Worker would sit CORS-blocked for minutes.
+>
+> Executed order: **Worker → smoke → floor tag → Pages project → client → attach
+> `notes.matamata.dev` → smokes.** The legacy `github.io` deploy is **skipped**.
+> This override applies to the FIRST rollout only; the roll-forward order for
+> subsequent releases (below) is unchanged.
+
 The usual "worker first" order is **wrong for the first deploy of this branch**.
 The new Worker is a *writer* of the recovery protocol (`committed:false` +
 `recovery` token), and clients from current `main` neither persist the token nor
