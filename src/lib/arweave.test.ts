@@ -180,6 +180,13 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     expect(res[0].encrypted.v).toBe(2);
     expect(res[0].encrypted.createdAt).toBe(note.createdAt);
     expect(res[0].txId).toBe('TX1');
+
+    // Regression guard (restore CORS bug): the note payload MUST be fetched from
+    // the /raw/<txId> endpoint. The bare gateway URL arweave.net/<txId> 302-
+    // redirects to a sandbox subdomain that sends no CORS headers, so a browser
+    // fetch is blocked — this silently broke restore for every user until pinned.
+    const dataCall = fetchMock.mock.calls.find(c => !String(c[0]).includes('/graphql'));
+    expect(String(dataCall?.[0])).toContain('/raw/TX1');
   });
 
   it('skips a candidate that fails to decrypt (replay/garbage)', async () => {

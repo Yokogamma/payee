@@ -468,7 +468,7 @@ export async function fetchAllNotes(
 
       let dataResponse: Response | null = null;
       try {
-        dataResponse = await fetch(`https://arweave.net/${cand.txId}`, {
+        dataResponse = await fetch(`https://arweave.net/raw/${cand.txId}`, {
           signal: AbortSignal.timeout(PAYLOAD_TIMEOUT_MS),
         });
       } catch {
