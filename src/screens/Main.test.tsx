@@ -109,6 +109,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     fireEvent.click(screen.getByLabelText('Настройки'));
     expect(screen.getAllByRole('dialog')).toHaveLength(1); // settings open
 
+    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
     const dialogs = screen.getAllByRole('dialog');
     expect(dialogs).toHaveLength(1); // confirm replaced settings, not stacked
@@ -121,15 +122,18 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
 
     // 1. Open Settings, reveal the seed.
     fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Seed-фраза')); // expand the block
     fireEvent.click(screen.getByText('Показать seed-фразу'));
     expect(screen.getByText('секретное')).toBeTruthy();
 
     // 2-3. Reset (closes settings, opens confirm) → cancel the confirm.
+    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
     fireEvent.click(screen.getByText('Отмена'));
 
     // 4. Reopen Settings — the seed must be hidden again, behind the toggle.
     fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Seed-фраза')); // expand the block again
     expect(screen.queryByText('секретное')).toBeNull();
     expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
   });
@@ -141,6 +145,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
     const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
@@ -159,6 +164,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
     const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
@@ -174,6 +180,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
     const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });
@@ -186,6 +193,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
     const dialog = screen.getByRole('dialog', { name: 'Сбросить приложение?' });

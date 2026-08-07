@@ -66,14 +66,31 @@ describe('SettingsModal a11y (Phase 7)', () => {
     const active = document.activeElement as HTMLElement;
     expect(dialog.contains(active)).toBe(true);      // never escapes behind the modal
     expect(active).not.toBe(dialog);                 // wrapped to a real control
-    expect(active.textContent).toBe('Закрыть');      // the LAST focusable inside
+    expect(active.textContent).toBe('Сброс приложения'); // LAST focusable = last block header
   });
 
   it('theme picker exposes the active option via aria-pressed', () => {
     renderModal();
-    const system = screen.getByText('Системная');
-    const dark = screen.getByText('Тёмная');
+    // Theme now lives inside a collapsed block — expand it first. "Системная"
+    // also appears as the block's status chip, so target the buttons by role.
+    fireEvent.click(screen.getByText('Тема'));
+    const system = screen.getByRole('button', { name: 'Системная' });
+    const dark = screen.getByRole('button', { name: 'Тёмная' });
     expect(system.getAttribute('aria-pressed')).toBe('true');
     expect(dark.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('PIN block: "Установить" with no PIN; "Сменить" + "Удалить" once set', () => {
+    renderModal();
+    fireEvent.click(screen.getByText('PIN-код'));
+    expect(screen.getByText('Установить PIN-код')).toBeTruthy();
+    expect(screen.queryByText('Сменить PIN-код')).toBeNull();
+    cleanup();
+
+    h.store.hasPin = true;
+    renderModal();
+    fireEvent.click(screen.getByText('PIN-код'));
+    expect(screen.getByText('Сменить PIN-код')).toBeTruthy();
+    expect(screen.getByText('Удалить PIN-код')).toBeTruthy();
   });
 });
