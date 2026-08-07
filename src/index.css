@@ -982,11 +982,15 @@ mark {
 .note-menu {
   position: absolute;
   right: 10px;
-  bottom: 38px;
+  /* Drop DOWN from the ⋯ button. Opening upward (was `bottom: 38px`) overflowed
+     ABOVE short cards near the top of the list, covering the composer / other
+     UI on mobile (the menu is taller than the gap above the button). */
+  top: calc(100% - 4px);
   z-index: 20;
   display: flex;
   flex-direction: column;
   min-width: 240px;
+  max-width: calc(100vw - 32px); /* never overflow a narrow phone horizontally */
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
