@@ -56,6 +56,7 @@ import {
   getMeta,
   setMeta,
   deleteMeta,
+  getPinConfigMeta,
   clearPinConfigMeta,
   resetAll,
   recoverStorage,
@@ -494,35 +495,48 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // An unreadable config fails CLOSED: a vault we cannot vouch for locks.
       lockCheckPendingRef.current = true;
       void (async () => {
-        // Config publication shares the reconcile ordering domain (round 4).
-        const myReconcile = ++reconcileGenerationRef.current;
-        let lock = true;
-        let freshHasPin = false;
-        let freshTimeout: AutoLockTimeout = null;
-        let readOk = false;
-        try {
-          const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
-          const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
-          freshHasPin = !!pinData;
-          freshTimeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
-          readOk = true;
-          lock = decideLockOnReturn(freshTimeout, freshHasPin, marker, now);
-        } catch (err) {
-          console.error('auto-lock config re-read failed — locking fail-closed:', err);
+        // The verdict must reflect the LATEST authoritative config. If a newer
+        // reconcile — or a local config write — lands while we read, our
+        // snapshot cannot be trusted in EITHER direction: completing a stale
+        // "no lock" would drop the gate with the marker already consumed
+        // (round 5 high). So a superseded snapshot never completes the
+        // verdict — gate and pending stay, and we re-decide against the
+        // newest state with the SAME consumed marker.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const myReconcile = ++reconcileGenerationRef.current;
+          let lock = true;
+          let freshHasPin = false;
+          let freshTimeout: AutoLockTimeout = null;
+          let readOk = false;
+          try {
+            const { pinSeed, autoLockTimeout: rawTimeout } = await getPinConfigMeta();
+            freshHasPin = !!pinSeed;
+            freshTimeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
+            readOk = true;
+            lock = decideLockOnReturn(freshTimeout, freshHasPin, marker, now);
+          } catch (err) {
+            console.error('auto-lock config re-read failed — locking fail-closed:', err);
+          }
+          // A newer hidden/lock/commit owns the gate — this return is over
+          // (rounds 3–4). Nothing to complete, nothing to publish.
+          if (lockCheckGenerationRef.current !== myGen || vaultEpochRef.current !== myEpoch) return;
+          // Superseded snapshot → decide again. An unreadable config (readOk
+          // false) skips the retry and locks fail-closed below instead.
+          if (readOk && reconcileGenerationRef.current !== myReconcile) continue;
+          lockCheckPendingRef.current = false;
+          if (readOk) {
+            applyHasPin(freshHasPin);
+            applyAutoLockTimeout(freshTimeout);
+          }
+          if (lock) lockApp();
+          else setLockGate(false);
+          return;
         }
-        // Apply ONLY while this return is the current lifecycle cycle (review
-        // rounds 3–4): a newer hidden edge owns the gate now, a re-opened
-        // vault (new commit/epoch) is not ours to lock, and a superseded read
-        // must not overwrite the new session's config refs either — everything
-        // publishes together, after the guard.
+        // A reconcile storm superseded every attempt — an UNVERIFIABLE config
+        // is treated exactly like an unreadable one: fail-closed.
         if (lockCheckGenerationRef.current !== myGen || vaultEpochRef.current !== myEpoch) return;
         lockCheckPendingRef.current = false;
-        if (readOk && reconcileGenerationRef.current === myReconcile) {
-          applyHasPin(freshHasPin);
-          applyAutoLockTimeout(freshTimeout);
-        }
-        if (lock) lockApp();
-        else setLockGate(false);
+        lockApp();
       })();
     };
     const onVisibility = () => {
@@ -608,9 +622,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   async function reconcileLockScreen(): Promise<void> {
     const myReconcile = ++reconcileGenerationRef.current;
     try {
-      const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
-      const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
-      if (reconcileGenerationRef.current !== myReconcile) return; // a newer read owns the refs
+      const { pinSeed, autoLockTimeout: rawTimeout } = await getPinConfigMeta();
+      if (reconcileGenerationRef.current !== myReconcile) return; // a newer read/write owns the refs
+      const pinData = pinSeed as PinEncryptedSeed | undefined;
       applyHasPin(!!pinData);
       applyAutoLockTimeout(isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null);
       if (!pinData) setScreen(prev => (prev === 'pin' ? 'restore' : prev));
@@ -629,6 +643,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     queueGenerationRef.current++;
     lockCheckGenerationRef.current++;
     lockCheckPendingRef.current = false;
+    // An in-flight reconcile read predates this invalidation — its snapshot
+    // must never resurrect the old config (e.g. hasPin=true on a clean
+    // landing after reset, round 5).
+    reconcileGenerationRef.current++;
     setLockGate(false);
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = null;
@@ -646,10 +664,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // 3. Check for PIN-encrypted seed + auto-lock config
-      const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
+      // 3. Check for PIN-encrypted seed + auto-lock config — ONE consistent
+      //    snapshot: a concurrent wipe in another tab must not be seen
+      //    half-applied (round 5 gap).
+      const { pinSeed, autoLockTimeout: rawTimeout } = await getPinConfigMeta();
+      const pinData = pinSeed as PinEncryptedSeed | undefined;
       if (pinData) applyHasPin(true);
-      const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
       const timeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
       applyAutoLockTimeout(timeout);
 
@@ -1463,6 +1483,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!mnemonic) return;
     const encrypted = await encryptWithPin(mnemonic, pin);
     await setMeta('pin-seed', encrypted);
+    // A local authoritative write wins over any in-flight reconcile read
+    // (round 5): the bump makes an older snapshot discard itself instead of
+    // reverting this state moments later.
+    reconcileGenerationRef.current++;
     applyHasPin(true);
     postVaultMessage('config'); // other tabs re-read pin-seed/timeout
   }, [mnemonic]);
@@ -1473,6 +1497,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  error mid-cleanup leaves the configuration fully intact, never partial. */
   async function clearPinConfiguration(): Promise<void> {
     await clearPinConfigMeta();
+    // Local write wins over any in-flight reconcile read (round 5).
+    reconcileGenerationRef.current++;
     applyHasPin(false);
     applyAutoLockTimeout(null);
     postVaultMessage('config');
@@ -1576,6 +1602,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       throw new Error(`Invalid auto-lock timeout: ${String(t)}`);
     }
     await setMeta('auto-lock-timeout', t); // persist-first: reject → state untouched
+    // Local write wins over any in-flight reconcile read (round 5).
+    reconcileGenerationRef.current++;
     applyAutoLockTimeout(t);
     postVaultMessage('config');
   }, []);

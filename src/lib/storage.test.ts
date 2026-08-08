@@ -15,6 +15,7 @@ import {
   getRecordsByStatus,
   getMeta,
   setMeta,
+  getPinConfigMeta,
   clearPinConfigMeta,
   type SyncRecord,
 } from './storage';
@@ -177,6 +178,28 @@ describe('clearPinConfigMeta (§8 — atomic PIN cleanup)', () => {
     expect(await getMeta('init')).toBe(true);
     expect(await getMeta('ar-enabled')).toBe(true);
     expect(await getMeta('vault-public-key')).toBe('pk');
+  });
+});
+
+describe('getPinConfigMeta (round 5 — one consistent snapshot)', () => {
+  it('returns both configured values from a single readonly transaction', async () => {
+    await setMeta('pin-seed', { ciphertext: 'ct', iv: 'iv', salt: 's' });
+    await setMeta('auto-lock-timeout', 300);
+    expect(await getPinConfigMeta()).toEqual({
+      pinSeed: { ciphertext: 'ct', iv: 'iv', salt: 's' },
+      autoLockTimeout: 300,
+    });
+  });
+
+  it('returns undefined values when nothing is configured', async () => {
+    expect(await getPinConfigMeta()).toEqual({ pinSeed: undefined, autoLockTimeout: undefined });
+  });
+
+  it('sees the post-wipe state as one piece (never pin gone + old timeout)', async () => {
+    await setMeta('pin-seed', { ciphertext: 'ct', iv: 'iv', salt: 's' });
+    await setMeta('auto-lock-timeout', 1800);
+    await clearPinConfigMeta();
+    expect(await getPinConfigMeta()).toEqual({ pinSeed: undefined, autoLockTimeout: null });
   });
 });
 

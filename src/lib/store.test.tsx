@@ -38,6 +38,7 @@ vi.mock('./storage', async importOriginal => {
     // Overridable per-test (persist-first / partial-cleanup / gate failures).
     getMeta: vi.fn(actual.getMeta),
     setMeta: vi.fn(actual.setMeta),
+    getPinConfigMeta: vi.fn(actual.getPinConfigMeta),
     clearPinConfigMeta: vi.fn(actual.clearPinConfigMeta),
   };
 });
@@ -68,7 +69,7 @@ Object.defineProperty(globalThis, 'crypto', {
 });
 
 import { NotesProvider, useNotes, PinWipedError } from './store';
-import { initStorage, resetAll, getMeta, setMeta, getAllSyncRecords, clearPinConfigMeta } from './storage';
+import { initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords, clearPinConfigMeta } from './storage';
 import { isArweaveOnline, uploadViaProxy, type UploadResult } from './arweave';
 import { decryptWithPin, WrongPinError } from './crypto';
 import { DRAFT_STORAGE_KEY, parseDraftEnvelope } from './draft';
@@ -330,8 +331,8 @@ describe('auto-lock on return to foreground', () => {
 
     // Hold the config read open: the verdict is pending, the gate must stay.
     let releaseRead!: () => void;
-    vi.mocked(getMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
     );
     act(() => { setVisibility('visible'); });
     expect(document.querySelector('.lock-gate')).not.toBeNull(); // still checking
@@ -355,7 +356,7 @@ describe('auto-lock on return to foreground', () => {
     await openMain();
 
     act(() => { setVisibility('hidden'); });
-    vi.mocked(getMeta).mockRejectedValueOnce(new Error('idb down'));
+    vi.mocked(getPinConfigMeta).mockRejectedValueOnce(new Error('idb down'));
     act(() => { setVisibility('visible'); });
 
     await waitFor(() => expect(store.screen).toBe('pin'));
@@ -428,8 +429,8 @@ describe('privacy gate across pending opens and generations', () => {
 
     act(() => { setVisibility('hidden'); });
     let releaseRead!: () => void;
-    vi.mocked(getMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
     );
     act(() => { setVisibility('visible'); }); // check A pending, gate up
 
@@ -460,8 +461,8 @@ describe('privacy gate across pending opens and generations', () => {
     await setMeta('auto-lock-timeout', 0); // changed elsewhere, broadcast missed
 
     let releaseRead!: () => void;
-    vi.mocked(getMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 0 }); }),
     );
     act(() => { setVisibility('visible'); }); // old check pending on the deferred read
 
@@ -520,9 +521,9 @@ describe('config publication ordering and reset lifecycle', () => {
     act(() => { setVisibility('hidden'); });
     // Check A will read STALE values (pin blob + timeout null) once released.
     let releaseRead!: () => void;
-    vi.mocked(getMeta)
-      .mockImplementationOnce(() => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }))
-      .mockImplementationOnce(async () => null);
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
+    );
     act(() => { setVisibility('visible'); }); // check A pending
 
     act(() => { setVisibility('hidden'); }); // a NEW cycle supersedes A
@@ -549,8 +550,8 @@ describe('config publication ordering and reset lifecycle', () => {
 
     act(() => { setVisibility('hidden'); });
     let releaseRead!: () => void;
-    vi.mocked(getMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
     );
     act(() => { setVisibility('visible'); }); // verdict pending — it owns the gate
     expect(document.querySelector('.lock-gate')).not.toBeNull();
@@ -578,10 +579,10 @@ describe('config publication ordering and reset lifecycle', () => {
     expect(store.hasPin).toBe(true);
     const { channel } = listenOnChannel();
 
-    // Reconcile A hangs on its first read…
+    // Reconcile A hangs on its read…
     let releaseRead!: () => void;
-    vi.mocked(getMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r4-a' });
     await act(async () => {});
@@ -598,6 +599,98 @@ describe('config publication ordering and reset lifecycle', () => {
     expect(store.hasPin).toBe(false);
     expect(store.autoLockTimeout).toBeNull();
     expect(store.screen).toBe('restore');
+  });
+});
+
+// ─── Verdict re-decides against the newest config (review round 5) ──
+
+describe('stale verdict vs newer config', () => {
+  it('«Сразу», включённый другой вкладкой mid-verdict, wins: the stale no-lock re-decides and LOCKS', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    // timeout null — the stale snapshot will say "no lock".
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    const { channel } = listenOnChannel();
+
+    act(() => { setVisibility('hidden'); });
+    let releaseRead!: () => void;
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
+    );
+    act(() => { setVisibility('visible'); }); // verdict A pending on the stale snapshot
+
+    // Another tab enables «Сразу» and announces it while A is still reading.
+    await setMeta('auto-lock-timeout', 0);
+    channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-a' });
+    await waitFor(() => expect(store.autoLockTimeout).toBe(0)); // reconcile applied
+    expect(store.screen).toBe('main'); // still gated, not yet locked
+
+    // A resolves with "no lock" — it must RE-DECIDE against the newest
+    // config (the marker is already consumed; dropping the gate here would
+    // leave the vault open forever).
+    await act(async () => { releaseRead(); });
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelector('.lock-gate')).toBeNull();
+  });
+
+  it('a reconcile resolving after resetApp cannot resurrect hasPin on landing', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 300);
+
+    renderStore();
+    await untilReady();
+    expect(store.screen).toBe('pin');
+    const { channel } = listenOnChannel();
+
+    let releaseRead!: () => void;
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    );
+    channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-b' });
+    await act(async () => {}); // reconcile A is now pending on the deferred read
+
+    await act(async () => { await store.resetApp(); });
+    expect(store.screen).toBe('landing');
+    expect(store.hasPin).toBe(false);
+
+    // The stale snapshot resolves AFTER the reset — it must be discarded.
+    await act(async () => { releaseRead(); });
+    await act(async () => {});
+    expect(store.hasPin).toBe(false); // NOT resurrected on the clean landing
+    expect(store.autoLockTimeout).toBeNull();
+    expect(store.screen).toBe('landing');
+  });
+
+  it('a local setAutoLockTimeout wins over an in-flight reconcile read', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 300);
+
+    renderStore();
+    await untilReady();
+    expect(store.autoLockTimeout).toBe(300);
+    const { channel } = listenOnChannel();
+
+    let releaseRead!: () => void;
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    );
+    channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-c' });
+    await act(async () => {}); // reconcile A pending with the OLD timeout
+
+    await act(async () => { await store.setAutoLockTimeout(1800); }); // local write + bump
+    expect(store.autoLockTimeout).toBe(1800);
+
+    await act(async () => { releaseRead(); });
+    await act(async () => {});
+    expect(store.autoLockTimeout).toBe(1800); // the old read did not revert it
+    expect(await getMeta('auto-lock-timeout')).toBe(1800);
   });
 });
 

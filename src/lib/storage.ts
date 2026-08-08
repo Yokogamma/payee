@@ -231,6 +231,21 @@ export async function deleteMeta(key: string): Promise<void> {
  * mid-cleanup must never leave a PARTIAL configuration (say, an auto-lock
  * timeout armed with no PIN to unlock with). Commits fully or not at all.
  */
+/** One CONSISTENT snapshot of the PIN/auto-lock configuration: both keys read
+ *  inside a single readonly transaction, so the atomic clearPinConfigMeta in
+ *  another tab can never be observed half-applied — e.g. pin-seed already
+ *  gone while the old timeout still looks armed (round 5 gap). */
+export async function getPinConfigMeta(): Promise<{ pinSeed: unknown; autoLockTimeout: unknown }> {
+  const tx = getDB().transaction('meta', 'readonly');
+  const meta = tx.objectStore('meta');
+  const [pinSeed, autoLockTimeout] = await Promise.all([
+    meta.get('pin-seed'),
+    meta.get('auto-lock-timeout'),
+  ]);
+  await tx.done;
+  return { pinSeed, autoLockTimeout };
+}
+
 export async function clearPinConfigMeta(): Promise<void> {
   const tx = getDB().transaction('meta', 'readwrite');
   try {
