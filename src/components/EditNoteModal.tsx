@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useModalA11y } from '../lib/useModalA11y';
 import { NoteComposer } from './NoteComposer';
 import { OperationInFlightError } from '../lib/store';
@@ -27,13 +27,20 @@ export function EditNoteModal({ open, chain, onClose, onSave }: EditNoteModalPro
   const [error, setError] = useState('');
   const containerRef = useModalA11y<HTMLDivElement>(open, onClose);
 
-  // Re-prefill whenever a (new) chain opens.
-  useEffect(() => {
-    if (open && chain) {
+  // Re-prefill once per OPENED CHAIN — keyed by root, adjusted during render.
+  // Never keyed by the chain OBJECT: the store rebuilds every chain whenever
+  // `notes` changes (a background restore merging a version into a DIFFERENT
+  // chain included), and an identity-keyed effect would silently overwrite
+  // the user's unsaved edit with the stored text.
+  const openKey = open && chain ? chain.root : null;
+  const [prevOpenKey, setPrevOpenKey] = useState<string | null>(null);
+  if (openKey !== prevOpenKey) {
+    setPrevOpenKey(openKey);
+    if (openKey && chain) {
       setText(chain.current.text);
       setError('');
     }
-  }, [open, chain]);
+  }
 
   if (!open || !chain) return null;
 

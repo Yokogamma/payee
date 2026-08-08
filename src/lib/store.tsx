@@ -378,10 +378,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // Core state
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [notes, setNotes] = useState<NoteData[]>([]);
-  // Mirror of `notes` for async flows (restore) that outlive the closure they
-  // were created in — state captured there is stale.
+  // Mirror of `notes` for async flows (restore, editNote freshness) that
+  // outlive the closure they were created in — state captured there is stale.
+  // The ref is mirrored SYNCHRONOUSLY at every publication site
+  // (commitVaultSnapshot / clearVaultState / publishNotes) — deliberately NO
+  // passive-effect sync here: a pending effect from an older render could
+  // flush at the start of a discrete event and roll the ref back past a
+  // publishNotes update, handing editNote a stale current (chain fork).
   const notesRef = useRef<NoteData[]>([]);
-  useEffect(() => { notesRef.current = notes; }, [notes]);
   const [isEncrypting, setIsEncrypting] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [restoring, setRestoring] = useState(false);
@@ -1223,13 +1227,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // sync record itself was already persisted unconditionally above.
     if (vaultEpochRef.current === myEpoch) {
       if (result.kind === 'accepted') {
-        // Auto-discovery
+        // Auto-discovery. The meta reads/writes above may straddle a lock —
+        // re-check the epoch before EVERY publication (invariant #2: sensitive
+        // state publishes only under the current epoch; a stale continuation
+        // must not write registered/lastSync into the locked INITIAL state).
         const pkB64 = bufferToBase64(pk);
         if (!(await getMeta<boolean>(`registered:${pkB64}`))) {
           await setMeta(`registered:${pkB64}`, true);
-          setArweave(prev => ({ ...prev, registered: true }));
+          if (vaultEpochRef.current === myEpoch) {
+            setArweave(prev => ({ ...prev, registered: true }));
+          }
         }
-        setArweave(prev => ({ ...prev, lastSync: Date.now() }));
+        if (vaultEpochRef.current === myEpoch) {
+          setArweave(prev => ({ ...prev, lastSync: Date.now() }));
+        }
       } else if (result.kind === 'v3_disabled') {
         // The worker's kill switch answered: the pause marker is already
         // persisted (atomically with the failure record, in upload-flow).
@@ -1310,6 +1321,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // (manual retry only). 'disabled'/'unknown' verdicts leave everything as is.
     try {
       const pause = await readV3PauseMeta();
+      if (vaultEpochRef.current !== myEpoch) return; // locked during the read
       if (pause !== null) {
         setV3Paused(true); // another tab may have set it since our last read
         if (pause !== 'malformed') {
@@ -1921,11 +1933,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   // ─── Search / chains ───────────────────────────────────────────────
 
-  const filteredNotes = searchQuery.trim()
-    ? notes.filter(n =>
-        n.text.toLowerCase().includes(searchQuery.toLowerCase())
-      )
-    : notes;
+  // Memoized like filteredChains: an inline computation would mint a fresh
+  // array identity on every provider render while a query is active,
+  // invalidating the L4 context-value memo below on renders that changed
+  // nothing else.
+  const filteredNotes = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return notes;
+    return notes.filter(n => n.text.toLowerCase().includes(q));
+  }, [notes, searchQuery]);
 
   // Reader view: ALWAYS derived, at both flag values (see NotesStore.chains).
   const chains = useMemo(() => groupChains(notes), [notes]);

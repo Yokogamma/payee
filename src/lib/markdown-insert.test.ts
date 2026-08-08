@@ -95,4 +95,12 @@ describe('edge cases', () => {
     const r = applyFormat('первая\nвторая', 0, 3, 'heading');
     expect(r.text).toBe('## первая\nвторая');
   });
+
+  it('caret at 0 with a LEADING newline: prefix lands on the first (empty) line, newline not duplicated', () => {
+    // Regression (review): lastIndexOf('\n', -1) clamps to 0 and would find
+    // the leading newline, producing '\n## \nтекст'.
+    const r = applyFormat('\nтекст', 0, 0, 'heading');
+    expect(r.text).toBe('## \nтекст');
+    expect(applyFormat('\nсписок', 0, 0, 'ul').text).toBe('- \nсписок');
+  });
 });

@@ -40,7 +40,10 @@ function linePrefix(
   selEnd: number,
   prefixFor: (lineIndex: number) => string,
 ): ApplyFormatResult {
-  const blockStart = text.lastIndexOf('\n', selStart - 1) + 1;
+  // selStart===0 must be its own case: lastIndexOf('\n', -1) clamps the
+  // fromIndex to 0 and would FIND a leading newline, shifting blockStart past
+  // it (prefix lands on a phantom line, the newline duplicates).
+  const blockStart = selStart === 0 ? 0 : text.lastIndexOf('\n', selStart - 1) + 1;
   const lineEndIdx = text.indexOf('\n', Math.max(selEnd, selStart));
   const blockEnd = lineEndIdx === -1 ? text.length : lineEndIdx;
 

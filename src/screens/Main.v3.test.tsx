@@ -233,3 +233,25 @@ describe('Main W3 — history + restore-version flow', () => {
     expect(screen.getByText(/редактирование добавляет новую версию/)).toBeTruthy();
   });
 });
+
+describe('Main W3 — edit buffer survives background chain rebuilds (review regression)', () => {
+  it('typing in the edit modal is NOT overwritten when the store rebuilds chain objects', async () => {
+    const s = h.store as ReturnType<typeof makeStore>;
+    const { rerender } = render(<Main />);
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('✏️ Редактировать'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
+    const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'несохранённый черновик правки' } });
+
+    // Background publishNotes (e.g. a restore sweep) rebuilds EVERY chain
+    // object with fresh identities — same data, new references.
+    h.store = { ...s, ...makeStore(chainNotes()) };
+    rerender(<Main />);
+
+    const after = screen.getByRole('dialog', { name: 'Редактирование заметки' })
+      .querySelector('.note-input') as HTMLTextAreaElement;
+    expect(after.value).toBe('несохранённый черновик правки'); // edit preserved
+  });
+});
