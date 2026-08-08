@@ -39,6 +39,11 @@ export interface UploadAttemptDeps {
   currentEpoch(): number;
   getSyncRecord(noteId: string): Promise<SyncRecord | undefined>;
   setSyncRecord(record: SyncRecord): Promise<void>;
+  /** ATOMIC sync+meta write for the v3_disabled result: persists the failure
+   *  record AND the v3-uploads-paused marker in one IndexedDB transaction.
+   *  Called INSTEAD of setSyncRecord for that branch — sequential writes would
+   *  reopen the crash window (error saved, pause lost → burst after unlock). */
+  commitV3PausedFailure(record: SyncRecord, pausedAt: number): Promise<void>;
   signPayload(privateKey: Uint8Array, payload: string): Promise<string>;
   uploadViaProxy(bodyText: string, publicKeyB64: string, signature: string): Promise<UploadResult>;
 }
@@ -83,6 +88,17 @@ export async function runUploadAttempt(
     await deps.setSyncRecord(
       afterInProgress(note.noteId, prev, deps.now())
         ?? afterFailure(note.noteId, prev, recheck, 'in_progress', deps.now()),
+    );
+  } else if (result.kind === 'v3_disabled') {
+    // Worker v3 kill switch: a PAUSE, not an error. The failure record (which
+    // preserves txId/recovery/needsRecheck via afterFailure) and the pause
+    // marker commit in ONE transaction, still inside the unconditional
+    // post-point-of-no-return window (no epoch gate — same as every other
+    // result persist).
+    const now = deps.now();
+    await deps.commitV3PausedFailure(
+      afterFailure(note.noteId, prev, recheck, result.error, now),
+      now,
     );
   } else {
     const errText = 'error' in result ? result.error : undefined;
