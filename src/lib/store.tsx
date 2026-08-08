@@ -359,6 +359,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const tabIdRef = useRef<string | null>(null);
   if (tabIdRef.current === null) tabIdRef.current = crypto.randomUUID();
   const channelRef = useRef<BroadcastChannel | null>(null);
+  // §8 dedup: messageIds already handled, so a replayed/duplicated delivery
+  // never re-runs a handler (a stale re-lock would abort a NEWER unlock).
+  const seenMessageIdsRef = useRef(new Set<string>());
 
   // Arweave state with ref-first pattern
   const [arweaveState, setArweaveReactState] = useState<ArweaveState>(INITIAL_ARWEAVE);
@@ -438,13 +441,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const evaluateReturn = () => {
       const now = Date.now();
       const marker = consumeHiddenMarker(sessionStorage, now);
+      // Fast path: decide on the refs we have — usually current, and it keeps
+      // the common-case lock synchronous with the return.
       if (decideLockOnReturn(autoLockTimeoutRef.current, hasPinRef.current, marker, now)) {
         lockApp();
-      } else {
-        // §8 self-heal: another tab may have changed the PIN/timeout while we
-        // were hidden and frozen (missed broadcast).
-        void selfHealPinConfig();
+        return;
       }
+      // The refs may be STALE: a frozen/hidden tab misses config broadcasts
+      // (§8). "No lock" is only FINAL once the authoritative IndexedDB config
+      // confirms it — re-evaluate the SAME consumed marker after self-heal, so
+      // a timeout enabled elsewhere while we slept still locks this tab.
+      void selfHealPinConfig().then(() => {
+        if (decideLockOnReturn(autoLockTimeoutRef.current, hasPinRef.current, marker, now)) {
+          lockApp();
+        }
+      });
     };
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
@@ -477,9 +488,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const channel = new BroadcastChannel('eternal-notes-vault');
     channelRef.current = channel;
     channel.onmessage = (e: MessageEvent) => {
-      const msg = e.data as { type?: unknown; originId?: unknown } | null;
+      const msg = e.data as { type?: unknown; originId?: unknown; messageId?: unknown } | null;
       if (!msg || typeof msg !== 'object') return;
       if (msg.originId === tabIdRef.current) return; // never act on our own echo
+      if (typeof msg.messageId === 'string') {
+        const seen = seenMessageIdsRef.current;
+        if (seen.has(msg.messageId)) return; // duplicate delivery — already handled
+        if (seen.size >= 256) seen.clear();  // bounded; handlers stay idempotent as backstop
+        seen.add(msg.messageId);
+      }
       if (msg.type === 'lock') {
         lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
       } else if (msg.type === 'config') {
@@ -691,9 +708,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   /** Lock the vault NOW. Fully synchronous (§3): epoch bump → abort in-flight
    *  vault op → wipe state → PIN screen → (optionally) tell the other tabs. */
   const lockApp = useCallback((opts: { broadcast?: boolean } = {}) => {
-    // Nothing to lock without an open vault or a live session in this tab —
-    // a foreign 'lock' broadcast may arrive while we sit on landing/restore.
+    // Nothing to lock without vault STATE in this tab — a foreign 'lock'
+    // broadcast may arrive while we sit on landing/restore. A vault op still
+    // in flight (PIN unlock / restore preparing, not yet committed) COUNTS:
+    // ignoring the lock would let the open complete right after it, publishing
+    // a vault the user just ordered locked everywhere.
     const hasVault = cryptoKeyRef.current !== null
+      || vaultOpAbortRef.current !== null
       || sessionStorage.getItem(SESSION_STORAGE_KEY) !== null;
     if (!hasVault) return;
 
@@ -1141,12 +1162,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const addNote = useCallback(async (text: string) => {
-    if (!readyRef.current || !cryptoKeyRef.current || !text.trim()) return;
+    // Key + epoch captured ONCE, before the first await (§4): a lock during
+    // encrypt()/saveNote() nulls the refs and bumps the epoch — the encrypted
+    // persist below may still complete, but the PLAINTEXT must never be
+    // re-published to React state behind the PIN screen.
+    const key = cryptoKeyRef.current;
+    const myEpoch = vaultEpochRef.current;
+    if (!readyRef.current || !key || !text.trim()) return;
 
     setIsEncrypting(true);
     try {
-      const encrypted = await encrypt(cryptoKeyRef.current, text.trim());
+      const encrypted = await encrypt(key, text.trim());
       await saveNote(encrypted);
+
+      // Locked mid-save: the note is safe on disk (ciphertext at rest) and the
+      // next unlock decrypts it from storage — but this vault is gone from the
+      // screen, so no UI publication and no queue work for the new generation.
+      if (vaultEpochRef.current !== myEpoch) return;
 
       const note: NoteData = {
         id: encrypted.noteId,
@@ -1163,7 +1195,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (arweaveRef.current.enabled) {
           enqueueUpload(encrypted); // sync is best-effort; the note is safe
         }
-        await refreshSyncCounts(vaultEpochRef.current);
+        await refreshSyncCounts(myEpoch);
       } catch (err) {
         console.error('post-save bookkeeping failed (note IS saved):', err);
       }

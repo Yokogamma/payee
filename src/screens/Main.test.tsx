@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react';
 
 // Component tests for the Phase-6 Main-screen behaviors the review called out:
 // TX link with auto-sync off, clipboard success/failure, search hotkey/Escape.
@@ -222,6 +222,46 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     const badge = document.querySelector('.sync-badge');
     expect(badge?.getAttribute('role')).toBe('status');
     expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне');
+  });
+});
+
+describe('Main — draft hydration dirty guard (§2)', () => {
+  it('hydrates the stored draft into a pristine composer', async () => {
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(async () => 'сохранённый черновик');
+    render(<Main />);
+    await waitFor(() => {
+      const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+      expect(input.value).toBe('сохранённый черновик');
+    });
+  });
+
+  it('does NOT resurrect the draft over text the user typed and DELETED (review finding 4)', async () => {
+    let resolveDraft!: (v: string | null) => void;
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
+    render(<Main />);
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+
+    // The user types and deletes everything while the read is in flight —
+    // the composer is EMPTY but not pristine.
+    fireEvent.change(input, { target: { value: 'набрал' } });
+    fireEvent.change(input, { target: { value: '' } });
+
+    await act(async () => { resolveDraft('старый черновик'); });
+    expect(input.value).toBe(''); // the user's deletion wins
+  });
+
+  it('does not overwrite text the user typed before hydration resolved', async () => {
+    let resolveDraft!: (v: string | null) => void;
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
+    render(<Main />);
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+
+    fireEvent.change(input, { target: { value: 'свежий ввод' } });
+    await act(async () => { resolveDraft('старый черновик'); });
+    expect(input.value).toBe('свежий ввод');
   });
 });
 

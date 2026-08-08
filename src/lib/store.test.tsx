@@ -192,6 +192,57 @@ describe('lock during bootstrap vault open', () => {
   });
 });
 
+describe('lock during a pending vault open (review finding 2)', () => {
+  it('a lock while openVault is preparing cancels it — nothing publishes afterwards', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+
+    renderStore();
+    await untilReady();
+    expect(store.screen).toBe('pin'); // no session yet — and no cryptoKey either
+
+    // Start an unlock-like open; the vault op is in flight but NOT committed.
+    // The lock must still take: a pending open counts as lockable state.
+    let pending!: Promise<void>;
+    act(() => {
+      pending = store.confirmMnemonic(MN);
+      store.lockApp();
+    });
+    await act(async () => { await pending; });
+
+    expect(store.screen).toBe('pin');
+    expect(store.mnemonic).toBeNull();
+    expect(store.notes).toEqual([]);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+  });
+});
+
+describe('lock during addNote (review finding 1)', () => {
+  it('the note persists encrypted, but its plaintext is NOT republished behind the PIN screen', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    let pending!: Promise<void>;
+    act(() => {
+      pending = store.addNote('секретный текст');
+      store.lockApp(); // lands while encrypt()/saveNote() are still in flight
+    });
+    await act(async () => { await pending; });
+
+    expect(store.screen).toBe('pin');
+    expect(store.notes).toEqual([]); // no plaintext behind the lock
+
+    // The save itself was committed (ciphertext at rest) — the next unlock
+    // decrypts it from storage.
+    await openMain();
+    await waitFor(() => expect(store.notes.map(n => n.text)).toEqual(['секретный текст']));
+  });
+});
+
 // ─── Bootstrap lock decision (§5) ───────────────────────────────────
 
 describe('decideBootstrapLock wiring', () => {
@@ -255,8 +306,33 @@ describe('auto-lock on return to foreground', () => {
 
     act(() => { setVisibility('hidden'); });
     act(() => { setVisibility('visible'); });
+    // Let the authoritative config re-read confirm the "no lock" decision.
+    await act(async () => {});
     expect(store.screen).toBe('main');
     expect(store.mnemonic).toBe(MN);
+  });
+
+  it('a config change missed while hidden still locks on return (review finding 3)', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    // Auto-lock starts OFF in this tab's refs.
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    expect(store.autoLockTimeout).toBeNull();
+
+    act(() => { setVisibility('hidden'); });
+    // Another tab enabled «Сразу» while we were frozen — its broadcast never
+    // reached us. Only the authoritative IndexedDB config knows.
+    await setMeta('auto-lock-timeout', 0);
+
+    act(() => { setVisibility('visible'); });
+    // The stale refs said "no lock"; the self-heal re-read must overturn that
+    // using the SAME consumed marker.
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    expect(store.mnemonic).toBeNull();
+    expect(store.autoLockTimeout).toBe(0);
   });
 });
 
@@ -379,6 +455,24 @@ describe('multi-tab vault channel', () => {
     channel.postMessage(own!); // an echoing transport replays our own message
     await act(async () => {});
     expect(store.screen).toBe('main'); // own-origin message must be ignored
+  });
+
+  it('a REPLAYED foreign lock (same messageId) is deduplicated (§8)', async () => {
+    await setMeta('init', true);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    const { channel } = listenOnChannel();
+
+    const msg = { type: 'lock', originId: 'other-tab', messageId: 'dup-1' };
+    channel.postMessage(msg);
+    await waitFor(() => expect(store.screen).toBe('restore')); // locked once
+
+    await openMain();
+    channel.postMessage(msg); // an echoing transport replays the SAME message
+    await act(async () => {});
+    expect(store.screen).toBe('main'); // deduped — must not lock the new session
   });
 
   it('a config message re-reads PIN/timeout from meta', async () => {

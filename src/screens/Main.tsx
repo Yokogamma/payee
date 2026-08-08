@@ -56,6 +56,9 @@ export function Main() {
   // hydration read is still in flight (text starts '' — a 300ms debounce could
   // otherwise wipe the very draft being decrypted).
   const draftSettledRef = useRef(false);
+  // True after ANY user edit. `text === ''` alone cannot distinguish a pristine
+  // composer from «набрал и стёр» — hydration must lose to both (§2 dirty guard).
+  const draftDirtyRef = useRef(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
@@ -91,15 +94,15 @@ export function Main() {
   }, [showSearch]);
 
   // Hydrate the encrypted draft on mount — dirty-guarded (§2): it only fills a
-  // CLEAN composer (the functional update checks atomically), and an unmount
-  // (lock!) cancels the application entirely.
+  // composer the user has NOT touched (typing and deleting counts as touched),
+  // and an unmount (lock!) cancels the application entirely.
   useEffect(() => {
     let cancelled = false;
     void readDraft()
       .then(draft => {
         if (cancelled) return;
         draftSettledRef.current = true;
-        if (draft) setText(prev => (prev === '' ? draft : prev));
+        if (draft && !draftDirtyRef.current) setText(prev => (prev === '' ? draft : prev));
       })
       .catch(() => { draftSettledRef.current = true; });
     return () => { cancelled = true; };
@@ -107,9 +110,10 @@ export function Main() {
   }, []);
 
   // Mirror the draft (debounced, encrypted at rest) so it survives a reload.
-  // An empty text clears the draft — but only after hydration settled.
+  // An empty text clears the draft. Skipped only for the PRISTINE pre-hydration
+  // emptiness — a user who typed and deleted everything intends a clear.
   useEffect(() => {
-    if (!draftSettledRef.current && text === '') return;
+    if (!draftSettledRef.current && !draftDirtyRef.current && text === '') return;
     const t = setTimeout(() => {
       void persistDraft(text);
     }, 300);
@@ -340,7 +344,7 @@ export function Main() {
           className="note-input"
           placeholder="Быстрая заметка..."
           value={text}
-          onChange={e => setText(e.target.value)}
+          onChange={e => { draftDirtyRef.current = true; setText(e.target.value); }}
           onKeyDown={handleKeyDown}
           rows={Math.min(text.split('\n').length + 1, 8)}
         />
