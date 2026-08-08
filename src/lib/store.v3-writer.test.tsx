@@ -331,8 +331,9 @@ describe('W3: v3 upload pause (kill switch, client side)', () => {
         .tags.some(t => t.name === 'App-Version' && t.value === '3'));
     expect(v3Calls).toHaveLength(1);
 
-    // recovery-critical: the failure record kept its identity, no unregister.
-    expect(store.arweave.registered).not.toBe(false || undefined); // registered untouched by 503
+    // recovery-critical: v3_disabled must never markUnregistered — the v1
+    // upload's accepted auto-discovery set registered=true and it must stay.
+    expect(store.arweave.registered).toBe(true);
   });
 
   it('the pause survives a remount (lock/reload): banner state re-derived from the marker', async () => {

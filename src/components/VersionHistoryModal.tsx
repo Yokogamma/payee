@@ -43,11 +43,20 @@ export function VersionHistoryModal({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
 
-  // Explicit focus restore for the cancel-from-confirm path: the row button is
-  // re-mounted by then, so useModalA11y's "previous element" cannot find it.
+  // Cancel-from-confirm path: expand the row the user came from. State is
+  // adjusted DURING render (the documented alternative to setState-in-effect);
+  // only the DOM focus itself stays in an effect below.
+  const [appliedFocusId, setAppliedFocusId] = useState<string | null>(null);
+  if (open && focusVersionId && appliedFocusId !== focusVersionId) {
+    setAppliedFocusId(focusVersionId);
+    setExpandedId(focusVersionId);
+  }
+  if (!open && appliedFocusId !== null) setAppliedFocusId(null);
+
+  // Explicit focus restore: the row button is re-mounted by then, so
+  // useModalA11y's "previous element" cannot find it.
   useEffect(() => {
     if (open && focusVersionId) {
-      setExpandedId(focusVersionId);
       requestAnimationFrame(() => rowRefs.current.get(focusVersionId)?.focus());
     }
   }, [open, focusVersionId]);
@@ -158,12 +167,17 @@ export function RestoreVersionDialog({ open, version, onConfirm, onCancel }: Res
   const guardedCancel = () => { if (!pending) onCancel(); };
   const containerRef = useModalA11y<HTMLDivElement>(open, guardedCancel);
 
-  useEffect(() => {
+  // Fresh lifecycle per opening — adjusted during render (not in an effect).
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
     if (open) {
       setError('');
       setPending(false);
-      cancelRef.current?.focus();
     }
+  }
+  useEffect(() => {
+    if (open) cancelRef.current?.focus(); // safe default, like ConfirmDialog
   }, [open]);
 
   if (!open || !version) return null;

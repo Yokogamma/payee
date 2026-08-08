@@ -10,6 +10,7 @@ import { SettingsModal } from './SettingsModal';
 beforeEach(() => {
   h.store = {
     notes: [],
+    chains: [],
     arweave: {
       enabled: true, online: true, syncing: false, registered: true,
       acceptedCount: 0, confirmedCount: 0, unsyncedCount: 0, errorCount: 0,
