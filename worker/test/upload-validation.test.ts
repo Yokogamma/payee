@@ -54,7 +54,8 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
   });
 }
 
-const NOTE_ID = '11111111-2222-4333-8444-555555555555'; // valid UUID shape
+const NOTE_ID = '11111111-2222-4333-8444-555555555555';    // valid UUIDv4 shape
+const NOTE_ID_V8 = '11111111-2222-8333-8444-555555555555'; // valid UUIDv8 shape (v3 namespace)
 const C = 'AAAA';                 // valid base64 (3 bytes)
 const IV = 'AAAAAAAAAAAAAAAA';    // valid base64, exactly 12 bytes
 
@@ -75,6 +76,15 @@ function v2Tags(): Tag[] {
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: 'PLACEHOLDER' },
     { name: 'Note-Id', value: NOTE_ID },
+  ];
+}
+function v3Tags(noteId: string = NOTE_ID_V8): Tag[] {
+  return [
+    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Version', value: '3' },
+    { name: 'Content-Type', value: 'application/json' },
+    { name: 'Owner-Hash', value: 'PLACEHOLDER' },
+    { name: 'Note-Id', value: noteId },
   ];
 }
 
@@ -134,9 +144,72 @@ describe('upload validation: version contract (v1/v2)', () => {
   });
 
   it('rejects an unsupported App-Version', async () => {
-    const tags = v2Tags().map(t => (t.name === 'App-Version' ? { ...t, value: '3' } : t));
+    const tags = v2Tags().map(t => (t.name === 'App-Version' ? { ...t, value: '4' } : t));
     const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV }, nextIp());
     expect(r.status).toBe(400);
+  });
+
+  // ── v3 contract (identical wire shape to v2 + UUIDv8 namespace) ──
+  it('accepts a well-formed v3 upload past validation (502 at Arweave stage)', async () => {
+    const r = await upload(v3Tags(), { id: NOTE_ID_V8, c: C, iv: IV }, nextIp());
+    expect(r.status).toBe(502);
+  });
+
+  it('rejects a v3 upload that carries a Timestamp tag (6 tags)', async () => {
+    const tags = [...v3Tags(), { name: 'Timestamp', value: '1700000000000' }];
+    const r = await upload(tags, { id: NOTE_ID_V8, c: C, iv: IV }, nextIp());
+    expect(r.status).toBe(400);
+  });
+
+  it('rejects a v3 upload whose data still includes t (strict key set)', async () => {
+    const r = await upload(v3Tags(), { id: NOTE_ID_V8, c: C, iv: IV, t: 1700000000000 }, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/Invalid data fields/);
+  });
+
+  it('rejects a v3 upload with a UUIDv4 Note-Id (namespace barrier)', async () => {
+    const tags = v3Tags(NOTE_ID);
+    const r = await upload(tags, { id: NOTE_ID, c: C, iv: IV }, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/UUIDv8/);
+  });
+
+  // Regression: a stale pre-v3 client tab serializing a runtime v3 record with
+  // the legacy v1 writer must be rejected — the permanent per-noteId idempotency
+  // must never commit garbage ciphertext under App-Version=1.
+  it('rejects a v1 upload with a UUIDv8 Note-Id (legacy serializer barrier)', async () => {
+    const tags = v1Tags().map(t => (t.name === 'Note-Id' ? { ...t, value: NOTE_ID_V8 } : t));
+    const r = await upload(tags, { id: NOTE_ID_V8, c: C, iv: IV, t: 1700000000000 }, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/UUIDv4/);
+  });
+
+  it('rejects a v2 upload with a UUIDv8 Note-Id (legacy serializer barrier)', async () => {
+    const tags = v2Tags().map(t => (t.name === 'Note-Id' ? { ...t, value: NOTE_ID_V8 } : t));
+    const r = await upload(tags, { id: NOTE_ID_V8, c: C, iv: IV }, nextIp());
+    expect(r.status).toBe(400);
+    expect(await r.text()).toMatch(/UUIDv4/);
+  });
+
+  // ── body size boundary (MAX_BODY_BYTES = 51200 in wrangler.toml vars) ──
+  it('accepts a v3 body just under the byte cap (502 at Arweave stage)', async () => {
+    // Build the body, then grow `c` (base64, multiples of 4 chars) to just
+    // under the 51200-byte cap. The worker validates base64 but never decrypts.
+    const probe = JSON.stringify({
+      data: JSON.stringify({ id: NOTE_ID_V8, c: '', iv: IV }),
+      tags: v3Tags(), ownerHash: 'x'.repeat(44), timestamp: Date.now(),
+    });
+    // JSON-escaping inflates nothing for base64 chars; leave 200 bytes of slack.
+    const room = 51200 - probe.length - 200;
+    const c = 'A'.repeat(room - (room % 4));
+    const r = await upload(v3Tags(), { id: NOTE_ID_V8, c, iv: IV }, nextIp());
+    expect(r.status).toBe(502);
+  });
+
+  it('rejects a v3 body over the byte cap (413)', async () => {
+    const c = 'A'.repeat(52000);
+    const r = await upload(v3Tags(), { id: NOTE_ID_V8, c, iv: IV }, nextIp());
+    expect(r.status).toBe(413);
   });
 
   // ── strict wire schema (extra fields / empty / null / mismatch) ──
