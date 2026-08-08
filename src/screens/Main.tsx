@@ -1,47 +1,47 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNotes, type NoteSyncStatus } from '../lib/store';
+import { useNotes, OperationInFlightError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsModal } from '../components/SettingsModal';
+import { NoteComposer } from '../components/NoteComposer';
+import { NoteMarkdown } from '../components/NoteMarkdown';
+import { EditNoteModal } from '../components/EditNoteModal';
+import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
+import { badgeFor } from '../components/syncBadge';
+import { V3_WRITER_ENABLED } from '../lib/flags';
+import { NoteTooLongError } from '../lib/limits';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
+import type { NoteData } from '../lib/crypto';
 
 // Draft survives an accidental tab close / PWA eviction, ENCRYPTED at rest
 // (draft.ts envelope, keyed to the current vault). The store owns the
 // storage/crypto; this screen only hydrates on mount and mirrors edits.
+// The feed shows one card per version CHAIN (chains/filteredChains); the raw
+// per-version list still backs search counters and reset accounting.
 
-/** Shown when sync is off / not set up: the note exists ONLY on this device.
- *  Never leave the card blank — a user must not mistake a local note for an
- *  eternal one and lose it by clearing the browser. */
-const LOCAL_ONLY_BADGE = {
-  icon: '📱',
-  label: 'Только на этом устройстве — не сохранена в блокчейне',
-  className: 'sync-badge--local',
-} as const;
-
-const SYNC_BADGE: Record<NoteSyncStatus, { icon: string; label: string; className: string }> = {
-  queued:    { icon: '○',  label: 'Ожидает загрузки',            className: 'sync-badge--queued' },
-  uploading: { icon: '⏳', label: 'Загружается...',              className: 'sync-badge--uploading' },
-  accepted:  { icon: '⏳', label: 'Ожидает подтверждения в сети', className: 'sync-badge--accepted' },
-  confirmed: { icon: '✓',  label: 'Сохранена в блокчейне',       className: 'sync-badge--confirmed' },
-  error:     { icon: '⚠️', label: 'Ошибка загрузки — повторить', className: 'sync-badge--error' },
-};
+/** Long-content clamp heuristic for feed cards. */
+function isLongNote(text: string): boolean {
+  return text.length > 600 || text.split('\n').length > 12;
+}
 
 export function Main() {
   const {
-    filteredNotes,
+    filteredChains,
+    chains,
     isEncrypting,
     searchQuery,
     addNote,
+    editNote,
     setSearchQuery,
     resetApp,
-    notes,
     arweave,
     retrySync,
     restoring,
     restoreProgress,
     restoreError,
     restoredCount,
+    restoredUpdatedCount,
     retryRestore,
     clearRestoreStatus,
     syncStatuses,
@@ -49,6 +49,8 @@ export function Main() {
     persistDraft,
     readDraft,
     clearDraft,
+    v3Paused,
+    resumeV3Uploads,
   } = useNotes();
 
   const [text, setText] = useState('');
@@ -68,11 +70,21 @@ export function Main() {
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
+
+  // Edit/history/restore UI (W3). Only ONE aria-modal layer at a time: opening
+  // the restore confirm CLOSES the history modal; cancelling reopens history
+  // with focus restored onto the same version row.
+  const [editChainRoot, setEditChainRoot] = useState<string | null>(null);
+  const [historyChainRoot, setHistoryChainRoot] = useState<string | null>(null);
+  const [historyFocusVersionId, setHistoryFocusVersionId] = useState<string | null>(null);
+  const [restoreTarget, setRestoreTarget] = useState<{ root: string; version: NoteData } | null>(null);
 
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
   useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
   const [theme, setTheme] = useTheme();
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
 
   // Autofocus on mount
   useEffect(() => {
@@ -126,6 +138,14 @@ export function Main() {
     try {
       await addNote(text);
     } catch (err) {
+      // A double submit raced past the disabled button: the FIRST call owns the
+      // outcome. Do NOT clear the text and do NOT show an error — the first
+      // save's resolution does both correctly.
+      if (err instanceof OperationInFlightError) return;
+      if (err instanceof NoteTooLongError) {
+        setSaveError('Заметка слишком длинная — сократите текст (лимит ~30 000 байт).');
+        return;
+      }
       // Persistence failed (quota/broken DB) — the note is still in the input,
       // never let it silently vanish.
       console.error('save failed:', err);
@@ -137,14 +157,6 @@ export function Main() {
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
     inputRef.current?.focus();
-  }
-
-  function handleKeyDown(e: React.KeyboardEvent) {
-    // Ctrl/Cmd+Enter to save
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      handleSave();
-    }
   }
 
   function formatDate(ts: number): string {
@@ -182,7 +194,10 @@ export function Main() {
     setTimeout(() => setCopyFeedback(null), 2000);
   }
 
-  /** Wrap query matches in <mark> (8.1) — case-insensitive, plain text only. */
+  /** Wrap query matches in <mark> (8.1) — case-insensitive, plain text only.
+   *  While a query is active, EVERY card renders as plain text through this
+   *  (markdown rendering resumes when the search closes) — injecting <mark>
+   *  into the react-markdown element tree is not worth the fragility. */
   function highlight(noteText: string, query: string): React.ReactNode {
     const q = query.trim();
     if (!q) return noteText;
@@ -200,26 +215,62 @@ export function Main() {
     return parts;
   }
 
-  // Reset-safety text is derived from what the user can SEE (notes) joined with
-  // the current per-note statuses — NOT from arweave's aggregate counter. The
-  // aggregate can be stale: a note is added to `notes` before refreshSyncCounts
-  // runs, and that refresh is best-effort (its failure is swallowed). A note
-  // absent from syncStatuses, or not 'confirmed', is unrecoverable after a wipe.
-  const unconfirmedVisible = notes.filter(
-    n => syncStatuses[n.id]?.status !== 'confirmed',
-  ).length;
+  function toggleExpanded(root: string) {
+    setExpandedCards(prev => {
+      const next = new Set(prev);
+      if (next.has(root)) next.delete(root);
+      else next.add(root);
+      return next;
+    });
+  }
+
+  const editChain = editChainRoot ? chains.find(c => c.root === editChainRoot) ?? null : null;
+  const historyChain = historyChainRoot ? chains.find(c => c.root === historyChainRoot) ?? null : null;
+
+  function requestRestore(version: NoteData) {
+    if (!historyChainRoot) return;
+    // Modal-stack discipline: close history BEFORE the confirm opens.
+    setRestoreTarget({ root: historyChainRoot, version });
+    setHistoryChainRoot(null);
+  }
+
+  function cancelRestore() {
+    if (!restoreTarget) return;
+    // Reopen history with focus back on the version row the user came from.
+    setHistoryFocusVersionId(restoreTarget.version.id);
+    setHistoryChainRoot(restoreTarget.root);
+    setRestoreTarget(null);
+  }
+
+  async function confirmRestore() {
+    if (!restoreTarget) return;
+    // Preserve the SOURCE version's fmt: restoring a plain note must not
+    // re-interpret its literal *stars* as markdown forever.
+    await editNote(restoreTarget.root, restoreTarget.version.text, { fmt: restoreTarget.version.fmt });
+    // Success: close the whole stack, focus the card's stable ⋯ trigger (the
+    // «Восстановить» button that opened this no longer exists in the DOM).
+    const root = restoreTarget.root;
+    setRestoreTarget(null);
+    setHistoryFocusVersionId(null);
+    requestAnimationFrame(() => menuBtnRefs.current.get(root)?.focus());
+  }
+
+  // Reset-safety is STORAGE-backed (arweave.resetRiskCount): every stored
+  // record that is not confirmed — visible or not (historical versions,
+  // quarantined/undecryptable records) — is unrecoverable after a wipe. The
+  // visible `notes` list undercounts exactly the records most at risk.
   const resetWarningMessage = !arweave.countsReady
     // Until the first sync-count read completes we cannot know what is safe.
     ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
       + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
       + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
-    : unconfirmedVisible > 0
+    : arweave.resetRiskCount > 0
       // Only CONFIRMED notes are recoverable: an `accepted` transaction can
       // still be dropped, and after a wipe there is no local ciphertext left.
-      ? `⚠️ ${unconfirmedVisible} заметок ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
-        + '(в том числе загруженные, но ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
+      ? `⚠️ ${arweave.resetRiskCount} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+        + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
         + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
-      : 'Все локальные данные будут удалены. Все заметки подтверждены в блокчейне — их можно вернуть по seed-фразе.';
+      : 'Все локальные данные будут удалены. Все записи подтверждены в блокчейне — их можно вернуть по seed-фразе.';
 
   return (
     <div className="main-screen">
@@ -248,12 +299,14 @@ export function Main() {
       )}
 
       {/* Restore succeeded — show what actually came back (0 included: a
-          completed empty sweep must be distinguishable from «не запускалось») */}
+          completed empty sweep must be distinguishable from «не запускалось»).
+          M = new chains (notes), K = existing chains that gained versions. */}
       {!restoring && !restoreError && restoredCount !== null && (
         <div className="success-banner" role="status">
           <span>
-            {restoredCount > 0
+            {restoredCount > 0 || (restoredUpdatedCount ?? 0) > 0
               ? `✓ Восстановлено заметок: ${restoredCount}`
+                + ((restoredUpdatedCount ?? 0) > 0 ? `, обновлено: ${restoredUpdatedCount}` : '')
               : '✓ Восстановление завершено: новых заметок не найдено'}
           </span>
           <button
@@ -263,6 +316,17 @@ export function Main() {
             aria-label="Скрыть уведомление о восстановлении"
           >
             ✕
+          </button>
+        </div>
+      )}
+
+      {/* v3 uploads paused by the server kill switch: a STANDING banner (the
+          toast dies with a reload; the persisted pause does not). */}
+      {v3Paused && arweave.enabled && (
+        <div className="offline-banner" role="status">
+          ⏸ Загрузка новых версий заметок временно приостановлена — всё сохраняется локально.
+          <button className="banner-btn" onClick={() => void resumeV3Uploads()}>
+            Возобновить
           </button>
         </div>
       )}
@@ -279,7 +343,7 @@ export function Main() {
         <div className="header-left">
           <span className="logo-small">∞</span>
           <span className="app-title">Eternal Notes</span>
-          <span className="note-count">{notes.length}</span>
+          <span className="note-count">{chains.length}</span>
           {arweave.enabled && (
             <span
               className={`ar-badge ${arweave.online ? 'text-green' : 'text-red'}`}
@@ -327,7 +391,7 @@ export function Main() {
           {searchQuery && (
             <>
               <span className="search-count">
-                {filteredNotes.length} из {notes.length}
+                {filteredChains.length} из {chains.length}
               </span>
               <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
                 ✕
@@ -337,62 +401,72 @@ export function Main() {
         </div>
       )}
 
-      {/* Input */}
+      {/* Input — the shared controlled composer; draft
+          hydration/persistence stays HERE (value/onChange above). */}
       <div className="note-input-wrap">
-        <textarea
-          ref={inputRef}
-          className="note-input"
-          placeholder="Быстрая заметка..."
+        <NoteComposer
           value={text}
-          onChange={e => { draftDirtyRef.current = true; setText(e.target.value); }}
-          onKeyDown={handleKeyDown}
-          rows={Math.min(text.split('\n').length + 1, 8)}
+          onChange={next => { draftDirtyRef.current = true; setText(next); }}
+          onSubmit={() => void handleSave()}
+          submitLabel="🔐 Сохранить"
+          submitBusyLabel="🔐..."
+          busy={isEncrypting}
+          placeholder="Быстрая заметка..."
+          markdown={V3_WRITER_ENABLED}
+          textareaRef={inputRef}
+          error={saveError}
+          hint={justSaved
+            ? '✓ Сохранено и зашифровано'
+            : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
         />
-        {saveError && <div className="error-msg">{saveError}</div>}
-        <div className="input-footer">
-          <span className="input-hint">
-            {justSaved
-              ? '✓ Сохранено и зашифровано'
-              : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
-          </span>
-          <button
-            className="btn btn-save"
-            onClick={handleSave}
-            disabled={!text.trim() || isEncrypting}
-          >
-            {isEncrypting ? '🔐...' : '🔐 Сохранить'}
-          </button>
-        </div>
       </div>
 
-      {/* Feed */}
+      {/* Feed — one card per version chain; fields come from chain.current. */}
       <div className="notes-feed">
-        {filteredNotes.length === 0 && !searchQuery ? (
+        {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
             <div className="empty-icon">📝</div>
             <p>Первая заметка — самая важная.</p>
             <p className="empty-sub">Просто начните печатать.</p>
           </div>
-        ) : filteredNotes.length === 0 && searchQuery ? (
+        ) : filteredChains.length === 0 && searchQuery ? (
           <div className="empty-state">
             <p>Ничего не найдено по «{searchQuery}»</p>
           </div>
         ) : (
-          filteredNotes.map(note => {
+          filteredChains.map(chain => {
+            const note = chain.current;
             // Sync info is derived UNCONDITIONALLY — a confirmed TX stays
             // linkable from the menu even with auto-sync switched off; the
             // enabled flag gates only the live status badge.
             const info = syncStatuses[note.id] ?? { status: 'queued' as const };
-            // With sync off (or no invite yet) the note lives only here — say so
-            // instead of showing nothing.
-            const badge = arweave.enabled && arweave.registered
-              ? SYNC_BADGE[info.status]
-              : (info.status === 'confirmed' ? SYNC_BADGE.confirmed : LOCAL_ONLY_BADGE);
+            const badge = badgeFor(info, arweave.enabled && arweave.registered);
+            const long = isLongNote(note.text);
+            const expanded = expandedCards.has(chain.root);
+            const clamped = long && !expanded;
             return (
-              <div className="note-card" key={note.id + note.createdAt}>
-                <div className="note-text">{highlight(note.text, searchQuery)}</div>
+              <div className="note-card" key={chain.root}>
+                <div className={`note-text ${clamped ? 'note-text--clamped' : ''}`}>
+                  {note.fmt === 'md' && !searchQuery.trim()
+                    ? <NoteMarkdown text={note.text} />
+                    : highlight(note.text, searchQuery)}
+                </div>
+                {long && (
+                  <button className="note-expand-btn" onClick={() => toggleExpanded(chain.root)}>
+                    {expanded ? 'Свернуть' : 'Развернуть'}
+                  </button>
+                )}
                 <div className="note-meta">
                   <span className="note-time">{formatDate(note.createdAt)}</span>
+                  {chain.versions.length > 1 && (
+                    <span
+                      className="note-rev-badge"
+                      title={`Версий: ${chain.versions.length}`}
+                      aria-label={`Версий: ${chain.versions.length}`}
+                    >
+                      v{chain.versions.length}
+                    </span>
+                  )}
                   {badge && info && (
                     info.status === 'error' && arweave.enabled && arweave.registered ? (
                       <button
@@ -416,16 +490,20 @@ export function Main() {
                   )}
                   <span className="note-lock" aria-hidden="true">🔒</span>
                   <button
+                    ref={el => {
+                      if (el) menuBtnRefs.current.set(chain.root, el);
+                      else menuBtnRefs.current.delete(chain.root);
+                    }}
                     className="icon-btn note-menu-btn"
-                    onClick={() => setOpenMenuId(openMenuId === note.id ? null : note.id)}
+                    onClick={() => setOpenMenuId(openMenuId === chain.root ? null : chain.root)}
                     title="Меню заметки"
                     aria-label="Меню заметки"
-                    aria-expanded={openMenuId === note.id}
+                    aria-expanded={openMenuId === chain.root}
                   >
                     ⋯
                   </button>
                 </div>
-                {openMenuId === note.id && (
+                {openMenuId === chain.root && (
                   <div className="note-menu">
                     <button
                       className="note-menu-item"
@@ -433,6 +511,26 @@ export function Main() {
                     >
                       📋 Копировать текст
                     </button>
+                    {V3_WRITER_ENABLED && (
+                      <button
+                        className="note-menu-item"
+                        onClick={() => { setOpenMenuId(null); setEditChainRoot(chain.root); }}
+                      >
+                        ✏️ Редактировать
+                      </button>
+                    )}
+                    {V3_WRITER_ENABLED && chain.versions.length > 1 && (
+                      <button
+                        className="note-menu-item"
+                        onClick={() => {
+                          setOpenMenuId(null);
+                          setHistoryFocusVersionId(null);
+                          setHistoryChainRoot(chain.root);
+                        }}
+                      >
+                        🕓 История версий ({chain.versions.length})
+                      </button>
+                    )}
                     {info?.status === 'confirmed' && info.txId && (
                       <a
                         className="note-menu-item"
@@ -445,8 +543,9 @@ export function Main() {
                       </a>
                     )}
                     <div className="note-menu-hint">
-                      Опубликованная в блокчейне копия неизменяема: её нельзя
-                      отредактировать или удалить.
+                      {V3_WRITER_ENABLED
+                        ? 'Каждая версия навсегда сохраняется в блокчейне: редактирование добавляет новую версию, старые остаются в истории. Удалить опубликованные данные невозможно.'
+                        : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
                     </div>
                   </div>
                 )}
@@ -529,6 +628,32 @@ export function Main() {
         danger
         onConfirm={() => { setShowResetConfirm(false); resetApp(); }}
         onCancel={() => setShowResetConfirm(false)}
+      />
+
+      {/* W3: edit + history + restore-version (one aria-modal layer at a time) */}
+      <EditNoteModal
+        open={editChain !== null}
+        chain={editChain}
+        onClose={() => setEditChainRoot(null)}
+        onSave={(rootId, newText) => editNote(rootId, newText)}
+      />
+
+      <VersionHistoryModal
+        open={historyChain !== null && restoreTarget === null}
+        chain={historyChain}
+        syncStatuses={syncStatuses}
+        syncActive={arweave.enabled && arweave.registered}
+        onClose={() => { setHistoryChainRoot(null); setHistoryFocusVersionId(null); }}
+        onRequestRestore={requestRestore}
+        focusVersionId={historyFocusVersionId}
+        formatDate={formatDate}
+      />
+
+      <RestoreVersionDialog
+        open={restoreTarget !== null}
+        version={restoreTarget?.version ?? null}
+        onConfirm={confirmRestore}
+        onCancel={cancelRestore}
       />
     </div>
   );
