@@ -26,16 +26,22 @@ import {
   deriveSigningKeypair,
   signPayload,
   encrypt,
-  decrypt,
+  encryptEnvelopeV3,
+  decryptNote,
   encryptWithPin,
   decryptWithPin,
   isPinKdfLegacy,
   WrongPinError,
+  UnsupportedNoteVersionError,
   bufferToBase64,
   type EncryptedNote,
   type NoteData,
+  type NoteFormat,
   type PinEncryptedSeed,
 } from './crypto';
+import { groupChains, type NoteChain } from './chains';
+import { V3_WRITER_ENABLED } from './flags';
+import { isNoteTooLong, noteJsonByteLength, NoteTooLongError } from './limits';
 import {
   isArweaveOnline,
   checkRegistration,
@@ -43,6 +49,7 @@ import {
   uploadViaProxy,
   fetchAllNotes,
   getTxStatus,
+  getWorkerCapabilities,
 } from './arweave';
 import {
   initStorage,
@@ -53,6 +60,9 @@ import {
   getRecordsByStatus,
   getSyncRecord,
   setSyncRecord,
+  commitV3PausedFailure,
+  readV3PauseMeta,
+  clearV3UploadsPaused,
   getMeta,
   setMeta,
   deleteMeta,
@@ -60,6 +70,7 @@ import {
   clearPinConfigMeta,
   resetAll,
   recoverStorage,
+  type SyncRecord,
 } from './storage';
 import { afterPoll, claimRestoredForUi } from './sync-transitions';
 import { runUploadAttempt } from './upload-flow';
@@ -108,6 +119,11 @@ export interface ArweaveState {
   errorCount: number;
   acceptedCount: number;
   confirmedCount: number;
+  /** STORAGE-BACKED reset risk: all EncryptedNote records minus confirmed ones.
+   *  The reset dialog must use THIS, not the visible `notes` — an invisible
+   *  quarantined/undecryptable record would otherwise let «всё подтверждено»
+   *  greenlight deleting data a newer client could still read. */
+  resetRiskCount: number;
   lastSync: number | null;
   lastError: string | null;
 }
@@ -122,6 +138,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   errorCount: 0,
   acceptedCount: 0,
   confirmedCount: 0,
+  resetRiskCount: 0,
   lastSync: null,
   lastError: null,
 };
@@ -149,6 +166,26 @@ export class PinWipedError extends Error {
   }
 }
 
+/** A save/edit is already in flight for this target. The UI must NOT treat
+ *  this as success: keep the text/draft, keep the modal open, no toast. The
+ *  disabled button is the primary guard — this error is the backstop against
+ *  a double submit racing ahead of the re-render. */
+export class OperationInFlightError extends Error {
+  constructor() {
+    super('Операция уже выполняется');
+    this.name = 'OperationInFlightError';
+  }
+}
+
+/** editNote called while V3_WRITER_ENABLED=false (R3). A silent no-op is
+ *  forbidden — the edit modal would read it as a successful save. */
+export class WriterDisabledError extends Error {
+  constructor() {
+    super('Редактирование заметок недоступно в этой версии приложения.');
+    this.name = 'WriterDisabledError';
+  }
+}
+
 interface NotesStore {
   screen: AppScreen;
   isReady: boolean;
@@ -157,6 +194,15 @@ interface NotesStore {
   isEncrypting: boolean;
   searchQuery: string;
   filteredNotes: NoteData[];
+  /** Version chains — the READER view of `notes`. ALWAYS active regardless of
+   *  V3_WRITER_ENABLED (after a W3→R3 rollback the store may hold v3 chains
+   *  and R3 must render them as one card per chain, not one per version). */
+  chains: NoteChain[];
+  /** Chains filtered by the search query against the CURRENT version's text. */
+  filteredChains: NoteChain[];
+  /** v3 uploads are paused by the worker's kill switch (persisted marker).
+   *  Shown as a standing banner with a manual resume button. */
+  v3Paused: boolean;
   arweave: ArweaveState;
   /** noteId → sync info, refreshed together with the aggregate counters. */
   syncStatuses: Record<string, NoteSyncInfo>;
@@ -164,8 +210,11 @@ interface NotesStore {
   /** Live progress of the current restore sweep (payloads settled / total). */
   restoreProgress: { done: number; total: number } | null;
   restoreError: string | null;
-  /** How many notes the last completed restore recovered (null = no restore yet). */
+  /** How many NEW chains (user-perceived notes) the last completed restore
+   *  recovered (null = no restore yet). */
   restoredCount: number | null;
+  /** How many EXISTING chains gained new versions in that restore. */
+  restoredUpdatedCount: number | null;
   vaultError: string | null;
   hasPin: boolean;
   /** Current auto-lock threshold (§1): null=never, 0=immediately, 300/1800 s. */
@@ -177,6 +226,15 @@ interface NotesStore {
   confirmMnemonic: (mnemonic: string) => Promise<void>;
   restoreFromMnemonic: (mnemonic: string) => Promise<void>;
   addNote: (text: string) => Promise<void>;
+  /** Create a NEW version of the chain rooted at rootId (fresh UUIDv8 noteId,
+   *  rev = current.rev+1). Regular edits pass fmt 'md' (default); «Восстановить
+   *  версию» passes the SOURCE version's fmt so a plain note never silently
+   *  turns into markdown. Throws WriterDisabledError under the OFF flag,
+   *  OperationInFlightError on a concurrent edit of the same chain,
+   *  NoteTooLongError over the byte limit. */
+  editNote: (rootId: string, newText: string, opts?: { fmt?: NoteFormat }) => Promise<void>;
+  /** Manual resume of paused v3 uploads (clears the marker unconditionally). */
+  resumeV3Uploads: () => Promise<void>;
   setSearchQuery: (query: string) => void;
   goToRestore: () => void;
   goToOnboarding: () => void;
@@ -272,11 +330,13 @@ export async function prepareVaultSnapshot(
   for (const enc of encrypted) {
     throwIfAborted();
     try {
-      const text = await decrypt(key, enc);
-      decrypted.push({ id: enc.noteId, text, createdAt: enc.createdAt });
+      const decoded = await decryptNote(key, enc);
+      decrypted.push({ id: enc.noteId, text: decoded.text, createdAt: decoded.createdAt, ...decoded.meta });
       decryptedCount++;
     } catch {
-      // Skip notes that can't be decrypted (wrong key or corrupted)
+      // Skip notes that can't be decrypted (wrong key, corrupted, or an
+      // unsupported version written by a NEWER client — fail-closed dispatch).
+      // Invisible records still count in the storage-backed resetRiskCount.
     }
   }
   decrypted.sort((a, b) => b.createdAt - a.createdAt);
@@ -329,6 +389,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [restoreProgress, setRestoreProgress] = useState<{ done: number; total: number } | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoredCount, setRestoredCount] = useState<number | null>(null);
+  const [restoredUpdatedCount, setRestoredUpdatedCount] = useState<number | null>(null);
+  // v3 uploads paused by the worker kill switch. Authoritative state lives in
+  // the shared IndexedDB marker (readV3PauseMeta) — this mirrors it for the UI.
+  const [v3Paused, setV3Paused] = useState(false);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [hasPin, setHasPin] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -403,6 +467,24 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // Bumped on lock/reset: the running processor stops taking iterations and
   // never mutates the NEW generation's queue (§7).
   const queueGenerationRef = useRef(0);
+
+  // Single-flight guards (synchronous check-and-claim BEFORE the first await —
+  // React state is not a mutex; a double click can outrun the re-render that
+  // disables the button). addNote: one at a time at BOTH flag values (the v1
+  // path is just as double-click-vulnerable); editNote: per-root, so edits of
+  // DIFFERENT chains may proceed concurrently.
+  const addInFlightRef = useRef(false);
+  const editInFlightRef = useRef(new Set<string>());
+
+  /** Publish a note-list transformation to BOTH the synchronous ref and React
+   *  state with the SAME functional update. The ref must be fresh IMMEDIATELY:
+   *  a second sequential editNote reads current rev/prev from it before React
+   *  re-renders (a useEffect-synced ref would hand it stale data and fork the
+   *  chain unintentionally). */
+  function publishNotes(apply: (prev: NoteData[]) => NoteData[]): void {
+    notesRef.current = apply(notesRef.current);
+    setNotes(apply);
+  }
 
   // ─── Bootstrap ──────────────────────────────────────────────────────
 
@@ -801,6 +883,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // (round-21 P1).
     await refreshSyncCounts(myEpoch);
 
+    // Surface a persisted v3-upload pause immediately: a transient toast died
+    // with the lock/reload, but the fail-closed pause itself must never look
+    // like silently-stuck sync. Malformed marker = paused (fail closed).
+    try {
+      const pause = await readV3PauseMeta();
+      if (vaultEpochRef.current === myEpoch) setV3Paused(pause !== null);
+    } catch (err) {
+      console.error('readV3PauseMeta at unlock failed:', err);
+    }
+
     // Background: network-dependent parts only (online probe + queue kick).
     void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
 
@@ -828,13 +920,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // Transient restore banners must not leak into the next unlock.
     setRestoreError(null);
     setRestoredCount(null);
+    setRestoredUpdatedCount(null);
     setRestoreProgress(null);
+    // The persisted marker survives; the mirror re-reads on next unlock.
+    setV3Paused(false);
 
     // Upload queue: drop queued work; the RUNNING processor (if any) exits on
     // its own via the generation check and must keep ownership of
     // isProcessingRef until it really finishes (§7).
     uploadQueueRef.current = [];
     queuedIdsRef.current.clear();
+    addInFlightRef.current = false;
+    editInFlightRef.current.clear();
 
     // Session seed + any LEGACY plaintext draft go now; the encrypted draft
     // envelope is exactly what at-rest protection is for — it stays (§2).
@@ -897,6 +994,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
 
     const unsynced = allNotes.length - accepted - confirmed;
+    // Storage-backed: EVERY stored record that is not confirmed is at risk on a
+    // reset — including versions invisible in the UI (historical, quarantined,
+    // undecryptable). Never derived from the visible `notes`.
+    const resetRisk = allNotes.length - confirmed;
 
     // Join notes ↔ sync records for the per-card indicator (+ txId for menus).
     const byId = new Map(allSync.map(r => [r.noteId, r]));
@@ -914,6 +1015,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       unsyncedCount: unsynced,
       countsReady: true,
       errorCount: errors,
+      resetRiskCount: resetRisk,
     }));
   }
 
@@ -997,6 +1099,30 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (!arweaveRef.current.enabled || !arweaveRef.current.online) break;
 
         const note = uploadQueueRef.current[0];
+
+        // v3 pause is authoritative SHARED state: re-read the marker right
+        // before every v3 dispatch (another tab may have set it; our per-tab
+        // refs know nothing). At most one initial 503 per already-open tab —
+        // after that the marker short-circuits here without HTTP.
+        if (note.v === 3) {
+          let paused = false;
+          try {
+            paused = (await readV3PauseMeta()) !== null;
+          } catch (err) {
+            console.error('readV3PauseMeta failed — treating v3 as paused:', err);
+            paused = true; // fail closed
+          }
+          if (queueGenerationRef.current !== myGen) break;
+          if (paused) {
+            // Drop from BOTH queue structures — a skipped id left in
+            // queuedIdsRef would block its re-enqueue forever after resume.
+            uploadQueueRef.current.shift();
+            queuedIdsRef.current.delete(note.noteId);
+            setV3Paused(true);
+            continue; // v1/v2 behind it keep uploading
+          }
+        }
+
         const result = await uploadSingleNote(note);
 
         // Superseded mid-upload: the queue we see now belongs to the NEXT
@@ -1051,19 +1177,45 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const myEpoch = vaultEpochRef.current;
     if (!sk || !oh || !pk) return 'error';
 
-    const outcome = await runUploadAttempt(
-      note,
-      { signingKey: sk, ownerHash: oh, publicKey: pk },
-      myEpoch,
-      {
-        now: () => Date.now(),
-        currentEpoch: () => vaultEpochRef.current,
-        getSyncRecord,
-        setSyncRecord,
-        signPayload,
-        uploadViaProxy,
-      },
-    );
+    let outcome;
+    try {
+      outcome = await runUploadAttempt(
+        note,
+        { signingKey: sk, ownerHash: oh, publicKey: pk },
+        myEpoch,
+        {
+          now: () => Date.now(),
+          currentEpoch: () => vaultEpochRef.current,
+          getSyncRecord,
+          setSyncRecord,
+          commitV3PausedFailure,
+          signPayload,
+          uploadViaProxy,
+        },
+      );
+    } catch (err) {
+      if (err instanceof UnsupportedNoteVersionError) {
+        // The stored record carries a version this build cannot serialize
+        // (written by a newer client). PERMANENT local quarantine: terminalError
+        // keeps it out of every future queue pass (a plain 'error' would retry
+        // forever), no HTTP was made, and resetRiskCount still counts it.
+        const prev = await getSyncRecord(note.noteId);
+        const quarantined: SyncRecord = {
+          noteId: note.noteId,
+          txId: prev?.txId,
+          status: 'error',
+          transport: 'proxy',
+          lastError: 'unsupported_version',
+          updatedAt: Date.now(),
+          recovery: prev?.recovery,
+          terminalError: 'unsupported_version',
+        };
+        await setSyncRecord(quarantined);
+        if (vaultEpochRef.current === myEpoch) await refreshSyncCounts(myEpoch);
+        return 'quarantined'; // processQueue treats it as recoverable: shift + continue
+      }
+      throw err;
+    }
     if (outcome.kind === 'cancelled') return 'cancelled';
     const result = outcome.result;
 
@@ -1078,6 +1230,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           setArweave(prev => ({ ...prev, registered: true }));
         }
         setArweave(prev => ({ ...prev, lastSync: Date.now() }));
+      } else if (result.kind === 'v3_disabled') {
+        // The worker's kill switch answered: the pause marker is already
+        // persisted (atomically with the failure record, in upload-flow).
+        // Mirror it to the UI with the dedicated standing message — NOT the
+        // generic error path, and NEVER markUnregistered.
+        setV3Paused(true);
+        setArweave(prev => ({
+          ...prev,
+          lastError: 'Загрузка новых версий заметок временно отключена на сервере. Заметка сохранена локально и будет загружена позже.',
+        }));
       } else {
         // L13: a clock-skew rejection looks like a permanent mystery to the
         // user — surface the actionable «проверьте время» toast.
@@ -1097,18 +1259,31 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const allSync = await getAllSyncRecords();
     const now = Date.now();
 
+    // v3 pause: don't even enqueue v3 records while the shared marker stands —
+    // the per-dispatch check in processQueue is the backstop, this avoids the
+    // churn. An unreadable marker counts as paused (fail closed).
+    let v3PausedNow = false;
+    try {
+      v3PausedNow = (await readV3PauseMeta()) !== null;
+    } catch {
+      v3PausedNow = true;
+    }
+
     // Skip: accepted-and-not-flagged + confirmed + fresh uploading (< 10 min) +
-    //       recheck notes still within their backoff window.
+    //       recheck notes still within their backoff window + PERMANENT
+    //       quarantine (terminalError — retrying can never succeed and risks
+    //       committing garbage; reload/poll/manual retry must not resurrect it).
     // Enqueue: error, accepted+needsRecheck past backoff, stale uploading, no record
     const skipIds = new Set(
       allSync.filter(r =>
+        r.terminalError !== undefined ||
         (r.status === 'accepted' && !r.needsRecheck) ||
         (r.status === 'accepted' && r.needsRecheck && (now - r.updatedAt) < RECHECK_BACKOFF_MS) ||
         r.status === 'confirmed' ||
         (r.status === 'uploading' && (now - r.updatedAt) < STALE_UPLOADING_MS)
       ).map(r => r.noteId)
     );
-    const pending = allNotes.filter(n => !skipIds.has(n.noteId));
+    const pending = allNotes.filter(n => !skipIds.has(n.noteId) && !(v3PausedNow && n.v === 3));
     for (const note of pending) {
       enqueueUpload(note);
     }
@@ -1127,6 +1302,30 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!cryptoKeyRef.current) return; // locked — nothing to poll for
     if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
     const myEpoch = vaultEpochRef.current;
+
+    // Resume channel (а): while the v3 pause stands, each poll cycle probes the
+    // strictly-validated /health. The marker is lifted ONLY via compare-and-
+    // delete on the pausedAt we read BEFORE the probe — a stale success can
+    // never erase a newer pause. A malformed marker is not auto-lifted at all
+    // (manual retry only). 'disabled'/'unknown' verdicts leave everything as is.
+    try {
+      const pause = await readV3PauseMeta();
+      if (pause !== null) {
+        setV3Paused(true); // another tab may have set it since our last read
+        if (pause !== 'malformed') {
+          const capability = await getWorkerCapabilities();
+          if (capability === 'enabled' && await clearV3UploadsPaused(pause.pausedAt)) {
+            if (vaultEpochRef.current !== myEpoch) return;
+            setV3Paused(false);
+            await syncPendingNotes(); // re-enqueue the v3 backlog
+            kickQueue();
+          }
+        }
+      }
+    } catch (err) {
+      console.error('v3 pause resume probe failed:', err);
+    }
+    if (vaultEpochRef.current !== myEpoch) return;
 
     const accepted = await getRecordsByStatus('accepted');
 
@@ -1216,10 +1415,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     setRestoreError(null);
     setRestoredCount(null);
+    setRestoredUpdatedCount(null);
     setRestoreProgress(null);
     try {
-      // fetchAllNotes decrypts + validates (v1/v2) and drops any TX not signed
-      // by a trusted owner or that fails to decrypt.
+      // fetchAllNotes decrypts + validates (v1/v2/v3) and drops any TX not
+      // signed by a trusted owner or that fails to decrypt.
       const { notes: remoteNotes, incomplete } = await fetchAllNotes(
         ownerHashRef.current,
         key,
@@ -1229,13 +1429,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         { signal: abort.signal },
       );
       if (vaultEpochRef.current !== myEpoch) return; // locked mid-sweep — publish nothing
-      let restoredCount = 0;
 
       // Snapshot of what the user can currently SEE (decrypted notes; the DB
       // may hold corrupted-invisible ones). A LOCAL set — extended as we add —
-      // keeps restoredCount exact even though notesRef only catches up after a
-      // render, and «Восстановлено N» never counts an already-visible note.
+      // keeps the counters exact even though notesRef only catches up after a
+      // render, and the summary never counts an already-visible version.
       const visibleIds = new Set(notesRef.current.map(n => n.id));
+      // Counter algorithm (snapshot-based): roots existing in the UI BEFORE the
+      // sweep. A chain whose root is new counts once in M («восстановлено»)
+      // however many versions arrive; an existing chain gaining >=1 new version
+      // counts once in K («обновлено»). EVERY new version is published to state
+      // either way — history is complete without a re-unlock.
+      const initialRoots = new Set(groupChains(notesRef.current).map(c => c.root));
+      const newRoots = new Set<string>();
+      const updatedRoots = new Set<string>();
       for (const remote of remoteNotes) {
         if (vaultEpochRef.current !== myEpoch) return; // locked — stop merging
         // Upsert the note payload + confirmed sync state atomically. The
@@ -1245,20 +1452,27 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
         if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
         if (vaultEpochRef.current !== myEpoch) return;
-        setNotes(prev =>
-          prev.some(n => n.id === remote.encrypted.noteId)
+        const restoredNote: NoteData = {
+          id: remote.encrypted.noteId,
+          text: remote.text,
+          createdAt: remote.encrypted.createdAt,
+          ...remote.meta,
+        };
+        publishNotes(prev =>
+          prev.some(n => n.id === restoredNote.id)
             ? prev
-            : [...prev, { id: remote.encrypted.noteId, text: remote.text, createdAt: remote.encrypted.createdAt }]
-                .sort((a, b) => b.createdAt - a.createdAt)
+            : [...prev, restoredNote].sort((a, b) => b.createdAt - a.createdAt)
         );
-        restoredCount++;
+        if (initialRoots.has(remote.meta.root)) updatedRoots.add(remote.meta.root);
+        else newRoots.add(remote.meta.root);
       }
 
       if (remoteNotes.length > 0) {
         await refreshSyncCounts(myEpoch);
       }
       if (vaultEpochRef.current !== myEpoch) return;
-      setRestoredCount(restoredCount);
+      setRestoredCount(newRoots.size);
+      setRestoredUpdatedCount(updatedRoots.size);
       if (incomplete) {
         // Some pages/payloads were unreachable — a "quiet partial restore" must
         // not look like a full one (the user could believe notes are lost).
@@ -1292,6 +1506,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const clearRestoreStatus = useCallback(() => {
     setRestoreError(null);
     setRestoredCount(null);
+    setRestoredUpdatedCount(null);
   }, []);
 
   const dismissError = useCallback(() => {
@@ -1306,10 +1521,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const key = cryptoKeyRef.current;
     const myEpoch = vaultEpochRef.current;
     if (!readyRef.current || !key || !text.trim()) return;
+    // Byte limit BEFORE anything is persisted: an over-limit note saved locally
+    // would be permanently unsyncable (the worker body cap would 413 it).
+    if (isNoteTooLong(text)) throw new NoteTooLongError(noteJsonByteLength(text));
+    // Single-flight (both flag values): claim synchronously before the first
+    // await. A second call must NOT resolve successfully — handleSave clears
+    // the composer on resolve, and the first save may still fail.
+    if (addInFlightRef.current) throw new OperationInFlightError();
+    addInFlightRef.current = true;
 
     setIsEncrypting(true);
     try {
-      const encrypted = await encrypt(key, text.trim());
+      // W3 writes v3 (markdown, rev-1 chain root, RAW text — markdown
+      // indentation is significant); R3 keeps the exact legacy v1 behavior.
+      const encrypted = V3_WRITER_ENABLED
+        ? await encryptEnvelopeV3(key, text, { fmt: 'md', rev: 1 })
+        : await encrypt(key, text.trim());
       await saveNote(encrypted);
 
       // Locked mid-save: the note is safe on disk (ciphertext at rest) and the
@@ -1319,10 +1546,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
       const note: NoteData = {
         id: encrypted.noteId,
-        text: text.trim(),
+        text: V3_WRITER_ENABLED ? text : text.trim(),
         createdAt: encrypted.createdAt,
+        fmt: V3_WRITER_ENABLED ? 'md' : 'plain',
+        rev: 1,
+        root: encrypted.noteId,
       };
-      setNotes(prev => [note, ...prev]);
+      publishNotes(prev => [note, ...prev]);
 
       // ── The note is SAVED from here on. Nothing below may reject: a failing
       //    secondary read would otherwise make the UI report «не удалось
@@ -1337,8 +1567,87 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         console.error('post-save bookkeeping failed (note IS saved):', err);
       }
     } finally {
+      addInFlightRef.current = false;
       setIsEncrypting(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** New version of an existing chain. Same commit discipline as addNote
+   *  (capture key+epoch → encrypt → save → epoch check → publish → swallowed
+   *  bookkeeping), plus: writer flag gate, per-root single-flight, and a
+   *  SYNCHRONOUSLY fresh `current` via notesRef/publishNotes — a stale ref
+   *  would base rev/prev on the pre-edit version and fork the chain. */
+  const editNote = useCallback(async (rootId: string, newText: string, opts?: { fmt?: NoteFormat }) => {
+    if (!V3_WRITER_ENABLED) throw new WriterDisabledError();
+    const key = cryptoKeyRef.current;
+    const myEpoch = vaultEpochRef.current;
+    if (!readyRef.current || !key || !newText.trim()) return;
+    if (isNoteTooLong(newText)) throw new NoteTooLongError(noteJsonByteLength(newText));
+
+    const chain = groupChains(notesRef.current).find(c => c.root === rootId);
+    if (!chain) throw new Error('Заметка не найдена.');
+    const current = chain.current;
+    if (current.rev >= Number.MAX_SAFE_INTEGER) {
+      throw new Error('Достигнут предел числа версий этой заметки.');
+    }
+
+    // Per-root single-flight — synchronous claim before the first await.
+    if (editInFlightRef.current.has(rootId)) throw new OperationInFlightError();
+    editInFlightRef.current.add(rootId);
+
+    setIsEncrypting(true);
+    try {
+      const fmt = opts?.fmt ?? 'md';
+      const encrypted = await encryptEnvelopeV3(key, newText, {
+        fmt,
+        rev: current.rev + 1,
+        root: rootId,
+        prev: current.id,
+      });
+      await saveNote(encrypted);
+
+      if (vaultEpochRef.current !== myEpoch) return;
+
+      const note: NoteData = {
+        id: encrypted.noteId,
+        text: newText,
+        createdAt: encrypted.createdAt,
+        fmt,
+        rev: current.rev + 1,
+        root: rootId,
+        prev: current.id,
+      };
+      publishNotes(prev => [note, ...prev]);
+
+      // Saved from here on — bookkeeping must not reject (same as addNote).
+      try {
+        if (arweaveRef.current.enabled) {
+          enqueueUpload(encrypted);
+        }
+        await refreshSyncCounts(myEpoch);
+      } catch (err) {
+        console.error('post-edit bookkeeping failed (version IS saved):', err);
+      }
+    } finally {
+      editInFlightRef.current.delete(rootId);
+      setIsEncrypting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Manual resume (channel б): clears the pause marker UNCONDITIONALLY
+   *  (including a malformed one) and immediately re-enqueues the v3 backlog.
+   *  Only ever called from the explicit banner button — automatic paths must
+   *  go through the /health-validated probe instead. */
+  const resumeV3Uploads = useCallback(async () => {
+    const myEpoch = vaultEpochRef.current;
+    await clearV3UploadsPaused('any');
+    if (vaultEpochRef.current !== myEpoch) return;
+    setV3Paused(false);
+    setArweave(prev => ({ ...prev, lastError: null }));
+    await syncPendingNotes();
+    kickQueue();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1610,13 +1919,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   const lockAppAction = useCallback(() => lockApp(), [lockApp]);
 
-  // ─── Search ─────────────────────────────────────────────────────────
+  // ─── Search / chains ───────────────────────────────────────────────
 
   const filteredNotes = searchQuery.trim()
     ? notes.filter(n =>
         n.text.toLowerCase().includes(searchQuery.toLowerCase())
       )
     : notes;
+
+  // Reader view: ALWAYS derived, at both flag values (see NotesStore.chains).
+  const chains = useMemo(() => groupChains(notes), [notes]);
+  // Search matches the CURRENT version only — what the user actually sees on
+  // the card; historical versions are reachable through the history modal.
+  const filteredChains = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return chains;
+    return chains.filter(c => c.current.text.toLowerCase().includes(q));
+  }, [chains, searchQuery]);
 
   // ─── Context Value ──────────────────────────────────────────────────
 
@@ -1631,12 +1950,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     isEncrypting,
     searchQuery,
     filteredNotes,
+    chains,
+    filteredChains,
+    v3Paused,
     arweave: arweaveState,
     syncStatuses,
     restoring,
     restoreProgress,
     restoreError,
     restoredCount,
+    restoredUpdatedCount,
     vaultError,
     hasPin,
     autoLockTimeout,
@@ -1646,6 +1969,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     confirmMnemonic,
     restoreFromMnemonic,
     addNote,
+    editNote,
+    resumeV3Uploads,
     setSearchQuery,
     goToRestore,
     goToOnboarding,
@@ -1671,9 +1996,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     dismissError,
   }), [
     screen, isReady, mnemonic, notes, isEncrypting, searchQuery, filteredNotes,
+    chains, filteredChains, v3Paused,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
-    restoredCount, vaultError, hasPin, autoLockTimeout, bootError,
+    restoredCount, restoredUpdatedCount, vaultError, hasPin, autoLockTimeout, bootError,
     createNewWallet, confirmMnemonic, restoreFromMnemonic, addNote,
+    editNote, resumeV3Uploads,
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
