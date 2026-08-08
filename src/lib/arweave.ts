@@ -324,9 +324,17 @@ interface GraphQLResponse {
 /**
  * Fetch a single page of transactions from Arweave GraphQL.
  */
+/** Combine the per-request deadline with the caller's abort signal (lock
+ *  aborts the whole restore sweep; the timeout still bounds each request). */
+function requestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
 async function fetchPage(
   ownerHash: string,
-  after: string | null
+  after: string | null,
+  signal?: AbortSignal
 ): Promise<{ edges: ArweaveEdge[]; hasNextPage: boolean }> {
   // `owners` restricts results to TX signed by the trusted proxy wallet(s) (C2):
   // an attacker cannot post under these addresses, so squatted/replayed Note-Ids
@@ -363,7 +371,7 @@ async function fetchPage(
     body: JSON.stringify({ query, variables }),
     // A hung gateway must not pin the UI in «Восстанавливаем…» forever; the
     // caller treats an aborted page as a partial restore (incomplete=true).
-    signal: AbortSignal.timeout(GRAPHQL_TIMEOUT_MS),
+    signal: requestSignal(GRAPHQL_TIMEOUT_MS, signal),
   });
 
   if (!response.ok) {
@@ -413,8 +421,10 @@ export async function fetchAllNotes(
   ownerHash: string,
   key: CryptoKey,
   onProgress?: (done: number, total: number) => void,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<FetchAllNotesResult> {
   assertTrustedOwners(); // fail-closed: never trust arbitrary on-chain TX
+  const { signal } = opts;
 
   let incomplete = false;
 
@@ -426,7 +436,7 @@ export async function fetchAllNotes(
     let hasNextPage: boolean;
 
     try {
-      const page = await fetchPage(ownerHash, cursor);
+      const page = await fetchPage(ownerHash, cursor, signal);
       edges = page.edges;
       hasNextPage = page.hasNextPage;
     } catch {
@@ -462,6 +472,12 @@ export async function fetchAllNotes(
   let done = 0;
   const runWorker = async () => {
     while (true) {
+      // Aborted sweep (lock): stop taking new candidates — every remaining
+      // fetch would fail instantly anyway; the sweep reports incomplete.
+      if (signal?.aborted) {
+        incomplete = true;
+        return;
+      }
       const i = nextIndex++;
       if (i >= candidates.length) return;
       const cand = candidates[i];
@@ -469,7 +485,7 @@ export async function fetchAllNotes(
       let dataResponse: Response | null = null;
       try {
         dataResponse = await fetch(`https://arweave.net/raw/${cand.txId}`, {
-          signal: AbortSignal.timeout(PAYLOAD_TIMEOUT_MS),
+          signal: requestSignal(PAYLOAD_TIMEOUT_MS, signal),
         });
       } catch {
         incomplete = true; // network — a legit note may be unreachable right now

@@ -1174,6 +1174,44 @@ mark {
   background: var(--accent-glow);
 }
 
+/* ─── Auto-lock picker (PIN block) — 2×2 grid, ≥44px targets ── */
+
+.autolock-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.autolock-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  width: 100%;
+}
+
+.autolock-option {
+  font-family: var(--font);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.autolock-option:hover {
+  border-color: var(--border-focus);
+}
+
+.autolock-option--active {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--accent-glow);
+}
+
 /* ─── Confirm dialog (in-app confirm() replacement) ─────────── */
 
 .confirm-overlay {

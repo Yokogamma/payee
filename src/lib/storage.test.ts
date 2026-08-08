@@ -14,6 +14,8 @@ import {
   getAllSyncRecords,
   getRecordsByStatus,
   getMeta,
+  setMeta,
+  clearPinConfigMeta,
   type SyncRecord,
 } from './storage';
 
@@ -142,6 +144,39 @@ describe('recoverStorage', () => {
     await recovery;
     await saveNote({ noteId: 'after-block', ciphertext: 'c', iv: 'iv', createdAt: 1 });
     expect(await getNoteById('after-block')).toBeDefined();
+  });
+});
+
+describe('clearPinConfigMeta (§8 — atomic PIN cleanup)', () => {
+  it('deletes pin-seed/attempts/lockout AND resets auto-lock-timeout to null', async () => {
+    await setMeta('pin-seed', { ciphertext: 'ct', iv: 'iv', salt: 's' });
+    await setMeta('pin-attempts', 7);
+    await setMeta('pin-locked-until', Date.now() + 60_000);
+    await setMeta('auto-lock-timeout', 300);
+
+    await clearPinConfigMeta();
+
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    // null (not undefined): the reset is an explicit «Никогда», not a deletion.
+    expect(await getMeta('auto-lock-timeout')).toBeNull();
+  });
+
+  it('is idempotent — succeeds with nothing configured', async () => {
+    await clearPinConfigMeta();
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    expect(await getMeta('auto-lock-timeout')).toBeNull();
+  });
+
+  it('leaves unrelated meta keys untouched', async () => {
+    await setMeta('init', true);
+    await setMeta('ar-enabled', true);
+    await setMeta('vault-public-key', 'pk');
+    await clearPinConfigMeta();
+    expect(await getMeta('init')).toBe(true);
+    expect(await getMeta('ar-enabled')).toBe(true);
+    expect(await getMeta('vault-public-key')).toBe('pk');
   });
 });
 

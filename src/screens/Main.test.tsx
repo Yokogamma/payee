@@ -45,6 +45,12 @@ function baseStore() {
     clearRestoreStatus: vi.fn(),
     syncStatuses: { n1: { status: 'confirmed' as const, txId: 'TX123' } },
     dismissError: vi.fn(),
+    // encrypted-at-rest draft API (§2)
+    persistDraft: vi.fn(async () => {}),
+    readDraft: vi.fn(async () => null),
+    clearDraft: vi.fn(),
+    autoLockTimeout: null,
+    setAutoLockTimeout: vi.fn(async () => {}),
     // consumed by the (closed) SettingsModal
     toggleArweave: vi.fn(),
     registerWithInvite: vi.fn(),

@@ -2,8 +2,19 @@
 /**
  * Eternal Notes — App Store (React Context)
  *
- * Manages: encryption key, notes, Arweave sync, registration, upload queue.
- * All persistence through IndexedDB (storage.ts). No localStorage.
+ * Manages: encryption key, notes, Arweave sync, registration, upload queue,
+ * auto-lock. All persistence through IndexedDB (storage.ts). No localStorage.
+ *
+ * Auto-lock invariants (план v7):
+ *  1. lockApp() is SYNCHRONOUS — it never awaits anything before the vault
+ *     refs/state are gone.
+ *  2. Sensitive state is published ONLY under the current vault epoch: every
+ *     async flow captures the epoch up front and re-checks it before touching
+ *     React state (prepare/commit split, epoch-aware helpers).
+ *  3. The composer draft is encrypted at rest (draft.ts envelope).
+ *  4. An upload past its point of no return is COMMITTED: it dispatches and
+ *     persists its result unconditionally (upload-flow.ts); no processed
+ *     branch leaves a record in 'uploading'.
  */
 
 import { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
@@ -32,7 +43,6 @@ import {
   uploadViaProxy,
   fetchAllNotes,
   getTxStatus,
-  buildUploadPayload,
 } from './arweave';
 import {
   initStorage,
@@ -46,20 +56,32 @@ import {
   getMeta,
   setMeta,
   deleteMeta,
+  clearPinConfigMeta,
   resetAll,
   recoverStorage,
 } from './storage';
-import { toUploading, toAccepted, afterInProgress, afterFailure, afterPoll, claimRestoredForUi } from './sync-transitions';
+import { afterPoll, claimRestoredForUi } from './sync-transitions';
+import { runUploadAttempt } from './upload-flow';
+import { DraftStore, dropLegacyPlaintextDraft, DRAFT_STORAGE_KEY } from './draft';
+import {
+  consumeHiddenMarker,
+  markHidden,
+  decideLockOnReturn,
+  decideBootstrapLock,
+  isValidAutoLockTimeout,
+  type AutoLockTimeout,
+  type BootstrapNavigationType,
+} from './auto-lock';
 import { userFacingUploadError, userFacingRegistrationError } from './errors';
+
+// Re-exported for callers that only need the storage key (reset paths, tests).
+export { DRAFT_STORAGE_KEY };
 
 // ─── Types ───────────────────────────────────────────────────────────
 
 export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main' | 'error';
 
-/** sessionStorage key of the in-progress note draft (plaintext). Defined here
- *  because every vault-destroying path must clear it — a draft left behind
- *  would surface inside the NEXT vault opened in the same tab. */
-export const DRAFT_STORAGE_KEY = 'eternal-notes-draft';
+const SESSION_STORAGE_KEY = 'eternal-notes-session';
 
 /** Per-note sync state for the card indicator: SyncRecord.status, or 'queued'
  *  when the note has no record yet (never attempted). */
@@ -145,6 +167,8 @@ interface NotesStore {
   restoredCount: number | null;
   vaultError: string | null;
   hasPin: boolean;
+  /** Current auto-lock threshold (§1): null=never, 0=immediately, 300/1800 s. */
+  autoLockTimeout: AutoLockTimeout;
   bootError: string | null;
 
   // Actions
@@ -168,6 +192,17 @@ interface NotesStore {
   /** Current PIN lockout/attempt state — read on PinUnlock mount so a reload
    *  doesn't bypass the visible lockout timer. */
   getPinLockState: () => Promise<{ lockedSeconds: number; attempts: number }>;
+  /** Persist-first (§6): rejects when the meta write fails — the UI keeps the
+   *  old value and shows the error. */
+  setAutoLockTimeout: (t: AutoLockTimeout) => Promise<void>;
+  /** Synchronous lock: wipes vault refs/state + session, keeps the encrypted
+   *  draft, shows the PIN screen. */
+  lockApp: () => void;
+  /** Encrypted-at-rest draft (§2). All three are safe to call while locked
+   *  (persist/read become no-ops without a vault key). */
+  persistDraft: (text: string) => Promise<void>;
+  readDraft: () => Promise<string | null>;
+  clearDraft: () => void;
   resetBrokenStorage: () => Promise<void>;
   retryRestore: () => Promise<void>;
   clearRestoreStatus: () => void;
@@ -183,6 +218,93 @@ const RECHECK_BACKOFF_MS = 5 * 60 * 1000;  // min gap between recheck re-attempt
 const TX_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TX_CONFIRM_THRESHOLD = 25;            // Arweave confirmations needed
 const TX_TIMEOUT_MS = 60 * 60 * 1000;      // 1 hour — mark pending TX as error
+
+// ─── Vault snapshot (prepare/commit split, §4) ──────────────────────
+
+/** Everything commitVaultSnapshot publishes — built entirely in locals so a
+ *  lock during preparation discards it without a trace. */
+export interface VaultSnapshot {
+  mnemonic: string;
+  key: CryptoKey;
+  privateKey: Uint8Array;
+  publicKey: Uint8Array;
+  pkB64: string;
+  ownerHash: string;
+  notes: NoteData[];
+  savedEnabled: boolean;
+}
+
+/**
+ * Pure preparation: derive keys, run the vault-identity guards, decrypt all
+ * notes — WITHOUT touching React state or refs. Throws VaultMismatchError on
+ * a foreign vault; throws AbortError if the caller's signal fires (lock).
+ */
+export async function prepareVaultSnapshot(
+  mn: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<VaultSnapshot> {
+  const { signal } = opts;
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw new DOMException('Vault preparation aborted', 'AbortError');
+  };
+
+  const key = await deriveKey(mn);
+  throwIfAborted();
+  const { privateKey, publicKey } = await deriveSigningKeypair(mn);
+  const ownerHash = await deriveOwnerHash(publicKey);
+  const pkB64 = bufferToBase64(publicKey);
+  throwIfAborted();
+
+  // VAULT IDENTITY GUARD
+  const savedVaultPK = await getMeta<string>('vault-public-key');
+  if (savedVaultPK && savedVaultPK !== pkB64) {
+    throw new VaultMismatchError(
+      'На устройстве уже есть данные другого хранилища. ' +
+      'Выполните «Сбросить приложение» перед восстановлением другого seed.'
+    );
+  }
+
+  // Decrypt all notes into LOCALS (never state — commit publishes them).
+  const encrypted = await getAllNotes();
+  const decrypted: NoteData[] = [];
+  let decryptedCount = 0;
+  for (const enc of encrypted) {
+    throwIfAborted();
+    try {
+      const text = await decrypt(key, enc);
+      decrypted.push({ id: enc.noteId, text, createdAt: enc.createdAt });
+      decryptedCount++;
+    } catch {
+      // Skip notes that can't be decrypted (wrong key or corrupted)
+    }
+  }
+  decrypted.sort((a, b) => b.createdAt - a.createdAt);
+
+  // Legacy binding: if vault-public-key absent but notes exist,
+  // only bind if at least one note decrypted successfully (proves ownership)
+  if (!savedVaultPK && encrypted.length > 0 && decryptedCount === 0) {
+    throw new VaultMismatchError(
+      'Seed-фраза не подходит к существующим заметкам на устройстве. ' +
+      'Введите правильный seed или выполните «Сбросить приложение».'
+    );
+  }
+
+  const savedEnabled = !!(await getMeta<boolean>('ar-enabled'));
+  return { mnemonic: mn, key, privateKey, publicKey, pkB64, ownerHash, notes: decrypted, savedEnabled };
+}
+
+/** PerformanceNavigationTiming.type mapped to the §5 matrix. */
+function currentNavigationType(): BootstrapNavigationType {
+  try {
+    const entries = performance.getEntriesByType('navigation') as PerformanceNavigationTiming[];
+    const t = entries[0]?.type;
+    if (t === 'reload' || t === 'back_forward') return t;
+    if (t === 'navigate' || t === 'prerender') return 'navigate';
+    return 'none';
+  } catch {
+    return 'none';
+  }
+}
 
 // ─── Provider ────────────────────────────────────────────────────────
 
@@ -209,12 +331,34 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [hasPin, setHasPin] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
+  const [autoLockTimeout, setAutoLockTimeoutState] = useState<AutoLockTimeout>(null);
 
   // Crypto refs (not React state — needed synchronously in async flows)
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
   const ownerHashRef = useRef<string | null>(null);
   const signingKeyRef = useRef<Uint8Array | null>(null);
   const publicKeyRef = useRef<Uint8Array | null>(null);
+
+  // Auto-lock machinery. The epoch is the vault's identity in time: bumped by
+  // every lock/reset, captured by every async flow, checked before every
+  // publication of sensitive state.
+  const vaultEpochRef = useRef(0);
+  // Aborts the in-flight vault operation (prepare or restore sweep) on lock.
+  const vaultOpAbortRef = useRef<AbortController | null>(null);
+  // Ref mirrors for values the lifecycle handlers need SYNCHRONOUSLY (a React
+  // state read inside an event listener would be stale).
+  const hasPinRef = useRef(false);
+  const autoLockTimeoutRef = useRef<AutoLockTimeout>(null);
+
+  const applyHasPin = (v: boolean) => { hasPinRef.current = v; setHasPin(v); };
+  const applyAutoLockTimeout = (t: AutoLockTimeout) => { autoLockTimeoutRef.current = t; setAutoLockTimeoutState(t); };
+
+  // Encrypted-at-rest draft (§2) + multi-tab identity (§8)
+  const draftStoreRef = useRef<DraftStore | null>(null);
+  if (draftStoreRef.current === null) draftStoreRef.current = new DraftStore(sessionStorage);
+  const tabIdRef = useRef<string | null>(null);
+  if (tabIdRef.current === null) tabIdRef.current = crypto.randomUUID();
+  const channelRef = useRef<BroadcastChannel | null>(null);
 
   // Arweave state with ref-first pattern
   const [arweaveState, setArweaveReactState] = useState<ArweaveState>(INITIAL_ARWEAVE);
@@ -237,6 +381,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const uploadQueueRef = useRef<EncryptedNote[]>([]);
   const queuedIdsRef = useRef(new Set<string>());
   const isProcessingRef = useRef(false);
+  // Bumped on lock/reset: the running processor stops taking iterations and
+  // never mutates the NEW generation's queue (§7).
+  const queueGenerationRef = useRef(0);
 
   // ─── Bootstrap ──────────────────────────────────────────────────────
 
@@ -282,6 +429,92 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady]);
 
+  // ─── Auto-lock lifecycle (§5) ──────────────────────────────────────
+  useEffect(() => {
+    // A page that LOADS hidden never fires a hidden transition — re-arm the
+    // marker so the eventual return still measures the away-time.
+    if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
+
+    const evaluateReturn = () => {
+      const now = Date.now();
+      const marker = consumeHiddenMarker(sessionStorage, now);
+      if (decideLockOnReturn(autoLockTimeoutRef.current, hasPinRef.current, marker, now)) {
+        lockApp();
+      } else {
+        // §8 self-heal: another tab may have changed the PIN/timeout while we
+        // were hidden and frozen (missed broadcast).
+        void selfHealPinConfig();
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
+      else evaluateReturn();
+    };
+    // pagehide refines the marker (earliest wins) — it also fires on
+    // navigation away, where visibilitychange:hidden may not.
+    const onPageHide = () => markHidden(sessionStorage, Date.now());
+    const onPageShow = (e: PageTransitionEvent) => {
+      // BFCache restore resumes the app exactly where it was — same decision
+      // as a visibility return. A non-persisted pageshow accompanies a normal
+      // load, where bootstrap already decided.
+      if (e.persisted) evaluateReturn();
+    };
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Multi-tab vault channel (§8) ──────────────────────────────────
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return; // older Safari — per-tab only
+    const channel = new BroadcastChannel('eternal-notes-vault');
+    channelRef.current = channel;
+    channel.onmessage = (e: MessageEvent) => {
+      const msg = e.data as { type?: unknown; originId?: unknown } | null;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.originId === tabIdRef.current) return; // never act on our own echo
+      if (msg.type === 'lock') {
+        lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
+      } else if (msg.type === 'config') {
+        void selfHealPinConfig();
+      }
+    };
+    return () => {
+      channel.close();
+      if (channelRef.current === channel) channelRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function postVaultMessage(type: 'lock' | 'config') {
+    try {
+      channelRef.current?.postMessage({ type, originId: tabIdRef.current, messageId: crypto.randomUUID() });
+    } catch (err) {
+      console.error('postVaultMessage failed:', err); // channel closed — per-tab behavior stays correct
+    }
+  }
+
+  /** Re-read the PIN/auto-lock configuration from meta (shared IndexedDB) —
+   *  the authoritative source after a 'config' broadcast or a return from
+   *  background. Never throws: a storage hiccup keeps the current state. */
+  async function selfHealPinConfig() {
+    try {
+      const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
+      applyHasPin(!!pinData);
+      const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
+      applyAutoLockTimeout(isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null);
+    } catch {
+      // storage not ready / broken — the periodic paths will retry
+    }
+  }
+
   async function bootstrap() {
     try {
       // 1. Init storage (IndexedDB + migrate localStorage)
@@ -294,27 +527,51 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // 3. Check for PIN-encrypted seed
+      // 3. Check for PIN-encrypted seed + auto-lock config
       const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
-      if (pinData) setHasPin(true);
+      if (pinData) applyHasPin(true);
+      const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
+      const timeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
+      applyAutoLockTimeout(timeout);
 
       // 4. Check session (survives tab refresh but not browser close)
-      const sessionMn = sessionStorage.getItem('eternal-notes-session');
+      const sessionMn = sessionStorage.getItem(SESSION_STORAGE_KEY);
       if (!sessionMn) {
         // No active session — show PIN screen if PIN is set, otherwise restore
         setScreen(pinData ? 'pin' : 'restore');
         return;
       }
 
-      // 4. Restore session
+      // 5. §5: bootstrap lock decision — BEFORE any key derivation. The marker
+      // is consumed atomically either way (one away-interval, one evaluation).
+      const marker = consumeHiddenMarker(sessionStorage, Date.now());
+      const doc = document as Document & { wasDiscarded?: boolean };
+      if (decideBootstrapLock({
+        hasPin: !!pinData,
+        timeoutSeconds: timeout,
+        wasDiscarded: doc.wasDiscarded === true,
+        navigationType: currentNavigationType(),
+        marker,
+        nowMs: Date.now(),
+      })) {
+        // Locked at boot: the plaintext seed must not survive in this tab.
+        // The encrypted draft envelope stays (§2).
+        sessionStorage.removeItem(SESSION_STORAGE_KEY);
+        dropLegacyPlaintextDraft(sessionStorage);
+        setScreen('pin');
+        return;
+      }
+
+      // 6. Restore session
       try {
-        await setupFromMnemonic(sessionMn);
+        const epoch = await openVault(sessionMn);
+        if (epoch === null) return; // a lock won the race — nothing was published
 
-        // 5. Check registration
-        await checkAndSetRegistration();
-        setScreen('main');
+        // 7. Check registration
+        await checkAndSetRegistration(epoch);
+        if (vaultEpochRef.current === epoch) setScreen('main');
 
-        // 6. Auto-recover stale uploads (non-blocking, gated on enabled)
+        // 8. Auto-recover stale uploads (non-blocking, gated on enabled)
         if (arweaveRef.current.enabled) {
           void retryAllPending().catch(err => console.error('bootstrap retryAllPending:', err));
         }
@@ -336,93 +593,129 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  // ─── Setup from mnemonic (shared for confirm/restore/session) ──────
+  // ─── Vault open (prepare → commit → side-effects, §4) ──────────────
 
-  async function setupFromMnemonic(mn: string) {
-    const key = await deriveKey(mn);
-    const { privateKey, publicKey } = await deriveSigningKeypair(mn);
-    const oh = await deriveOwnerHash(publicKey);
-    const pkB64 = bufferToBase64(publicKey);
+  /** Synchronous publication of a prepared snapshot. NO draft hydration here —
+   *  that is Main's mount-time, dirty-guarded job. */
+  function commitVaultSnapshot(snap: VaultSnapshot) {
+    cryptoKeyRef.current = snap.key;
+    ownerHashRef.current = snap.ownerHash;
+    signingKeyRef.current = snap.privateKey;
+    publicKeyRef.current = snap.publicKey;
+    setMnemonic(snap.mnemonic);
+    setNotes(snap.notes);
+    // Mirror synchronously: a restore may start before React flushes the state
+    // update above, and its visibility decisions must see THIS list.
+    notesRef.current = snap.notes;
+    setArweave(prev => ({ ...prev, registered: false, enabled: snap.savedEnabled }));
+  }
 
-    // VAULT IDENTITY GUARD
-    const savedVaultPK = await getMeta<string>('vault-public-key');
-    if (savedVaultPK && savedVaultPK !== pkB64) {
-      throw new VaultMismatchError(
-        'На устройстве уже есть данные другого хранилища. ' +
-        'Выполните «Сбросить приложение» перед восстановлением другого seed.'
-      );
+  /**
+   * Shared open path (bootstrap/confirm/restore/PIN-unlock): prepare → epoch
+   * check → commit → persistent side-effects. Returns the epoch the vault was
+   * published under, or null when a lock superseded the attempt (nothing was
+   * published, the caller must go quiet). Throws VaultMismatchError from
+   * preparation.
+   */
+  async function openVault(mn: string): Promise<number | null> {
+    const myEpoch = vaultEpochRef.current;
+    const abort = new AbortController();
+    vaultOpAbortRef.current?.abort();
+    vaultOpAbortRef.current = abort;
+
+    let snap: VaultSnapshot;
+    try {
+      snap = await prepareVaultSnapshot(mn, { signal: abort.signal });
+    } catch (err) {
+      if (abort.signal.aborted) return null; // lock during prepare — stand down silently
+      throw err;
+    } finally {
+      if (vaultOpAbortRef.current === abort) vaultOpAbortRef.current = null;
     }
+    if (vaultEpochRef.current !== myEpoch) return null; // locked between prepare and commit
 
-    // Set refs
-    cryptoKeyRef.current = key;
-    setArweave(prev => ({ ...prev, registered: false }));
-    setMnemonic(mn);
-    ownerHashRef.current = oh;
-    signingKeyRef.current = privateKey;
-    publicKeyRef.current = publicKey;
+    commitVaultSnapshot(snap);
+    sessionStorage.setItem(SESSION_STORAGE_KEY, mn);
 
-    // Decrypt all notes, returns count of successfully decrypted
-    const decryptedCount = await decryptAllNotes(key);
-
-    // Legacy binding: if vault-public-key absent but notes exist,
-    // only bind if at least one note decrypted successfully (proves ownership)
-    const existingNotes = await getAllNotes();
-    if (!savedVaultPK && existingNotes.length > 0 && decryptedCount === 0) {
-      throw new VaultMismatchError(
-        'Seed-фраза не подходит к существующим заметкам на устройстве. ' +
-        'Введите правильный seed или выполните «Сбросить приложение».'
-      );
-    }
-    await setMeta('vault-public-key', pkB64);
-
-    // Restore persisted sync toggle
-    const savedEnabled = !!(await getMeta<boolean>('ar-enabled'));
-    setArweave({ enabled: savedEnabled });
+    // Persistent (non-React) side-effects may complete even if a lock lands
+    // now — they publish nothing sensitive to the UI (§4).
+    await setMeta('vault-public-key', snap.pkB64);
 
     // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
     // populate them (and flip countsReady) before the UI is interactive, so the
     // destructive-reset dialog never renders against empty placeholder state
     // (round-21 P1).
-    await refreshSyncCounts();
+    await refreshSyncCounts(myEpoch);
 
     // Background: network-dependent parts only (online probe + queue kick).
-    void initArweaveState().catch(err => console.error('initArweaveState:', err));
+    void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
+
+    return myEpoch;
   }
 
-  async function decryptAllNotes(key: CryptoKey): Promise<number> {
-    const encrypted = await getAllNotes();
-    const decrypted: NoteData[] = [];
-    let count = 0;
+  // ─── Lock (§3) ─────────────────────────────────────────────────────
 
-    for (const enc of encrypted) {
-      try {
-        const text = await decrypt(key, enc);
-        decrypted.push({
-          id: enc.noteId,
-          text,
-          createdAt: enc.createdAt,
-        });
-        count++;
-      } catch {
-        // Skip notes that can't be decrypted (wrong key or corrupted)
-      }
-    }
+  /** Synchronous wipe of every live vault reference. Shared by lockApp and
+   *  resetApp. NO byte zero-fill (round-5 med): an in-flight signer may share
+   *  the buffer, and JS cannot guarantee zeroing anyway — the guarantee is the
+   *  synchronous removal of refs + plaintext from UI/storage. */
+  function clearVaultState() {
+    cryptoKeyRef.current = null;
+    ownerHashRef.current = null;
+    signingKeyRef.current = null;
+    publicKeyRef.current = null;
+    setMnemonic(null);
+    setNotes([]);
+    notesRef.current = [];
+    setSyncStatuses({});
+    setSearchQuery('');
+    setArweave(INITIAL_ARWEAVE);
+    setVaultError(null);
+    // Transient restore banners must not leak into the next unlock.
+    setRestoreError(null);
+    setRestoredCount(null);
+    setRestoreProgress(null);
 
-    decrypted.sort((a, b) => b.createdAt - a.createdAt);
-    setNotes(decrypted);
-    // Mirror synchronously: a restore may start before React flushes the state
-    // update above, and its visibility decisions must see THIS list.
-    notesRef.current = decrypted;
-    return count;
+    // Upload queue: drop queued work; the RUNNING processor (if any) exits on
+    // its own via the generation check and must keep ownership of
+    // isProcessingRef until it really finishes (§7).
+    uploadQueueRef.current = [];
+    queuedIdsRef.current.clear();
+
+    // Session seed + any LEGACY plaintext draft go now; the encrypted draft
+    // envelope is exactly what at-rest protection is for — it stays (§2).
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    dropLegacyPlaintextDraft(sessionStorage);
   }
+
+  /** Lock the vault NOW. Fully synchronous (§3): epoch bump → abort in-flight
+   *  vault op → wipe state → PIN screen → (optionally) tell the other tabs. */
+  const lockApp = useCallback((opts: { broadcast?: boolean } = {}) => {
+    // Nothing to lock without an open vault or a live session in this tab —
+    // a foreign 'lock' broadcast may arrive while we sit on landing/restore.
+    const hasVault = cryptoKeyRef.current !== null
+      || sessionStorage.getItem(SESSION_STORAGE_KEY) !== null;
+    if (!hasVault) return;
+
+    vaultEpochRef.current++;
+    queueGenerationRef.current++;
+    vaultOpAbortRef.current?.abort();
+    vaultOpAbortRef.current = null;
+    clearVaultState();
+    // Without a PIN there is nothing to unlock against — seed re-entry it is.
+    setScreen(hasPinRef.current ? 'pin' : 'restore');
+    if (opts.broadcast !== false) postVaultMessage('lock');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ─── Arweave State ──────────────────────────────────────────────────
 
-  async function initArweaveState() {
-    // Counts were already loaded synchronously during bootstrap; refresh them
+  async function initArweaveState(epoch: number) {
+    // Counts were already loaded synchronously during vault open; refresh them
     // again after the (slow) probe so a queue kick sees fresh numbers.
     const online = await isArweaveOnline();
-    await refreshSyncCounts();
+    await refreshSyncCounts(epoch);
+    if (vaultEpochRef.current !== epoch) return; // locked meanwhile
     setArweave(prev => ({ ...prev, online }));
 
     // If online + enabled + items queued → trigger queue
@@ -431,9 +724,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function refreshSyncCounts() {
+  /** Epoch-aware (§4): reads storage first, then publishes to React state only
+   *  if the vault the caller saw is still the vault on screen. */
+  async function refreshSyncCounts(epoch: number) {
     const allNotes = await getAllNotes();
     const allSync = await getAllSyncRecords();
+    if (vaultEpochRef.current !== epoch) return; // stale — never touch the UI
 
     let accepted = 0, confirmed = 0, errors = 0;
     for (const r of allSync) {
@@ -467,7 +763,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   /** @param force skip the local marker and always ask the server — used by the
    *  manual «Проверить доступ», which must be able to DISCOVER a revocation. */
-  async function checkAndSetRegistration(force = false) {
+  async function checkAndSetRegistration(epoch: number, force = false) {
+    // Captured ONCE — post-lock the refs are null, but the network round-trip
+    // below may already be in flight with these locals. Every React mutation
+    // is epoch-gated instead.
     const publicKey = publicKeyRef.current;
     const signingKey = signingKeyRef.current;
     if (!publicKey || !signingKey) return;
@@ -476,7 +775,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const localRegistered = force ? false : await getMeta<boolean>(`registered:${publicKeyB64}`);
 
     if (localRegistered) {
-      setArweave(prev => ({ ...prev, registered: true }));
+      if (vaultEpochRef.current === epoch) setArweave(prev => ({ ...prev, registered: true }));
     } else {
       const checkPayload = JSON.stringify({ publicKey: publicKeyB64, timestamp: Date.now() });
       const checkSig = await signPayload(signingKey, checkPayload);
@@ -484,12 +783,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
       if (status === 'allowed') {
         await setMeta(`registered:${publicKeyB64}`, true);
-        setArweave(prev => ({ ...prev, registered: true }));
+        if (vaultEpochRef.current === epoch) setArweave(prev => ({ ...prev, registered: true }));
       } else if (status === 'invalid_request') {
         console.error('checkRegistration returned invalid_request:', message);
         // L13: a clock-skew 401 is user-actionable — surface the hint instead
         // of failing silently on a freshly-restored device.
-        if (message && /timestamp|clock|skew/i.test(message)) {
+        if (message && /timestamp|clock|skew/i.test(message) && vaultEpochRef.current === epoch) {
           setArweave(prev => ({ ...prev, lastError: userFacingUploadError('error', message) }));
         }
       } else if (status === 'denied') {
@@ -497,7 +796,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // invite form comes back instead of a permanently "registered" client
         // that only ever gets 403s.
         await deleteMeta(`registered:${publicKeyB64}`);
-        setArweave(prev => ({ ...prev, registered: false }));
+        if (vaultEpochRef.current === epoch) setArweave(prev => ({ ...prev, registered: false }));
       }
       // 'unavailable' → don't change registered, user can retry
     }
@@ -511,7 +810,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setArweave(prev => ({ ...prev, registered: false }));
   }
 
-  // ─── Upload Queue ───────────────────────────────────────────────────
+  // ─── Upload Queue (§7) ─────────────────────────────────────────────
 
   function kickQueue() {
     void processQueue().catch(err => console.error('processQueue error:', err));
@@ -528,16 +827,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (isProcessingRef.current) return;
     if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
 
+    const myGen = queueGenerationRef.current;
     isProcessingRef.current = true;
     setArweave(prev => ({ ...prev, syncing: true }));
 
     try {
       while (uploadQueueRef.current.length > 0) {
+        // A lock bumped the generation: stop taking iterations. The in-flight
+        // upload (if any) already landed via runUploadAttempt's commit rules.
+        if (queueGenerationRef.current !== myGen) break;
         if (!arweaveRef.current.enabled || !arweaveRef.current.online) break;
 
         const note = uploadQueueRef.current[0];
         const result = await uploadSingleNote(note);
 
+        // Superseded mid-upload: the queue we see now belongs to the NEXT
+        // generation (unlock refilled it) — it is not ours to shift.
+        if (queueGenerationRef.current !== myGen) break;
+
+        if (result === 'cancelled') break; // lock before the point of no return
         if (result === 'rate_limited') {
           setArweave(prev => ({ ...prev, lastError: userFacingUploadError('rate_limited') }));
           break;
@@ -561,69 +869,68 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         }
       }
     } finally {
+      // Released only on REAL completion — the generation check never
+      // force-clears a running processor's flag (§7).
       isProcessingRef.current = false;
       setArweave(prev => ({ ...prev, syncing: false }));
+      // Superseded processor hands off: work enqueued for the new generation
+      // (unlock → retryAllPending) would otherwise wait for an external kick
+      // that already came and saw isProcessing=true.
+      if (queueGenerationRef.current !== myGen && uploadQueueRef.current.length > 0) {
+        kickQueue();
+      }
     }
   }
 
+  /** One upload attempt. Returns the UploadResult kind, or 'cancelled' when a
+   *  lock preempted the attempt before its point of no return. The state
+   *  machine itself lives in upload-flow.ts; here we only capture the refs
+   *  ONCE and gate the React/meta side-effects on the epoch (§7 step 5). */
   async function uploadSingleNote(note: EncryptedNote): Promise<string> {
-    if (!ownerHashRef.current || !signingKeyRef.current || !publicKeyRef.current) return 'error';
+    const sk = signingKeyRef.current;
+    const oh = ownerHashRef.current;
+    const pk = publicKeyRef.current;
+    const myEpoch = vaultEpochRef.current;
+    if (!sk || !oh || !pk) return 'error';
 
-    // A dropped/timed-out TX asks the server to re-verify + re-post (C1).
-    const prev = await getSyncRecord(note.noteId);
-    const recheck = prev?.needsRecheck === true;
+    const outcome = await runUploadAttempt(
+      note,
+      { signingKey: sk, ownerHash: oh, publicKey: pk },
+      myEpoch,
+      {
+        now: () => Date.now(),
+        currentEpoch: () => vaultEpochRef.current,
+        getSyncRecord,
+        setSyncRecord,
+        signPayload,
+        uploadViaProxy,
+      },
+    );
+    if (outcome.kind === 'cancelled') return 'cancelled';
+    const result = outcome.result;
 
-    // All SyncRecord transitions are pure functions (sync-transitions.ts) so
-    // the recovery-protocol invariants stay unit-tested.
-    await setSyncRecord(toUploading(note.noteId, prev, Date.now()));
-
-    // Build payload — serialized per the note's own version (v1 or v2), so a
-    // restored v2 ciphertext can never be re-published under v1 tags. Recheck
-    // reconciliation is server-authoritative; the only client-echoed value is a
-    // server-SIGNED recovery hint (if any) from a prior triple-failure.
-    const payload = buildUploadPayload(note, ownerHashRef.current, Date.now(), recheck, prev?.recovery);
-
-    const bodyText = JSON.stringify(payload);
-    const signature = await signPayload(signingKeyRef.current, bodyText);
-    const publicKeyB64 = bufferToBase64(publicKeyRef.current);
-
-    const result = await uploadViaProxy(bodyText, publicKeyB64, signature);
-
-    if (result.kind === 'accepted') {
-      await setSyncRecord(toAccepted(note.noteId, prev, result, Date.now()));
-      // Auto-discovery
-      const pkB64 = bufferToBase64(publicKeyRef.current!);
-      if (!(await getMeta<boolean>(`registered:${pkB64}`))) {
-        await setMeta(`registered:${pkB64}`, true);
-        setArweave(prev => ({ ...prev, registered: true }));
+    // React state + registration meta — ONLY under the current epoch. The
+    // sync record itself was already persisted unconditionally above.
+    if (vaultEpochRef.current === myEpoch) {
+      if (result.kind === 'accepted') {
+        // Auto-discovery
+        const pkB64 = bufferToBase64(pk);
+        if (!(await getMeta<boolean>(`registered:${pkB64}`))) {
+          await setMeta(`registered:${pkB64}`, true);
+          setArweave(prev => ({ ...prev, registered: true }));
+        }
+        setArweave(prev => ({ ...prev, lastSync: Date.now() }));
+      } else {
+        // L13: a clock-skew rejection looks like a permanent mystery to the
+        // user — surface the actionable «проверьте время» toast.
+        const errText = 'error' in result ? result.error : undefined;
+        if (errText && /timestamp|clock|skew/i.test(errText)) {
+          setArweave(prev => ({ ...prev, lastError: userFacingUploadError(result.kind, errText) }));
+        }
       }
-      setArweave(prev => ({ ...prev, lastSync: Date.now() }));
-      await refreshSyncCounts();
-      return 'accepted';
+      await refreshSyncCounts(myEpoch);
     }
 
-    if (result.kind === 'in_progress') {
-      // 409: a reservation is alive on the server (e.g. the pre-triple-failure
-      // reserved slot still within its TTL). Restore the prior accepted state —
-      // leaving the record 'uploading' would strand txId/recovery if the app
-      // closes before the next attempt.
-      const restored = afterInProgress(note.noteId, prev, Date.now());
-      if (restored) await setSyncRecord(restored);
-      await refreshSyncCounts();
-      return 'in_progress';
-    }
-
-    // Any non-definitive outcome (unavailable/rate_limited/not_registered/error).
-    // An already-accepted note keeps 'accepted' + txId + recovery and stays in
-    // the recheck loop; only a never-accepted note becomes a hard 'error'.
-    const errText = 'error' in result ? result.error : undefined;
-    // L13: a clock-skew rejection looks like a permanent mystery to the user —
-    // surface the actionable «проверьте время» toast instead of staying silent.
-    if (errText && /timestamp|clock|skew/i.test(errText)) {
-      setArweave(prev2 => ({ ...prev2, lastError: userFacingUploadError(result.kind, errText) }));
-    }
-    await setSyncRecord(afterFailure(note.noteId, prev, recheck, errText, Date.now()));
-    await refreshSyncCounts();
     return result.kind;
   }
 
@@ -659,7 +966,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   async function pollTxStatuses() {
     if (document.visibilityState !== 'visible') return;
+    if (!cryptoKeyRef.current) return; // locked — nothing to poll for
     if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
+    const myEpoch = vaultEpochRef.current;
 
     const accepted = await getRecordsByStatus('accepted');
 
@@ -667,6 +976,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     let changed = false;
 
     for (const record of accepted) {
+      if (vaultEpochRef.current !== myEpoch) return; // locked mid-poll — stop
       if (!record.txId) continue;
 
       const status = await getTxStatus(record.txId);
@@ -681,8 +991,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     }
 
-    if (changed) await refreshSyncCounts();
+    if (changed) await refreshSyncCounts(myEpoch);
     // Drain any ready work each cycle (recheck notes past their backoff).
+    if (vaultEpochRef.current !== myEpoch) return;
     if (arweaveRef.current.enabled && arweaveRef.current.online) {
       await syncPendingNotes();
       kickQueue();
@@ -698,22 +1009,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const confirmMnemonic = useCallback(async (mn: string) => {
-    await setupFromMnemonic(mn);
-    sessionStorage.setItem('eternal-notes-session', mn);
+    const epoch = await openVault(mn);
+    if (epoch === null) return;
     await setMeta('init', true);
-    await checkAndSetRegistration();
-    setScreen('main');
+    await checkAndSetRegistration(epoch);
+    if (vaultEpochRef.current === epoch) setScreen('main');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const restoreFromMnemonic = useCallback(async (mn: string) => {
     if (!isValidMnemonic(mn)) throw new Error('Invalid mnemonic');
 
-    await setupFromMnemonic(mn);
-    sessionStorage.setItem('eternal-notes-session', mn);
+    const epoch = await openVault(mn);
+    if (epoch === null) return;
     await setMeta('init', true);
 
-    await checkAndSetRegistration();
+    await checkAndSetRegistration(epoch);
+    if (vaultEpochRef.current !== epoch) return;
     setScreen('main');
 
     // Auto-restore from Arweave
@@ -726,7 +1038,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       setRestoring(false);
     }
 
-    // Auto-recover stale uploads (gated on enabled)
+    // Auto-recover stale uploads (gated on enabled; post-lock enabled=false)
     if (arweaveRef.current.enabled) {
       void retryAllPending().catch(err => console.error('retryAllPending after restore:', err));
     }
@@ -736,6 +1048,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   async function restoreFromArweaveInternal() {
     const key = cryptoKeyRef.current;
     if (!key || !ownerHashRef.current) return;
+    const myEpoch = vaultEpochRef.current;
+
+    // The sweep is abortable: lockApp() cancels every in-flight page/payload
+    // fetch instead of letting them settle against a locked vault.
+    const abort = new AbortController();
+    vaultOpAbortRef.current?.abort();
+    vaultOpAbortRef.current = abort;
 
     setRestoreError(null);
     setRestoredCount(null);
@@ -746,8 +1065,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const { notes: remoteNotes, incomplete } = await fetchAllNotes(
         ownerHashRef.current,
         key,
-        (done, total) => setRestoreProgress({ done, total }),
+        (done, total) => {
+          if (vaultEpochRef.current === myEpoch) setRestoreProgress({ done, total });
+        },
+        { signal: abort.signal },
       );
+      if (vaultEpochRef.current !== myEpoch) return; // locked mid-sweep — publish nothing
       let restoredCount = 0;
 
       // Snapshot of what the user can currently SEE (decrypted notes; the DB
@@ -756,12 +1079,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // render, and «Восстановлено N» never counts an already-visible note.
       const visibleIds = new Set(notesRef.current.map(n => n.id));
       for (const remote of remoteNotes) {
+        if (vaultEpochRef.current !== myEpoch) return; // locked — stop merging
         // Upsert the note payload + confirmed sync state atomically. The
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
         await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
 
         if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
+        if (vaultEpochRef.current !== myEpoch) return;
         setNotes(prev =>
           prev.some(n => n.id === remote.encrypted.noteId)
             ? prev
@@ -772,8 +1097,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
 
       if (remoteNotes.length > 0) {
-        await refreshSyncCounts();
+        await refreshSyncCounts(myEpoch);
       }
+      if (vaultEpochRef.current !== myEpoch) return;
       setRestoredCount(restoredCount);
       if (incomplete) {
         // Some pages/payloads were unreachable — a "quiet partial restore" must
@@ -782,9 +1108,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     } catch (err) {
       console.error('restoreFromArweave failed:', err);
-      setRestoreError('Не удалось восстановить заметки из Arweave.');
+      if (vaultEpochRef.current === myEpoch) {
+        setRestoreError('Не удалось восстановить заметки из Arweave.');
+      }
     } finally {
-      setRestoreProgress(null);
+      if (vaultOpAbortRef.current === abort) vaultOpAbortRef.current = null;
+      if (vaultEpochRef.current === myEpoch) setRestoreProgress(null);
     }
   }
 
@@ -834,7 +1163,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (arweaveRef.current.enabled) {
           enqueueUpload(encrypted); // sync is best-effort; the note is safe
         }
-        await refreshSyncCounts();
+        await refreshSyncCounts(vaultEpochRef.current);
       } catch (err) {
         console.error('post-save bookkeeping failed (note IS saved):', err);
       }
@@ -890,7 +1219,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const checkAccessAction = useCallback(async () => {
-    await checkAndSetRegistration(true); // manual check must reach the server
+    await checkAndSetRegistration(vaultEpochRef.current, true); // manual check must reach the server
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -903,30 +1232,26 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // 1. IndexedDB — all stores
     await resetAll();
 
-    // 2. sessionStorage — prevent bootstrap mnemonic loop AND drop the
-    //    plaintext draft: it belonged to the vault being destroyed and would
-    //    otherwise resurface inside the NEXT vault opened in this tab.
-    sessionStorage.removeItem('eternal-notes-session');
-    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+    // 2. Invalidate every in-flight flow exactly like a lock would.
+    vaultEpochRef.current++;
+    queueGenerationRef.current++;
+    vaultOpAbortRef.current?.abort();
+    vaultOpAbortRef.current = null;
 
-    // 3. In-memory refs and state
-    cryptoKeyRef.current = null;
-    ownerHashRef.current = null;
-    signingKeyRef.current = null;
-    publicKeyRef.current = null;
-    setArweave(INITIAL_ARWEAVE);
-    setNotes([]);
-    setMnemonic(null);
-    setVaultError(null);
-    setHasPin(false);
+    // 3. In-memory refs/state + session (shared with lockApp)
+    clearVaultState();
 
-    // 4. Upload queue
-    uploadQueueRef.current = [];
-    queuedIdsRef.current.clear();
-    isProcessingRef.current = false;
+    // 4. Unlike a lock, a RESET destroys the draft ciphertext too (§2): it
+    //    belonged to the vault being destroyed and would otherwise resurface
+    //    inside the NEXT vault opened in this tab.
+    draftStoreRef.current!.clear();
+
+    applyHasPin(false);
+    applyAutoLockTimeout(null);
 
     // 5. Redirect
     setScreen('landing');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
@@ -954,10 +1279,33 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       setBootError(`Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
       throw err;
     }
-    // Success: clean boot from scratch (draft belonged to the destroyed vault).
-    sessionStorage.removeItem('eternal-notes-session');
-    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+    // Success: clean boot from scratch. Explicit recovery destroys the draft
+    // ciphertext too (§2) — it belonged to the destroyed vault.
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    draftStoreRef.current!.clear();
     window.location.reload();
+  }, []);
+
+  // ─── Draft actions (§2) ────────────────────────────────────────────
+
+  const persistDraftAction = useCallback(async (text: string) => {
+    const key = cryptoKeyRef.current;
+    const pk = publicKeyRef.current;
+    // Locked: there is no key to encrypt with — and plaintext must NEVER be
+    // written as a fallback. The composer is unmounted by then anyway.
+    if (!key || !pk) return;
+    await draftStoreRef.current!.persist(text, { key, vaultId: bufferToBase64(pk) });
+  }, []);
+
+  const readDraftAction = useCallback(async (): Promise<string | null> => {
+    const key = cryptoKeyRef.current;
+    const pk = publicKeyRef.current;
+    if (!key || !pk) return null;
+    return draftStoreRef.current!.read({ key, vaultId: bufferToBase64(pk) });
+  }, []);
+
+  const clearDraftAction = useCallback(() => {
+    draftStoreRef.current!.clear();
   }, []);
 
   // ─── PIN Actions ────────────────────────────────────────────────────
@@ -966,12 +1314,24 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!mnemonic) return;
     const encrypted = await encryptWithPin(mnemonic, pin);
     await setMeta('pin-seed', encrypted);
-    setHasPin(true);
+    applyHasPin(true);
+    postVaultMessage('config'); // other tabs re-read pin-seed/timeout
   }, [mnemonic]);
 
+  /** Shared by manual PIN removal AND the 10-strike wipe (§8): ONE atomic meta
+   *  transaction (pin-seed + attempts + lockout + auto-lock-timeout→null);
+   *  React state and the config broadcast follow ONLY after the commit — an
+   *  error mid-cleanup leaves the configuration fully intact, never partial. */
+  async function clearPinConfiguration(): Promise<void> {
+    await clearPinConfigMeta();
+    applyHasPin(false);
+    applyAutoLockTimeout(null);
+    postVaultMessage('config');
+  }
+
   const removePinAction = useCallback(async () => {
-    await deleteMeta('pin-seed');
-    setHasPin(false);
+    await clearPinConfiguration();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const unlockWithPinAction = useCallback(async (pin: string) => {
@@ -1001,11 +1361,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       await setMeta('pin-attempts', attempts);
 
       if (attempts >= 10) {
-        // Wipe PIN — require seed
-        await deleteMeta('pin-seed');
-        await deleteMeta('pin-attempts');
-        await deleteMeta('pin-locked-until');
-        setHasPin(false);
+        // Wipe PIN — require seed. Atomic (§8): also resets the auto-lock
+        // timeout and tells the other tabs, or changes nothing on failure.
+        await clearPinConfiguration();
         throw new PinWipedError();
       }
 
@@ -1038,11 +1396,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     }
 
-    await setupFromMnemonic(mn);
-    sessionStorage.setItem('eternal-notes-session', mn);
+    const epoch = await openVault(mn);
+    if (epoch === null) return;
 
-    await checkAndSetRegistration();
-    setScreen('main');
+    await checkAndSetRegistration(epoch);
+    if (vaultEpochRef.current === epoch) setScreen('main');
 
     if (arweaveRef.current.enabled) {
       void retryAllPending().catch(err => console.error('pin unlock retryAllPending:', err));
@@ -1058,6 +1416,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       : 0;
     return { lockedSeconds, attempts };
   }, []);
+
+  // ─── Auto-lock timeout setting (§6) ────────────────────────────────
+
+  const setAutoLockTimeoutAction = useCallback(async (t: AutoLockTimeout) => {
+    // Whitelist even against our own callers — a bad value persisted here
+    // would fail-secure into «Никогда» on next boot, silently disabling the
+    // protection the user thinks is on.
+    if (!isValidAutoLockTimeout(t)) {
+      throw new Error(`Invalid auto-lock timeout: ${String(t)}`);
+    }
+    await setMeta('auto-lock-timeout', t); // persist-first: reject → state untouched
+    applyAutoLockTimeout(t);
+    postVaultMessage('config');
+  }, []);
+
+  const lockAppAction = useCallback(() => lockApp(), [lockApp]);
 
   // ─── Search ─────────────────────────────────────────────────────────
 
@@ -1088,6 +1462,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     restoredCount,
     vaultError,
     hasPin,
+    autoLockTimeout,
     bootError,
 
     createNewWallet,
@@ -1108,6 +1483,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     removePin: removePinAction,
     unlockWithPin: unlockWithPinAction,
     getPinLockState,
+    setAutoLockTimeout: setAutoLockTimeoutAction,
+    lockApp: lockAppAction,
+    persistDraft: persistDraftAction,
+    readDraft: readDraftAction,
+    clearDraft: clearDraftAction,
     resetBrokenStorage,
     retryRestore,
     clearRestoreStatus,
@@ -1115,11 +1495,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }), [
     screen, isReady, mnemonic, notes, isEncrypting, searchQuery, filteredNotes,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
-    restoredCount, vaultError, hasPin, bootError,
+    restoredCount, vaultError, hasPin, autoLockTimeout, bootError,
     createNewWallet, confirmMnemonic, restoreFromMnemonic, addNote,
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
+    setAutoLockTimeoutAction, lockAppAction, persistDraftAction,
+    readDraftAction, clearDraftAction,
     resetBrokenStorage, retryRestore, clearRestoreStatus, dismissError,
   ]);
 

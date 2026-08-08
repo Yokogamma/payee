@@ -1,15 +1,14 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNotes, DRAFT_STORAGE_KEY, type NoteSyncStatus } from '../lib/store';
+import { useNotes, type NoteSyncStatus } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsModal } from '../components/SettingsModal';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
 
-// Draft survives an accidental tab close / PWA eviction (same lifetime model as
-// the session seed: sessionStorage, never persisted to disk unencrypted forever).
-// The key lives in the store so every reset path can clear it.
-const DRAFT_KEY = DRAFT_STORAGE_KEY;
+// Draft survives an accidental tab close / PWA eviction, ENCRYPTED at rest
+// (draft.ts envelope, keyed to the current vault). The store owns the
+// storage/crypto; this screen only hydrates on mount and mirrors edits.
 
 /** Shown when sync is off / not set up: the note exists ONLY on this device.
  *  Never leave the card blank — a user must not mistake a local note for an
@@ -47,9 +46,16 @@ export function Main() {
     clearRestoreStatus,
     syncStatuses,
     dismissError,
+    persistDraft,
+    readDraft,
+    clearDraft,
   } = useNotes();
 
-  const [text, setText] = useState(() => sessionStorage.getItem(DRAFT_KEY) ?? '');
+  const [text, setText] = useState('');
+  // Blocks the persist mirror from CLEARING the stored draft while the initial
+  // hydration read is still in flight (text starts '' — a 300ms debounce could
+  // otherwise wipe the very draft being decrypted).
+  const draftSettledRef = useRef(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
@@ -84,14 +90,31 @@ export function Main() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showSearch]);
 
-  // Mirror the draft to sessionStorage (debounced) so it survives a reload.
+  // Hydrate the encrypted draft on mount — dirty-guarded (§2): it only fills a
+  // CLEAN composer (the functional update checks atomically), and an unmount
+  // (lock!) cancels the application entirely.
   useEffect(() => {
+    let cancelled = false;
+    void readDraft()
+      .then(draft => {
+        if (cancelled) return;
+        draftSettledRef.current = true;
+        if (draft) setText(prev => (prev === '' ? draft : prev));
+      })
+      .catch(() => { draftSettledRef.current = true; });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Mirror the draft (debounced, encrypted at rest) so it survives a reload.
+  // An empty text clears the draft — but only after hydration settled.
+  useEffect(() => {
+    if (!draftSettledRef.current && text === '') return;
     const t = setTimeout(() => {
-      if (text) sessionStorage.setItem(DRAFT_KEY, text);
-      else sessionStorage.removeItem(DRAFT_KEY);
+      void persistDraft(text);
     }, 300);
     return () => clearTimeout(t);
-  }, [text]);
+  }, [text, persistDraft]);
 
   async function handleSave() {
     if (!text.trim() || isEncrypting) return;
@@ -106,7 +129,7 @@ export function Main() {
       return;
     }
     setText('');
-    sessionStorage.removeItem(DRAFT_KEY); // don't wait out the debounce
+    clearDraft(); // don't wait out the debounce (also invalidates in-flight persists)
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
     inputRef.current?.focus();

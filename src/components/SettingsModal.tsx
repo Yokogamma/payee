@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { useNotes } from '../lib/store';
+import type { AutoLockTimeout } from '../lib/auto-lock';
 import type { ThemePref } from '../lib/theme';
 import { useModalA11y } from '../lib/useModalA11y';
 
@@ -84,6 +85,8 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     setupPin,
     removePin,
     showMnemonic,
+    autoLockTimeout,
+    setAutoLockTimeout,
   } = useNotes();
 
   const [showSeed, setShowSeed] = useState(false);
@@ -170,6 +173,12 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
             chip={hasPin ? 'установлен' : 'не установлен'}
           >
             <PinSection hasPin={hasPin} setupPin={setupPin} removePin={removePin} />
+            {hasPin && (
+              <AutoLockSection
+                autoLockTimeout={autoLockTimeout}
+                setAutoLockTimeout={setAutoLockTimeout}
+              />
+            )}
           </SettingsBlock>
 
           <SettingsBlock
@@ -363,6 +372,56 @@ function PinSection({ hasPin, setupPin, removePin }: {
         </div>
       )}
     </>
+  );
+}
+
+/** Auto-lock threshold (§9): shown only with a PIN set — without one there is
+ *  nothing to unlock against. Persist-first: the highlighted option changes
+ *  only after the meta write commits; a failed write shows an error and keeps
+ *  the previous value. */
+const AUTO_LOCK_OPTIONS: { value: AutoLockTimeout; label: string }[] = [
+  { value: null, label: 'Никогда' },
+  { value: 0, label: 'Сразу' },
+  { value: 300, label: 'Через 5 мин' },
+  { value: 1800, label: 'Через 30 мин' },
+];
+
+function AutoLockSection({ autoLockTimeout, setAutoLockTimeout }: {
+  autoLockTimeout: AutoLockTimeout;
+  setAutoLockTimeout: (t: AutoLockTimeout) => Promise<void>;
+}) {
+  const [saveError, setSaveError] = useState('');
+
+  async function choose(value: AutoLockTimeout) {
+    setSaveError('');
+    try {
+      await setAutoLockTimeout(value);
+    } catch (err) {
+      console.error('setAutoLockTimeout failed:', err);
+      setSaveError('Не удалось сохранить настройку. Попробуйте ещё раз.');
+    }
+  }
+
+  return (
+    <div className="autolock-section">
+      <div className="settings-hint">
+        Авто-блокировка: запрашивать PIN после ухода приложения в фон.
+      </div>
+      <div className="autolock-grid" role="group" aria-label="Авто-блокировка при уходе в фон">
+        {AUTO_LOCK_OPTIONS.map(opt => (
+          <button
+            key={String(opt.value)}
+            type="button"
+            className={`autolock-option ${autoLockTimeout === opt.value ? 'autolock-option--active' : ''}`}
+            aria-pressed={autoLockTimeout === opt.value}
+            onClick={() => void choose(opt.value)}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+      {saveError && <div className="error-msg" role="alert">{saveError}</div>}
+    </div>
   );
 }
 

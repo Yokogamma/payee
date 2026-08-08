@@ -223,6 +223,32 @@ export async function deleteMeta(key: string): Promise<void> {
   await getDB().delete('meta', key);
 }
 
+/**
+ * Atomically clear the ENTIRE PIN configuration in ONE transaction over the
+ * meta store: delete pin-seed, pin-attempts and pin-locked-until, and reset
+ * the auto-lock timeout to null («Никогда»). Removing the PIN — manually or
+ * via the 10-strike wipe — must also disable auto-lock (§8), and a failure
+ * mid-cleanup must never leave a PARTIAL configuration (say, an auto-lock
+ * timeout armed with no PIN to unlock with). Commits fully or not at all.
+ */
+export async function clearPinConfigMeta(): Promise<void> {
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    await meta.delete('pin-seed');
+    await meta.delete('pin-attempts');
+    await meta.delete('pin-locked-until');
+    await meta.put(null, 'auto-lock-timeout');
+    await tx.done;
+  } catch (e) {
+    // Same rollback discipline as saveNoteWithSync: an error after the first
+    // delete must not let the transaction auto-commit half the cleanup.
+    tx.done.catch(() => {}); // swallow the resulting abort rejection (we rethrow e)
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
 // ─── Migration from localStorage ────────────────────────────────────
 
 /**
