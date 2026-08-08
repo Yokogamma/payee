@@ -22,7 +22,10 @@ import * as ed25519 from '@noble/ed25519';
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface EncryptedNote {
-  /** Unique ID (crypto.randomUUID). Primary key in IndexedDB and Arweave tag. */
+  /** Unique ID. v1/v2: crypto.randomUUID() (UUIDv4). v3: randomUuidV8() — a
+   *  DISJOINT namespace so legacy serializers can never pass a v3 record off
+   *  as v1 (the worker enforces the split per App-Version). Primary key in
+   *  IndexedDB and Arweave tag. */
   noteId: string;
   /** Base64-encoded ciphertext (includes GCM auth tag — integrity guaranteed) */
   ciphertext: string;
@@ -36,8 +39,10 @@ export interface EncryptedNote {
    * ciphertext is an encrypted envelope {v,id,t,text}: the DATE is hidden
    * on-chain (no Timestamp tag), while the noteId stays public as the outer
    * Note-Id tag but is GCM-bound to the envelope (mismatch → rejected).
+   * 3 = v3: envelope additionally carries PRIVATE version-chain metadata
+   * {fmt,rev,root,prev} — same wire shape as v2 on-chain.
    */
-  v?: 1 | 2;
+  v?: 1 | 2 | 3;
   // No hash field. GCM auth tag inside ciphertext ensures integrity.
   // If decrypt succeeds — data is not corrupted.
 }
@@ -50,7 +55,33 @@ interface NoteEnvelopeV2 {
   text: string;
 }
 
-export interface NoteData {
+/** v3 plaintext payload — v2 plus the version-chain metadata. The chain graph
+ *  (root/rev/prev) and the display format stay INSIDE the ciphertext: zero new
+ *  on-chain tags, the version history is private. */
+interface NoteEnvelopeV3 {
+  v: 3;
+  id: string;    // must equal the outer noteId (GCM-bound)
+  t: number;     // createdAt of THIS version
+  text: string;
+  fmt: NoteFormat;
+  rev: number;   // integer >= 1 within the chain
+  root: string;  // noteId of the chain's FIRST version; rev===1 ⇒ root===id
+  prev?: string; // noteId of the predecessor version (rev>=2); informational
+}
+
+export type NoteFormat = 'md' | 'plain';
+
+/** Version-chain metadata attached to every decrypted note. For v1/v2 records
+ *  it is SYNTHESIZED ({fmt:'plain', rev:1, root:noteId}) — old notes are chain
+ *  roots by definition, no stored-data rewrite needed. */
+export interface NoteVersionMeta {
+  fmt: NoteFormat;
+  rev: number;
+  root: string;
+  prev?: string;
+}
+
+export interface NoteData extends NoteVersionMeta {
   id: string;
   text: string;
   createdAt: number;
@@ -227,6 +258,61 @@ export async function encryptEnvelope(
   };
 }
 
+/**
+ * Random UUIDv8 — the id namespace for v3 note versions. DISJOINT from the
+ * UUIDv4s that crypto.randomUUID() produces for v1/v2, so a stale pre-v3
+ * client that re-serializes a v3 record with the legacy v1 writer is rejected
+ * by the worker's per-App-Version namespace check instead of permanently
+ * committing garbage ciphertext (per-noteId idempotency is forever).
+ */
+export function randomUuidV8(): string {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x80; // version nibble = 8
+  b[8] = (b[8] & 0x3f) | 0x80; // RFC variant = 10
+  const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/**
+ * Encrypt a note as a v3 envelope: v2 privacy plus version-chain metadata
+ * (fmt/rev/root/prev) inside the ciphertext. Every version gets a FRESH
+ * UUIDv8 noteId; the chain identity is `root` (defaults to the new noteId for
+ * rev-1 roots). Gated by V3_WRITER_ENABLED at the store level.
+ */
+export async function encryptEnvelopeV3(
+  key: CryptoKey,
+  plaintext: string,
+  meta: { fmt: NoteFormat; rev: number; root?: string; prev?: string },
+): Promise<EncryptedNote> {
+  const noteId = randomUuidV8();
+  const createdAt = Date.now();
+  const envelope: NoteEnvelopeV3 = {
+    v: 3,
+    id: noteId,
+    t: createdAt,
+    text: plaintext,
+    fmt: meta.fmt,
+    rev: meta.rev,
+    root: meta.root ?? noteId,
+    ...(meta.prev !== undefined ? { prev: meta.prev } : {}),
+  };
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertextBuffer = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(envelope))
+  );
+
+  return {
+    noteId,
+    ciphertext: bufferToBase64(ciphertextBuffer),
+    iv: bufferToBase64(iv),
+    createdAt,
+    v: 3,
+  };
+}
+
 /** Low-level AES-256-GCM decrypt → UTF-8 string. Throws on wrong key/tamper. */
 async function aesDecrypt(key: CryptoKey, encrypted: EncryptedNote): Promise<string> {
   const ciphertext = base64ToBuffer(encrypted.ciphertext);
@@ -239,35 +325,113 @@ async function aesDecrypt(key: CryptoKey, encrypted: EncryptedNote): Promise<str
   return new TextDecoder().decode(decrypted);
 }
 
+// Runtime validators shared by ALL versions: synthesized v1/v2 meta feeds the
+// same chain grouping/sorting as v3, so a malformed legacy value must not slip
+// through just because its version predates the checks.
+const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_V8_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_ANY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/** ECMAScript Date range ceiling (±8.64e15 ms; we require non-negative). */
+const MAX_TIMESTAMP_MS = 8_640_000_000_000_000;
+
+function isValidTimestamp(t: unknown): t is number {
+  return typeof t === 'number' && Number.isSafeInteger(t) && t >= 0 && t <= MAX_TIMESTAMP_MS;
+}
+
+/** Thrown for a record whose `v` is not a known version. Callers must treat the
+ *  record as unreadable (skip/quarantine) — NEVER fall back to the v1 raw-text
+ *  path, which would render (or worse, re-upload) an unknown envelope as text. */
+export class UnsupportedNoteVersionError extends Error {
+  constructor(v: unknown) {
+    super(`Unsupported note version: ${String(v)}`);
+    this.name = 'UnsupportedNoteVersionError';
+  }
+}
+
+function parseEnvelopeV3(raw: string, noteId: string): { text: string; createdAt: number; meta: NoteVersionMeta } {
+  const env = JSON.parse(raw) as NoteEnvelopeV3;
+  const fail = (why: string): never => {
+    throw new Error(`v3 envelope integrity check failed: ${why}`);
+  };
+
+  if (env === null || typeof env !== 'object' || env.v !== 3) fail('shape');
+  if (typeof env.text !== 'string') fail('text');
+  if (typeof env.id !== 'string' || env.id !== noteId) fail('id mismatch');
+  if (!UUID_V8_REGEX.test(env.id)) fail('id namespace');
+  if (!isValidTimestamp(env.t)) fail('t');
+  if (env.fmt !== 'md' && env.fmt !== 'plain') fail('fmt');
+  if (!Number.isSafeInteger(env.rev) || env.rev < 1) fail('rev');
+  if (typeof env.root !== 'string' || !UUID_ANY_REGEX.test(env.root)) fail('root');
+  if (env.prev !== undefined && (typeof env.prev !== 'string' || !UUID_ANY_REGEX.test(env.prev))) fail('prev');
+  // Linkage invariants: a root version links to nothing; a non-root version
+  // must link somewhere and can be neither its own root nor its own prev.
+  if (env.rev === 1 && (env.root !== env.id || env.prev !== undefined)) fail('rev-1 linkage');
+  if (env.rev > 1 && (env.prev === undefined || env.prev === env.id || env.root === env.id)) fail('rev-n linkage');
+
+  const meta: NoteVersionMeta = {
+    fmt: env.fmt,
+    rev: env.rev,
+    root: env.root,
+    ...(env.prev !== undefined ? { prev: env.prev } : {}),
+  };
+  return { text: env.text, createdAt: env.t, meta };
+}
+
 /**
- * Decrypt a note to its text AND authoritative timestamp, dispatching on version.
- * - v1 (absent/1): ciphertext IS the text; createdAt comes from the record.
- * - v2: ciphertext is an envelope; validate it, cross-check the inner id against
- *   the record's noteId (defeats swapping ciphertext under a forged outer id),
- *   and take the timestamp from the (authenticated) envelope.
+ * Decrypt a note to its text, authoritative timestamp AND version-chain meta,
+ * dispatching on an EXPLICIT version switch (fail closed — an unknown `v` must
+ * never fall through to the v1 raw-text path).
+ * - v1 (absent/1): ciphertext IS the text; createdAt from the record; meta
+ *   synthesized (plain, rev 1, root = own noteId).
+ * - v2: envelope {v,id,t,text}; inner id cross-checked against the record's
+ *   noteId (defeats swapping ciphertext under a forged outer id); timestamp
+ *   from the authenticated envelope; meta synthesized.
+ * - v3: envelope additionally validated for fmt/rev/root/prev + linkage
+ *   invariants and the UUIDv8 id namespace.
  * Throws if decryption fails or the envelope is inconsistent.
  */
 export async function decryptNote(
   key: CryptoKey,
   encrypted: EncryptedNote
-): Promise<{ text: string; createdAt: number }> {
+): Promise<{ text: string; createdAt: number; meta: NoteVersionMeta }> {
+  const v = encrypted.v;
+  if (v !== undefined && v !== 1 && v !== 2 && v !== 3) {
+    throw new UnsupportedNoteVersionError(v);
+  }
+
   const raw = await aesDecrypt(key, encrypted);
 
-  if (encrypted.v === 2) {
+  if (v === 3) {
+    return parseEnvelopeV3(raw, encrypted.noteId);
+  }
+
+  const legacyMeta = (noteId: string): NoteVersionMeta => ({ fmt: 'plain', rev: 1, root: noteId });
+
+  if (v === 2) {
     const env = JSON.parse(raw) as NoteEnvelopeV2;
     if (
+      env === null || typeof env !== 'object' ||
       env.v !== 2 ||
       typeof env.text !== 'string' ||
       typeof env.id !== 'string' ||
-      typeof env.t !== 'number' ||
-      env.id !== encrypted.noteId
+      env.id !== encrypted.noteId ||
+      !UUID_V4_REGEX.test(env.id) ||
+      !isValidTimestamp(env.t)
     ) {
       throw new Error('v2 envelope integrity check failed');
     }
-    return { text: env.text, createdAt: env.t };
+    return { text: env.text, createdAt: env.t, meta: legacyMeta(encrypted.noteId) };
   }
 
-  return { text: raw, createdAt: encrypted.createdAt };
+  // v1 (absent/1): the id/timestamp live outside the ciphertext — still apply
+  // the shared validators so garbage can't reach chain grouping/sorting.
+  if (!UUID_V4_REGEX.test(encrypted.noteId)) {
+    throw new Error('v1 record integrity check failed: noteId');
+  }
+  if (!isValidTimestamp(encrypted.createdAt)) {
+    throw new Error('v1 record integrity check failed: createdAt');
+  }
+  return { text: raw, createdAt: encrypted.createdAt, meta: legacyMeta(encrypted.noteId) };
 }
 
 /** Decrypt a note to its text only (v1 or v2). Throws on failure/tamper. */
