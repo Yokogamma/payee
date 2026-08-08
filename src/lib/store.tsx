@@ -332,11 +332,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [hasPin, setHasPin] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [autoLockTimeout, setAutoLockTimeoutState] = useState<AutoLockTimeout>(null);
-  // Opaque privacy gate (review round 2): raised SYNCHRONOUSLY on the hidden
-  // edge while a vault is open, dropped only after the return-lock decision is
-  // confirmed against the authoritative IndexedDB config — so no frame painted
-  // after a return can show plaintext that the verdict then locks away.
+  // Opaque privacy gate (review rounds 2–3): raised SYNCHRONOUSLY on the
+  // hidden edge — or when a vault COMMITS into a hidden tab — and dropped only
+  // by the lifecycle cycle that owns it, so no frame painted after a return
+  // can show plaintext that the verdict then locks away.
   const [lockGate, setLockGate] = useState(false);
+  // Ownership of the pending return-verdict (review round 3): bumped on every
+  // hidden edge, lock and vault commit. A verdict may apply itself — lock or
+  // drop the gate — only if its generation (and vault epoch) is still current;
+  // a superseded verdict must neither unlock a NEW away-interval's gate nor
+  // lock a vault the user has re-opened since.
+  const lockCheckGenerationRef = useRef(0);
+  const lockCheckPendingRef = useRef(false);
 
   // Crypto refs (not React state — needed synchronously in async flows)
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
@@ -440,31 +447,41 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // ─── Auto-lock lifecycle (§5) ──────────────────────────────────────
   useEffect(() => {
     // A page that LOADS hidden never fires a hidden transition — re-arm the
-    // marker so the eventual return still measures the away-time.
-    if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
+    // marker so the eventual return still measures the away-time, and
+    // pre-gate anything a hidden bootstrap may still publish (session seed).
+    if (document.visibilityState === 'hidden') {
+      markHidden(sessionStorage, Date.now());
+      if (vaultPresentInTab()) setLockGate(true);
+    }
 
-    // Hidden edge: record the marker AND raise the opaque gate while a vault
-    // is open. Nothing paints while hidden, so the FIRST frame after the
-    // return already carries the gate — plaintext can never flash before the
-    // lock verdict below lands.
+    // Hidden edge: record the marker, supersede any pending verdict, and
+    // raise the opaque gate over anything that IS or MAY BECOME an open vault
+    // (committed key, pending openVault, session seed — review round 3).
+    // Nothing paints while hidden, so the FIRST frame after the return
+    // already carries the gate — plaintext can never flash before the
+    // verdict below lands.
     const onHiddenEdge = () => {
       markHidden(sessionStorage, Date.now());
-      if (cryptoKeyRef.current !== null) setLockGate(true);
+      lockCheckGenerationRef.current++;
+      lockCheckPendingRef.current = false;
+      if (vaultPresentInTab()) setLockGate(true);
     };
 
     const evaluateReturn = () => {
       const now = Date.now();
+      const myGen = lockCheckGenerationRef.current;
+      const myEpoch = vaultEpochRef.current;
       const marker = consumeHiddenMarker(sessionStorage, now);
       // Fast path: current refs already demand a lock — do it synchronously.
+      // lockApp drops the gate and reconciles its target screen itself.
       if (decideLockOnReturn(autoLockTimeoutRef.current, hasPinRef.current, marker, now)) {
         lockApp();
-        setLockGate(false);
         return;
       }
       if (marker.kind === 'none') {
-        // The tab never actually went hidden: no away-interval to judge, and
-        // no config broadcast can have been missed behind a marker-less return.
-        setLockGate(false);
+        // Nothing to judge — but never drop a gate an in-flight verdict owns
+        // (visibilitychange and pageshow can both fire for one return).
+        if (!lockCheckPendingRef.current) setLockGate(false);
         return;
       }
       // The refs may be STALE (a frozen tab misses config broadcasts, §8).
@@ -472,6 +489,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // confirms it — the gate stays up (Main is mounted but cannot paint
       // anything sensitive) until the verdict on the SAME consumed marker.
       // An unreadable config fails CLOSED: a vault we cannot vouch for locks.
+      lockCheckPendingRef.current = true;
       void (async () => {
         let lock = true;
         try {
@@ -485,8 +503,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         } catch (err) {
           console.error('auto-lock config re-read failed — locking fail-closed:', err);
         }
+        // Apply the verdict ONLY while this return is the current lifecycle
+        // cycle (review round 3): a newer hidden edge owns the gate now, and
+        // a re-opened vault (new commit/epoch) is not ours to lock.
+        if (lockCheckGenerationRef.current !== myGen || vaultEpochRef.current !== myEpoch) return;
+        lockCheckPendingRef.current = false;
         if (lock) lockApp();
-        setLockGate(false);
+        else setLockGate(false);
       })();
     };
     const onVisibility = () => {
@@ -532,7 +555,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (msg.type === 'lock') {
         lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
       } else if (msg.type === 'config') {
-        void selfHealPinConfig();
+        void reconcileLockScreen();
       }
     };
     return () => {
@@ -550,15 +573,30 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  /** Re-read the PIN/auto-lock configuration from meta (shared IndexedDB) —
-   *  the authoritative source after a 'config' broadcast or a return from
-   *  background. Never throws: a storage hiccup keeps the current state. */
-  async function selfHealPinConfig() {
+  /** True when this tab holds ANYTHING that is — or may still become — an
+   *  open vault: a committed key, a vault op in flight (openVault/restore
+   *  preparing), or a session seed a hidden bootstrap could still publish.
+   *  Shared by lockApp and the privacy-gate logic (review round 3). */
+  function vaultPresentInTab(): boolean {
+    return cryptoKeyRef.current !== null
+      || vaultOpAbortRef.current !== null
+      || sessionStorage.getItem(SESSION_STORAGE_KEY) !== null;
+  }
+
+  /** Re-read the authoritative PIN/auto-lock config from meta (shared
+   *  IndexedDB) and fix a stale LOCK TARGET screen: a PIN wiped in another tab
+   *  must not strand the user on a PIN screen with no pin-seed behind it
+   *  (§8, review round 3). Only ever downgrades pin→restore — the restore
+   *  screen always works, so a late reconcile can never yank a user off a
+   *  screen they navigated to deliberately. Never throws: on a storage hiccup
+   *  the stale screen stays, and PinUnlock still offers manual seed entry. */
+  async function reconcileLockScreen(): Promise<void> {
     try {
       const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
-      applyHasPin(!!pinData);
       const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
+      applyHasPin(!!pinData);
       applyAutoLockTimeout(isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null);
+      if (!pinData) setScreen(prev => (prev === 'pin' ? 'restore' : prev));
     } catch {
       // storage not ready / broken — the periodic paths will retry
     }
@@ -611,6 +649,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      // The pre-load marker (if any) was consumed by the decision above. A
+      // page still HIDDEN re-arms it now: the post-load background time must
+      // count against the timeout when the user finally returns.
+      if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
+
       // 6. Restore session
       try {
         const epoch = await openVault(sessionMn);
@@ -647,6 +690,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   /** Synchronous publication of a prepared snapshot. NO draft hydration here —
    *  that is Main's mount-time, dirty-guarded job. */
   function commitVaultSnapshot(snap: VaultSnapshot) {
+    // A commit supersedes any pending return-verdict (review round 3): an old
+    // check must never lock the vault being published right now.
+    lockCheckGenerationRef.current++;
+    lockCheckPendingRef.current = false;
+    // Publishing into a HIDDEN tab pre-raises the opaque gate — the eventual
+    // return must paint gated, exactly like a vault that was open at the
+    // hidden edge. A visible commit is the user interactively unlocking:
+    // clear any stale gate instead.
+    setLockGate(document.visibilityState === 'hidden');
+
     cryptoKeyRef.current = snap.key;
     ownerHashRef.current = snap.ownerHash;
     signingKeyRef.current = snap.privateKey;
@@ -745,19 +798,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // in flight (PIN unlock / restore preparing, not yet committed) COUNTS:
     // ignoring the lock would let the open complete right after it, publishing
     // a vault the user just ordered locked everywhere.
-    const hasVault = cryptoKeyRef.current !== null
-      || vaultOpAbortRef.current !== null
-      || sessionStorage.getItem(SESSION_STORAGE_KEY) !== null;
-    if (!hasVault) return;
+    if (!vaultPresentInTab()) return;
 
     vaultEpochRef.current++;
     queueGenerationRef.current++;
+    // A lock supersedes any pending return-verdict and owns the gate: the
+    // locked UI is non-sensitive, so no gate may be left covering it.
+    lockCheckGenerationRef.current++;
+    lockCheckPendingRef.current = false;
+    setLockGate(false);
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = null;
     clearVaultState();
     // Without a PIN there is nothing to unlock against — seed re-entry it is.
     setScreen(hasPinRef.current ? 'pin' : 'restore');
     if (opts.broadcast !== false) postVaultMessage('lock');
+    // The target screen above used possibly-stale hasPin — reconcile it
+    // against the authoritative pin-seed (review round 3): a PIN wiped in
+    // another tab must not dead-end the user on a seedless PIN screen.
+    void reconcileLockScreen();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1571,7 +1630,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   return (
     <StoreContext.Provider value={value}>
-      {children}
+      {/* display:contents keeps the wrapper layout-neutral; `inert` while the
+          gate is up removes the underlying UI from focus, pointer events and
+          the accessibility tree — the visual overlay alone would leave
+          keyboard/AT access to the plaintext behind it. */}
+      <div style={{ display: 'contents' }} inert={lockGate || undefined}>
+        {children}
+      </div>
       {/* Rendered by the PROVIDER, not a screen: the gate must exist wherever
           the vault state does and can never be forgotten by a route. Fully
           opaque and above every modal. */}

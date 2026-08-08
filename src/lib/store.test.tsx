@@ -336,10 +336,13 @@ describe('auto-lock on return to foreground', () => {
     act(() => { setVisibility('visible'); });
     expect(document.querySelector('.lock-gate')).not.toBeNull(); // still checking
     expect(store.screen).toBe('main'); // Main mounted, but covered by the gate
+    // The gated content is INERT: no keyboard focus / AT access behind the overlay.
+    expect(document.querySelector('div[inert]')).not.toBeNull();
 
     await act(async () => { releaseRead(); });
     await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
     expect(store.screen).toBe('main'); // verdict: no lock — gate down, app usable
+    expect(document.querySelector('div[inert]')).toBeNull(); // content interactive again
   });
 
   it('an unreadable config on return fails CLOSED (review round 2)', async () => {
@@ -382,6 +385,122 @@ describe('auto-lock on return to foreground', () => {
     await waitFor(() => expect(store.screen).toBe('pin'));
     expect(store.mnemonic).toBeNull();
     expect(store.autoLockTimeout).toBe(0);
+  });
+});
+
+// ─── Privacy gate lifecycle (review round 3) ────────────────────────
+
+describe('privacy gate across pending opens and generations', () => {
+  it('a vault COMMITTED while hidden comes up gated until the return verdict', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    // timeout null — no sync lock; the gate is the only protection.
+
+    renderStore();
+    await untilReady();
+    expect(store.screen).toBe('pin'); // no session yet
+
+    // The tab hides while openVault is still preparing — no key exists yet,
+    // but the pending op MUST count as gateable vault state.
+    let pending!: Promise<void>;
+    act(() => {
+      pending = store.confirmMnemonic(MN);
+      setVisibility('hidden');
+    });
+    expect(document.querySelector('.lock-gate')).not.toBeNull(); // gated already
+
+    await act(async () => { await pending; });
+    expect(store.screen).toBe('main'); // committed while hidden…
+    expect(document.querySelector('.lock-gate')).not.toBeNull(); // …but still gated
+
+    act(() => { setVisibility('visible'); });
+    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    expect(store.screen).toBe('main'); // verdict (timeout null): stay open
+  });
+
+  it('a NEW hidden edge while the old verdict is pending keeps the NEW gate up (generation)', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    act(() => { setVisibility('hidden'); });
+    let releaseRead!: () => void;
+    vi.mocked(getMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    );
+    act(() => { setVisibility('visible'); }); // check A pending, gate up
+
+    act(() => { setVisibility('hidden'); }); // SECOND away-interval begins
+
+    // Check A resolves now — it is superseded and must NOT drop the new gate.
+    await act(async () => { releaseRead(); });
+    expect(document.querySelector('.lock-gate')).not.toBeNull();
+
+    // The second return runs its own (unmocked) verdict and settles the gate.
+    act(() => { setVisibility('visible'); });
+    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    expect(store.screen).toBe('main');
+  });
+
+  it('an old pending verdict cannot lock a vault the user re-opened since', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    // Refs know timeout=null; the meta will say 0 — the OLD verdict, once
+    // released, would demand a lock. It must be abandoned instead.
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    const { channel } = listenOnChannel();
+
+    act(() => { setVisibility('hidden'); });
+    await setMeta('auto-lock-timeout', 0); // changed elsewhere, broadcast missed
+
+    let releaseRead!: () => void;
+    vi.mocked(getMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    );
+    act(() => { setVisibility('visible'); }); // old check pending on the deferred read
+
+    // Meanwhile: a foreign lock takes the tab down…
+    channel.postMessage({ type: 'lock', originId: 'other-tab', messageId: 'r3-1' });
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    // …and the user re-unlocks a fresh session.
+    await openMain();
+
+    // The old verdict resolves to "lock" — but its cycle is gone.
+    await act(async () => { releaseRead(); });
+    await act(async () => {});
+    expect(store.screen).toBe('main'); // the NEW session stays open
+    expect(store.mnemonic).toBe(MN);
+    expect(document.querySelector('.lock-gate')).toBeNull();
+  });
+
+  it('fast-path lock reconciles a stale PIN target: wiped pin-seed → restore screen', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 0);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    expect(store.hasPin).toBe(true);
+
+    // Another tab wipes the whole PIN configuration; the broadcast is missed.
+    await clearPinConfigMeta();
+
+    act(() => { setVisibility('hidden'); });
+    act(() => { setVisibility('visible'); });
+    // Stale refs (hasPin=true, timeout=0) lock synchronously to 'pin' — the
+    // reconciliation must move the user off the seedless PIN dead-end.
+    await waitFor(() => expect(store.screen).toBe('restore'));
+    expect(store.hasPin).toBe(false);
+    expect(store.autoLockTimeout).toBeNull();
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
   });
 });
 
