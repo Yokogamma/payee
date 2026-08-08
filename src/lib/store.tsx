@@ -344,6 +344,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // lock a vault the user has re-opened since.
   const lockCheckGenerationRef = useRef(0);
   const lockCheckPendingRef = useRef(false);
+  // Orders every CONFIG publication (reconcile / return-verdict): last caller
+  // wins, an older in-flight read can never overwrite newer refs (round 4).
+  const reconcileGenerationRef = useRef(0);
 
   // Crypto refs (not React state — needed synchronously in async flows)
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
@@ -491,23 +494,33 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // An unreadable config fails CLOSED: a vault we cannot vouch for locks.
       lockCheckPendingRef.current = true;
       void (async () => {
+        // Config publication shares the reconcile ordering domain (round 4).
+        const myReconcile = ++reconcileGenerationRef.current;
         let lock = true;
+        let freshHasPin = false;
+        let freshTimeout: AutoLockTimeout = null;
+        let readOk = false;
         try {
           const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
           const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
-          const freshHasPin = !!pinData;
-          const freshTimeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
-          applyHasPin(freshHasPin);
-          applyAutoLockTimeout(freshTimeout);
+          freshHasPin = !!pinData;
+          freshTimeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
+          readOk = true;
           lock = decideLockOnReturn(freshTimeout, freshHasPin, marker, now);
         } catch (err) {
           console.error('auto-lock config re-read failed — locking fail-closed:', err);
         }
-        // Apply the verdict ONLY while this return is the current lifecycle
-        // cycle (review round 3): a newer hidden edge owns the gate now, and
-        // a re-opened vault (new commit/epoch) is not ours to lock.
+        // Apply ONLY while this return is the current lifecycle cycle (review
+        // rounds 3–4): a newer hidden edge owns the gate now, a re-opened
+        // vault (new commit/epoch) is not ours to lock, and a superseded read
+        // must not overwrite the new session's config refs either — everything
+        // publishes together, after the guard.
         if (lockCheckGenerationRef.current !== myGen || vaultEpochRef.current !== myEpoch) return;
         lockCheckPendingRef.current = false;
+        if (readOk && reconcileGenerationRef.current === myReconcile) {
+          applyHasPin(freshHasPin);
+          applyAutoLockTimeout(freshTimeout);
+        }
         if (lock) lockApp();
         else setLockGate(false);
       })();
@@ -588,18 +601,37 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  must not strand the user on a PIN screen with no pin-seed behind it
    *  (§8, review round 3). Only ever downgrades pin→restore — the restore
    *  screen always works, so a late reconcile can never yank a user off a
-   *  screen they navigated to deliberately. Never throws: on a storage hiccup
-   *  the stale screen stays, and PinUnlock still offers manual seed entry. */
+   *  screen they navigated to deliberately. Last-caller-wins (round 4): two
+   *  racing reconciles apply in call order, never read order. Never throws:
+   *  on a storage hiccup the stale screen stays, and PinUnlock still offers
+   *  manual seed entry. */
   async function reconcileLockScreen(): Promise<void> {
+    const myReconcile = ++reconcileGenerationRef.current;
     try {
       const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
       const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
+      if (reconcileGenerationRef.current !== myReconcile) return; // a newer read owns the refs
       applyHasPin(!!pinData);
       applyAutoLockTimeout(isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null);
       if (!pinData) setScreen(prev => (prev === 'pin' ? 'restore' : prev));
     } catch {
       // storage not ready / broken — the periodic paths will retry
     }
+  }
+
+  /** Everything a lock must invalidate, in one place (round 4): vault epoch,
+   *  upload-queue generation, the lifecycle cycle that owns the privacy gate
+   *  (pending return-verdict), the gate itself and the in-flight vault op.
+   *  Shared by lockApp and resetApp — a reset that skipped any of these could
+   *  leave an orphaned gate over the landing screen forever. */
+  function invalidateVaultLifecycle(): void {
+    vaultEpochRef.current++;
+    queueGenerationRef.current++;
+    lockCheckGenerationRef.current++;
+    lockCheckPendingRef.current = false;
+    setLockGate(false);
+    vaultOpAbortRef.current?.abort();
+    vaultOpAbortRef.current = null;
   }
 
   async function bootstrap() {
@@ -800,15 +832,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // a vault the user just ordered locked everywhere.
     if (!vaultPresentInTab()) return;
 
-    vaultEpochRef.current++;
-    queueGenerationRef.current++;
-    // A lock supersedes any pending return-verdict and owns the gate: the
-    // locked UI is non-sensitive, so no gate may be left covering it.
-    lockCheckGenerationRef.current++;
-    lockCheckPendingRef.current = false;
-    setLockGate(false);
-    vaultOpAbortRef.current?.abort();
-    vaultOpAbortRef.current = null;
+    // Supersedes any pending return-verdict and owns the gate: the locked UI
+    // is non-sensitive, so no gate may be left covering it.
+    invalidateVaultLifecycle();
     clearVaultState();
     // Without a PIN there is nothing to unlock against — seed re-entry it is.
     setScreen(hasPinRef.current ? 'pin' : 'restore');
@@ -1355,11 +1381,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // 1. IndexedDB — all stores
     await resetAll();
 
-    // 2. Invalidate every in-flight flow exactly like a lock would.
-    vaultEpochRef.current++;
-    queueGenerationRef.current++;
-    vaultOpAbortRef.current?.abort();
-    vaultOpAbortRef.current = null;
+    // 2. Invalidate every in-flight flow exactly like a lock would — INCLUDING
+    //    the lifecycle generation and the privacy gate (round 4): a return-
+    //    verdict pending across the reset would otherwise abandon itself via
+    //    the epoch check and leave its gate covering the landing screen forever.
+    invalidateVaultLifecycle();
 
     // 3. In-memory refs/state + session (shared with lockApp)
     clearVaultState();

@@ -504,6 +504,103 @@ describe('privacy gate across pending opens and generations', () => {
   });
 });
 
+// ─── Verdict/config ordering + reset invalidation (review round 4) ──
+
+describe('config publication ordering and reset lifecycle', () => {
+  it('a superseded verdict cannot overwrite the new cycle\'s config refs', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setAutoLockTimeout(1800); });
+    expect(store.autoLockTimeout).toBe(1800);
+
+    act(() => { setVisibility('hidden'); });
+    // Check A will read STALE values (pin blob + timeout null) once released.
+    let releaseRead!: () => void;
+    vi.mocked(getMeta)
+      .mockImplementationOnce(() => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }))
+      .mockImplementationOnce(async () => null);
+    act(() => { setVisibility('visible'); }); // check A pending
+
+    act(() => { setVisibility('hidden'); }); // a NEW cycle supersedes A
+
+    await act(async () => { releaseRead(); });
+    // A resolved with timeout=null — but its cycle is gone: the refs must
+    // keep the CURRENT configuration, not A's stale read.
+    expect(store.autoLockTimeout).toBe(1800);
+    expect(document.querySelector('.lock-gate')).not.toBeNull(); // new gate intact
+
+    act(() => { setVisibility('visible'); }); // cycle B settles normally
+    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    expect(store.autoLockTimeout).toBe(1800);
+    expect(store.screen).toBe('main'); // 1800s not elapsed — stays open
+  });
+
+  it('resetApp performs the full lifecycle invalidation — no orphaned gate over landing', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    act(() => { setVisibility('hidden'); });
+    let releaseRead!: () => void;
+    vi.mocked(getMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    );
+    act(() => { setVisibility('visible'); }); // verdict pending — it owns the gate
+    expect(document.querySelector('.lock-gate')).not.toBeNull();
+
+    await act(async () => { await store.resetApp(); });
+    expect(store.screen).toBe('landing');
+    expect(document.querySelector('.lock-gate')).toBeNull(); // dropped synchronously
+    expect(document.querySelector('div[inert]')).toBeNull();
+
+    // The abandoned verdict resolves later — landing must stay ungated.
+    await act(async () => { releaseRead(); });
+    await act(async () => {});
+    expect(store.screen).toBe('landing');
+    expect(document.querySelector('.lock-gate')).toBeNull();
+  });
+
+  it('an OLDER reconcile cannot overwrite a NEWER one (last caller wins)', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 300);
+
+    renderStore();
+    await untilReady();
+    expect(store.screen).toBe('pin');
+    expect(store.hasPin).toBe(true);
+    const { channel } = listenOnChannel();
+
+    // Reconcile A hangs on its first read…
+    let releaseRead!: () => void;
+    vi.mocked(getMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    );
+    channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r4-a' });
+    await act(async () => {});
+
+    // …while the PIN is wiped and a SECOND config message applies it.
+    await clearPinConfigMeta();
+    channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r4-b' });
+    await waitFor(() => expect(store.hasPin).toBe(false));
+    expect(store.screen).toBe('restore'); // dead PIN screen downgraded
+
+    // A finally resolves with the OLD pin blob — it must be discarded.
+    await act(async () => { releaseRead(); });
+    await act(async () => {});
+    expect(store.hasPin).toBe(false);
+    expect(store.autoLockTimeout).toBeNull();
+    expect(store.screen).toBe('restore');
+  });
+});
+
 // ─── PIN wipe (§8) ──────────────────────────────────────────────────
 
 describe('10-strike PIN wipe', () => {
