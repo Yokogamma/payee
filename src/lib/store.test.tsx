@@ -35,7 +35,8 @@ vi.mock('./storage', async importOriginal => {
   const actual = await importOriginal<typeof import('./storage')>();
   return {
     ...actual,
-    // Overridable per-test (persist-first / partial-cleanup failures).
+    // Overridable per-test (persist-first / partial-cleanup / gate failures).
+    getMeta: vi.fn(actual.getMeta),
     setMeta: vi.fn(actual.setMeta),
     clearPinConfigMeta: vi.fn(actual.clearPinConfigMeta),
   };
@@ -294,9 +295,10 @@ describe('auto-lock on return to foreground', () => {
     expect(store.screen).toBe('pin');
     expect(store.mnemonic).toBeNull();
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelector('.lock-gate')).toBeNull(); // decided — gate down
   });
 
-  it('timeout null: hidden → visible does NOT lock', async () => {
+  it('timeout null: hidden → visible does NOT lock (gate drops after the verdict)', async () => {
     await setMeta('init', true);
     await setMeta('pin-seed', FAKE_PIN_BLOB);
 
@@ -306,10 +308,57 @@ describe('auto-lock on return to foreground', () => {
 
     act(() => { setVisibility('hidden'); });
     act(() => { setVisibility('visible'); });
-    // Let the authoritative config re-read confirm the "no lock" decision.
-    await act(async () => {});
+    // The authoritative config re-read must confirm "no lock" and drop the gate.
+    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
     expect(store.screen).toBe('main');
     expect(store.mnemonic).toBe(MN);
+  });
+
+  it('the opaque gate is up from the hidden edge until the authoritative verdict (review round 2)', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    // timeout null → the sync path says "no lock"; only the async re-read decides.
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    // Raised synchronously on the hidden edge — the first frame a return
+    // paints already contains the gate, never plaintext.
+    act(() => { setVisibility('hidden'); });
+    expect(document.querySelector('.lock-gate')).not.toBeNull();
+
+    // Hold the config read open: the verdict is pending, the gate must stay.
+    let releaseRead!: () => void;
+    vi.mocked(getMeta).mockImplementationOnce(
+      () => new Promise(res => { releaseRead = () => res(FAKE_PIN_BLOB); }),
+    );
+    act(() => { setVisibility('visible'); });
+    expect(document.querySelector('.lock-gate')).not.toBeNull(); // still checking
+    expect(store.screen).toBe('main'); // Main mounted, but covered by the gate
+
+    await act(async () => { releaseRead(); });
+    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    expect(store.screen).toBe('main'); // verdict: no lock — gate down, app usable
+  });
+
+  it('an unreadable config on return fails CLOSED (review round 2)', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    // timeout null in refs — a fail-open bug would keep the vault on screen.
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    act(() => { setVisibility('hidden'); });
+    vi.mocked(getMeta).mockRejectedValueOnce(new Error('idb down'));
+    act(() => { setVisibility('visible'); });
+
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelector('.lock-gate')).toBeNull(); // decided (locked) — gate down
   });
 
   it('a config change missed while hidden still locks on return (review finding 3)', async () => {

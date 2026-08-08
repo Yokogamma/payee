@@ -332,6 +332,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [hasPin, setHasPin] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [autoLockTimeout, setAutoLockTimeoutState] = useState<AutoLockTimeout>(null);
+  // Opaque privacy gate (review round 2): raised SYNCHRONOUSLY on the hidden
+  // edge while a vault is open, dropped only after the return-lock decision is
+  // confirmed against the authoritative IndexedDB config — so no frame painted
+  // after a return can show plaintext that the verdict then locks away.
+  const [lockGate, setLockGate] = useState(false);
 
   // Crypto refs (not React state — needed synchronously in async flows)
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
@@ -438,32 +443,59 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // marker so the eventual return still measures the away-time.
     if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
 
+    // Hidden edge: record the marker AND raise the opaque gate while a vault
+    // is open. Nothing paints while hidden, so the FIRST frame after the
+    // return already carries the gate — plaintext can never flash before the
+    // lock verdict below lands.
+    const onHiddenEdge = () => {
+      markHidden(sessionStorage, Date.now());
+      if (cryptoKeyRef.current !== null) setLockGate(true);
+    };
+
     const evaluateReturn = () => {
       const now = Date.now();
       const marker = consumeHiddenMarker(sessionStorage, now);
-      // Fast path: decide on the refs we have — usually current, and it keeps
-      // the common-case lock synchronous with the return.
+      // Fast path: current refs already demand a lock — do it synchronously.
       if (decideLockOnReturn(autoLockTimeoutRef.current, hasPinRef.current, marker, now)) {
         lockApp();
+        setLockGate(false);
         return;
       }
-      // The refs may be STALE: a frozen/hidden tab misses config broadcasts
-      // (§8). "No lock" is only FINAL once the authoritative IndexedDB config
-      // confirms it — re-evaluate the SAME consumed marker after self-heal, so
-      // a timeout enabled elsewhere while we slept still locks this tab.
-      void selfHealPinConfig().then(() => {
-        if (decideLockOnReturn(autoLockTimeoutRef.current, hasPinRef.current, marker, now)) {
-          lockApp();
+      if (marker.kind === 'none') {
+        // The tab never actually went hidden: no away-interval to judge, and
+        // no config broadcast can have been missed behind a marker-less return.
+        setLockGate(false);
+        return;
+      }
+      // The refs may be STALE (a frozen tab misses config broadcasts, §8).
+      // "No lock" becomes FINAL only when the AUTHORITATIVE IndexedDB config
+      // confirms it — the gate stays up (Main is mounted but cannot paint
+      // anything sensitive) until the verdict on the SAME consumed marker.
+      // An unreadable config fails CLOSED: a vault we cannot vouch for locks.
+      void (async () => {
+        let lock = true;
+        try {
+          const pinData = await getMeta<PinEncryptedSeed>('pin-seed');
+          const rawTimeout = await getMeta<unknown>('auto-lock-timeout');
+          const freshHasPin = !!pinData;
+          const freshTimeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
+          applyHasPin(freshHasPin);
+          applyAutoLockTimeout(freshTimeout);
+          lock = decideLockOnReturn(freshTimeout, freshHasPin, marker, now);
+        } catch (err) {
+          console.error('auto-lock config re-read failed — locking fail-closed:', err);
         }
-      });
+        if (lock) lockApp();
+        setLockGate(false);
+      })();
     };
     const onVisibility = () => {
-      if (document.visibilityState === 'hidden') markHidden(sessionStorage, Date.now());
+      if (document.visibilityState === 'hidden') onHiddenEdge();
       else evaluateReturn();
     };
     // pagehide refines the marker (earliest wins) — it also fires on
     // navigation away, where visibilitychange:hidden may not.
-    const onPageHide = () => markHidden(sessionStorage, Date.now());
+    const onPageHide = () => onHiddenEdge();
     const onPageShow = (e: PageTransitionEvent) => {
       // BFCache restore resumes the app exactly where it was — same decision
       // as a visibility return. A non-persisted pageshow accompanies a normal
@@ -1540,6 +1572,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   return (
     <StoreContext.Provider value={value}>
       {children}
+      {/* Rendered by the PROVIDER, not a screen: the gate must exist wherever
+          the vault state does and can never be forgotten by a route. Fully
+          opaque and above every modal. */}
+      {lockGate && (
+        <div className="lock-gate" role="status" aria-live="polite" aria-label="Проверка авто-блокировки">
+          <span className="lock-gate-icon" aria-hidden="true">🔒</span>
+        </div>
+      )}
     </StoreContext.Provider>
   );
 }

@@ -1174,6 +1174,23 @@ mark {
   background: var(--accent-glow);
 }
 
+/* ─── Auto-lock privacy gate (opaque, above everything) ─────── */
+
+.lock-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 100; /* above every modal/overlay — nothing may paint over the gate */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg); /* fully opaque: no plaintext may shine through */
+}
+
+.lock-gate-icon {
+  font-size: 28px;
+  opacity: 0.6;
+}
+
 /* ─── Auto-lock picker (PIN block) — 2×2 grid, ≥44px targets ── */
 
 .autolock-section {
