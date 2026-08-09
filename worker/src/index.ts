@@ -31,6 +31,13 @@ interface Env {
    *  Deliberately NOT derived from ARWEAVE_JWK: wallet rotation must not
    *  invalidate outstanding tokens (they'd fail closed, blocking recovery). */
   RECOVERY_HMAC_SECRET: string;
+  /** Upload kill switch for App-Version=3 (versioned notes). Strictly "true"
+   *  enables; ANY other value (missing, garbage) fails CLOSED — v3 uploads get
+   *  503 {code:'v3_uploads_disabled'} after the IP limiter but BEFORE any
+   *  per-owner RateLimiter DO call or Arweave POST. v1/v2 are unaffected.
+   *  Source of truth: wrangler.toml (dashboard overrides are emergency-only
+   *  and must be synced back to the repo immediately). */
+  V3_UPLOADS_ENABLED?: string;
 }
 
 // ─── Per-IP baseline rate limit (D-baseline) ────────────────────────
@@ -70,7 +77,13 @@ export default {
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
-  if (url.pathname === '/health') return json({ ok: true });
+  // Capability surface: lets clients (and the operator runbook) verify what the
+  // deployed worker accepts WITHOUT a paid probe. `versions` = accepted
+  // App-Versions; `v3Uploads` mirrors the kill switch. Clients resume paused v3
+  // uploads only on ok===true && v3Uploads===true && versions includes '3'.
+  if (url.pathname === '/health') {
+    return json({ ok: true, versions: ['1', '2', '3'], v3Uploads: v3UploadsEnabled(env) });
+  }
 
   // Diagnostics only: lets an operator discover the proxy wallet address to pin
   // in the client's VITE_TRUSTED_OWNERS. NEVER used as the client's root of trust.
@@ -452,26 +465,29 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (!checkResult.allowed) return error('Not registered', 403);
   }
 
-  // 7. Validate tags — STRICT, version-specific (reader-before-writer: accept both).
+  // 7. Validate tags — STRICT, version-specific (reader-before-writer: accept all).
   //    v1: 6 tags incl. Timestamp; outer data {id,c,iv,t}.
   //    v2: 5 tags, NO Timestamp (date lives inside the encrypted envelope);
   //        outer data {id,c,iv} — no t on-chain.
+  //    v3: identical wire shape to v2 (5 tags, {id,c,iv}); the version-chain
+  //        metadata lives INSIDE the encrypted envelope. Distinguished on-chain
+  //        only by the App-Version tag and the UUIDv8 Note-Id namespace.
   const declaredVersion = Array.isArray(tags)
     ? tags.find(t => t && t.name === 'App-Version')?.value
     : undefined;
-  if (declaredVersion !== '1' && declaredVersion !== '2') {
+  if (declaredVersion !== '1' && declaredVersion !== '2' && declaredVersion !== '3') {
     return error('Unsupported App-Version', 400);
   }
-  const isV2 = declaredVersion === '2';
+  const hasTimestamp = declaredVersion === '1';
 
   const REQUIRED_TAGS = new Map<string, string>([
     ['App-Name', 'EternalNotes'],
     ['App-Version', declaredVersion],
     ['Content-Type', 'application/json'],
   ]);
-  const REQUIRED_DYNAMIC = isV2
-    ? new Set(['Owner-Hash', 'Note-Id'])
-    : new Set(['Owner-Hash', 'Timestamp', 'Note-Id']);
+  const REQUIRED_DYNAMIC = hasTimestamp
+    ? new Set(['Owner-Hash', 'Timestamp', 'Note-Id'])
+    : new Set(['Owner-Hash', 'Note-Id']);
   const ALL_EXPECTED = new Set([...REQUIRED_TAGS.keys(), ...REQUIRED_DYNAMIC]);
 
   if (!Array.isArray(tags)) return error('tags must be an array', 400);
@@ -505,9 +521,9 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Invalid data: must be a JSON object', 400);
   }
 
-  // 9. STRICT data schema — EXACT key set per version (no extra fields, so a v2
-  //    payload cannot smuggle a Timestamp/`t` and leak the date on-chain).
-  const allowedKeys = isV2 ? ['id', 'c', 'iv'] : ['id', 'c', 'iv', 't'];
+  // 9. STRICT data schema — EXACT key set per version (no extra fields, so a
+  //    v2/v3 payload cannot smuggle a Timestamp/`t` and leak the date on-chain).
+  const allowedKeys = hasTimestamp ? ['id', 'c', 'iv', 't'] : ['id', 'c', 'iv'];
   const actualKeys = Object.keys(parsedData);
   if (actualKeys.length !== allowedKeys.length || actualKeys.some(k => !allowedKeys.includes(k))) {
     return error(`Invalid data fields: expected exactly [${allowedKeys.join(', ')}]`, 400);
@@ -529,19 +545,42 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
   if (ivBytes.length !== 12) return error('Invalid data: iv must be 12 bytes', 400);
 
-  if (!isV2 && typeof parsedData.t !== 'number') {
+  if (hasTimestamp && typeof parsedData.t !== 'number') {
     return error('Invalid data structure: t (number) required for v1', 400);
   }
 
   // Cross-check tags ↔ data
   if (tagMap.get('Note-Id') !== parsedData.id) return error('Note-Id mismatch', 400);
   if (tagMap.get('Owner-Hash') !== ownerHash) return error('Owner-Hash mismatch', 400);
-  if (!isV2 && tagMap.get('Timestamp') !== String(parsedData.t)) {
+  if (hasTimestamp && tagMap.get('Timestamp') !== String(parsedData.t)) {
     return error('Timestamp mismatch', 400);
   }
 
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (!uuidRegex.test(parsedData.id)) return error('Note-Id must be a valid UUID', 400);
+  // UUID namespace barrier (mixed-client protection): v3 note ids live in a
+  // DISJOINT namespace (UUIDv8) from v1/v2 (UUIDv4). A stale pre-v3 client tab
+  // that reads a v3 record from shared IndexedDB and serializes it as v1 sends
+  // a v8 id under App-Version=1 — rejected HERE, before the per-owner DO, so
+  // the permanent noteId idempotency can never commit garbage ciphertext.
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const uuidMatch = uuidRegex.exec(parsedData.id);
+  if (!uuidMatch) return error('Note-Id must be a valid UUID', 400);
+  const uuidVersion = uuidMatch[1].toLowerCase();
+  const expectedUuidVersion = declaredVersion === '3' ? '8' : '4';
+  if (uuidVersion !== expectedUuidVersion) {
+    return error(`Note-Id must be a UUIDv${expectedUuidVersion} for App-Version ${declaredVersion}`, 400);
+  }
+
+  // Upload kill switch (v3 only) — checked AFTER auth + full schema validation,
+  // BEFORE any per-owner RateLimiter DO call and before the Arweave POST. When
+  // disabled, ALL v3 traffic (including reconciliation of committed/reserved
+  // states and recovery hints) pauses until re-enabled: /check-and-reserve
+  // mutates state even on a lookup, so no disabled branch may reach the DO.
+  if (declaredVersion === '3' && !v3UploadsEnabled(env)) {
+    return new Response(JSON.stringify({ code: 'v3_uploads_disabled' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 
   // 10. Idempotency + rate limit + reserve (C1/M6 lifecycle).
   const limiterStub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(publicKeyB64));
@@ -757,6 +796,12 @@ function error(message: string, status: number): Response {
 /** Anti-replay freshness: a real number within ±5 min (rejects NaN/non-number). */
 function isFreshTimestamp(ts: unknown): boolean {
   return typeof ts === 'number' && Number.isFinite(ts) && Math.abs(Date.now() - ts) <= 300_000;
+}
+
+/** v3 upload kill switch. STRICTLY "true" enables — a missing, empty, or
+ *  garbage value fails CLOSED (disabled). See Env.V3_UPLOADS_ENABLED. */
+function v3UploadsEnabled(env: Env): boolean {
+  return env.V3_UPLOADS_ENABLED === 'true';
 }
 
 /** Parse a required positive-integer config value. Returns null (→ fail closed,

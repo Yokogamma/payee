@@ -76,6 +76,7 @@ function SettingsBlock({ icon, title, chip, chipClass, danger, children }: {
 export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestReset }: SettingsModalProps) {
   const {
     notes,
+    chains,
     arweave,
     toggleArweave,
     retrySync,
@@ -135,7 +136,11 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
         </div>
 
         <div className="settings-statusbar">
-          <span><IconNote /> Заметок: <strong>{notes.length}</strong></span>
+          {/* Notes = chains (what the user perceives); записи = raw versions. */}
+          <span>
+            <IconNote /> Заметок: <strong>{chains.length}</strong>
+            {notes.length !== chains.length && <> · записей: <strong>{notes.length}</strong></>}
+          </span>
           <span><IconShield /> AES-256-GCM</span>
         </div>
 
@@ -200,7 +205,8 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               <div>Статус: <strong className={arweave.online ? 'text-green' : 'text-red'}>
                 {arweave.online ? '● Онлайн' : '○ Оффлайн'}
               </strong></div>
-              <div>Синхронизировано: <strong>{arweave.acceptedCount + arweave.confirmedCount}</strong> из <strong>{notes.length}</strong></div>
+              {/* Per-version accounting: every version is its own transaction. */}
+              <div>Синхронизировано записей: <strong>{arweave.acceptedCount + arweave.confirmedCount}</strong> из <strong>{notes.length}</strong></div>
               {arweave.confirmedCount > 0 && (
                 <div className="text-green">✓ Подтверждено в блокчейне: <strong>{arweave.confirmedCount}</strong></div>
               )}
@@ -212,6 +218,14 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               )}
               {arweave.errorCount > 0 && (
                 <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
+              )}
+              {arweave.quarantinedCount > 0 && (
+                // Permanent by design — deliberately NOT lumped into «Ошибки»:
+                // no «Повторить» can ever fix a quarantined record.
+                <div>
+                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — созданы
+                  более новой версией приложения; обновите приложение, чтобы загрузить их.
+                </div>
               )}
               {arweave.lastSync && (
                 <div>Последняя синхронизация: {new Date(arweave.lastSync).toLocaleString('ru')}</div>

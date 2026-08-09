@@ -64,6 +64,65 @@ The worker + client at this point READ v1+v2 but the client still WRITES v1.
 Only after R is deployed **everywhere and stable** flip the client to writing v2
 (a later change to `addNote`). Do not enable W until R is the live baseline.
 
+## v3 release (Markdown + note versioning) — R3 / W3
+
+The v3 envelope carries version-chain metadata (`rev`, `root`, `prev`, `fmt`)
+inside the ciphertext; on-chain it is wire-identical to v2 except the
+`App-Version=3` tag and the **UUIDv8 Note-Id namespace** (v1/v2 ids are UUIDv4;
+the worker enforces the split — a stale pre-v3 client tab re-serializing a v3
+record as v1 gets 400, never a committed garbage TX).
+
+Deploy order for THIS release is **strictly worker-first** (the only sanctioned
+sequence): **Worker v3-acceptor → R3 → W3.**
+
+1. **Worker v3-acceptor** (`deploy-worker.yml`): accepts App-Version 1/2/3,
+   `V3_UPLOADS_ENABLED = "true"` in wrangler.toml (see kill switch below),
+   `/health` reports `{versions, v3Uploads}`. Smoke, then append the release
+   tag to the allowlist below.
+2. **R3 client** (tag `client-r3`): READS v1–v3 (chains grouping + fmt-aware
+   render always active — R3 must correctly display v3 data after a W3
+   rollback), WRITES v1 (`V3_WRITER_ENABLED=false`; edit/history/Markdown
+   composer hidden, `editNote` throws in the store).
+3. **W3 client** (tag `client-w3`): flips `V3_WRITER_ENABLED` only — no other
+   code. **Mandatory preconditions:** production `/health` shows
+   `versions:['1','2','3']` and `v3Uploads:true`; the **staging signed v3
+   smoke passed** (`npm --prefix worker run smoke:v3` against the staging env —
+   see `worker/wrangler.toml [env.staging]` prerequisites); the real worker
+   floor tag/SHA is recorded below. A production paid smoke is optional.
+
+### v3 upload kill switch (`V3_UPLOADS_ENABLED`)
+
+Honest name: an **upload kill switch** — it stops the worker ACCEPTING v3
+uploads; an open W3 client keeps creating local v3 versions, which sync once
+the gate re-opens (the client pauses its v3 queue on the first
+`503 {code:'v3_uploads_disabled'}` and resumes via `/health` polling or manual
+retry).
+
+- **Full v3 pause**: while disabled, ALL v3 traffic — including reconciliation
+  of committed/posted/reserved states and recovery hints — gets 503 after the
+  IP limiter but **before any per-owner RateLimiter DO call and before any
+  Arweave POST**. v1/v2 are unaffected.
+- **Fail-closed**: strictly `"true"` enables; a missing/garbage value disables.
+- **Source of truth = `worker/wrangler.toml`.** Toggle = edit the var +
+  `npm --prefix worker run deploy` from the verified v3-acceptor tag (never a
+  bare `npx wrangler`). A dashboard override is EMERGENCY-ONLY and must be
+  synced back to the repo immediately — the next deploy silently restores the
+  repo value. After EVERY worker deploy verify:
+  `curl <worker>/health` → `v3Uploads` matches the intended state.
+
+### v3 rollback rules
+
+- **W3 rollback is gradual by nature**: rolling Pages back to R3 does NOT stop
+  already-open/installed W3 PWAs from writing v3 locally and uploading
+  (`registerType:'prompt'` — the new SW activates only on user consent; no
+  unconditional skipWaiting). Immediate stop = the kill switch above.
+- **After W3 has run even once: never roll the client below R3, never roll the
+  worker below the v3-acceptor** — older code cannot read v3 notes / accepts
+  the wrong Note-Id namespace.
+- Release notes must tell users to close/refresh stale pre-R3 tabs and update
+  installed PWAs: a stale tab renders a v3 envelope as JSON text and keeps
+  retrying an upload the worker rejects (harmless on-chain, wastes IP quota).
+
 ## Rollback rules
 
 - **Never roll back below the reader release R** once v2 writes are enabled: an

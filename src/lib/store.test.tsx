@@ -26,8 +26,9 @@ vi.mock('./crypto', async importOriginal => {
   const actual = await importOriginal<typeof import('./crypto')>();
   return {
     ...actual,
-    // Overridable per-test (wipe path) — defaults to the real implementation.
+    // Overridable per-test (wipe path / reset races) — default to the real impl.
     decryptWithPin: vi.fn(actual.decryptWithPin),
+    encrypt: vi.fn(actual.encrypt),
   };
 });
 
@@ -38,6 +39,7 @@ vi.mock('./storage', async importOriginal => {
     // Overridable per-test (persist-first / partial-cleanup / gate failures).
     getMeta: vi.fn(actual.getMeta),
     setMeta: vi.fn(actual.setMeta),
+    saveNote: vi.fn(actual.saveNote),
     getPinConfigMeta: vi.fn(actual.getPinConfigMeta),
     clearPinConfigMeta: vi.fn(actual.clearPinConfigMeta),
   };
@@ -68,10 +70,14 @@ Object.defineProperty(globalThis, 'crypto', {
   },
 });
 
-import { NotesProvider, useNotes, PinWipedError } from './store';
-import { initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords, clearPinConfigMeta } from './storage';
+import { NotesProvider, useNotes, PinWipedError, WriterDisabledError, OperationInFlightError } from './store';
+import {
+  initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords,
+  clearPinConfigMeta, saveNote, getAllNotes as getStoredNotes,
+} from './storage';
 import { isArweaveOnline, uploadViaProxy, type UploadResult } from './arweave';
-import { decryptWithPin, WrongPinError } from './crypto';
+import { decryptWithPin, WrongPinError, deriveKey, encryptEnvelopeV3, type EncryptedNote } from './crypto';
+import { NoteTooLongError, MAX_NOTE_JSON_BYTES } from './limits';
 import { DRAFT_STORAGE_KEY, parseDraftEnvelope } from './draft';
 import { HIDDEN_AT_KEY } from './auto-lock';
 
@@ -943,5 +949,225 @@ describe('encrypted draft across lock/unlock/reset', () => {
     sessionStorage.setItem(DRAFT_STORAGE_KEY, 'старый плейнтекст');
     act(() => { store.lockApp(); });
     expect(sessionStorage.getItem(DRAFT_STORAGE_KEY)).toBeNull();
+  });
+});
+
+// ─── v3 writer gate OFF (R3 contract) ────────────────────────────────
+// V3_WRITER_ENABLED is the real (false) flag in this file; the ON matrix
+// lives in store.v3-writer.test.tsx with a mocked flag.
+
+describe('R3 contract: writer OFF, reader always on', () => {
+  it('addNote keeps writing v1 (no envelope version on the stored record)', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    await act(async () => { await store.addNote('обычная заметка'); });
+    const stored = await getStoredNotes();
+    expect(stored).toHaveLength(1);
+    expect(stored[0].v).toBeUndefined(); // legacy v1 record
+    expect(store.notes[0].fmt).toBe('plain');
+    expect(store.notes[0].rev).toBe(1);
+    expect(store.notes[0].root).toBe(stored[0].noteId);
+  });
+
+  it('editNote throws WriterDisabledError — never a silent no-op', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.addNote('текст'); });
+    const root = store.notes[0].root;
+
+    await expect(store.editNote(root, 'новый текст')).rejects.toThrow(WriterDisabledError);
+    // Nothing was created.
+    expect(await getStoredNotes()).toHaveLength(1);
+  });
+
+  it('a double addNote before re-render: second call rejects, ONE record saved', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    let secondError: unknown = null;
+    await act(async () => {
+      const p1 = store.addNote('раз');
+      const p2 = store.addNote('раз').catch(e => { secondError = e; });
+      await Promise.all([p1, p2]);
+    });
+    expect(secondError).toBeInstanceOf(OperationInFlightError);
+    expect(await getStoredNotes()).toHaveLength(1);
+  });
+
+  it('a failed save releases the single-flight mutex (retry works, text not lost)', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    vi.mocked(saveNote).mockRejectedValueOnce(new Error('quota'));
+    await expect(store.addNote('первая попытка')).rejects.toThrow('quota');
+    // Mutex released — the retry saves normally.
+    await act(async () => { await store.addNote('первая попытка'); });
+    expect(await getStoredNotes()).toHaveLength(1);
+  });
+
+  it('addNote rejects an over-limit note with NoteTooLongError and saves NOTHING', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    const huge = 'ж'.repeat(MAX_NOTE_JSON_BYTES); // 2 bytes/char → 2× the limit
+    await expect(store.addNote(huge)).rejects.toThrow(NoteTooLongError);
+    expect(await getStoredNotes()).toHaveLength(0);
+  });
+
+  it('READER stays active under the OFF flag: a stored v3 chain renders as ONE card', async () => {
+    // Simulates the W3→R3 rollback: v3 data already in storage.
+    await setMeta('init', true);
+    const key = await deriveKey(MN);
+    const v1root = await encryptEnvelopeV3(key, 'корень', { fmt: 'md', rev: 1 });
+    const v2edit = await encryptEnvelopeV3(key, '# правка', {
+      fmt: 'md', rev: 2, root: v1root.noteId, prev: v1root.noteId,
+    });
+    await saveNote(v1root);
+    await saveNote(v2edit);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    // Raw versions both decrypted and visible to sync/reset accounting…
+    expect(store.notes).toHaveLength(2);
+    // …but the feed view groups them into a single chain with the edit current.
+    expect(store.chains).toHaveLength(1);
+    expect(store.chains[0].root).toBe(v1root.noteId);
+    expect(store.chains[0].current.text).toBe('# правка');
+    expect(store.chains[0].current.fmt).toBe('md');
+    expect(store.chains[0].versions).toHaveLength(2);
+    // Storage-backed reset risk counts BOTH versions (nothing confirmed).
+    expect(store.arweave.resetRiskCount).toBe(2);
+  });
+
+  it('an unknown-version record is invisible in the UI but counted by resetRiskCount', async () => {
+    await setMeta('init', true);
+    const key = await deriveKey(MN);
+    const good = await encryptEnvelopeV3(key, 'нормальная', { fmt: 'md', rev: 1 });
+    const alien = { ...(await encryptEnvelopeV3(key, 'из будущего', { fmt: 'md', rev: 1 })), v: 4 };
+    await saveNote(good);
+    await saveNote(alien as unknown as EncryptedNote);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    expect(store.notes).toHaveLength(1); // alien skipped, no crash
+    expect(store.arweave.resetRiskCount).toBe(2); // but still at risk on reset
+  });
+});
+
+// ─── Exclusive reset (P1): no write may land after «Удалить всё» ─────
+
+describe('exclusive reset — post-point-of-no-return persists are refused', () => {
+  it('an upload result arriving AFTER resetApp writes NO sync record into the wiped DB', async () => {
+    await setMeta('init', true);
+    await setMeta('ar-enabled', true);
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+
+    // The upload passes its point of no return, then hangs in HTTP.
+    // (The mock's call counter accumulates across this file — baseline it.)
+    const callsBefore = vi.mocked(uploadViaProxy).mock.calls.length;
+    const inFlight = deferred<UploadResult>();
+    vi.mocked(uploadViaProxy).mockImplementationOnce(() => inFlight.promise);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.addNote('заметка'); });
+    await waitFor(() =>
+      expect(vi.mocked(uploadViaProxy).mock.calls.length).toBe(callsBefore + 1));
+
+    // «Удалить всё» while the request is still in flight.
+    await act(async () => { await store.resetApp(); });
+    expect(store.screen).toBe('landing');
+
+    // The response lands afterwards — its unconditional persist must be
+    // REFUSED by the generation guard, not written into the fresh DB.
+    await act(async () => {
+      inFlight.resolve({ kind: 'accepted', txId: 'TX-LATE', committed: true });
+      await new Promise(r => setTimeout(r, 50));
+    });
+
+    expect(await getAllSyncRecords()).toEqual([]);
+    expect(await getStoredNotes()).toEqual([]);
+  });
+
+  it('an addNote save racing resetApp rejects instead of resurrecting the note', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    // Pause addNote INSIDE encrypt — i.e. before its generation guard. In
+    // production there is no await between the guard and the write-transaction
+    // creation, so the only real race window is the awaits BEFORE the guard.
+    const { encrypt } = await import('./crypto');
+    const { encrypt: realEncrypt } = await vi.importActual<typeof import('./crypto')>('./crypto');
+    let releaseEncrypt!: () => void;
+    const gate = new Promise<void>(r => { releaseEncrypt = r; });
+    vi.mocked(encrypt).mockImplementationOnce(async (key, text) => {
+      await gate;
+      return realEncrypt(key, text);
+    });
+
+    let saveError: unknown = null;
+    let savePromise!: Promise<void>;
+    await act(async () => {
+      savePromise = store.addNote('гонка со сбросом').catch(e => { saveError = e; });
+      await new Promise(r => setTimeout(r, 10));
+    });
+    await act(async () => { await store.resetApp(); });
+    await act(async () => { releaseEncrypt(); await savePromise; });
+
+    // The note belongs to a destroyed vault: the save must fail loudly…
+    expect(saveError).toBeInstanceOf(Error);
+    expect(String(saveError)).toMatch(/сброшено/);
+    // …and nothing may exist in the fresh DB.
+    expect(await getStoredNotes()).toEqual([]);
+  });
+
+  it('resetApp broadcasts a reset message so other tabs invalidate their writes', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+    const { received } = listenOnChannel();
+
+    await act(async () => { await store.resetApp(); });
+    await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+
+    expect(received.some(m => m.type === 'reset')).toBe(true);
+  });
+
+  it('receiving a foreign reset locks this tab and bumps its DB generation', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    const { getDbGeneration } = await import('./storage');
+    const genBefore = getDbGeneration();
+    const { channel } = listenOnChannel();
+    await act(async () => {
+      channel.postMessage({ type: 'reset', originId: 'other-tab', messageId: crypto.randomUUID() });
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    expect(getDbGeneration()).toBe(genBefore + 1); // local writes invalidated
+    await waitFor(() => expect(store.screen).not.toBe('main')); // locked out
+    expect(store.mnemonic).toBeNull();
   });
 });

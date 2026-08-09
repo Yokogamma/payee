@@ -439,3 +439,193 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
     expect(res).toHaveLength(0);
   });
 });
+
+describe('buildUploadPayload v3 + fail-closed serialization (P0)', () => {
+  it('serializes a v3 note as 5 tags, App-Version=3, no Timestamp/outer t', async () => {
+    const { buildUploadPayload } = await import('./arweave');
+    const note = { noteId: 'id3', ciphertext: 'c', iv: 'iv', createdAt: 789, v: 3 as const };
+    const p = buildUploadPayload(note, 'owner-hash', 1000);
+    const names = p.tags.map(t => t.name);
+    expect(names).toHaveLength(5);
+    expect(names).not.toContain('Timestamp');
+    expect(p.tags.find(t => t.name === 'App-Version')?.value).toBe('3');
+    expect(JSON.parse(p.data)).toEqual({ id: 'id3', c: 'c', iv: 'iv' });
+  });
+
+  it('throws UnsupportedNoteVersionError for an unknown runtime v (never ships as v1)', async () => {
+    const { buildUploadPayload } = await import('./arweave');
+    const { UnsupportedNoteVersionError } = await import('./crypto');
+    const base = { noteId: 'idX', ciphertext: 'c', iv: 'iv', createdAt: 1 };
+    for (const v of [4, '3', 0, {}] as const) {
+      const note = { ...base, v } as unknown as import('./crypto').EncryptedNote;
+      expect(() => buildUploadPayload(note, 'oh', 1000)).toThrow(UnsupportedNoteVersionError);
+    }
+  });
+
+  it('wire-payload boundary: a limit-sized v3 note fits under the worker cap (51200)', async () => {
+    const { buildUploadPayload } = await import('./arweave');
+    const { deriveKey, generateMnemonic, encryptEnvelopeV3 } = await import('./crypto');
+    const { MAX_NOTE_JSON_BYTES } = await import('./limits');
+    const key = await deriveKey(generateMnemonic());
+    // Worst-case escaped text exactly at the limit: newlines double via JSON
+    // escaping; the serialized form (quotes included) hits MAX exactly.
+    const text = '\n'.repeat((MAX_NOTE_JSON_BYTES - 2) / 2);
+    const note = await encryptEnvelopeV3(key, text, { fmt: 'md', rev: 1 });
+    const payload = buildUploadPayload(note, 'x'.repeat(44), Date.now(), true, {
+      txId: 'T'.repeat(43), postedAt: Date.now(), token: 'k'.repeat(44),
+    });
+    const bodyBytes = new TextEncoder().encode(JSON.stringify(payload)).length;
+    expect(bodyBytes).toBeLessThanOrEqual(51_200);
+  });
+});
+
+describe('uploadViaProxy v3_disabled classification', () => {
+  it('maps a 503 with the machine code to kind v3_disabled', async () => {
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ code: 'v3_uploads_disabled' }), { status: 503 })));
+    const { uploadViaProxy } = await import('./arweave');
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('v3_disabled');
+  });
+
+  it('keeps a plain-text 503 as the generic retryable unavailable', async () => {
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('recheck deferred', { status: 503 })));
+    const { uploadViaProxy } = await import('./arweave');
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('unavailable');
+  });
+
+  it('a 503 with unrelated JSON stays unavailable', async () => {
+    vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ code: 'other' }), { status: 503 })));
+    const { uploadViaProxy } = await import('./arweave');
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('unavailable');
+  });
+});
+
+describe('getWorkerCapabilities (strict /health validation)', () => {
+  const proxyEnv = () => vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+
+  it('enabled ONLY on ok + versions with 3 + v3Uploads true', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, versions: ['1', '2', '3'], v3Uploads: true }), { status: 200 })));
+    const { getWorkerCapabilities } = await import('./arweave');
+    expect(await getWorkerCapabilities()).toBe('enabled');
+  });
+
+  it('disabled when the worker reports the gate off', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, versions: ['1', '2', '3'], v3Uploads: false }), { status: 200 })));
+    const { getWorkerCapabilities } = await import('./arweave');
+    expect(await getWorkerCapabilities()).toBe('disabled');
+  });
+
+  it('unknown for an OLD worker ({ok:true} without capability fields)', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    const { getWorkerCapabilities } = await import('./arweave');
+    expect(await getWorkerCapabilities()).toBe('unknown');
+  });
+
+  it('unknown for malformed bodies, non-200 and network errors (pause stays)', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not json', { status: 200 })));
+    let mod = await import('./arweave');
+    expect(await mod.getWorkerCapabilities()).toBe('unknown');
+
+    vi.resetModules(); proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, versions: ['1', '2'], v3Uploads: true }), { status: 200 })));
+    mod = await import('./arweave');
+    expect(await mod.getWorkerCapabilities()).toBe('unknown'); // versions without '3'
+
+    vi.resetModules(); proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 500 })));
+    mod = await import('./arweave');
+    expect(await mod.getWorkerCapabilities()).toBe('unknown');
+
+    vi.resetModules(); proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
+    mod = await import('./arweave');
+    expect(await mod.getWorkerCapabilities()).toBe('unknown');
+  });
+});
+
+describe('fetchAllNotes v3 (chain meta through restore)', () => {
+  it('restores a v3 note with its meta and authenticated createdAt', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+
+    const { deriveKey, generateMnemonic, encryptEnvelopeV3, randomUuidV8 } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const root = randomUuidV8();
+    const note = await encryptEnvelopeV3(key, '# v3 markdown', { fmt: 'md', rev: 2, root, prev: root });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [{ cursor: 'c1', node: { id: 'TXV3', tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '3' },
+            { name: 'Note-Id', value: note.noteId },
+          ] } }],
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+
+    expect(incomplete).toBe(false);
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('# v3 markdown');
+    expect(res[0].encrypted.v).toBe(3);
+    expect(res[0].encrypted.createdAt).toBe(note.createdAt);
+    expect(res[0].meta).toEqual({ fmt: 'md', rev: 2, root, prev: root });
+  });
+
+  it('skips a v3 candidate whose envelope meta is malformed (intentional skip)', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+
+    const { deriveKey, generateMnemonic, randomUuidV8, bufferToBase64 } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    // Forge a v3 record whose envelope violates the rev-1 linkage invariant.
+    const id = randomUuidV8();
+    const envelope = { v: 3, id, t: Date.now(), text: 'x', fmt: 'md', rev: 1, root: crypto.randomUUID() };
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(envelope)));
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [{ cursor: 'c1', node: { id: 'TXBAD', tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '3' },
+            { name: 'Note-Id', value: id },
+          ] } }],
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ id, c: bufferToBase64(ct), iv: bufferToBase64(iv) }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    expect(res).toHaveLength(0);
+    expect(incomplete).toBe(false); // malformed = intentional skip, not partial
+  });
+});

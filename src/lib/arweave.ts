@@ -7,8 +7,8 @@
  * No wallet management — auth via Ed25519 signature + server-side allowlist.
  */
 
-import type { EncryptedNote } from './crypto';
-import { decryptNote } from './crypto';
+import type { EncryptedNote, NoteVersionMeta } from './crypto';
+import { decryptNote, UnsupportedNoteVersionError } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
 
 // ─── Config ──────────────────────────────────────────────────────────
@@ -30,20 +30,30 @@ export const APP_NAME = 'EternalNotes';
 export const APP_VERSION = '1';
 
 // Supported data format versions for READING. Client still writes v1 in this
-// release (reader-before-writer); v2 is accepted so the writer flip is seamless.
-const SUPPORTED_VERSIONS = new Set(['1', '2']);
+// release (reader-before-writer); v2/v3 are accepted so the writer flip is
+// seamless (v3 writes are gated by V3_WRITER_ENABLED in the store).
+const SUPPORTED_VERSIONS = new Set(['1', '2', '3']);
 
-/** A note recovered from Arweave: the record to persist + its decrypted text. */
+/** A note recovered from Arweave: the record to persist, its decrypted text and
+ *  the version-chain meta (synthesized for v1/v2) — restore must carry the meta
+ *  through to the UI or chains would degrade to per-version cards. */
 export interface RestoredNote {
   encrypted: EncryptedNote;
   text: string;
   txId: string;
+  meta: NoteVersionMeta;
 }
 
 /**
  * Build the proxy upload payload for a note, serializing per its OWN version.
- * A v2 note is ALWAYS sent as v2 (5 tags, no Timestamp, {id,c,iv}); a v1 note as
- * v1. This guarantees a restored v2 ciphertext can never be re-published as v1.
+ * A v2/v3 note is ALWAYS sent under its own App-Version (5 tags, no Timestamp,
+ * {id,c,iv}); a v1 note as v1 — a restored envelope ciphertext can never be
+ * re-published under the wrong version.
+ *
+ * FAIL CLOSED on an unknown runtime `v` (P0): the legacy behavior "everything
+ * that is not v2 goes out as v1" would let a record with v:4 (or a corrupted
+ * string) be permanently committed as a paid v1 transaction. Unknown version →
+ * typed throw; the queue quarantines the record without any HTTP.
  */
 export function buildUploadPayload(
   note: EncryptedNote,
@@ -52,17 +62,23 @@ export function buildUploadPayload(
   recheck = false,
   recovery?: RecoveryHint,
 ): ProxyUploadPayload {
-  const isV2 = note.v === 2;
-  const data = isV2
-    ? JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv })
-    : JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv, t: note.createdAt });
+  const v = note.v;
+  if (v !== undefined && v !== 1 && v !== 2 && v !== 3) {
+    throw new UnsupportedNoteVersionError(v);
+  }
+  const hasTimestamp = v === undefined || v === 1;
+  const versionTag = hasTimestamp ? APP_VERSION : String(v);
+
+  const data = hasTimestamp
+    ? JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv, t: note.createdAt })
+    : JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv });
 
   const tags = [
     { name: 'App-Name', value: APP_NAME },
-    { name: 'App-Version', value: isV2 ? '2' : APP_VERSION },
+    { name: 'App-Version', value: versionTag },
     { name: 'Owner-Hash', value: ownerHash },
     { name: 'Content-Type', value: 'application/json' },
-    ...(isV2 ? [] : [{ name: 'Timestamp', value: note.createdAt.toString() }]),
+    ...(hasTimestamp ? [{ name: 'Timestamp', value: note.createdAt.toString() }] : []),
     { name: 'Note-Id', value: note.noteId },
   ];
 
@@ -101,6 +117,11 @@ export type UploadResult =
   | { kind: 'not_registered'; error: string }
   | { kind: 'in_progress'; error: string }
   | { kind: 'unavailable'; error: string } // 503 — retryable (recheck deferred / gateway)
+  /** 503 {code:'v3_uploads_disabled'} — the worker's v3 kill switch is on.
+   *  NOT an error state: the client pauses its whole v3 queue (persisted
+   *  pause marker) and resumes via /health or manual retry. Registration and
+   *  recovery/txId state MUST survive this untouched. */
+  | { kind: 'v3_disabled'; error: string }
   | { kind: 'error'; error: string };
 
 export type RegistrationStatus = 'allowed' | 'denied' | 'unavailable' | 'invalid_request';
@@ -291,12 +312,54 @@ export async function uploadViaProxy(
     if (response.status === 429) return { kind: 'rate_limited', error: text };
     if (response.status === 403) return { kind: 'not_registered', error: text };
     if (response.status === 409) return { kind: 'in_progress', error: text };
-    if (response.status === 503) return { kind: 'unavailable', error: text }; // retryable
+    if (response.status === 503) {
+      // The v3 kill switch answers 503 with a machine-readable JSON code; a
+      // plain-text 503 stays the generic retryable 'unavailable'.
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (typeof parsed === 'object' && parsed !== null &&
+            (parsed as { code?: unknown }).code === 'v3_uploads_disabled') {
+          return { kind: 'v3_disabled', error: text };
+        }
+      } catch { /* not JSON → generic 503 */ }
+      return { kind: 'unavailable', error: text }; // retryable
+    }
     return { kind: 'error', error: `HTTP ${response.status}: ${text}` };
   } catch (e) {
     // A network exception is transient/retryable — classify as unavailable so the
     // caller preserves an accepted TX rather than downgrading it to a hard error.
     return { kind: 'unavailable', error: e instanceof Error ? e.message : 'Network error' };
+  }
+}
+
+// ─── Worker capabilities (/health) ──────────────────────────────────
+
+export type V3UploadsCapability = 'enabled' | 'disabled' | 'unknown';
+
+/**
+ * Strictly-validated /health probe used to lift the persisted v3-upload pause.
+ * 'enabled' ONLY when ok===true AND versions includes '3' AND v3Uploads===true.
+ * A network error, an old worker ({ok:true} without the fields) or a malformed
+ * body all yield 'unknown' — the pause stays (fail closed).
+ */
+export async function getWorkerCapabilities(): Promise<V3UploadsCapability> {
+  if (!PROXY_URL) return 'unknown';
+  try {
+    const response = await fetch(`${PROXY_URL}/health`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) return 'unknown';
+    const data: unknown = await response.json();
+    if (typeof data !== 'object' || data === null) return 'unknown';
+    const d = data as { ok?: unknown; versions?: unknown; v3Uploads?: unknown };
+    if (d.ok !== true) return 'unknown';
+    if (!Array.isArray(d.versions) || !d.versions.includes('3')) return 'unknown';
+    if (d.v3Uploads === true) return 'enabled';
+    if (d.v3Uploads === false) return 'disabled';
+    return 'unknown';
+  } catch {
+    return 'unknown';
   }
 }
 
@@ -527,8 +590,9 @@ export async function fetchAllNotes(
 
 /**
  * Assemble + decrypt a candidate TX by version. Returns null (skip) on any
- * shape mismatch or decryption failure. For v2 the createdAt comes from the
- * authenticated envelope, not from any on-chain field.
+ * shape mismatch or decryption failure. For v2/v3 the createdAt comes from the
+ * authenticated envelope, not from any on-chain field; v3 envelope validation
+ * (chain meta, UUIDv8 namespace, linkage invariants) happens in decryptNote.
  */
 async function buildRestoredNote(
   key: CryptoKey,
@@ -539,10 +603,10 @@ async function buildRestoredNote(
 ): Promise<RestoredNote | null> {
   let encrypted: EncryptedNote;
 
-  if (version === '2') {
+  if (version === '2' || version === '3') {
     if (typeof raw.c !== 'string' || typeof raw.iv !== 'string' || typeof raw.id !== 'string') return null;
     if (raw.id !== noteIdTag) return null; // outer id must match the tag
-    encrypted = { noteId: raw.id, ciphertext: raw.c, iv: raw.iv, createdAt: 0, v: 2 };
+    encrypted = { noteId: raw.id, ciphertext: raw.c, iv: raw.iv, createdAt: 0, v: version === '3' ? 3 : 2 };
   } else {
     if (
       typeof raw.c !== 'string' || typeof raw.iv !== 'string' ||
@@ -552,13 +616,13 @@ async function buildRestoredNote(
     encrypted = { noteId: raw.id, ciphertext: raw.c, iv: raw.iv, createdAt: raw.t };
   }
 
-  let decoded: { text: string; createdAt: number };
+  let decoded: { text: string; createdAt: number; meta: NoteVersionMeta };
   try {
     decoded = await decryptNote(key, encrypted);
   } catch {
-    return null; // not ours / replay / tampered
+    return null; // not ours / replay / tampered / malformed envelope
   }
 
-  encrypted.createdAt = decoded.createdAt; // v2: authoritative from envelope
-  return { encrypted, text: decoded.text, txId };
+  encrypted.createdAt = decoded.createdAt; // v2/v3: authoritative from envelope
+  return { encrypted, text: decoded.text, txId, meta: decoded.meta };
 }

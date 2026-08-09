@@ -35,6 +35,15 @@ export interface SyncRecord {
    * without a duplicate re-post. Cleared once committed.
    */
   recovery?: { txId: string; postedAt: number; token: string };
+  /**
+   * PERMANENT local quarantine reason. A plain status:'error' is retryable —
+   * the queue re-enqueues it on every poll/reload; a record with terminalError
+   * is NEVER enqueued again (no HTTP). 'unsupported_version': the stored
+   * EncryptedNote carries a `v` this build cannot serialize — uploading it
+   * would risk committing garbage under the permanent noteId idempotency.
+   * Still counted by reset-safety (a newer build might read it).
+   */
+  terminalError?: 'unsupported_version';
 }
 
 // ─── Database ────────────────────────────────────────────────────────
@@ -105,6 +114,7 @@ export function closeStorage(): void {
  * after the database was actually deleted and re-initialized.
  */
 export async function recoverStorage(opts: { onBlocked?: () => void } = {}): Promise<void> {
+  dbGeneration++; // destructive path — same reset-exclusivity token as resetAll
   try { db?.close(); } catch { /* already closed */ }
   db = null;
   initPromise = null;
@@ -213,6 +223,95 @@ export async function getAllSyncRecords(): Promise<SyncRecord[]> {
 
 export async function getMeta<T = unknown>(key: string): Promise<T | undefined> {
   return getDB().get('meta', key) as Promise<T | undefined>;
+}
+
+// ─── v3 upload pause (worker kill switch, client side) ──────────────
+//
+// Shared, persisted, authoritative across tabs: the queue re-reads this meta
+// right before every v3 dispatch. Written ATOMICALLY with the failure
+// SyncRecord (commitV3PausedFailure) — separate writes would leave a crash
+// window where the error is recorded but the pause is lost, and the next
+// unlock bursts the whole v3 backlog again.
+
+export const V3_PAUSE_META_KEY = 'v3-uploads-paused';
+
+export interface V3PauseMeta {
+  pausedAt: number;
+}
+
+/** Runtime-validated read. 'malformed' = a value is PRESENT but unreadable —
+ *  fail closed: treat as paused (clearable via manual retry / valid health). */
+export async function readV3PauseMeta(): Promise<V3PauseMeta | 'malformed' | null> {
+  const raw = await getMeta<unknown>(V3_PAUSE_META_KEY);
+  if (raw === undefined) return null;
+  if (typeof raw === 'object' && raw !== null) {
+    const pausedAt = (raw as { pausedAt?: unknown }).pausedAt;
+    if (typeof pausedAt === 'number' && Number.isSafeInteger(pausedAt) && pausedAt >= 0) {
+      return { pausedAt };
+    }
+  }
+  return 'malformed';
+}
+
+/**
+ * Persist a v3_disabled upload failure AND the pause marker in ONE transaction
+ * over sync+meta. Called from the committed part of runUploadAttempt INSTEAD
+ * of the final setSyncRecord (never in addition — two writes reopen the crash
+ * window this exists to close).
+ */
+export async function commitV3PausedFailure(
+  record: SyncRecord,
+  pausedAt: number,
+): Promise<void> {
+  const tx = getDB().transaction(['sync', 'meta'], 'readwrite');
+  try {
+    await tx.objectStore('sync').put(record);
+    await tx.objectStore('meta').put({ pausedAt } satisfies V3PauseMeta, V3_PAUSE_META_KEY);
+    await tx.done;
+  } catch (e) {
+    // Same rollback discipline as saveNoteWithSync: an error on the SECOND put
+    // must not let the transaction auto-commit with only the record written.
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/**
+ * Conditionally lift the pause (compare-and-delete): the marker is removed only
+ * while its pausedAt still equals `expectedPausedAt` — a stale successful
+ * /health probe must never erase a NEWER pause set after the probe started.
+ * Pass 'any' for the unconditional manual-retry path. Returns whether the
+ * marker was removed.
+ */
+export async function clearV3UploadsPaused(
+  expectedPausedAt: number | 'any',
+): Promise<boolean> {
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const raw: unknown = await meta.get(V3_PAUSE_META_KEY);
+    if (raw === undefined) {
+      await tx.done;
+      return false;
+    }
+    if (expectedPausedAt !== 'any') {
+      const pausedAt = (typeof raw === 'object' && raw !== null)
+        ? (raw as { pausedAt?: unknown }).pausedAt
+        : undefined;
+      if (pausedAt !== expectedPausedAt) {
+        await tx.done;
+        return false; // a newer (or malformed) marker — leave it
+      }
+    }
+    await meta.delete(V3_PAUSE_META_KEY);
+    await tx.done;
+    return true;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
 }
 
 export async function setMeta(key: string, value: unknown): Promise<void> {
@@ -364,8 +463,39 @@ async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesM
 
 // ─── Reset ───────────────────────────────────────────────────────────
 
+// DB generation — the reset-exclusivity token (P1 review). Every background
+// flow that persists vault data (uploads, restore merges, poll transitions,
+// note saves) captures the generation when it starts and re-checks it
+// SYNCHRONOUSLY right before creating its write transaction. The two possible
+// interleavings are both clean:
+//  - the flow's check ran before the reset bumped the counter → the flow's
+//    transaction was also CREATED before the reset's clear transaction, and
+//    IndexedDB serializes readwrite transactions per store in creation order,
+//    so the clear wipes that write;
+//  - the reset bumped first → the check fails and the write is skipped.
+// There is no TOCTOU window between check and transaction creation: both are
+// synchronous in single-threaded JS. Cross-tab, the reset broadcasts a
+// 'reset' message and the receiving tab bumps its OWN generation
+// (noteExternalReset) — the residual window is broadcast delivery latency
+// only (milliseconds), instead of an entire in-flight upload.
+let dbGeneration = 0;
+
+export function getDbGeneration(): number {
+  return dbGeneration;
+}
+
+/** Another tab announced a destructive reset: invalidate every write this tab
+ *  might still commit for the vault that is being destroyed. */
+export function noteExternalReset(): void {
+  dbGeneration++;
+}
+
 /** Clear ALL IndexedDB data (notes, sync, meta). Used for app reset. */
 export async function resetAll(): Promise<void> {
+  // Bump FIRST: any generation check that runs after this line refuses to
+  // write; any write whose check passed earlier lost the transaction-order
+  // race and gets cleared below.
+  dbGeneration++;
   const database = getDB();
   const tx = database.transaction(['notes', 'sync', 'meta'], 'readwrite');
   await tx.objectStore('notes').clear();

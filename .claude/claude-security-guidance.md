@@ -22,6 +22,19 @@ violates one, even if it type-checks and tests pass.
 - v2 envelope hides the timestamp on-chain. Do not reintroduce a plaintext date
   (Timestamp tag / outer `t`) on the v2 path — that leaks metadata the envelope
   exists to protect. The inner `id` must be cross-checked against `noteId`.
+- v3 envelope (note versioning) keeps the chain metadata (`rev`, `root`, `prev`,
+  `fmt`) **inside the ciphertext** — never move any of it into tags or the outer
+  JSON (the version graph is private metadata). `decryptNote` dispatches on an
+  **explicit version switch** (absent/1, 2, 3) and rejects anything else — an
+  unknown `v` must never fall through to the v1 raw-text path.
+- **UUID namespace barrier**: v3 noteIds are UUID**v8** (`randomUuidV8`), v1/v2
+  are UUIDv4. The worker enforces the split per App-Version so a stale pre-v3
+  client tab re-serializing a shared-IndexedDB v3 record as v1 is rejected
+  (400) instead of permanently committing garbage ciphertext under the
+  per-noteId idempotency. Never relax either direction of this check.
+- Every note **version** gets a FRESH UUID (worker idempotency is permanent per
+  noteId — re-using an id can never produce a second transaction). The chain
+  identity is `root` inside the envelope, never the noteId.
 
 ## PIN unlock — typed errors gate the wipe (`src/lib/crypto.ts`)
 
@@ -67,7 +80,16 @@ violates one, even if it type-checks and tests pass.
   `Content-Length` alone. Auth endpoints cap at `AUTH_BODY_MAX_BYTES` (4 KB).
 - Tag/data validation is **strict and exact-key** per `App-Version`. Do not
   accept extra tags/fields — that's how a v2 payload could smuggle a Timestamp
-  and leak the date on-chain.
+  and leak the date on-chain. v3 is wire-identical to v2 (5 tags, `{id,c,iv}`)
+  plus the UUIDv8 Note-Id requirement; a new format means a NEW App-Version
+  with its own exact set, never a loosened existing one.
+- **v3 upload kill switch** (`V3_UPLOADS_ENABLED`): strictly `"true"` enables;
+  anything else fails CLOSED — v3 uploads (including reconciliation and
+  recovery hints) get `503 {code:'v3_uploads_disabled'}` after the IP limiter
+  but **before any per-owner RateLimiter DO call or Arweave POST**. Never move
+  the gate check after a DO call (`/check-and-reserve` mutates state even on a
+  lookup) and never respond 403 (the client treats 403 as not_registered and
+  drops its registration marker).
 
 ## Allowlist / revocation invariants (`worker/src/invite-manager.ts`)
 

@@ -247,3 +247,126 @@ describe('localStorage migration validation', () => {
     localStorage.removeItem('eternal-notes-encrypted');
   });
 });
+
+// ─── v3 pause meta + atomic quarantine helpers ──────────────────────
+
+import {
+  readV3PauseMeta,
+  commitV3PausedFailure,
+  clearV3UploadsPaused,
+  setSyncRecord,
+  getSyncRecord,
+  V3_PAUSE_META_KEY,
+} from './storage';
+
+describe('commitV3PausedFailure (atomic sync+meta)', () => {
+  it('a successful commit writes the SyncRecord AND the pause marker together', async () => {
+    const record: SyncRecord = {
+      noteId: 'p1', status: 'error', transport: 'proxy', updatedAt: 5,
+      lastError: 'v3_uploads_disabled',
+    };
+    await commitV3PausedFailure(record, 12345);
+    expect(await getSyncRecord('p1')).toEqual(record);
+    expect(await readV3PauseMeta()).toEqual({ pausedAt: 12345 });
+  });
+
+  it('preserves txId/recovery/needsRecheck fields on the committed record', async () => {
+    const record: SyncRecord = {
+      noteId: 'p2', txId: 'TX-KEEP', status: 'accepted', transport: 'proxy',
+      updatedAt: 5, needsRecheck: true,
+      recovery: { txId: 'TX-KEEP', postedAt: 1, token: 'tok' },
+    };
+    await commitV3PausedFailure(record, 1);
+    const stored = await getSyncRecord('p2');
+    expect(stored?.txId).toBe('TX-KEEP');
+    expect(stored?.needsRecheck).toBe(true);
+    expect(stored?.recovery).toEqual(record.recovery);
+  });
+
+  it('aborts BOTH writes when the record is invalid (rollback, no half-commit)', async () => {
+    // sync store keyPath is noteId — a record without it fails the first put.
+    const bad = { status: 'error', transport: 'proxy', updatedAt: 5 } as unknown as SyncRecord;
+    await expect(commitV3PausedFailure(bad, 777)).rejects.toBeDefined();
+    expect(await readV3PauseMeta()).toBeNull(); // pause marker NOT written
+  });
+});
+
+describe('readV3PauseMeta (fail-closed validation)', () => {
+  it('returns null when absent', async () => {
+    expect(await readV3PauseMeta()).toBeNull();
+  });
+
+  it('treats a malformed present value as paused-equivalent ("malformed")', async () => {
+    await setMeta(V3_PAUSE_META_KEY, 'garbage');
+    expect(await readV3PauseMeta()).toBe('malformed');
+    await setMeta(V3_PAUSE_META_KEY, { pausedAt: 'soon' });
+    expect(await readV3PauseMeta()).toBe('malformed');
+    await setMeta(V3_PAUSE_META_KEY, { pausedAt: -1 });
+    expect(await readV3PauseMeta()).toBe('malformed');
+  });
+});
+
+describe('clearV3UploadsPaused (compare-and-delete)', () => {
+  it('removes the marker only when pausedAt matches the expectation', async () => {
+    await setMeta(V3_PAUSE_META_KEY, { pausedAt: 100 });
+    expect(await clearV3UploadsPaused(999)).toBe(false); // stale probe — newer marker stays
+    expect(await readV3PauseMeta()).toEqual({ pausedAt: 100 });
+    expect(await clearV3UploadsPaused(100)).toBe(true);
+    expect(await readV3PauseMeta()).toBeNull();
+  });
+
+  it('a stale health probe cannot erase a NEWER pause set after the probe started', async () => {
+    await setMeta(V3_PAUSE_META_KEY, { pausedAt: 100 });
+    // health check started, saw pausedAt=100... meanwhile a new pause landed:
+    await setMeta(V3_PAUSE_META_KEY, { pausedAt: 200 });
+    expect(await clearV3UploadsPaused(100)).toBe(false);
+    expect(await readV3PauseMeta()).toEqual({ pausedAt: 200 });
+  });
+
+  it("'any' clears unconditionally (manual retry), including malformed markers", async () => {
+    await setMeta(V3_PAUSE_META_KEY, 'garbage');
+    expect(await clearV3UploadsPaused('any')).toBe(true);
+    expect(await readV3PauseMeta()).toBeNull();
+  });
+
+  it('returns false when there is no marker', async () => {
+    expect(await clearV3UploadsPaused('any')).toBe(false);
+  });
+});
+
+describe('SyncRecord.terminalError round-trip', () => {
+  it('persists the quarantine reason', async () => {
+    await setSyncRecord({
+      noteId: 'q1', status: 'error', transport: 'proxy', updatedAt: 1,
+      terminalError: 'unsupported_version',
+    });
+    expect((await getSyncRecord('q1'))?.terminalError).toBe('unsupported_version');
+  });
+});
+
+describe('v3 EncryptedNote round-trip', () => {
+  it('stores and merges a v3 record like any other version', async () => {
+    const note = { noteId: 'v3n', ciphertext: 'c', iv: 'iv', createdAt: 9, v: 3 as const };
+    await mergeRestoredNote(note, 'TX-V3', 10);
+    expect((await getNoteById('v3n'))?.v).toBe(3);
+    expect((await getSyncRecord('v3n'))?.status).toBe('confirmed');
+  });
+});
+
+// ─── DB generation (reset-exclusivity token, P1) ────────────────────
+
+import { getDbGeneration, noteExternalReset } from './storage';
+
+describe('dbGeneration', () => {
+  it('bumps on resetAll — a captured token from before the wipe goes stale', async () => {
+    const before = getDbGeneration();
+    await resetAll();
+    expect(getDbGeneration()).toBe(before + 1);
+  });
+
+  it('bumps on noteExternalReset (another tab announced the wipe)', () => {
+    const before = getDbGeneration();
+    noteExternalReset();
+    expect(getDbGeneration()).toBe(before + 1);
+  });
+});

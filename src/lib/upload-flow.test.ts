@@ -28,6 +28,8 @@ const ACCEPTED: UploadResult = { kind: 'accepted', txId: 'TX9', committed: true 
 interface Harness {
   deps: UploadAttemptDeps;
   writes: SyncRecord[];
+  /** Atomic sync+meta commits for the v3_disabled branch (record, pausedAt). */
+  pausedCommits: Array<{ record: SyncRecord; pausedAt: number }>;
   httpCalls: number;
   epoch: { value: number };
 }
@@ -44,7 +46,8 @@ function makeHarness(opts?: {
 }): Harness {
   const epoch = { value: 1 };
   const writes: SyncRecord[] = [];
-  const h: Harness = { deps: null as unknown as UploadAttemptDeps, writes, httpCalls: 0, epoch };
+  const pausedCommits: Array<{ record: SyncRecord; pausedAt: number }> = [];
+  const h: Harness = { deps: null as unknown as UploadAttemptDeps, writes, pausedCommits, httpCalls: 0, epoch };
   h.deps = {
     now: () => NOW,
     currentEpoch: () => epoch.value,
@@ -52,6 +55,9 @@ function makeHarness(opts?: {
     setSyncRecord: async record => {
       writes.push(record);
       if (record.status === 'uploading' && opts?.lockDuringToUploading) epoch.value++;
+    },
+    commitV3PausedFailure: async (record, pausedAt) => {
+      pausedCommits.push({ record, pausedAt });
     },
     signPayload: async () => {
       if (opts?.lockDuringSign) epoch.value++;
@@ -136,6 +142,44 @@ describe('runUploadAttempt — in_progress WITHOUT a prior record (round-5 #1)',
     expect(final.status).toBe('error');      // syncPendingNotes re-enqueues 'error'
     expect(final.status).not.toBe('uploading');
     expect(final.lastError).toBe('in_progress');
+  });
+});
+
+describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)', () => {
+  const V3_DISABLED: UploadResult = { kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}' };
+
+  it('commits the failure record + pause via commitV3PausedFailure, NOT setSyncRecord', async () => {
+    const h = makeHarness({ result: V3_DISABLED });
+    const outcome = await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    expect(outcome.kind).toBe('committed');
+    // Only the toUploading write went through setSyncRecord — the final record
+    // travelled through the atomic sync+meta path exactly once.
+    expect(h.writes.map(w => w.status)).toEqual(['uploading']);
+    expect(h.pausedCommits).toHaveLength(1);
+    expect(h.pausedCommits[0].pausedAt).toBe(NOW);
+    const rec = h.pausedCommits[0].record;
+    expect(rec.status).toBe('error');
+    expect(rec.lastError).toContain('v3_uploads_disabled');
+  });
+
+  it('preserves txId/recovery/needsRecheck from the prior record (afterFailure semantics)', async () => {
+    const prev: SyncRecord = {
+      noteId: 'note-1', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      updatedAt: NOW - 100_000, needsRecheck: true,
+      recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
+    };
+    const h = makeHarness({ prev, result: V3_DISABLED });
+    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    const rec = h.pausedCommits[0].record;
+    expect(rec.txId).toBe('TX-old');           // accepted TX never downgraded away
+    expect(rec.recovery).toEqual(prev.recovery); // recovery hint survives the pause
+    expect(rec.status).not.toBe('uploading');
+  });
+
+  it('persists even when a lock lands mid-dispatch (no epoch gate after the point of no return)', async () => {
+    const h = makeHarness({ lockDuringDispatch: true, result: V3_DISABLED });
+    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    expect(h.pausedCommits).toHaveLength(1); // pause not lost to the lock
   });
 });
 
