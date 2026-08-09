@@ -5,6 +5,10 @@ import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-libra
 // Component tests for the Phase-6 Main-screen behaviors the review called out:
 // TX link with auto-sync off, clipboard success/failure, search hotkey/Escape.
 
+// Writer-OFF (R3) UI matrix — flag pinned explicitly; the ON surface lives in
+// Main.v3.test.tsx. Keeps the W3 flip a pure one-line change.
+vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: false }));
+
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({
   useNotes: () => h.store,

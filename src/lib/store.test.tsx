@@ -9,6 +9,12 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // hand-off and the encrypted draft lifecycle — against REAL storage
 // (fake-indexeddb) and real crypto, with only the network mocked.
 
+// This file IS the writer-OFF (R3) matrix — pin the flag explicitly instead of
+// inheriting whatever flags.ts currently ships, so the W3 flip stays a pure
+// one-line change and both matrices (here / store.v3-writer.test.tsx) keep
+// asserting their own half forever.
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false }));
+
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();
   return {
