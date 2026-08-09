@@ -15,10 +15,11 @@ export const MAX_NOTE_JSON_BYTES = 30_000;
 const encoder = new TextEncoder();
 
 /** Byte size of the text as it will actually be serialized inside the
- *  encrypted JSON envelope (UTF-8 of the JSON-escaped form, minus the two
- *  surrounding quotes). */
+ *  encrypted JSON envelope: the FULL `JSON.stringify(text)` in UTF-8,
+ *  surrounding quotes included — exactly the plan's contract (P3 review;
+ *  no `-2` quote discount, so a 30 001-byte serialization is rejected). */
 export function noteJsonByteLength(text: string): number {
-  return encoder.encode(JSON.stringify(text)).length - 2;
+  return encoder.encode(JSON.stringify(text)).length;
 }
 
 export function isNoteTooLong(text: string): boolean {

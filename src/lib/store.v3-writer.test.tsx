@@ -482,3 +482,30 @@ describe('W3: quarantine is counted separately from retryable errors (review fix
     });
   });
 });
+
+describe('W3: exclusive reset refuses a late v3 pause marker (P1)', () => {
+  it('a v3_disabled response arriving AFTER resetApp writes neither the marker nor a record', async () => {
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+    await setMeta('ar-enabled', true);
+
+    let resolveUpload!: (v: Awaited<ReturnType<typeof uploadViaProxy>>) => void;
+    vi.mocked(uploadViaProxy).mockImplementationOnce(
+      () => new Promise(r => { resolveUpload = r; }));
+
+    renderStore();
+    await openMain();
+    await act(async () => { await store.addNote('v3 заметка'); });
+    await waitFor(() => expect(vi.mocked(uploadViaProxy)).toHaveBeenCalledTimes(1));
+
+    await act(async () => { await store.resetApp(); });
+
+    await act(async () => {
+      resolveUpload({ kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}' });
+      await new Promise(r => setTimeout(r, 50));
+    });
+
+    // Neither the pause marker nor the failure record may haunt the next vault.
+    expect(await readV3PauseMeta()).toBeNull();
+    expect(await getAllSyncRecords()).toEqual([]);
+  });
+});

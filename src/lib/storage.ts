@@ -114,6 +114,7 @@ export function closeStorage(): void {
  * after the database was actually deleted and re-initialized.
  */
 export async function recoverStorage(opts: { onBlocked?: () => void } = {}): Promise<void> {
+  dbGeneration++; // destructive path — same reset-exclusivity token as resetAll
   try { db?.close(); } catch { /* already closed */ }
   db = null;
   initPromise = null;
@@ -462,8 +463,39 @@ async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesM
 
 // ─── Reset ───────────────────────────────────────────────────────────
 
+// DB generation — the reset-exclusivity token (P1 review). Every background
+// flow that persists vault data (uploads, restore merges, poll transitions,
+// note saves) captures the generation when it starts and re-checks it
+// SYNCHRONOUSLY right before creating its write transaction. The two possible
+// interleavings are both clean:
+//  - the flow's check ran before the reset bumped the counter → the flow's
+//    transaction was also CREATED before the reset's clear transaction, and
+//    IndexedDB serializes readwrite transactions per store in creation order,
+//    so the clear wipes that write;
+//  - the reset bumped first → the check fails and the write is skipped.
+// There is no TOCTOU window between check and transaction creation: both are
+// synchronous in single-threaded JS. Cross-tab, the reset broadcasts a
+// 'reset' message and the receiving tab bumps its OWN generation
+// (noteExternalReset) — the residual window is broadcast delivery latency
+// only (milliseconds), instead of an entire in-flight upload.
+let dbGeneration = 0;
+
+export function getDbGeneration(): number {
+  return dbGeneration;
+}
+
+/** Another tab announced a destructive reset: invalidate every write this tab
+ *  might still commit for the vault that is being destroyed. */
+export function noteExternalReset(): void {
+  dbGeneration++;
+}
+
 /** Clear ALL IndexedDB data (notes, sync, meta). Used for app reset. */
 export async function resetAll(): Promise<void> {
+  // Bump FIRST: any generation check that runs after this line refuses to
+  // write; any write whose check passed earlier lost the transaction-order
+  // race and gets cleared below.
+  dbGeneration++;
   const database = getDB();
   const tx = database.transaction(['notes', 'sync', 'meta'], 'readwrite');
   await tx.objectStore('notes').clear();

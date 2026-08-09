@@ -26,8 +26,9 @@ vi.mock('./crypto', async importOriginal => {
   const actual = await importOriginal<typeof import('./crypto')>();
   return {
     ...actual,
-    // Overridable per-test (wipe path) — defaults to the real implementation.
+    // Overridable per-test (wipe path / reset races) — default to the real impl.
     decryptWithPin: vi.fn(actual.decryptWithPin),
+    encrypt: vi.fn(actual.encrypt),
   };
 });
 
@@ -1065,5 +1066,108 @@ describe('R3 contract: writer OFF, reader always on', () => {
 
     expect(store.notes).toHaveLength(1); // alien skipped, no crash
     expect(store.arweave.resetRiskCount).toBe(2); // but still at risk on reset
+  });
+});
+
+// ─── Exclusive reset (P1): no write may land after «Удалить всё» ─────
+
+describe('exclusive reset — post-point-of-no-return persists are refused', () => {
+  it('an upload result arriving AFTER resetApp writes NO sync record into the wiped DB', async () => {
+    await setMeta('init', true);
+    await setMeta('ar-enabled', true);
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+
+    // The upload passes its point of no return, then hangs in HTTP.
+    // (The mock's call counter accumulates across this file — baseline it.)
+    const callsBefore = vi.mocked(uploadViaProxy).mock.calls.length;
+    const inFlight = deferred<UploadResult>();
+    vi.mocked(uploadViaProxy).mockImplementationOnce(() => inFlight.promise);
+
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.addNote('заметка'); });
+    await waitFor(() =>
+      expect(vi.mocked(uploadViaProxy).mock.calls.length).toBe(callsBefore + 1));
+
+    // «Удалить всё» while the request is still in flight.
+    await act(async () => { await store.resetApp(); });
+    expect(store.screen).toBe('landing');
+
+    // The response lands afterwards — its unconditional persist must be
+    // REFUSED by the generation guard, not written into the fresh DB.
+    await act(async () => {
+      inFlight.resolve({ kind: 'accepted', txId: 'TX-LATE', committed: true });
+      await new Promise(r => setTimeout(r, 50));
+    });
+
+    expect(await getAllSyncRecords()).toEqual([]);
+    expect(await getStoredNotes()).toEqual([]);
+  });
+
+  it('an addNote save racing resetApp rejects instead of resurrecting the note', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    // Pause addNote INSIDE encrypt — i.e. before its generation guard. In
+    // production there is no await between the guard and the write-transaction
+    // creation, so the only real race window is the awaits BEFORE the guard.
+    const { encrypt } = await import('./crypto');
+    const { encrypt: realEncrypt } = await vi.importActual<typeof import('./crypto')>('./crypto');
+    let releaseEncrypt!: () => void;
+    const gate = new Promise<void>(r => { releaseEncrypt = r; });
+    vi.mocked(encrypt).mockImplementationOnce(async (key, text) => {
+      await gate;
+      return realEncrypt(key, text);
+    });
+
+    let saveError: unknown = null;
+    let savePromise!: Promise<void>;
+    await act(async () => {
+      savePromise = store.addNote('гонка со сбросом').catch(e => { saveError = e; });
+      await new Promise(r => setTimeout(r, 10));
+    });
+    await act(async () => { await store.resetApp(); });
+    await act(async () => { releaseEncrypt(); await savePromise; });
+
+    // The note belongs to a destroyed vault: the save must fail loudly…
+    expect(saveError).toBeInstanceOf(Error);
+    expect(String(saveError)).toMatch(/сброшено/);
+    // …and nothing may exist in the fresh DB.
+    expect(await getStoredNotes()).toEqual([]);
+  });
+
+  it('resetApp broadcasts a reset message so other tabs invalidate their writes', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+    const { received } = listenOnChannel();
+
+    await act(async () => { await store.resetApp(); });
+    await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+
+    expect(received.some(m => m.type === 'reset')).toBe(true);
+  });
+
+  it('receiving a foreign reset locks this tab and bumps its DB generation', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    await openMain();
+
+    const { getDbGeneration } = await import('./storage');
+    const genBefore = getDbGeneration();
+    const { channel } = listenOnChannel();
+    await act(async () => {
+      channel.postMessage({ type: 'reset', originId: 'other-tab', messageId: crypto.randomUUID() });
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    expect(getDbGeneration()).toBe(genBefore + 1); // local writes invalidated
+    await waitFor(() => expect(store.screen).not.toBe('main')); // locked out
+    expect(store.mnemonic).toBeNull();
   });
 });

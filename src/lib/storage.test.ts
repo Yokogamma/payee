@@ -352,3 +352,21 @@ describe('v3 EncryptedNote round-trip', () => {
     expect((await getSyncRecord('v3n'))?.status).toBe('confirmed');
   });
 });
+
+// ─── DB generation (reset-exclusivity token, P1) ────────────────────
+
+import { getDbGeneration, noteExternalReset } from './storage';
+
+describe('dbGeneration', () => {
+  it('bumps on resetAll — a captured token from before the wipe goes stale', async () => {
+    const before = getDbGeneration();
+    await resetAll();
+    expect(getDbGeneration()).toBe(before + 1);
+  });
+
+  it('bumps on noteExternalReset (another tab announced the wipe)', () => {
+    const before = getDbGeneration();
+    noteExternalReset();
+    expect(getDbGeneration()).toBe(before + 1);
+  });
+});

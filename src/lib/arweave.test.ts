@@ -467,8 +467,9 @@ describe('buildUploadPayload v3 + fail-closed serialization (P0)', () => {
     const { deriveKey, generateMnemonic, encryptEnvelopeV3 } = await import('./crypto');
     const { MAX_NOTE_JSON_BYTES } = await import('./limits');
     const key = await deriveKey(generateMnemonic());
-    // Worst-case escaped text exactly at the limit: newlines double via JSON escaping.
-    const text = '\n'.repeat(MAX_NOTE_JSON_BYTES / 2);
+    // Worst-case escaped text exactly at the limit: newlines double via JSON
+    // escaping; the serialized form (quotes included) hits MAX exactly.
+    const text = '\n'.repeat((MAX_NOTE_JSON_BYTES - 2) / 2);
     const note = await encryptEnvelopeV3(key, text, { fmt: 'md', rev: 1 });
     const payload = buildUploadPayload(note, 'x'.repeat(44), Date.now(), true, {
       txId: 'T'.repeat(43), postedAt: Date.now(), token: 'k'.repeat(44),

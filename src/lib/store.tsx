@@ -70,6 +70,8 @@ import {
   clearPinConfigMeta,
   resetAll,
   recoverStorage,
+  getDbGeneration,
+  noteExternalReset,
   type SyncRecord,
 } from './storage';
 import { afterPoll, claimRestoredForUi } from './sync-transitions';
@@ -675,6 +677,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
       } else if (msg.type === 'config') {
         void reconcileLockScreen();
+      } else if (msg.type === 'reset') {
+        // Another tab is DESTROYING the shared DB. Invalidate every write this
+        // tab might still commit for the doomed vault (reset-exclusivity, P1),
+        // drop the per-tab draft ciphertext (it belonged to that vault), and
+        // lock. reconcileLockScreen (explicit — lockApp early-returns without
+        // a vault) downgrades a now-seedless PIN screen to seed entry.
+        noteExternalReset();
+        draftStoreRef.current?.clear();
+        lockApp({ broadcast: false });
+        void reconcileLockScreen();
       }
     };
     return () => {
@@ -684,7 +696,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function postVaultMessage(type: 'lock' | 'config') {
+  function postVaultMessage(type: 'lock' | 'config' | 'reset') {
     try {
       channelRef.current?.postMessage({ type, originId: tabIdRef.current, messageId: crypto.randomUUID() });
     } catch (err) {
@@ -1191,6 +1203,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const oh = ownerHashRef.current;
     const pk = publicKeyRef.current;
     const myEpoch = vaultEpochRef.current;
+    // Reset-exclusivity token (P1): a LOCK must still persist the committed
+    // result (epoch changes, generation doesn't), but a RESET must not let a
+    // post-point-of-no-return persist resurrect data in the wiped DB. The
+    // checks are synchronous right before each write — see storage.ts.
+    const myDbGen = getDbGeneration();
     if (!sk || !oh || !pk) return 'error';
 
     let outcome;
@@ -1203,8 +1220,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           now: () => Date.now(),
           currentEpoch: () => vaultEpochRef.current,
           getSyncRecord,
-          setSyncRecord,
-          commitV3PausedFailure,
+          setSyncRecord: async record => {
+            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
+            await setSyncRecord(record);
+          },
+          commitV3PausedFailure: async (record, pausedAt) => {
+            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
+            await commitV3PausedFailure(record, pausedAt);
+          },
           signPayload,
           uploadViaProxy,
         },
@@ -1226,6 +1249,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           recovery: prev?.recovery,
           terminalError: 'unsupported_version',
         };
+        if (getDbGeneration() !== myDbGen) return 'quarantined'; // reset won
         await setSyncRecord(quarantined);
         if (vaultEpochRef.current === myEpoch) await refreshSyncCounts(myEpoch);
         return 'quarantined'; // processQueue treats it as recoverable: shift + continue
@@ -1323,6 +1347,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!cryptoKeyRef.current) return; // locked — nothing to poll for
     if (!arweaveRef.current.enabled || !arweaveRef.current.online) return;
     const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration(); // reset-exclusivity token (P1)
 
     // Resume channel (а): while the v3 pause stands, each poll cycle probes the
     // strictly-validated /health. The marker is lifted ONLY via compare-and-
@@ -1370,6 +1395,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // unavailable → unchanged (gateway degradation).
       const next = afterPoll(record, status, now, TX_CONFIRM_THRESHOLD, TX_TIMEOUT_MS);
       if (next) {
+        if (getDbGeneration() !== myDbGen) return; // reset won — refuse the write
         await setSyncRecord(next);
         changed = true;
       }
@@ -1433,6 +1459,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const key = cryptoKeyRef.current;
     if (!key || !ownerHashRef.current) return;
     const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration(); // reset-exclusivity token (P1)
 
     // The sweep is abortable: lockApp() cancels every in-flight page/payload
     // fetch instead of letting them settle against a locked vault.
@@ -1472,6 +1499,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const updatedRoots = new Set<string>();
       for (const remote of remoteNotes) {
         if (vaultEpochRef.current !== myEpoch) return; // locked — stop merging
+        // A reset destroyed the vault this sweep belongs to: writing the merge
+        // would resurrect a note in the freshly-wiped DB (P1). The epoch check
+        // above catches it too (reset bumps both), but the generation check is
+        // the one whose synchronous placement right before the write closes
+        // the interleaving with resetAll's clear transaction.
+        if (getDbGeneration() !== myDbGen) return;
         // Upsert the note payload + confirmed sync state atomically. The
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
@@ -1547,6 +1580,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // re-published to React state behind the PIN screen.
     const key = cryptoKeyRef.current;
     const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration(); // reset-exclusivity token (P1)
     if (!readyRef.current || !key || !text.trim()) return;
     // Byte limit BEFORE anything is persisted: an over-limit note saved locally
     // would be permanently unsyncable (the worker body cap would 413 it).
@@ -1564,6 +1598,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const encrypted = V3_WRITER_ENABLED
         ? await encryptEnvelopeV3(key, text, { fmt: 'md', rev: 1 })
         : await encrypt(key, text.trim());
+      // A LOCK mid-save may proceed (ciphertext at rest is the point) — a
+      // RESET may not: the vault this note belongs to is being destroyed, and
+      // the save would resurrect data in the wiped DB. Throw (not return):
+      // a silent resolve would flash «Сохранено» for a destroyed note.
+      if (getDbGeneration() !== myDbGen) {
+        throw new Error('Приложение было сброшено — заметка не сохранена.');
+      }
       await saveNote(encrypted);
 
       // Locked mid-save: the note is safe on disk (ciphertext at rest) and the
@@ -1609,6 +1650,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!V3_WRITER_ENABLED) throw new WriterDisabledError();
     const key = cryptoKeyRef.current;
     const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration(); // reset-exclusivity token (P1)
     if (!readyRef.current || !key || !newText.trim()) return;
     if (isNoteTooLong(newText)) throw new NoteTooLongError(noteJsonByteLength(newText));
 
@@ -1632,6 +1674,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         root: rootId,
         prev: current.id,
       });
+      // Same reset gate as addNote: never write a version into a wiped DB.
+      if (getDbGeneration() !== myDbGen) {
+        throw new Error('Приложение было сброшено — версия не сохранена.');
+      }
       await saveNote(encrypted);
 
       if (vaultEpochRef.current !== myEpoch) return;
@@ -1734,25 +1780,34 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const showMnemonic = useCallback(() => mnemonic, [mnemonic]);
 
   const resetApp = useCallback(async () => {
+    // EXCLUSIVE RESET (P1 review). Order matters:
     // 1. Invalidate every in-flight flow exactly like a lock would — INCLUDING
     //    the lifecycle generation and the privacy gate (round 4): a return-
     //    verdict pending across the reset would otherwise abandon itself via
     //    the epoch check and leave its gate covering the landing screen forever.
-    //    BEFORE the wipe (re-review): with the old order an upload could still
-    //    pass its point of no return DURING resetAll() and then persist its
-    //    result — e.g. a v3_disabled pause marker — into the freshly-emptied
-    //    DB, haunting the NEXT vault. The bump cancels every pre-PONR attempt;
-    //    the residual window (an attempt already past its PONR when reset is
-    //    confirmed) is the same pre-existing one every post-PONR persist has.
     invalidateVaultLifecycle();
 
-    // 2. IndexedDB — all stores
-    await resetAll();
-
-    // 3. In-memory refs/state + session (shared with lockApp)
+    // 2. In-memory refs/state + session FIRST (shared with lockApp): empties
+    //    the upload queue so the processor stops after its current item.
     clearVaultState();
 
-    // 4. Unlike a lock, a RESET destroys the draft ciphertext too (§2): it
+    // 3. Tell the OTHER tabs before wiping: each receiver bumps its own DB
+    //    generation (noteExternalReset) so its in-flight persists — including
+    //    a post-point-of-no-return upload result or a v3 pause marker —
+    //    refuse to write into the DB we are about to destroy. Residual
+    //    cross-tab window = broadcast delivery latency (ms), not a whole HTTP
+    //    round-trip.
+    postVaultMessage('reset');
+
+    // 4. IndexedDB — all stores. resetAll() bumps THIS tab's DB generation
+    //    first, so every local generation-guarded write (upload results,
+    //    restore merges, poll transitions, note saves) is either refused
+    //    (checked after the bump) or wiped (its transaction was created
+    //    before the clear — IndexedDB serializes readwrite tx per store in
+    //    creation order). Nothing can reappear after «Удалить всё».
+    await resetAll();
+
+    // 5. Unlike a lock, a RESET destroys the draft ciphertext too (§2): it
     //    belonged to the vault being destroyed and would otherwise resurface
     //    inside the NEXT vault opened in this tab.
     draftStoreRef.current!.clear();
@@ -1760,7 +1815,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     applyHasPin(false);
     applyAutoLockTimeout(null);
 
-    // 5. Redirect
+    // 6. Redirect
     setScreen('landing');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
