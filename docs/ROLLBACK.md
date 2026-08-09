@@ -88,10 +88,16 @@ sequence): **Worker v3-acceptor → R3 → W3.**
    (worker-r2) — order Worker → R3 held.
 3. **W3 client** (tag `client-w3`): flips `V3_WRITER_ENABLED` only — no other
    code. **Mandatory preconditions:** production `/health` shows
-   `versions:['1','2','3']` and `v3Uploads:true`; the **staging signed v3
-   smoke passed** (`npm --prefix worker run smoke:v3` against the staging env —
-   see `worker/wrangler.toml [env.staging]` prerequisites); the real worker
-   floor tag/SHA is recorded below. A production paid smoke is optional.
+   `versions:['1','2','3']` and `v3Uploads:true`; a **signed v3 upload smoke
+   passed** (`npm --prefix worker run smoke:v3`) — against staging, or against
+   PRODUCTION when there are no users yet (it posts one real, tiny paid
+   transaction); the real worker floor tag/SHA is recorded below.
+   **DEPLOYED 2026-08-09** (tag `client-w3` = 9107811). Preconditions met the
+   same day: prod `/health` verified; production smoke passed — upload
+   accepted (`8bldiJx5cf…`), repeat returned the SAME txId with no second paid
+   POST, and a v1 upload carrying a UUIDv8 Note-Id was rejected 400.
+   Shipped bundle verified to contain the writer UI. Users existed: none.
+   **From this point the rollback floors below are binding.**
 
 ### v3 upload kill switch (`V3_UPLOADS_ENABLED`)
 
