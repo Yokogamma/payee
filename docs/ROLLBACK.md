@@ -83,6 +83,9 @@ sequence): **Worker v3-acceptor → R3 → W3.**
    render always active — R3 must correctly display v3 data after a W3
    rollback), WRITES v1 (`V3_WRITER_ENABLED=false`; edit/history/Markdown
    composer hidden, `editNote` throws in the store).
+   **DEPLOYED 2026-08-09** (tag `client-r3` = cd7524e) on notes.matamata.dev;
+   smoke-headers + CSP verified. Worker deployed first the same day
+   (worker-r2) — order Worker → R3 held.
 3. **W3 client** (tag `client-w3`): flips `V3_WRITER_ENABLED` only — no other
    code. **Mandatory preconditions:** production `/health` shows
    `versions:['1','2','3']` and `v3Uploads:true`; the **staging signed v3
@@ -150,6 +153,10 @@ retry).
   - Allowed release tags (append on each deploy):
     - worker-r1 — 15b87d4cacbc19a3371a19b9141f1562b63781d8 (2026-07-23, first
       production worker deploy; recovery-protocol writer)
+    - worker-r2 — cd7524e (2026-08-09, v3-acceptor: App-Version=3, UUIDv8
+      namespace barrier, V3_UPLOADS_ENABLED kill switch, /health capability;
+      prod /health verified: {ok, versions:[1,2,3], v3Uploads:true}).
+      **Becomes the worker rollback floor the moment W3 ships.**
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
