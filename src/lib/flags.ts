@@ -19,4 +19,4 @@
  * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
  * branch into unreachable dead code under TS narrowing.
  */
-export const V3_WRITER_ENABLED: boolean = false;
+export const V3_WRITER_ENABLED: boolean = true;
