@@ -182,15 +182,15 @@ describe('Main W3 — history + restore-version flow', () => {
 
     // Expand the OLD version → restore button appears.
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Восстановить эту версию'));
+    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
 
     // Modal-stack: history replaced by the confirm — still exactly ONE dialog.
     const dialogs = screen.getAllByRole('dialog');
     expect(dialogs).toHaveLength(1);
-    expect(dialogs[0].getAttribute('aria-label')).toBe('Восстановить версию?');
+    expect(dialogs[0].getAttribute('aria-label')).toBe('Вернуть эту версию?');
 
     // Confirm: editNote is called with the OLD text AND its original fmt.
-    fireEvent.click(screen.getByText('Восстановить'));
+    fireEvent.click(screen.getByText('Вернуть'));
     await waitFor(() =>
       expect(s.editNote).toHaveBeenCalledWith('root1', 'исходный текст', { fmt: 'plain' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
@@ -201,7 +201,7 @@ describe('Main W3 — history + restore-version flow', () => {
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('🕓 История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Восстановить эту версию'));
+    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
     fireEvent.click(screen.getByText('Отмена'));
 
     // History back, one dialog, the old-version row focused + expanded.
@@ -220,11 +220,11 @@ describe('Main W3 — history + restore-version flow', () => {
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('🕓 История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Восстановить эту версию'));
-    fireEvent.click(screen.getByText('Восстановить'));
+    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть'));
 
-    expect(await screen.findByText(/Не удалось восстановить версию/)).toBeTruthy();
-    expect(screen.getByRole('dialog', { name: 'Восстановить версию?' })).toBeTruthy();
+    expect(await screen.findByText(/Не удалось вернуть версию/)).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: 'Вернуть эту версию?' })).toBeTruthy();
   });
 
   it('the updated immutability hint mentions versions', () => {
@@ -253,5 +253,20 @@ describe('Main W3 — edit buffer survives background chain rebuilds (review reg
     const after = screen.getByRole('dialog', { name: 'Редактирование заметки' })
       .querySelector('.note-input') as HTMLTextAreaElement;
     expect(after.value).toBe('несохранённый черновик правки'); // edit preserved
+  });
+});
+
+describe('Main W3 — Ctrl+Enter works in preview mode (review fix)', () => {
+  it('submits from the preview surface where the textarea is unmounted', async () => {
+    const s = h.store as ReturnType<typeof makeStore>;
+    render(<Main />);
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'из превью' } });
+    fireEvent.click(screen.getByText('Превью'));
+    expect(document.querySelector('.note-input')).toBeNull(); // textarea gone
+
+    const preview = document.querySelector('.composer-preview') as HTMLElement;
+    fireEvent.keyDown(preview, { key: 'Enter', ctrlKey: true });
+    await waitFor(() => expect(s.addNote).toHaveBeenCalledWith('из превью'));
   });
 });

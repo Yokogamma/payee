@@ -91,7 +91,10 @@ export function NoteComposer({
   }
 
   return (
-    <div className="note-composer">
+    // Ctrl/Cmd+Enter lives on the WRAPPER, not the textarea: in preview mode
+    // the textarea is unmounted (focus sits on the toggle button), yet the
+    // hint still promises the shortcut and the save button is live.
+    <div className="note-composer" onKeyDown={handleKeyDown}>
       {markdown && (
         <div className="composer-toolbar" role="toolbar" aria-label="Форматирование">
           {TOOLBAR.map(({ format, label, title }) => (
@@ -132,7 +135,6 @@ export function NoteComposer({
           placeholder={placeholder}
           value={value}
           onChange={e => onChange(e.target.value)}
-          onKeyDown={handleKeyDown}
           rows={Math.min(value.split('\n').length + 1, 8)}
           autoFocus={autoFocus}
         />

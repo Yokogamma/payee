@@ -119,6 +119,11 @@ export interface ArweaveState {
   errorCount: number;
   acceptedCount: number;
   confirmedCount: number;
+  /** Permanently-quarantined records (SyncRecord.terminalError) — NOT part of
+   *  errorCount: no retry can ever fix them (e.g. a record written by a newer
+   *  app version). Settings shows a dedicated explainer instead of a lying
+   *  «Ошибки: N — Повторить». */
+  quarantinedCount: number;
   /** STORAGE-BACKED reset risk: all EncryptedNote records minus confirmed ones.
    *  The reset dialog must use THIS, not the visible `notes` — an invisible
    *  quarantined/undecryptable record would otherwise let «всё подтверждено»
@@ -138,6 +143,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   errorCount: 0,
   acceptedCount: 0,
   confirmedCount: 0,
+  quarantinedCount: 0,
   resetRiskCount: 0,
   lastSync: null,
   lastError: null,
@@ -990,10 +996,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const allSync = await getAllSyncRecords();
     if (vaultEpochRef.current !== epoch) return; // stale — never touch the UI
 
-    let accepted = 0, confirmed = 0, errors = 0;
+    // terminalError (permanent quarantine) is counted SEPARATELY from errors:
+    // «Ошибки: N» implies «Повторить» can fix it, but the retry paths skip
+    // quarantined records by design — showing them as retryable errors would
+    // be a lie the user can never resolve. They still count in resetRiskCount.
+    let accepted = 0, confirmed = 0, errors = 0, quarantined = 0;
     for (const r of allSync) {
       if (r.status === 'accepted') accepted++;
       else if (r.status === 'confirmed') confirmed++;
+      else if (r.terminalError !== undefined) quarantined++;
       else if (r.status === 'error') errors++;
     }
 
@@ -1019,6 +1030,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       unsyncedCount: unsynced,
       countsReady: true,
       errorCount: errors,
+      quarantinedCount: quarantined,
       resetRiskCount: resetRisk,
     }));
   }
@@ -1244,13 +1256,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       } else if (result.kind === 'v3_disabled') {
         // The worker's kill switch answered: the pause marker is already
         // persisted (atomically with the failure record, in upload-flow).
-        // Mirror it to the UI with the dedicated standing message — NOT the
-        // generic error path, and NEVER markUnregistered.
+        // The STANDING pause banner (v3Paused) is the only UI surface —
+        // deliberately NOT lastError: that toast's «Повторить» (retrySync)
+        // cannot lift the pause, so it would sit next to the banner's working
+        // «Возобновить» as a contradicting dead control. NEVER markUnregistered.
         setV3Paused(true);
-        setArweave(prev => ({
-          ...prev,
-          lastError: 'Загрузка новых версий заметок временно отключена на сервере. Заметка сохранена локально и будет загружена позже.',
-        }));
       } else {
         // L13: a clock-skew rejection looks like a permanent mystery to the
         // user — surface the actionable «проверьте время» toast.
@@ -1333,6 +1343,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
             kickQueue();
           }
         }
+      } else {
+        // The marker is GONE (another tab's /health probe or manual resume
+        // lifted it). Without this branch the local banner would claim a
+        // pause forever while this tab's uploads actually work.
+        setV3Paused(false);
       }
     } catch (err) {
       console.error('v3 pause resume probe failed:', err);
@@ -1719,14 +1734,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const showMnemonic = useCallback(() => mnemonic, [mnemonic]);
 
   const resetApp = useCallback(async () => {
-    // 1. IndexedDB — all stores
-    await resetAll();
-
-    // 2. Invalidate every in-flight flow exactly like a lock would — INCLUDING
+    // 1. Invalidate every in-flight flow exactly like a lock would — INCLUDING
     //    the lifecycle generation and the privacy gate (round 4): a return-
     //    verdict pending across the reset would otherwise abandon itself via
     //    the epoch check and leave its gate covering the landing screen forever.
+    //    BEFORE the wipe (re-review): with the old order an upload could still
+    //    pass its point of no return DURING resetAll() and then persist its
+    //    result — e.g. a v3_disabled pause marker — into the freshly-emptied
+    //    DB, haunting the NEXT vault. The bump cancels every pre-PONR attempt;
+    //    the residual window (an attempt already past its PONR when reset is
+    //    confirmed) is the same pre-existing one every post-PONR persist has.
     invalidateVaultLifecycle();
+
+    // 2. IndexedDB — all stores
+    await resetAll();
 
     // 3. In-memory refs/state + session (shared with lockApp)
     clearVaultState();

@@ -427,3 +427,58 @@ describe('W3: unsupported-version quarantine in the queue', () => {
     }
   });
 });
+
+describe('W3: stale pause banner clears when another tab lifted the marker (review fix)', () => {
+  it('a poll cycle that finds NO marker drops the local v3Paused mirror', async () => {
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+    await setMeta('ar-enabled', true);
+    renderStore();
+    await openMain();
+
+    // Pause this tab via a real v3_disabled round-trip.
+    vi.mocked(uploadViaProxy).mockResolvedValue({
+      kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}',
+    });
+    await act(async () => { await store.addNote('нота'); });
+    await act(async () => { await store.retrySync(); });
+    await waitFor(() => expect(store.v3Paused).toBe(true));
+
+    // Another tab resumed: the shared marker is gone, our mirror is stale.
+    const { clearV3UploadsPaused } = await import('./storage');
+    await clearV3UploadsPaused('any');
+    vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'accepted', txId: 'TX-OK', committed: true });
+
+    // Next poll cycle (visibility return) must clear the stale banner.
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await new Promise(r => setTimeout(r, 50));
+    });
+    await waitFor(() => expect(store.v3Paused).toBe(false));
+  });
+});
+
+describe('W3: quarantine is counted separately from retryable errors (review fix)', () => {
+  it('a terminalError record lands in quarantinedCount, NOT errorCount', async () => {
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+    await setMeta('ar-enabled', true);
+    renderStore();
+    await openMain();
+
+    const key = await deriveKey(MN);
+    const future = { ...(await encryptEnvelopeV3(key, 'из будущего', { fmt: 'md', rev: 1 })), v: 4 };
+    await saveNote(future as unknown as EncryptedNote);
+
+    vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'accepted', txId: 'TX-OK', committed: true });
+    await act(async () => { await store.retrySync(); });
+
+    await waitFor(async () => {
+      const rec = await getSyncRecord(future.noteId);
+      expect(rec?.terminalError).toBe('unsupported_version');
+    });
+    await waitFor(() => {
+      expect(store.arweave.quarantinedCount).toBe(1);
+      expect(store.arweave.errorCount).toBe(0); // not a lying «Повторить» error
+      expect(store.arweave.resetRiskCount).toBeGreaterThanOrEqual(1); // still at risk
+    });
+  });
+});

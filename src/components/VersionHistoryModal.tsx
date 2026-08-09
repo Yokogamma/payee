@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useModalA11y } from '../lib/useModalA11y';
 import { NoteMarkdown } from './NoteMarkdown';
 import { badgeFor } from './syncBadge';
-import { OperationInFlightError, type NoteSyncInfo } from '../lib/store';
-import { NoteTooLongError } from '../lib/limits';
+import { type NoteSyncInfo } from '../lib/store';
+import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
 
@@ -124,7 +124,9 @@ export function VersionHistoryModal({
                         className="btn btn-ghost history-restore-btn"
                         onClick={() => onRequestRestore(version)}
                       >
-                        ↩️ Восстановить эту версию
+                        {/* «Вернуть», не «Восстановить» — восстановление в
+                            продукте уже значит restore-по-seed из блокчейна. */}
+                        ↩️ Вернуть эту версию
                       </button>
                     )}
                   </div>
@@ -135,8 +137,8 @@ export function VersionHistoryModal({
         </div>
 
         <p className="modal-note">
-          Каждая версия навсегда сохранена в блокчейне. Восстановление старой
-          версии создаёт новую версию с её текстом.
+          Каждая версия навсегда сохранена в блокчейне. Возврат старой версии
+          создаёт новую версию с её текстом.
         </p>
       </div>
     </div>
@@ -189,14 +191,12 @@ export function RestoreVersionDialog({ open, version, onConfirm, onCancel }: Res
     try {
       await onConfirm();
     } catch (err) {
-      if (err instanceof OperationInFlightError) {
-        setError('Эта заметка уже сохраняется — подождите.');
-      } else if (err instanceof NoteTooLongError) {
-        setError('Версия слишком длинная для текущего лимита.');
-      } else {
-        console.error('restore version failed:', err);
-        setError('Не удалось восстановить версию. Попробуйте ещё раз.');
-      }
+      const outcome = classifySaveError(err, SAVE_FALLBACK.restore);
+      // This dialog STAYS OPEN, so in_flight gets a gentle wait notice here
+      // (unlike the composer surfaces, where silence is the right answer).
+      setError(outcome.kind === 'in_flight'
+        ? 'Эта заметка уже сохраняется — подождите.'
+        : outcome.text);
       setPending(false);
     }
     // Success: the parent closes this dialog (and moves focus) itself.
@@ -209,10 +209,10 @@ export function RestoreVersionDialog({ open, version, onConfirm, onCancel }: Res
         className="modal confirm-dialog"
         role="dialog"
         aria-modal="true"
-        aria-label="Восстановить версию?"
+        aria-label="Вернуть эту версию?"
         onClick={e => e.stopPropagation()}
       >
-        <h2>Восстановить эту версию?</h2>
+        <h2>Вернуть эту версию?</h2>
         <p className="confirm-message">
           Текст выбранной версии станет новой (текущей) версией заметки.
           История не изменится — все версии сохранятся.
@@ -223,7 +223,7 @@ export function RestoreVersionDialog({ open, version, onConfirm, onCancel }: Res
             Отмена
           </button>
           <button className="btn btn-primary" onClick={() => void handleConfirm()} disabled={pending}>
-            {pending ? '...' : 'Восстановить'}
+            {pending ? '...' : 'Вернуть'}
           </button>
         </div>
       </div>

@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { useModalA11y } from '../lib/useModalA11y';
 import { NoteComposer } from './NoteComposer';
-import { OperationInFlightError } from '../lib/store';
-import { NoteTooLongError } from '../lib/limits';
+import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
 
 /**
@@ -51,15 +50,9 @@ export function EditNoteModal({ open, chain, onClose, onSave }: EditNoteModalPro
     try {
       await onSave(chain.root, text);
     } catch (err) {
-      // A double submit raced ahead of the disabled button: the FIRST call is
-      // still running and owns the outcome — change nothing, claim nothing.
-      if (err instanceof OperationInFlightError) return;
-      if (err instanceof NoteTooLongError) {
-        setError('Заметка слишком длинная — сократите текст.');
-      } else {
-        console.error('edit save failed:', err);
-        setError('Не удалось сохранить версию. Попробуйте ещё раз.');
-      }
+      const outcome = classifySaveError(err, SAVE_FALLBACK.edit);
+      // in_flight: the first submit owns the outcome — change nothing.
+      if (outcome.kind === 'message') setError(outcome.text);
       return; // text stays, modal stays
     } finally {
       setBusy(false);

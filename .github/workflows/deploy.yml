@@ -32,6 +32,8 @@ jobs:
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck
       - run: npm --prefix worker test
+      # Staging config gate — see deploy-pages-cf.yml.
+      - run: npm --prefix worker run deploy:staging:check
       # ── Build (base=/payee/ default; postbuild stamps SW hash + writes _headers) ──
       - run: npm run build
         env:
@@ -39,6 +41,8 @@ jobs:
           VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
           # SW updates are driven by Workbox content-hash revisions — no
           # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
+      # Bundle budget gate (see scripts/check-bundle-budget.mjs).
+      - run: node scripts/check-bundle-budget.mjs
       # GitHub Pages has no _redirects support → SPA fallback via 404.html.
       - run: cp dist/index.html dist/404.html
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3

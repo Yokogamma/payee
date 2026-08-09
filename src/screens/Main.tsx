@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNotes, OperationInFlightError } from '../lib/store';
+import { useNotes } from '../lib/store';
+import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsModal } from '../components/SettingsModal';
 import { NoteComposer } from '../components/NoteComposer';
@@ -8,7 +9,6 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { badgeFor } from '../components/syncBadge';
 import { V3_WRITER_ENABLED } from '../lib/flags';
-import { NoteTooLongError } from '../lib/limits';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
@@ -138,18 +138,11 @@ export function Main() {
     try {
       await addNote(text);
     } catch (err) {
-      // A double submit raced past the disabled button: the FIRST call owns the
-      // outcome. Do NOT clear the text and do NOT show an error — the first
-      // save's resolution does both correctly.
-      if (err instanceof OperationInFlightError) return;
-      if (err instanceof NoteTooLongError) {
-        setSaveError('Заметка слишком длинная — сократите текст (лимит ~30 000 байт).');
-        return;
-      }
-      // Persistence failed (quota/broken DB) — the note is still in the input,
-      // never let it silently vanish.
-      console.error('save failed:', err);
-      setSaveError('Не удалось сохранить заметку. Попробуйте ещё раз.');
+      const outcome = classifySaveError(err, SAVE_FALLBACK.add);
+      // in_flight: a double submit raced past the disabled button — the FIRST
+      // call owns the outcome, change nothing. Otherwise the note is still in
+      // the input; show why and never let it silently vanish.
+      if (outcome.kind === 'message') setSaveError(outcome.text);
       return;
     }
     setText('');

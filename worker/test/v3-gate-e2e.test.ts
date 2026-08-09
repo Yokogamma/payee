@@ -1,7 +1,8 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { beforeAll, afterAll, afterEach, describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
 
 // Direct-dispatch suites (env-override) for the v3 upload kill switch and the
 // v3 committed-idempotency e2e. Same pattern as e2e-repost.test.ts: SELF gets
@@ -13,48 +14,7 @@ const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }
 type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
 
-interface OutboundRoute {
-  method: string;
-  url: RegExp;
-  status: number;
-  body: string;
-  times: number;
-  calls: number;
-}
-const outboundRoutes: OutboundRoute[] = [];
-
-function mockRoute(method: string, url: RegExp, status: number, body: string, times = 1): OutboundRoute {
-  const route: OutboundRoute = { method, url, status, body, times, calls: 0 };
-  outboundRoutes.push(route);
-  return route;
-}
-
-beforeAll(() => {
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = input instanceof Request ? input.url : String(input);
-    const method = ((input instanceof Request ? input.method : init?.method) ?? 'GET').toUpperCase();
-    const route = outboundRoutes.find(r => r.method === method && r.url.test(url) && r.calls < r.times);
-    if (!route) throw new Error(`unmocked or exhausted outbound fetch: ${method} ${url}`);
-    route.calls++;
-    return new Response(route.body, { status: route.status });
-  });
-});
-afterAll(() => vi.unstubAllGlobals());
-
-afterEach(() => {
-  const pending = outboundRoutes
-    .filter(r => r.calls !== r.times)
-    .map(r => `${r.method} ${r.url} (${r.calls}/${r.times})`);
-  outboundRoutes.length = 0;
-  expect(pending, `unconsumed outbound mocks: ${pending.join('; ')}`).toEqual([]);
-});
-
-function b64(bytes: Uint8Array): string {
-  let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s);
-}
-async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-}
+const { mockRoute } = setupOutboundMock();
 
 const C = 'AAAA';
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes

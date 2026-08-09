@@ -219,6 +219,14 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               {arweave.errorCount > 0 && (
                 <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
               )}
+              {arweave.quarantinedCount > 0 && (
+                // Permanent by design — deliberately NOT lumped into «Ошибки»:
+                // no «Повторить» can ever fix a quarantined record.
+                <div>
+                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — созданы
+                  более новой версией приложения; обновите приложение, чтобы загрузить их.
+                </div>
+              )}
               {arweave.lastSync && (
                 <div>Последняя синхронизация: {new Date(arweave.lastSync).toLocaleString('ru')}</div>
               )}

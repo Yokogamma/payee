@@ -41,6 +41,10 @@ jobs:
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck
       - run: npm --prefix worker test
+      # Staging config gate: --dry-run validates [env.staging] (bindings,
+      # migrations, vars) without auth — catches wrangler.toml drift before an
+      # operator hits it during the mandatory pre-W3 smoke.
+      - run: npm --prefix worker run deploy:staging:check
       # ── Build at ROOT base for Cloudflare Pages ──
       - run: npm run build
         env:
@@ -49,6 +53,9 @@ jobs:
           VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
           # SW updates are driven by Workbox content-hash revisions — no
           # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
+      # Bundle budget: fail before deploying if the gzipped JS quietly grew
+      # past the declared ceiling (see scripts/check-bundle-budget.mjs).
+      - run: node scripts/check-bundle-budget.mjs
       # ── Deploy ──
       - id: deploy
         uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
