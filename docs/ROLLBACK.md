@@ -177,6 +177,35 @@ Deploy order is **strictly worker-first**: **Worker v4-acceptor → R4 → W4.**
    other code. **Mandatory preconditions:** production `/health` shows
    `versions` containing `'4'` and `v4Uploads:true`; the signed v4 staging smoke
    passed; the v4-acceptor worker tag is recorded below as the floor.
+   **DEPLOYED 2026-08-12** (tag `client-w4` = c1346e4) on notes.matamata.dev,
+   run 31594140875 — all gates green, smoke-headers passed. All three
+   preconditions were met first: prod `/health` `v4Uploads:true`, the signed v4
+   smoke passed 8/8 against PRODUCTION (see `worker-r3` below), `worker-r3` was
+   already the recorded floor. The diff is literally one line in
+   `src/lib/flags.ts`.
+
+   Verified against the live site, as a brand-new user on a clean profile:
+   - the deployed bundle (`index-CMXYxCUh.js`) CONTAINS «+ Запись», «Вернуть
+     эту версию» and the password-generator strings — at R4 tree-shaking
+     removed them, so their presence is direct evidence the flag is `true` in
+     the artifact, not merely in the source;
+   - the header shows the **«Защищённый сейф» 🔐** button for a user with no
+     safebox data and no PIN — the `SAFEBOX_WRITER_ENABLED || … ` visibility
+     formula end to end (at R4 the same check found it absent);
+   - IndexedDB is at **version 2** with stores `meta/notes/safebox/sync`;
+   - CSP / `X-Frame-Options: DENY` / `nosniff` / `Referrer-Policy` intact.
+
+   ⚠️ **The update is prompt-gated, so W4 does NOT reach open clients on its
+   own.** Observed live: an already-loaded tab kept running R4 (no safebox
+   button) and only switched after «Обновить» in the update toast —
+   `registerType:'prompt'`, no unconditional `skipWaiting`. Expect a long tail
+   of R4 clients; that is by design, not a failed deploy.
+
+   NOT verified (deliberately, cost/side-effects): creating a real safebox
+   entry end-to-end from the UI. That path needs a registered account (an
+   invite) and posts a real paid v4 transaction. The v4 wire format itself is
+   covered by the signed smoke; what remains unexercised in production is the
+   client-side publish path (`publishUnlockedSafebox` → upload).
 
 ### v4 upload kill switch (`V4_UPLOADS_ENABLED`)
 
@@ -309,6 +338,16 @@ KV placeholder is still in `wrangler.toml`.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
+  **Client floor since 2026-08-12: `client-r4`** (f43e503) — never below it.
+  R4 raises IndexedDB to version 2 on first launch regardless of the writer
+  flag, and any device that has run R4 gets a `VersionError` on a client with
+  `DB_VERSION=1`. Rolling W4 → R4 is allowed and is the writer kill switch for
+  the safebox; rolling below R4 is not.
+  **A W4 → R4 rollback is gradual, exactly like W3 → R3**: already-loaded tabs
+  and installed PWAs keep running W4 until the user accepts the update prompt,
+  so they keep writing v4 locally and uploading. Observed live on the W4
+  deploy: an open tab stayed on R4 until «Обновить» was clicked. The immediate
+  server-side stop is `V4_UPLOADS_ENABLED=false`, not a Pages rollback.
 - **CORS:** if the Pages origin changes, update `ALLOWED_ORIGINS` in
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
   the new origin is allowed while a stranger origin is rejected.
