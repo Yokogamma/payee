@@ -1,0 +1,67 @@
+name: CI
+
+# Automatic quality gates. The three deploy workflows are workflow_dispatch-only,
+# so until this file existed the test suite ran ONLY when an operator dispatched a
+# deploy — i.e. a broken suite was discovered at deploy time, on the release path.
+# That is exactly how PR #23 landed a test that could not even be COLLECTED (a
+# shebang in the imported worker/scripts/derive-smoke-key.mjs; fixed in PR #24):
+# four tests vanished from the run and nobody saw it until a local gate run.
+#
+# This workflow runs the SAME gates as the deploys, minus everything that needs a
+# secret or touches infrastructure. It deploys nothing and holds no credentials.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege, matching the deploy workflows: read the code, nothing else.
+# No secrets are referenced anywhere below — see the note on `npm run build`.
+permissions:
+  contents: read
+
+# Superseded PR runs are pointless once a new commit is pushed; main is never
+# cancelled, so every commit on the default branch keeps a real status.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      # ── Client ──
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      # The typecheck half of `npm run build` (`tsc -b`, noEmit in both projects).
+      # The deploys get it for free inside the build; CI cannot run the build
+      # (see below), so the gate is invoked directly — it needs no secrets.
+      - run: npm run typecheck
+      # ── Worker ──
+      - run: npm --prefix worker ci
+      - run: npm --prefix worker run typecheck
+      - run: npm --prefix worker test
+      # Staging config gate: --dry-run validates [env.staging] (bindings,
+      # migrations, vars) without auth — catches wrangler.toml drift before an
+      # operator hits it during the mandatory pre-W3 smoke.
+      - run: npm --prefix worker run deploy:staging:check
+
+      # ── Deliberately NOT here: `npm run build` + scripts/check-bundle-budget.mjs ──
+      # The build is fail-closed on VITE_TRUSTED_OWNERS (vite.config.ts throws when
+      # it is empty), and the budget check needs the build's output, so both need a
+      # value CI cannot obtain honestly:
+      #   * repo secrets DO reach pull_request runs from branches of this repo, but
+      #     NOT fork PRs and NOT Dependabot PRs (those get the separate Dependabot
+      #     secret store) — and .github/dependabot.yml watches three ecosystems
+      #     weekly, so wiring secrets.VITE_TRUSTED_OWNERS here would paint every
+      #     Dependabot PR red for a missing secret rather than a real defect;
+      #   * a hard-coded placeholder owner would turn the fail-closed root-of-trust
+      #     gate green on a value that is not the production one — the invariant in
+      #     AGENTS.md exists precisely to stop that.
+      # Both gates stay where they can run truthfully: the deploy workflows, which
+      # already hold the secrets and run them before publishing.
