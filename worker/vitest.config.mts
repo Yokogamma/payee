@@ -31,7 +31,12 @@ export default defineConfig({
   ],
   test: {
     include: ['test/**/*.test.ts', 'src/**/*.test.ts'],
-    exclude: ['**/node_modules/**', 'test/e2e-repost.test.ts', 'test/v3-gate-e2e.test.ts'],
+    exclude: [
+      '**/node_modules/**',
+      'test/e2e-repost.test.ts',
+      'test/v3-gate-e2e.test.ts',
+      'test/v4-gate-e2e.test.ts',
+    ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that
     // survives a file boundary (the global InviteManager) then throws

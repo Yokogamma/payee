@@ -4,8 +4,8 @@ import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
 
-// Direct-dispatch suites (env-override) for the v3 upload kill switch and the
-// v3 committed-idempotency e2e. Same pattern as e2e-repost.test.ts: SELF gets
+// Direct-dispatch suite (env-override) for the v4 upload kill switch and the
+// v4 committed-idempotency e2e. Same pattern as v3-gate-e2e.test.ts: SELF gets
 // its own env copy, so gate/JWK overrides must go through worker.fetch directly.
 
 const ALLOWLIST = (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST;
@@ -16,7 +16,8 @@ const baseEnv = env as unknown as WorkerEnv;
 
 const { mockRoute } = setupOutboundMock();
 
-const C = 'AAAA';
+const MC = 'AAAAAAAA';
+const SC = 'BBBBBBBB';
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes
 
 function uuidV8(): string {
@@ -36,23 +37,22 @@ async function makeIdentity() {
   return { priv, pkB64, ownerHash };
 }
 
-async function v3Request(
+async function versionedRequest(
   id: { priv: Uint8Array; pkB64: string; ownerHash: string },
   noteId: string,
   ip: string,
-  version: '1' | '2' | '3' = '3',
+  version: '3' | '4' = '4',
 ): Promise<Request> {
   const tags = [
     { name: 'App-Name', value: 'EternalNotes' },
     { name: 'App-Version', value: version },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: id.ownerHash },
-    ...(version === '1' ? [{ name: 'Timestamp', value: '1700000000000' }] : []),
     { name: 'Note-Id', value: noteId },
   ];
-  const dataObj = version === '1'
-    ? { id: noteId, c: C, iv: IV, t: 1700000000000 }
-    : { id: noteId, c: C, iv: IV };
+  const dataObj = version === '4'
+    ? { id: noteId, mc: MC, miv: IV, sc: SC, siv: IV }
+    : { id: noteId, c: MC, iv: IV };
   const body = JSON.stringify({
     data: JSON.stringify(dataObj),
     tags,
@@ -67,36 +67,39 @@ async function v3Request(
   });
 }
 
-const nextIp = () => `v3g-${crypto.randomUUID().slice(0, 8)}`;
+const nextIp = () => `v4g-${crypto.randomUUID().slice(0, 8)}`;
 
-describe('/health capability surface', () => {
-  it('reports versions and the live gate state', async () => {
+describe('/health capability surface (v4)', () => {
+  it('reports v4 in versions and the live gate state, independently of v3', async () => {
     const rOn = await worker.fetch(new Request('https://proxy.example.com/health'), baseEnv);
-    const bOn = await rOn.json() as { ok: boolean; versions: string[]; v3Uploads: boolean };
+    const bOn = await rOn.json() as { ok: boolean; versions: string[]; v3Uploads: boolean; v4Uploads: boolean };
     expect(bOn.ok).toBe(true);
     expect(bOn.versions).toEqual(['1', '2', '3', '4']);
-    expect(bOn.v3Uploads).toBe(true); // wrangler.toml vars: V3_UPLOADS_ENABLED="true"
+    expect(bOn.v4Uploads).toBe(true); // wrangler.toml vars: V4_UPLOADS_ENABLED="true"
 
+    // The two switches are independent: v4 off must not read as v3 off.
     const rOff = await worker.fetch(
       new Request('https://proxy.example.com/health'),
-      { ...baseEnv, V3_UPLOADS_ENABLED: 'false' },
+      { ...baseEnv, V4_UPLOADS_ENABLED: 'false' },
     );
-    const bOff = await rOff.json() as { v3Uploads: boolean };
-    expect(bOff.v3Uploads).toBe(false);
+    const bOff = await rOff.json() as { versions: string[]; v3Uploads: boolean; v4Uploads: boolean };
+    expect(bOff.v4Uploads).toBe(false);
+    expect(bOff.v3Uploads).toBe(true);
+    // `versions` describes the ACCEPTOR and still contains '4' while the gate
+    // is off — a client that resumed on `versions` alone would burst uploads.
+    expect(bOff.versions).toContain('4');
   });
 });
 
-describe('v3 upload kill switch (V3_UPLOADS_ENABLED)', () => {
+describe('v4 upload kill switch (V4_UPLOADS_ENABLED)', () => {
   // No outbound routes are registered in these tests: any Arweave attempt would
   // throw in the post path and surface as 502 — a 503 with the machine code
   // proves the request never reached the paid path.
-  const gateOff = { ...baseEnv, V3_UPLOADS_ENABLED: 'false' };
+  const gateOff = { ...baseEnv, V4_UPLOADS_ENABLED: 'false' };
 
-  it('503s a valid signed v3 upload with the machine-readable code, before the per-owner DO', async () => {
+  it('503s a valid signed v4 upload with the machine-readable code, before the per-owner DO', async () => {
     const id = await makeIdentity();
-    const noteId = uuidV8();
 
-    // Counting per-owner RATE_LIMITER stub: the gate must fire BEFORE any call.
     let ownerDoCalls = 0;
     const countingLimiter = {
       idFromName: (name: string) => RATE_LIMITER.idFromName(name),
@@ -104,49 +107,47 @@ describe('v3 upload kill switch (V3_UPLOADS_ENABLED)', () => {
     } as unknown as DurableObjectNamespace;
 
     const r = await worker.fetch(
-      await v3Request(id, noteId, nextIp()),
+      await versionedRequest(id, uuidV8(), nextIp()),
       { ...gateOff, RATE_LIMITER: countingLimiter },
     );
     expect(r.status).toBe(503);
     expect(r.headers.get('Content-Type')).toBe('application/json');
     const body = await r.json() as { code: string };
-    expect(body.code).toBe('v3_uploads_disabled');
-    expect(ownerDoCalls).toBe(0); // one IP-limiter call happened; zero per-owner calls
+    expect(body.code).toBe('v4_uploads_disabled');
+    expect(ownerDoCalls).toBe(0);
   });
 
   it('fails CLOSED when the var is missing or garbage', async () => {
     const id = await makeIdentity();
     const missingEnv = { ...baseEnv } as Record<string, unknown>;
-    delete missingEnv.V3_UPLOADS_ENABLED;
+    delete missingEnv.V4_UPLOADS_ENABLED;
 
     const rMissing = await worker.fetch(
-      await v3Request(id, uuidV8(), nextIp()), missingEnv as WorkerEnv,
+      await versionedRequest(id, uuidV8(), nextIp()), missingEnv as WorkerEnv,
     );
     expect(rMissing.status).toBe(503);
-    expect(((await rMissing.json()) as { code: string }).code).toBe('v3_uploads_disabled');
+    expect(((await rMissing.json()) as { code: string }).code).toBe('v4_uploads_disabled');
 
     const rGarbage = await worker.fetch(
-      await v3Request(id, uuidV8(), nextIp()),
-      { ...baseEnv, V3_UPLOADS_ENABLED: 'yes' },
+      await versionedRequest(id, uuidV8(), nextIp()),
+      { ...baseEnv, V4_UPLOADS_ENABLED: 'yes' },
     );
     expect(rGarbage.status).toBe(503);
   });
 
-  it('pauses even committed/reserved reconciliation and recovery — full v3 pause', async () => {
+  it('pauses even committed reconciliation — the DO record stays untouched', async () => {
     const id = await makeIdentity();
     const noteId = uuidV8();
 
-    // Pre-existing committed record in the DO: the gate must still 503 and the
-    // record must stay untouched (no adoption/commit while disabled).
     const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
     const committedRecord = {
-      status: 'committed', txId: 'TX-COMMITTED', committedAt: Date.now() - 60 * 60_000, gen: 0,
+      status: 'committed', txId: 'TX-COMMITTED-V4', committedAt: Date.now() - 60 * 60_000, gen: 0,
     };
     await runInDurableObject(stub, async (_i, state) => {
       await state.storage.put(`note:${noteId}`, committedRecord);
     });
 
-    const r = await worker.fetch(await v3Request(id, noteId, nextIp()), gateOff);
+    const r = await worker.fetch(await versionedRequest(id, noteId, nextIp()), gateOff);
     expect(r.status).toBe(503);
 
     const rec = await runInDurableObject(stub, async (_i, state) =>
@@ -154,20 +155,27 @@ describe('v3 upload kill switch (V3_UPLOADS_ENABLED)', () => {
     expect(rec).toEqual(committedRecord);
   });
 
-  it('leaves v1 uploads untouched while the gate is off (502 at Arweave stub)', async () => {
+  it('leaves v3 uploads untouched while the v4 gate is off (502 at Arweave stub)', async () => {
     const id = await makeIdentity();
-    const v4Id = crypto.randomUUID();
-    const r = await worker.fetch(await v3Request(id, v4Id, nextIp(), '1'), gateOff);
-    expect(r.status).toBe(502); // passed validation + gate, failed at stub JWK
+    const r = await worker.fetch(await versionedRequest(id, uuidV8(), nextIp(), '3'), gateOff);
+    expect(r.status).toBe(502); // passed validation + gates, failed at stub JWK
+  });
+
+  it('leaves v4 uploads untouched while the V3 gate is off', async () => {
+    const id = await makeIdentity();
+    const r = await worker.fetch(
+      await versionedRequest(id, uuidV8(), nextIp(), '4'),
+      { ...baseEnv, V3_UPLOADS_ENABLED: 'false' },
+    );
+    expect(r.status).toBe(502);
   });
 });
 
-describe('v3 e2e idempotency (committed): exactly one paid POST', () => {
-  it('repeat upload of the same noteId returns the same txId without a second POST', async () => {
+describe('v4 e2e idempotency (committed): exactly one paid POST', () => {
+  it('repeat upload of the same entryId returns the same txId without a second POST', async () => {
     const id = await makeIdentity();
     const noteId = uuidV8();
 
-    // Real signable wallet so the post path runs end-to-end.
     const keyPair = await crypto.subtle.generateKey(
       { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
       true, ['sign', 'verify'],
@@ -179,22 +187,17 @@ describe('v3 e2e idempotency (committed): exactly one paid POST', () => {
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
     const postTx = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
 
-    const r1 = await worker.fetch(await v3Request(id, noteId, nextIp()), envWithJwk);
+    const r1 = await worker.fetch(await versionedRequest(id, noteId, nextIp()), envWithJwk);
     expect(r1.status).toBe(200);
     const b1 = await r1.json() as { txId: string; status: string; committed: boolean };
     expect(b1.status).toBe('accepted');
     expect(b1.committed).toBe(true);
-    expect(b1.txId).toBeTruthy();
 
-    // Second upload, same noteId: the public contract is the ORIGINAL response
-    // shape (accepted/committed:true, same txId) — 'exists' is DO-internal and
-    // never surfaces. No POST route is left, so a re-post would throw → 502.
-    const r2 = await worker.fetch(await v3Request(id, noteId, nextIp()), envWithJwk);
+    const r2 = await worker.fetch(await versionedRequest(id, noteId, nextIp()), envWithJwk);
     expect(r2.status).toBe(200);
-    const b2 = await r2.json() as { txId: string; status: string; committed: boolean };
-    expect(b2.status).toBe('accepted');
-    expect(b2.committed).toBe(true);
+    const b2 = await r2.json() as { txId: string; committed: boolean };
     expect(b2.txId).toBe(b1.txId);
+    expect(b2.committed).toBe(true);
 
     expect(postTx.calls).toBe(1); // the financial invariant
   });

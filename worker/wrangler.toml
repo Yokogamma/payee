@@ -41,6 +41,12 @@ RATE_LIMIT_PER_HOUR = "20"
 # restore the repo value). Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v3Uploads" matches the intended state.
 V3_UPLOADS_ENABLED = "true"
+# v4 (safebox) upload kill switch — SAME contract as V3_UPLOADS_ENABLED, on its
+# own switch so pausing one version never stops the other. Strictly "true"
+# enables; anything else fails CLOSED (503 {code:'v4_uploads_disabled'}).
+# Verify after EVERY worker deploy:
+#   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
+V4_UPLOADS_ENABLED = "true"
 
 # Secrets (via `wrangler secret put`):
 # ARWEAVE_JWK — server Arweave wallet (JSON string)
@@ -101,3 +107,4 @@ ALLOWED_ORIGINS = "http://localhost:5173"
 MAX_BODY_BYTES = "51200"
 RATE_LIMIT_PER_HOUR = "20"
 V3_UPLOADS_ENABLED = "true"
+V4_UPLOADS_ENABLED = "true"

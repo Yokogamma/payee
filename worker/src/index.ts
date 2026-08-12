@@ -38,6 +38,12 @@ interface Env {
    *  Source of truth: wrangler.toml (dashboard overrides are emergency-only
    *  and must be synced back to the repo immediately). */
   V3_UPLOADS_ENABLED?: string;
+  /** Upload kill switch for App-Version=4 (safebox entries). EXACT copy of the
+   *  v3 contract: strictly "true" enables; ANY other value (missing, garbage)
+   *  fails CLOSED — v4 uploads get 503 {code:'v4_uploads_disabled'} after the
+   *  IP limiter but BEFORE any per-owner RateLimiter DO call or Arweave POST.
+   *  v1/v2/v3 are unaffected. Source of truth: wrangler.toml. */
+  V4_UPLOADS_ENABLED?: string;
 }
 
 // ─── Per-IP baseline rate limit (D-baseline) ────────────────────────
@@ -79,10 +85,17 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   // Capability surface: lets clients (and the operator runbook) verify what the
   // deployed worker accepts WITHOUT a paid probe. `versions` = accepted
-  // App-Versions; `v3Uploads` mirrors the kill switch. Clients resume paused v3
-  // uploads only on ok===true && v3Uploads===true && versions includes '3'.
+  // App-Versions; `v3Uploads`/`v4Uploads` mirror the kill switches. Clients
+  // resume a paused version only on ok===true AND that version's flag===true
+  // AND versions includes it (the list describes the ACCEPTOR and still
+  // contains the version while its gate is off).
   if (url.pathname === '/health') {
-    return json({ ok: true, versions: ['1', '2', '3'], v3Uploads: v3UploadsEnabled(env) });
+    return json({
+      ok: true,
+      versions: ['1', '2', '3', '4'],
+      v3Uploads: v3UploadsEnabled(env),
+      v4Uploads: v4UploadsEnabled(env),
+    });
   }
 
   // Diagnostics only: lets an operator discover the proxy wallet address to pin
@@ -472,13 +485,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   //    v3: identical wire shape to v2 (5 tags, {id,c,iv}); the version-chain
   //        metadata lives INSIDE the encrypted envelope. Distinguished on-chain
   //        only by the App-Version tag and the UUIDv8 Note-Id namespace.
+  //    v4: safebox entry — same 5 tags, but a SPLIT-ENVELOPE data object
+  //        {id,mc,miv,sc,siv}: two independently-keyed ciphertexts (meta +
+  //        secret) in one record. UUIDv8 ids like v3.
   const declaredVersion = Array.isArray(tags)
     ? tags.find(t => t && t.name === 'App-Version')?.value
     : undefined;
-  if (declaredVersion !== '1' && declaredVersion !== '2' && declaredVersion !== '3') {
+  if (declaredVersion !== '1' && declaredVersion !== '2' &&
+      declaredVersion !== '3' && declaredVersion !== '4') {
     return error('Unsupported App-Version', 400);
   }
   const hasTimestamp = declaredVersion === '1';
+  const isSplitEnvelope = declaredVersion === '4';
 
   const REQUIRED_TAGS = new Map<string, string>([
     ['App-Name', 'EternalNotes'],
@@ -511,7 +529,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
 
   // 8. Parse data — must be a plain object (not null/array/primitive)
-  let parsedData: { id?: unknown; c?: unknown; iv?: unknown; t?: unknown };
+  let parsedData: {
+    id?: unknown; c?: unknown; iv?: unknown; t?: unknown;
+    mc?: unknown; miv?: unknown; sc?: unknown; siv?: unknown;
+  };
   try {
     parsedData = JSON.parse(data);
   } catch {
@@ -522,31 +543,54 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
 
   // 9. STRICT data schema — EXACT key set per version (no extra fields, so a
-  //    v2/v3 payload cannot smuggle a Timestamp/`t` and leak the date on-chain).
-  const allowedKeys = hasTimestamp ? ['id', 'c', 'iv', 't'] : ['id', 'c', 'iv'];
+  //    v2/v3 payload cannot smuggle a Timestamp/`t` and leak the date on-chain,
+  //    and a v4 record can never carry a single-envelope `c`/`iv` pair).
+  const allowedKeys = isSplitEnvelope
+    ? ['id', 'mc', 'miv', 'sc', 'siv']
+    : hasTimestamp ? ['id', 'c', 'iv', 't'] : ['id', 'c', 'iv'];
   const actualKeys = Object.keys(parsedData);
   if (actualKeys.length !== allowedKeys.length || actualKeys.some(k => !allowedKeys.includes(k))) {
     return error(`Invalid data fields: expected exactly [${allowedKeys.join(', ')}]`, 400);
   }
 
-  // id / c / iv: non-empty strings; c & iv valid base64; iv exactly 12 bytes.
-  if (typeof parsedData.id !== 'string' || typeof parsedData.c !== 'string' || typeof parsedData.iv !== 'string') {
-    return error('Invalid data structure: id, c, iv (strings) required', 400);
+  if (typeof parsedData.id !== 'string') {
+    return error('Invalid data structure: id (string) required', 400);
   }
-  if (parsedData.c.length === 0 || parsedData.iv.length === 0) {
-    return error('Invalid data: c and iv must be non-empty', 400);
-  }
-  let ivBytes: Uint8Array;
-  try {
-    ivBytes = base64ToBytes(parsedData.iv);
-    base64ToBytes(parsedData.c); // validate base64
-  } catch {
-    return error('Invalid data: c and iv must be base64', 400);
-  }
-  if (ivBytes.length !== 12) return error('Invalid data: iv must be 12 bytes', 400);
 
-  if (hasTimestamp && typeof parsedData.t !== 'number') {
-    return error('Invalid data structure: t (number) required for v1', 400);
+  /** ciphertext+iv pair: non-empty strings, valid base64, iv exactly 12 bytes. */
+  const checkEnvelope = (cName: string, cVal: unknown, ivName: string, ivVal: unknown): Response | null => {
+    if (typeof cVal !== 'string' || typeof ivVal !== 'string') {
+      return error(`Invalid data structure: ${cName}, ${ivName} (strings) required`, 400);
+    }
+    if (cVal.length === 0 || ivVal.length === 0) {
+      return error(`Invalid data: ${cName} and ${ivName} must be non-empty`, 400);
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = base64ToBytes(ivVal);
+      base64ToBytes(cVal); // validate base64
+    } catch {
+      return error(`Invalid data: ${cName} and ${ivName} must be base64`, 400);
+    }
+    if (bytes.length !== 12) return error(`Invalid data: ${ivName} must be 12 bytes`, 400);
+    return null;
+  };
+
+  if (isSplitEnvelope) {
+    // BOTH halves are validated identically — a v4 record with a well-formed
+    // meta blob and a garbage secret blob must never be posted (the client's
+    // restore rejects such a candidate wholesale, so it would be dead weight
+    // on-chain, permanently).
+    const metaBad = checkEnvelope('mc', parsedData.mc, 'miv', parsedData.miv);
+    if (metaBad) return metaBad;
+    const secretBad = checkEnvelope('sc', parsedData.sc, 'siv', parsedData.siv);
+    if (secretBad) return secretBad;
+  } else {
+    const bad = checkEnvelope('c', parsedData.c, 'iv', parsedData.iv);
+    if (bad) return bad;
+    if (hasTimestamp && typeof parsedData.t !== 'number') {
+      return error('Invalid data structure: t (number) required for v1', 400);
+    }
   }
 
   // Cross-check tags ↔ data
@@ -556,7 +600,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Timestamp mismatch', 400);
   }
 
-  // UUID namespace barrier (mixed-client protection): v3 note ids live in a
+  // UUID namespace barrier (mixed-client protection): v3/v4 ids live in a
   // DISJOINT namespace (UUIDv8) from v1/v2 (UUIDv4). A stale pre-v3 client tab
   // that reads a v3 record from shared IndexedDB and serializes it as v1 sends
   // a v8 id under App-Version=1 — rejected HERE, before the per-owner DO, so
@@ -565,7 +609,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const uuidMatch = uuidRegex.exec(parsedData.id);
   if (!uuidMatch) return error('Note-Id must be a valid UUID', 400);
   const uuidVersion = uuidMatch[1].toLowerCase();
-  const expectedUuidVersion = declaredVersion === '3' ? '8' : '4';
+  const expectedUuidVersion = (declaredVersion === '3' || declaredVersion === '4') ? '8' : '4';
   if (uuidVersion !== expectedUuidVersion) {
     return error(`Note-Id must be a UUIDv${expectedUuidVersion} for App-Version ${declaredVersion}`, 400);
   }
@@ -577,6 +621,16 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // mutates state even on a lookup, so no disabled branch may reach the DO.
   if (declaredVersion === '3' && !v3UploadsEnabled(env)) {
     return new Response(JSON.stringify({ code: 'v3_uploads_disabled' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Same contract for v4 (safebox), on its OWN switch: one version's pause must
+  // never stop the other. Deliberately 503 (never 403 — the client reads 403 as
+  // "not registered" and drops its registration marker).
+  if (declaredVersion === '4' && !v4UploadsEnabled(env)) {
+    return new Response(JSON.stringify({ code: 'v4_uploads_disabled' }), {
       status: 503,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -802,6 +856,12 @@ function isFreshTimestamp(ts: unknown): boolean {
  *  garbage value fails CLOSED (disabled). See Env.V3_UPLOADS_ENABLED. */
 function v3UploadsEnabled(env: Env): boolean {
   return env.V3_UPLOADS_ENABLED === 'true';
+}
+
+/** v4 (safebox) upload kill switch. STRICTLY "true" enables — a missing, empty,
+ *  or garbage value fails CLOSED (disabled). See Env.V4_UPLOADS_ENABLED. */
+function v4UploadsEnabled(env: Env): boolean {
+  return env.V4_UPLOADS_ENABLED === 'true';
 }
 
 /** Parse a required positive-integer config value. Returns null (→ fail closed,
