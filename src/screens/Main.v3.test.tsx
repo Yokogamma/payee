@@ -85,6 +85,8 @@ function makeStore(notes: NoteData[]) {
     restoredUpdatedCount: null,
     retryRestore: vi.fn(),
     clearRestoreStatus: vi.fn(),
+    updateCheck: { status: 'idle' as const },
+    checkForUpdates: vi.fn(),
     syncStatuses: {} as Record<string, { status: string; txId?: string }>,
     dismissError: vi.fn(),
     persistDraft: vi.fn(async () => {}),

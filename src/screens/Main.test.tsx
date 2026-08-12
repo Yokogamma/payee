@@ -97,6 +97,8 @@ function baseStore() {
     restoredUpdatedCount: null,
     retryRestore: vi.fn(),
     clearRestoreStatus: vi.fn(),
+    updateCheck: { status: 'idle' as const },
+    checkForUpdates: vi.fn(),
     syncStatuses: { n1: { status: 'confirmed' as const, txId: 'TX123' } },
     dismissError: vi.fn(),
     // encrypted-at-rest draft API (§2)
@@ -495,5 +497,55 @@ describe('Main — the safebox subtree is remounted on every lock', () => {
     // Remounted from scratch: no PIN and no seed word survives.
     expect((document.querySelector('#sbx-new-code') as HTMLInputElement).value).toBe('');
     expect((screen.getAllByLabelText(/Слово \d+ из 12/)[0] as HTMLInputElement).value).toBe('');
+  });
+});
+
+describe('Main — «Проверить обновления» в шапке', () => {
+  const done = (over: Partial<{ addedNotes: number; updatedNotes: number; changedSafebox: number }> = {}) => ({
+    status: 'done' as const,
+    at: 1_700_000_000_000,
+    addedNotes: 0, updatedNotes: 0, changedSafebox: 0, partial: false,
+    ...over,
+  });
+
+  it('иконка вызывает checkForUpdates', () => {
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Проверить обновления'));
+    expect(h.store.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('во время проверки иконка заблокирована', () => {
+    h.store.updateCheck = { status: 'checking', progress: null };
+    render(<Main />);
+    const btn = screen.getByLabelText('Проверить обновления') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('тост показывает, сколько всего пришло — заметки, правки и сейф вместе', async () => {
+    const { rerender } = render(<Main />);
+    h.store.updateCheck = done({ addedNotes: 2, updatedNotes: 1, changedSafebox: 3 });
+    rerender(<Main />);
+    expect(await screen.findByText('✓ Получено с других устройств: 6')).toBeTruthy();
+  });
+
+  it('пустая проверка тоста не даёт', () => {
+    const { rerender } = render(<Main />);
+    h.store.updateCheck = done();
+    rerender(<Main />);
+    expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
+  });
+
+  it('проверка, завершившаяся при ОТКРЫТЫХ настройках, не всплывает тостом после их закрытия', () => {
+    const { rerender } = render(<Main />);
+    fireEvent.click(screen.getByLabelText('Настройки'));
+
+    // Finishes while the panel is open — the panel's own result line reports it.
+    h.store.updateCheck = done({ addedNotes: 2 });
+    rerender(<Main />);
+    expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
+
+    // Closing must NOT resurrect the news out of context.
+    fireEvent.click(screen.getByLabelText('Закрыть настройки'));
+    expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
   });
 });
