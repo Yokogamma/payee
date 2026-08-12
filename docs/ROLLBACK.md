@@ -184,6 +184,23 @@ version never stops the other):
   `ok && v4Uploads===true && versions∋'4'`, or via the manual banner button.
   `versions` alone is NOT sufficient — it still lists '4' while the gate is off.
 
+### OPERATOR DECISION 2026-08-12: v4 ships WITHOUT staging
+
+> The operator confirmed that **there are still no real users — every account is
+> a test account**. On that basis the staging precondition below is waived for
+> the v4 rollout and the smoke runs against PRODUCTION, exactly as it did for
+> W3 and for the same reason.
+>
+> This is the escape hatch, invoked explicitly and recorded here as required.
+> What it costs: the first real exercise of the v4 acceptor happens on the
+> production worker and posts one real, tiny paid transaction. What it does NOT
+> waive: the smoke itself is still mandatory before the acceptor is tagged as
+> the floor, and `smoke-v4.mjs` still demands `ALLOW_PRODUCTION_SMOKE=true` so
+> the choice can never be made by accident.
+>
+> **The moment real users exist, this waiver expires** — provision staging
+> before the next version bump (checklist below).
+
 ### STAGING IS A HARD PRECONDITION (operator, currently NOT provisioned)
 
 `[env.staging]` in `worker/wrangler.toml` still carries the KV **placeholder id**
