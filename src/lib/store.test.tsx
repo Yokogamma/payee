@@ -13,7 +13,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // inheriting whatever flags.ts currently ships, so the W3 flip stays a pure
 // one-line change and both matrices (here / store.v3-writer.test.tsx) keep
 // asserting their own half forever.
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false }));
 
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();
@@ -23,7 +23,7 @@ vi.mock('./arweave', async importOriginal => {
     checkRegistration: vi.fn(async () => ({ status: 'unavailable' as const })),
     registerWithProxy: vi.fn(async () => ({ error: 'unavailable' })),
     uploadViaProxy: vi.fn(async () => ({ kind: 'error' as const, error: 'offline' })),
-    fetchAllNotes: vi.fn(async () => ({ notes: [], incomplete: false })),
+    fetchAllNotes: vi.fn(async () => ({ notes: [], safeboxEntries: [], incomplete: false })),
     getTxStatus: vi.fn(async () => ({ kind: 'unavailable' as const })),
   };
 });
@@ -168,6 +168,14 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+/** The privacy gate is ALWAYS mounted (its raise must be a synchronous DOM
+ *  flip, not a React commit — see store.tsx). «Up» therefore means *visible*,
+ *  i.e. the element exists and is not `hidden`. */
+function gateUp(): boolean {
+  const el = document.querySelector('.lock-gate');
+  return el !== null && !el.hasAttribute('hidden');
+}
+
 function setVisibility(state: 'visible' | 'hidden') {
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
   document.dispatchEvent(new Event('visibilitychange'));
@@ -308,7 +316,7 @@ describe('auto-lock on return to foreground', () => {
     expect(store.screen).toBe('pin');
     expect(store.mnemonic).toBeNull();
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
-    expect(document.querySelector('.lock-gate')).toBeNull(); // decided — gate down
+    expect(gateUp()).toBe(false); // decided — gate down
   });
 
   it('timeout null: hidden → visible does NOT lock (gate drops after the verdict)', async () => {
@@ -322,7 +330,7 @@ describe('auto-lock on return to foreground', () => {
     act(() => { setVisibility('hidden'); });
     act(() => { setVisibility('visible'); });
     // The authoritative config re-read must confirm "no lock" and drop the gate.
-    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    await waitFor(() => expect(gateUp()).toBe(false));
     expect(store.screen).toBe('main');
     expect(store.mnemonic).toBe(MN);
   });
@@ -339,7 +347,7 @@ describe('auto-lock on return to foreground', () => {
     // Raised synchronously on the hidden edge — the first frame a return
     // paints already contains the gate, never plaintext.
     act(() => { setVisibility('hidden'); });
-    expect(document.querySelector('.lock-gate')).not.toBeNull();
+    expect(gateUp()).toBe(true);
 
     // Hold the config read open: the verdict is pending, the gate must stay.
     let releaseRead!: () => void;
@@ -347,13 +355,13 @@ describe('auto-lock on return to foreground', () => {
       () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
     );
     act(() => { setVisibility('visible'); });
-    expect(document.querySelector('.lock-gate')).not.toBeNull(); // still checking
+    expect(gateUp()).toBe(true); // still checking
     expect(store.screen).toBe('main'); // Main mounted, but covered by the gate
     // The gated content is INERT: no keyboard focus / AT access behind the overlay.
     expect(document.querySelector('div[inert]')).not.toBeNull();
 
     await act(async () => { releaseRead(); });
-    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    await waitFor(() => expect(gateUp()).toBe(false));
     expect(store.screen).toBe('main'); // verdict: no lock — gate down, app usable
     expect(document.querySelector('div[inert]')).toBeNull(); // content interactive again
   });
@@ -374,7 +382,7 @@ describe('auto-lock on return to foreground', () => {
     await waitFor(() => expect(store.screen).toBe('pin'));
     expect(store.mnemonic).toBeNull();
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
-    expect(document.querySelector('.lock-gate')).toBeNull(); // decided (locked) — gate down
+    expect(gateUp()).toBe(false); // decided (locked) — gate down
   });
 
   it('a config change missed while hidden still locks on return (review finding 3)', async () => {
@@ -420,14 +428,14 @@ describe('privacy gate across pending opens and generations', () => {
       pending = store.confirmMnemonic(MN);
       setVisibility('hidden');
     });
-    expect(document.querySelector('.lock-gate')).not.toBeNull(); // gated already
+    expect(gateUp()).toBe(true); // gated already
 
     await act(async () => { await pending; });
     expect(store.screen).toBe('main'); // committed while hidden…
-    expect(document.querySelector('.lock-gate')).not.toBeNull(); // …but still gated
+    expect(gateUp()).toBe(true); // …but still gated
 
     act(() => { setVisibility('visible'); });
-    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    await waitFor(() => expect(gateUp()).toBe(false));
     expect(store.screen).toBe('main'); // verdict (timeout null): stay open
   });
 
@@ -450,11 +458,11 @@ describe('privacy gate across pending opens and generations', () => {
 
     // Check A resolves now — it is superseded and must NOT drop the new gate.
     await act(async () => { releaseRead(); });
-    expect(document.querySelector('.lock-gate')).not.toBeNull();
+    expect(gateUp()).toBe(true);
 
     // The second return runs its own (unmocked) verdict and settles the gate.
     act(() => { setVisibility('visible'); });
-    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    await waitFor(() => expect(gateUp()).toBe(false));
     expect(store.screen).toBe('main');
   });
 
@@ -489,7 +497,7 @@ describe('privacy gate across pending opens and generations', () => {
     await act(async () => {});
     expect(store.screen).toBe('main'); // the NEW session stays open
     expect(store.mnemonic).toBe(MN);
-    expect(document.querySelector('.lock-gate')).toBeNull();
+    expect(gateUp()).toBe(false);
   });
 
   it('fast-path lock reconciles a stale PIN target: wiped pin-seed → restore screen', async () => {
@@ -544,10 +552,10 @@ describe('config publication ordering and reset lifecycle', () => {
     // A resolved with timeout=null — but its cycle is gone: the refs must
     // keep the CURRENT configuration, not A's stale read.
     expect(store.autoLockTimeout).toBe(1800);
-    expect(document.querySelector('.lock-gate')).not.toBeNull(); // new gate intact
+    expect(gateUp()).toBe(true); // new gate intact
 
     act(() => { setVisibility('visible'); }); // cycle B settles normally
-    await waitFor(() => expect(document.querySelector('.lock-gate')).toBeNull());
+    await waitFor(() => expect(gateUp()).toBe(false));
     expect(store.autoLockTimeout).toBe(1800);
     expect(store.screen).toBe('main'); // 1800s not elapsed — stays open
   });
@@ -566,18 +574,18 @@ describe('config publication ordering and reset lifecycle', () => {
       () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: null }); }),
     );
     act(() => { setVisibility('visible'); }); // verdict pending — it owns the gate
-    expect(document.querySelector('.lock-gate')).not.toBeNull();
+    expect(gateUp()).toBe(true);
 
     await act(async () => { await store.resetApp(); });
     expect(store.screen).toBe('landing');
-    expect(document.querySelector('.lock-gate')).toBeNull(); // dropped synchronously
+    expect(gateUp()).toBe(false); // dropped synchronously
     expect(document.querySelector('div[inert]')).toBeNull();
 
     // The abandoned verdict resolves later — landing must stay ungated.
     await act(async () => { releaseRead(); });
     await act(async () => {});
     expect(store.screen).toBe('landing');
-    expect(document.querySelector('.lock-gate')).toBeNull();
+    expect(gateUp()).toBe(false);
   });
 
   it('an OLDER reconcile cannot overwrite a NEWER one (last caller wins)', async () => {
@@ -647,7 +655,7 @@ describe('stale verdict vs newer config', () => {
     await waitFor(() => expect(store.screen).toBe('pin'));
     expect(store.mnemonic).toBeNull();
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
-    expect(document.querySelector('.lock-gate')).toBeNull();
+    expect(gateUp()).toBe(false);
   });
 
   it('a reconcile resolving after resetApp cannot resurrect hasPin on landing', async () => {
@@ -1055,10 +1063,10 @@ describe('R3 contract: writer OFF, reader always on', () => {
     expect(store.chains[0].current.fmt).toBe('md');
     expect(store.chains[0].versions).toHaveLength(2);
     // Storage-backed reset risk counts BOTH versions (nothing confirmed).
-    expect(store.arweave.resetRiskCount).toBe(2);
+    expect(store.arweave.resetRisk.notes).toBe(2);
   });
 
-  it('an unknown-version record is invisible in the UI but counted by resetRiskCount', async () => {
+  it('an unknown-version record is invisible in the UI but counted by resetRisk.notes', async () => {
     await setMeta('init', true);
     const key = await deriveKey(MN);
     const good = await encryptEnvelopeV3(key, 'нормальная', { fmt: 'md', rev: 1 });
@@ -1071,7 +1079,7 @@ describe('R3 contract: writer OFF, reader always on', () => {
     await openMain();
 
     expect(store.notes).toHaveLength(1); // alien skipped, no crash
-    expect(store.arweave.resetRiskCount).toBe(2); // but still at risk on reset
+    expect(store.arweave.resetRisk.notes).toBe(2); // but still at risk on reset
   });
 });
 

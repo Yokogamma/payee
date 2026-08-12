@@ -8,7 +8,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // flag mocked ON. Kept in a separate file — a hoisted vi.mock cannot flip a
 // build-time constant between tests inside one statically-importing module.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false }));
 
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();
@@ -18,9 +18,9 @@ vi.mock('./arweave', async importOriginal => {
     checkRegistration: vi.fn(async () => ({ status: 'unavailable' as const })),
     registerWithProxy: vi.fn(async () => ({ error: 'unavailable' })),
     uploadViaProxy: vi.fn(async () => ({ kind: 'error' as const, error: 'offline' })),
-    fetchAllNotes: vi.fn(async () => ({ notes: [], incomplete: false })),
+    fetchAllNotes: vi.fn(async () => ({ notes: [], safeboxEntries: [], incomplete: false })),
     getTxStatus: vi.fn(async () => ({ kind: 'unavailable' as const })),
-    getWorkerCapabilities: vi.fn(async () => 'unknown' as const),
+    getWorkerCapabilities: vi.fn(async () => ({ v3: 'unknown' as const, v4: 'unknown' as const })),
   };
 });
 
@@ -100,7 +100,7 @@ beforeEach(async () => {
   vi.mocked(isArweaveOnline).mockResolvedValue(false);
   vi.mocked(uploadViaProxy).mockReset();
   vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'error', error: 'offline' });
-  vi.mocked(fetchAllNotes).mockResolvedValue({ notes: [], incomplete: false });
+  vi.mocked(fetchAllNotes).mockResolvedValue({ notes: [], safeboxEntries: [], incomplete: false });
   await setMeta('init', true);
 });
 
@@ -239,7 +239,7 @@ describe('W3: restore counters M/K (snapshot algorithm)', () => {
     await openMain();
     const key = await deriveKey(MN);
     const chain = await makeRemoteChain(key, ['a', 'b', 'c']);
-    vi.mocked(fetchAllNotes).mockResolvedValue({ notes: chain, incomplete: false });
+    vi.mocked(fetchAllNotes).mockResolvedValue({ notes: chain, safeboxEntries: [], incomplete: false });
 
     await act(async () => { await store.retryRestore(); });
 
@@ -269,6 +269,7 @@ describe('W3: restore counters M/K (snapshot algorithm)', () => {
         { encrypted: remoteEdit, text: 'правка с другого устройства', txId: 'TX-EDIT', meta: remoteEditDec.meta },
         ...newChain,
       ],
+      safeboxEntries: [],
       incomplete: false,
     });
 
@@ -478,7 +479,7 @@ describe('W3: quarantine is counted separately from retryable errors (review fix
     await waitFor(() => {
       expect(store.arweave.quarantinedCount).toBe(1);
       expect(store.arweave.errorCount).toBe(0); // not a lying «Повторить» error
-      expect(store.arweave.resetRiskCount).toBeGreaterThanOrEqual(1); // still at risk
+      expect(store.arweave.resetRisk.notes).toBeGreaterThanOrEqual(1); // still at risk
     });
   });
 });

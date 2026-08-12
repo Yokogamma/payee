@@ -13,6 +13,7 @@ const RECOVERY = { txId: 'TX1', postedAt: NOW - 60_000, token: 'signed-token' };
 
 const acceptedUncommitted: SyncRecord = {
   noteId: 'n1',
+  kind: 'note',
   txId: 'TX1',
   status: 'accepted',
   transport: 'proxy',
@@ -23,7 +24,7 @@ const acceptedUncommitted: SyncRecord = {
 
 describe('toUploading', () => {
   it('carries txId, recheck intent AND the recovery token into uploading', () => {
-    const rec = toUploading('n1', acceptedUncommitted, NOW);
+    const rec = toUploading('n1', 'note', acceptedUncommitted, NOW);
     expect(rec.status).toBe('uploading');
     expect(rec.txId).toBe('TX1');
     expect(rec.needsRecheck).toBe(true);
@@ -31,7 +32,7 @@ describe('toUploading', () => {
   });
 
   it('starts clean for a note without prior record', () => {
-    const rec = toUploading('n2', undefined, NOW);
+    const rec = toUploading('n2', 'note', undefined, NOW);
     expect(rec).toMatchObject({ noteId: 'n2', status: 'uploading', needsRecheck: false });
     expect(rec.txId).toBeUndefined();
     expect(rec.recovery).toBeUndefined();
@@ -40,20 +41,20 @@ describe('toUploading', () => {
 
 describe('toAccepted', () => {
   it('committed:true clears needsRecheck and drops the recovery hint', () => {
-    const rec = toAccepted('n1', acceptedUncommitted, { txId: 'TX2', committed: true }, NOW);
+    const rec = toAccepted('n1', 'note', acceptedUncommitted, { txId: 'TX2', committed: true }, NOW);
     expect(rec).toMatchObject({ status: 'accepted', txId: 'TX2', needsRecheck: false });
     expect(rec.recovery).toBeUndefined();
   });
 
   it('committed:false keeps needsRecheck and prefers the FRESH server hint', () => {
     const fresh = { txId: 'TX2', postedAt: NOW, token: 'fresh-token' };
-    const rec = toAccepted('n1', acceptedUncommitted, { txId: 'TX2', committed: false, recovery: fresh }, NOW);
+    const rec = toAccepted('n1', 'note', acceptedUncommitted, { txId: 'TX2', committed: false, recovery: fresh }, NOW);
     expect(rec.needsRecheck).toBe(true);
     expect(rec.recovery).toEqual(fresh);
   });
 
   it('committed:false without a fresh hint carries the previous one forward', () => {
-    const rec = toAccepted('n1', acceptedUncommitted, { txId: 'TX1', committed: false }, NOW);
+    const rec = toAccepted('n1', 'note', acceptedUncommitted, { txId: 'TX1', committed: false }, NOW);
     expect(rec.recovery).toEqual(RECOVERY);
   });
 });
@@ -62,26 +63,26 @@ describe('afterInProgress (409)', () => {
   it('restores accepted + needsRecheck + txId + recovery instead of leaving uploading', () => {
     // Realistic post-triple-failure 409: the pre-failure reserved slot is still
     // within its TTL. The recovery proof must NOT be stranded in 'uploading'.
-    const rec = afterInProgress('n1', acceptedUncommitted, NOW);
+    const rec = afterInProgress('n1', 'note', acceptedUncommitted, NOW);
     expect(rec).toMatchObject({ status: 'accepted', txId: 'TX1', needsRecheck: true });
     expect(rec?.recovery).toEqual(RECOVERY);
   });
 
   it('returns null when the note was never accepted (nothing to restore)', () => {
-    expect(afterInProgress('n2', undefined, NOW)).toBeNull();
-    expect(afterInProgress('n2', { noteId: 'n2', status: 'error', transport: 'proxy', updatedAt: NOW }, NOW)).toBeNull();
+    expect(afterInProgress('n2', 'note', undefined, NOW)).toBeNull();
+    expect(afterInProgress('n2', 'note', { noteId: 'n2', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW }, NOW)).toBeNull();
   });
 });
 
 describe('afterFailure (503/429/network)', () => {
   it('keeps accepted + txId + recovery across a transient failure', () => {
-    const rec = afterFailure('n1', acceptedUncommitted, true, 'HTTP 503', NOW);
+    const rec = afterFailure('n1', 'note', acceptedUncommitted, true, 'HTTP 503', NOW);
     expect(rec).toMatchObject({ status: 'accepted', txId: 'TX1', needsRecheck: true, lastError: 'HTTP 503' });
     expect(rec.recovery).toEqual(RECOVERY);
   });
 
   it('a never-accepted note becomes error but keeps the recheck intent', () => {
-    const rec = afterFailure('n2', undefined, true, 'HTTP 429', NOW);
+    const rec = afterFailure('n2', 'note', undefined, true, 'HTTP 429', NOW);
     expect(rec).toMatchObject({ status: 'error', needsRecheck: true, lastError: 'HTTP 429' });
   });
 });
@@ -138,7 +139,7 @@ describe('claimRestoredForUi (restoredCount accuracy)', () => {
 describe('full reconciliation loop (triple-failure → recheck → commit → confirm)', () => {
   it('the recovery token survives until the server commits, then the TX confirms', () => {
     // 1. Triple-failure upload: accepted, committed:false, server hands a token.
-    let rec = toAccepted('n1', undefined, { txId: 'TX1', committed: false, recovery: RECOVERY }, NOW);
+    let rec = toAccepted('n1', 'note', undefined, { txId: 'TX1', committed: false, recovery: RECOVERY }, NOW);
     expect(rec.needsRecheck).toBe(true);
     expect(rec.recovery).toEqual(RECOVERY);
 
@@ -146,20 +147,20 @@ describe('full reconciliation loop (triple-failure → recheck → commit → co
     expect(afterPoll(rec, { kind: 'confirmed', confirmations: 30, blockHeight: 1 }, NOW + 1, 25, TX_TIMEOUT_MS)).toBeNull();
 
     // 3. Recheck attempt starts: uploading still holds the token.
-    rec = toUploading('n1', rec, NOW + 2);
+    rec = toUploading('n1', 'note', rec, NOW + 2);
     expect(rec.recovery).toEqual(RECOVERY);
 
     // 4. Server still has the live reservation → 409; state restored, token kept.
-    rec = afterInProgress('n1', rec, NOW + 3)!;
+    rec = afterInProgress('n1', 'note', rec, NOW + 3)!;
     expect(rec).toMatchObject({ status: 'accepted', needsRecheck: true });
     expect(rec.recovery).toEqual(RECOVERY);
 
     // 5. Next recheck: transient 503; token still kept.
-    rec = afterFailure('n1', toUploading('n1', rec, NOW + 4), true, 'HTTP 503', NOW + 5);
+    rec = afterFailure('n1', 'note', toUploading('n1', 'note', rec, NOW + 4), true, 'HTTP 503', NOW + 5);
     expect(rec.recovery).toEqual(RECOVERY);
 
     // 6. Recheck finally reaches the server; it verifies the token and commits.
-    rec = toAccepted('n1', toUploading('n1', rec, NOW + 6), { txId: 'TX1', committed: true }, NOW + 7);
+    rec = toAccepted('n1', 'note', toUploading('n1', 'note', rec, NOW + 6), { txId: 'TX1', committed: true }, NOW + 7);
     expect(rec.needsRecheck).toBe(false);
     expect(rec.recovery).toBeUndefined();
 

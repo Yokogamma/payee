@@ -7,8 +7,18 @@
  * No wallet management — auth via Ed25519 signature + server-side allowlist.
  */
 
-import type { EncryptedNote, NoteVersionMeta } from './crypto';
-import { decryptNote, UnsupportedNoteVersionError } from './crypto';
+import type {
+  EncryptedNote,
+  NoteVersionMeta,
+  EncryptedSafeboxEntry,
+  SafeboxEntryData,
+} from './crypto';
+import {
+  decryptNote,
+  decryptSafeboxMeta,
+  decryptSafeboxSecret,
+  UnsupportedNoteVersionError,
+} from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
 
 // ─── Config ──────────────────────────────────────────────────────────
@@ -29,10 +39,10 @@ const PROXY_URL = (() => {
 export const APP_NAME = 'EternalNotes';
 export const APP_VERSION = '1';
 
-// Supported data format versions for READING. Client still writes v1 in this
-// release (reader-before-writer); v2/v3 are accepted so the writer flip is
-// seamless (v3 writes are gated by V3_WRITER_ENABLED in the store).
-const SUPPORTED_VERSIONS = new Set(['1', '2', '3']);
+// Supported data format versions for READING (reader-before-writer): v4
+// safebox entries are accepted here before SAFEBOX_WRITER_ENABLED flips, so a
+// restore on R4 already brings the safebox back.
+const SUPPORTED_VERSIONS = new Set(['1', '2', '3', '4']);
 
 /** A note recovered from Arweave: the record to persist, its decrypted text and
  *  the version-chain meta (synthesized for v1/v2) — restore must carry the meta
@@ -88,6 +98,58 @@ export function buildUploadPayload(
   return payload;
 }
 
+/**
+ * Build the proxy upload payload for a SAFEBOX entry (App-Version=4): the same
+ * 5 tags as v2/v3 with a SPLIT-ENVELOPE data object `{id,mc,miv,sc,siv}` — both
+ * ciphertexts travel in ONE transaction, so a version can never end up on-chain
+ * with only half of itself.
+ *
+ * Fail-closed on an unexpected runtime `v`, exactly like the notes builder: a
+ * mis-serialized record would be permanently committed under the per-id
+ * idempotency.
+ */
+export function buildSafeboxUploadPayload(
+  entry: EncryptedSafeboxEntry,
+  ownerHash: string,
+  now: number,
+  recheck = false,
+  recovery?: RecoveryHint,
+): ProxyUploadPayload {
+  if (entry.v !== 4) throw new UnsupportedSafeboxVersionError(entry.v);
+
+  const data = JSON.stringify({
+    id: entry.entryId,
+    mc: entry.metaCiphertext,
+    miv: entry.metaIv,
+    sc: entry.secretCiphertext,
+    siv: entry.secretIv,
+  });
+
+  const tags = [
+    { name: 'App-Name', value: APP_NAME },
+    { name: 'App-Version', value: SAFEBOX_APP_VERSION },
+    { name: 'Owner-Hash', value: ownerHash },
+    { name: 'Content-Type', value: 'application/json' },
+    { name: 'Note-Id', value: entry.entryId },
+  ];
+
+  const payload: ProxyUploadPayload = { data, tags, ownerHash, timestamp: now };
+  if (recheck) payload.recheck = true;
+  if (recheck && recovery) payload.recovery = recovery;
+  return payload;
+}
+
+export const SAFEBOX_APP_VERSION = '4';
+
+/** A stored safebox record whose `v` this build cannot serialize (written by a
+ *  newer client). Quarantined locally — never uploaded. */
+export class UnsupportedSafeboxVersionError extends Error {
+  constructor(v: unknown) {
+    super(`Unsupported safebox entry version: ${String(v)}`);
+    this.name = 'UnsupportedSafeboxVersionError';
+  }
+}
+
 // ─── Types ───────────────────────────────────────────────────────────
 
 /** Opaque, server-HMAC-signed recovery hint for a lost-anchor upload. */
@@ -122,6 +184,9 @@ export type UploadResult =
    *  pause marker) and resumes via /health or manual retry. Registration and
    *  recovery/txId state MUST survive this untouched. */
   | { kind: 'v3_disabled'; error: string }
+  /** 503 {code:'v4_uploads_disabled'} — the worker's SAFEBOX kill switch is on.
+   *  Same contract as v3_disabled, on its own independent pause marker. */
+  | { kind: 'v4_disabled'; error: string }
   | { kind: 'error'; error: string };
 
 export type RegistrationStatus = 'allowed' | 'denied' | 'unavailable' | 'invalid_request';
@@ -313,13 +378,14 @@ export async function uploadViaProxy(
     if (response.status === 403) return { kind: 'not_registered', error: text };
     if (response.status === 409) return { kind: 'in_progress', error: text };
     if (response.status === 503) {
-      // The v3 kill switch answers 503 with a machine-readable JSON code; a
+      // The kill switches answer 503 with a machine-readable JSON code; a
       // plain-text 503 stays the generic retryable 'unavailable'.
       try {
         const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null &&
-            (parsed as { code?: unknown }).code === 'v3_uploads_disabled') {
-          return { kind: 'v3_disabled', error: text };
+        if (typeof parsed === 'object' && parsed !== null) {
+          const code = (parsed as { code?: unknown }).code;
+          if (code === 'v3_uploads_disabled') return { kind: 'v3_disabled', error: text };
+          if (code === 'v4_uploads_disabled') return { kind: 'v4_disabled', error: text };
         }
       } catch { /* not JSON → generic 503 */ }
       return { kind: 'unavailable', error: text }; // retryable
@@ -334,32 +400,48 @@ export async function uploadViaProxy(
 
 // ─── Worker capabilities (/health) ──────────────────────────────────
 
-export type V3UploadsCapability = 'enabled' | 'disabled' | 'unknown';
+export type UploadsCapability = 'enabled' | 'disabled' | 'unknown';
+
+/** One /health probe answers for EVERY gated version. Each verdict is
+ *  independent: an old worker that knows v3 but not v4 reports
+ *  `{v3:'enabled', v4:'unknown'}` and the v4 pause stays up (fail closed). */
+export interface WorkerCapabilities {
+  v3: UploadsCapability;
+  v4: UploadsCapability;
+}
+
+const UNKNOWN_CAPABILITIES: WorkerCapabilities = { v3: 'unknown', v4: 'unknown' };
 
 /**
- * Strictly-validated /health probe used to lift the persisted v3-upload pause.
- * 'enabled' ONLY when ok===true AND versions includes '3' AND v3Uploads===true.
- * A network error, an old worker ({ok:true} without the fields) or a malformed
- * body all yield 'unknown' — the pause stays (fail closed).
+ * Strictly-validated /health probe used to lift a persisted upload pause.
+ * A version is 'enabled' ONLY when ok===true AND `versions` includes it AND its
+ * own `vNUploads` flag is exactly true — `versions` describes the ACCEPTOR and
+ * still lists the version while its kill switch is off, so it can never be the
+ * sole resume condition. A network error, an old worker ({ok:true} without the
+ * fields) or a malformed body all yield 'unknown' — the pause stays.
  */
-export async function getWorkerCapabilities(): Promise<V3UploadsCapability> {
-  if (!PROXY_URL) return 'unknown';
+export async function getWorkerCapabilities(): Promise<WorkerCapabilities> {
+  if (!PROXY_URL) return UNKNOWN_CAPABILITIES;
   try {
     const response = await fetch(`${PROXY_URL}/health`, {
       method: 'GET',
       signal: AbortSignal.timeout(10_000),
     });
-    if (!response.ok) return 'unknown';
+    if (!response.ok) return UNKNOWN_CAPABILITIES;
     const data: unknown = await response.json();
-    if (typeof data !== 'object' || data === null) return 'unknown';
-    const d = data as { ok?: unknown; versions?: unknown; v3Uploads?: unknown };
-    if (d.ok !== true) return 'unknown';
-    if (!Array.isArray(d.versions) || !d.versions.includes('3')) return 'unknown';
-    if (d.v3Uploads === true) return 'enabled';
-    if (d.v3Uploads === false) return 'disabled';
-    return 'unknown';
+    if (typeof data !== 'object' || data === null) return UNKNOWN_CAPABILITIES;
+    const d = data as { ok?: unknown; versions?: unknown; v3Uploads?: unknown; v4Uploads?: unknown };
+    if (d.ok !== true) return UNKNOWN_CAPABILITIES;
+    const versions = d.versions;
+    const readOne = (version: string, flag: unknown): UploadsCapability => {
+      if (!Array.isArray(versions) || !versions.includes(version)) return 'unknown';
+      if (flag === true) return 'enabled';
+      if (flag === false) return 'disabled';
+      return 'unknown';
+    };
+    return { v3: readOne('3', d.v3Uploads), v4: readOne('4', d.v4Uploads) };
   } catch {
-    return 'unknown';
+    return UNKNOWN_CAPABILITIES;
   }
 }
 
@@ -448,12 +530,32 @@ async function fetchPage(
   };
 }
 
-/** Result of a restore sweep. `incomplete` = some pages or note payloads could
- *  not be FETCHED (network/gateway) — real notes may be missing, tell the user.
+/** A safebox entry recovered from Arweave. The record to persist plus its
+ *  decrypted META. The SECRET plaintext is deliberately absent: restore
+ *  decrypts it only to VALIDATE the candidate and drops it immediately — only
+ *  ciphertext is ever carried out of the sweep. */
+export interface RestoredSafeboxEntry {
+  encrypted: EncryptedSafeboxEntry;
+  meta: SafeboxEntryData;
+  txId: string;
+}
+
+/** Keys the restore sweep needs. Notes and safebox halves are separate HKDF
+ *  domains; a missing safebox pair simply means v4 candidates are skipped. */
+export interface RestoreKeyring {
+  note: CryptoKey;
+  safeboxMeta: CryptoKey;
+  /** Used ONLY to prove a v4 candidate decrypts in BOTH halves. */
+  safeboxSecret: CryptoKey;
+}
+
+/** Result of a restore sweep. `incomplete` = some pages or payloads could not
+ *  be FETCHED (network/gateway) — real records may be missing, tell the user.
  *  Garbage/replay candidates that fail validation or decryption are intentional
  *  skips and do NOT set the flag. */
 export interface FetchAllNotesResult {
   notes: RestoredNote[];
+  safeboxEntries: RestoredSafeboxEntry[];
   incomplete: boolean;
 }
 
@@ -482,7 +584,7 @@ interface RestoreCandidate {
  */
 export async function fetchAllNotes(
   ownerHash: string,
-  key: CryptoKey,
+  keys: RestoreKeyring,
   onProgress?: (done: number, total: number) => void,
   opts: { signal?: AbortSignal } = {},
 ): Promise<FetchAllNotesResult> {
@@ -530,7 +632,7 @@ export async function fetchAllNotes(
 
   // Phase 2: bounded-parallel payload fetch + decrypt. Results keep the
   // original slot so claiming stays deterministic (HEIGHT_DESC order).
-  const results: (RestoredNote | null)[] = new Array(candidates.length).fill(null);
+  const results: (RestoredNote | RestoredSafeboxEntry | null)[] = new Array(candidates.length).fill(null);
   let nextIndex = 0;
   let done = 0;
   const runWorker = async () => {
@@ -559,7 +661,9 @@ export async function fetchAllNotes(
         } else {
           try {
             const raw = await dataResponse.json();
-            results[i] = await buildRestoredNote(key, cand.version, cand.noteId, raw, cand.txId);
+            results[i] = cand.version === '4'
+              ? await buildRestoredSafeboxEntry(keys, cand.noteId, raw, cand.txId)
+              : await buildRestoredNote(keys.note, cand.version, cand.noteId, raw, cand.txId);
           } catch {
             // malformed entry — intentional skip, not a partial restore
           }
@@ -573,19 +677,78 @@ export async function fetchAllNotes(
     Array.from({ length: Math.min(RESTORE_CONCURRENCY, candidates.length) }, runWorker),
   );
 
-  // Phase 3: claim Note-Ids in the original chain order (newest block first) —
-  // parallel completion order must not decide which duplicate wins.
+  // Phase 3: claim ids in the original chain order (newest block first) —
+  // parallel completion order must not decide which duplicate wins. The claim
+  // happens AFTER a successful decrypt of EVERY half, so a corrupted candidate
+  // can never shadow an intact older duplicate with the same id.
   const restored: RestoredNote[] = [];
-  const seenNoteIds = new Set<string>();
+  const restoredSafebox: RestoredSafeboxEntry[] = [];
+  // ONE id space: v3 notes and v4 entries share the UUIDv8 namespace, so an id
+  // claimed by one kind must not be re-claimed by the other.
+  const seenIds = new Set<string>();
   for (const built of results) {
     if (!built) continue;
-    if (seenNoteIds.has(built.encrypted.noteId)) continue;
-    seenNoteIds.add(built.encrypted.noteId);
-    restored.push(built);
+    if (isSafeboxResult(built)) {
+      if (seenIds.has(built.encrypted.entryId)) continue;
+      seenIds.add(built.encrypted.entryId);
+      restoredSafebox.push(built);
+    } else {
+      if (seenIds.has(built.encrypted.noteId)) continue;
+      seenIds.add(built.encrypted.noteId);
+      restored.push(built);
+    }
   }
 
   restored.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);
-  return { notes: restored, incomplete };
+  restoredSafebox.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);
+  return { notes: restored, safeboxEntries: restoredSafebox, incomplete };
+}
+
+function isSafeboxResult(r: RestoredNote | RestoredSafeboxEntry): r is RestoredSafeboxEntry {
+  return 'entryId' in r.encrypted;
+}
+
+/**
+ * Assemble + decrypt a v4 SAFEBOX candidate. Returns null (skip) on any shape
+ * mismatch or decryption failure of EITHER half.
+ *
+ * Both halves must decrypt AND validate — a candidate with an intact meta blob
+ * and a corrupted/substituted secret blob is rejected WHOLESALE (fail closed):
+ * accepting it would claim the id and permanently shadow an intact older
+ * duplicate, leaving the user with a readable title and an unreadable password.
+ * The decrypted secret is discarded here and never leaves this function.
+ */
+async function buildRestoredSafeboxEntry(
+  keys: RestoreKeyring,
+  entryIdTag: string,
+  raw: { id?: unknown; mc?: unknown; miv?: unknown; sc?: unknown; siv?: unknown },
+  txId: string,
+): Promise<RestoredSafeboxEntry | null> {
+  if (typeof raw.id !== 'string' || raw.id !== entryIdTag) return null; // outer id must match the tag
+  if (typeof raw.mc !== 'string' || typeof raw.miv !== 'string') return null;
+  if (typeof raw.sc !== 'string' || typeof raw.siv !== 'string') return null;
+
+  const encrypted: EncryptedSafeboxEntry = {
+    entryId: raw.id,
+    metaCiphertext: raw.mc,
+    metaIv: raw.miv,
+    secretCiphertext: raw.sc,
+    secretIv: raw.siv,
+    createdAt: 0, // replaced by the AUTHENTICATED `t` below
+    v: 4,
+  };
+
+  let meta: SafeboxEntryData;
+  try {
+    meta = await decryptSafeboxMeta(keys.safeboxMeta, encrypted);
+    // Validate the secret half too, then drop the plaintext immediately.
+    await decryptSafeboxSecret(keys.safeboxSecret, encrypted, meta.files);
+  } catch {
+    return null; // not ours / replay / tampered / malformed envelope
+  }
+
+  encrypted.createdAt = meta.createdAt; // authoritative, from the envelope
+  return { encrypted, meta, txId };
 }
 
 /**

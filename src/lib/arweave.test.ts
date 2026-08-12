@@ -18,6 +18,16 @@ async function anyKey(): Promise<CryptoKey> {
   return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 
+/** The restore keyring: notes key + the two safebox halves. Tests that only
+ *  care about notes reuse the same key for the safebox slots — no v4 candidate
+ *  is served in those fixtures. */
+function ring(key: CryptoKey) {
+  return { note: key, safeboxMeta: key, safeboxSecret: key };
+}
+async function keyring() {
+  return ring(await anyKey());
+}
+
 describe('fetchAllNotes owner filter (C2)', () => {
   it('passes the pinned trusted owners into the GraphQL query and query text', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', `${OWNER_A},${OWNER_B}`);
@@ -32,7 +42,7 @@ describe('fetchAllNotes owner filter (C2)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    await fetchAllNotes('owner-hash-xyz', await anyKey());
+    await fetchAllNotes('owner-hash-xyz', await keyring());
 
     expect(fetchMock).toHaveBeenCalled();
     const init = fetchMock.mock.calls[0][1] as RequestInit;
@@ -47,13 +57,13 @@ describe('fetchAllNotes owner filter (C2)', () => {
   it('fails closed (throws) when no trusted owners are pinned', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', '');
     const { fetchAllNotes } = await import('./arweave');
-    await expect(fetchAllNotes('owner-hash-xyz', await anyKey())).rejects.toThrow(/VITE_TRUSTED_OWNERS/);
+    await expect(fetchAllNotes('owner-hash-xyz', await keyring())).rejects.toThrow(/VITE_TRUSTED_OWNERS/);
   });
 
   it('fails closed (throws) on a malformed trusted owner (typo guard)', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', 'not-a-real-address');
     const { fetchAllNotes } = await import('./arweave');
-    await expect(fetchAllNotes('owner-hash-xyz', await anyKey())).rejects.toThrow(/malformed Arweave address/);
+    await expect(fetchAllNotes('owner-hash-xyz', await keyring())).rejects.toThrow(/malformed Arweave address/);
   });
 });
 
@@ -172,7 +182,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
 
     expect(incomplete).toBe(false);
     expect(res).toHaveLength(1);
@@ -217,7 +227,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
     expect(res).toHaveLength(0);
     // A decrypt-failure is an intentional skip, NOT a partial restore.
     expect(incomplete).toBe(false);
@@ -254,7 +264,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
 
     expect(incomplete).toBe(false);
     expect(res.map(r => r.text).sort()).toEqual(['под новым кошельком', 'под старым кошельком']);
@@ -327,7 +337,7 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
 
     const progress: Array<[number, number]> = [];
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key, (d, t) => progress.push([d, t]));
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key), (d, t) => progress.push([d, t]));
 
     expect(incomplete).toBe(false);
     expect(res).toHaveLength(7);
@@ -371,7 +381,7 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res } = await fetchAllNotes('oh', key);
+    const { notes: res } = await fetchAllNotes('oh', ring(key));
 
     expect(res).toHaveLength(12);
     expect(maxInFlight).toBeGreaterThan(1); // the pool really parallelizes...
@@ -406,7 +416,7 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
 
     expect(incomplete).toBe(true);   // user must see "partial", not silence
     expect(res).toHaveLength(1);     // what DID load is kept
@@ -434,7 +444,7 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
     expect(incomplete).toBe(true);
     expect(res).toHaveLength(0);
   });
@@ -504,54 +514,67 @@ describe('uploadViaProxy v3_disabled classification', () => {
   });
 });
 
-describe('getWorkerCapabilities (strict /health validation)', () => {
+describe('getWorkerCapabilities (strict /health validation, per version)', () => {
   const proxyEnv = () => vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
+  const health = (body: unknown, status = 200) =>
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), { status })));
 
-  it('enabled ONLY on ok + versions with 3 + v3Uploads true', async () => {
+  it('enabled ONLY on ok + versions containing the version + its own flag true', async () => {
     proxyEnv();
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ ok: true, versions: ['1', '2', '3'], v3Uploads: true }), { status: 200 })));
+    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true, v4Uploads: true });
     const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toBe('enabled');
+    expect(await getWorkerCapabilities()).toEqual({ v3: 'enabled', v4: 'enabled' });
   });
 
-  it('disabled when the worker reports the gate off', async () => {
+  it('disabled when the worker reports a gate off', async () => {
     proxyEnv();
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ ok: true, versions: ['1', '2', '3'], v3Uploads: false }), { status: 200 })));
+    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: false, v4Uploads: false });
     const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toBe('disabled');
+    expect(await getWorkerCapabilities()).toEqual({ v3: 'disabled', v4: 'disabled' });
+  });
+
+  it('the two gates are INDEPENDENT (v4 off must not disable v3)', async () => {
+    proxyEnv();
+    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true, v4Uploads: false });
+    const { getWorkerCapabilities } = await import('./arweave');
+    expect(await getWorkerCapabilities()).toEqual({ v3: 'enabled', v4: 'disabled' });
+  });
+
+  it('a worker that lists v4 but omits v4Uploads is UNKNOWN (pause stays)', async () => {
+    proxyEnv();
+    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true });
+    const { getWorkerCapabilities } = await import('./arweave');
+    expect(await getWorkerCapabilities()).toEqual({ v3: 'enabled', v4: 'unknown' });
   });
 
   it('unknown for an OLD worker ({ok:true} without capability fields)', async () => {
     proxyEnv();
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    health({ ok: true });
     const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toBe('unknown');
+    expect(await getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
   });
 
   it('unknown for malformed bodies, non-200 and network errors (pause stays)', async () => {
     proxyEnv();
     vi.stubGlobal('fetch', vi.fn(async () => new Response('not json', { status: 200 })));
     let mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toBe('unknown');
+    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
 
     vi.resetModules(); proxyEnv();
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ ok: true, versions: ['1', '2'], v3Uploads: true }), { status: 200 })));
+    health({ ok: true, versions: ['1', '2'], v3Uploads: true, v4Uploads: true });
     mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toBe('unknown'); // versions without '3'
+    // versions without '3'/'4' → unknown even though the flags say true
+    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
 
     vi.resetModules(); proxyEnv();
     vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 500 })));
     mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toBe('unknown');
+    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
 
     vi.resetModules(); proxyEnv();
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
     mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toBe('unknown');
+    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
   });
 });
 
@@ -583,7 +606,7 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
 
     expect(incomplete).toBe(false);
     expect(res).toHaveLength(1);
@@ -624,7 +647,7 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
-    const { notes: res, incomplete } = await fetchAllNotes('oh', key);
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
     expect(res).toHaveLength(0);
     expect(incomplete).toBe(false); // malformed = intentional skip, not partial
   });

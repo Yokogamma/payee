@@ -132,6 +132,103 @@ retry).
   installed PWAs: a stale tab renders a v3 envelope as JSON text and keeps
   retrying an upload the worker rejects (harmless on-chain, wastes IP quota).
 
+## v4 release (Защищённый сейф / safebox) — worker v4-acceptor → R4 → W4
+
+App-Version=4 is the **safebox** record: same 5 tags as v2/v3, but a
+**split-envelope** data object `{id, mc, miv, sc, siv}` — two independently-keyed
+AES-GCM ciphertexts (meta + secret) in ONE transaction. Ids are UUIDv8 (same
+namespace as v3; the worker enforces the split per App-Version).
+
+Deploy order is **strictly worker-first**: **Worker v4-acceptor → R4 → W4.**
+
+1. **Worker v4-acceptor** (`deploy-worker.yml`): accepts App-Version 1/2/3/4,
+   `V4_UPLOADS_ENABLED = "true"` in wrangler.toml, `/health` reports
+   `{versions:['1','2','3','4'], v3Uploads, v4Uploads}`. Smoke
+   (`npm --prefix worker run smoke:v4` — **staging**), then append the release
+   tag to the allowlist below and **raise `WORKER_FLOOR_TAG` to it immediately**
+   (an older worker rejects App-Version=4 outright, so once safebox entries
+   exist they would stop syncing).
+   *Tag it on its OWN worker commit* — do not reuse `worker-r2`/`client-r3`
+   (both point at `cd7524e`).
+2. **R4 client** (tag `client-r4`): the complete safebox code with
+   `SAFEBOX_WRITER_ENABLED=false`. Reader + PIN + viewing + activation +
+   PIN change/deactivation/seed-reset all work; `addSafeboxEntry` /
+   `editSafeboxEntry` / `restoreSafeboxVersion` throw `WriterDisabledError` and
+   their UI is hidden.
+   **R4 IS AN IRREVERSIBLE CLIENT FLOOR from its FIRST production run**: it
+   raises IndexedDB from v1 to v2 on the very first launch, regardless of the
+   writer flag, and rolling that device back to W3 (`DB_VERSION=1`) yields a
+   `VersionError`. Therefore, **with R4** (not W4): publish the release note
+   «закройте старые вкладки Eternal Notes / обновите установленные PWA», and
+   verify the non-destructive `VersionError` screen (reload prompt, **no**
+   `resetBrokenStorage` button) before deploying.
+3. **W4 client** (tag `client-w4`): flips `SAFEBOX_WRITER_ENABLED` only — no
+   other code. **Mandatory preconditions:** production `/health` shows
+   `versions` containing `'4'` and `v4Uploads:true`; the signed v4 staging smoke
+   passed; the v4-acceptor worker tag is recorded below as the floor.
+
+### v4 upload kill switch (`V4_UPLOADS_ENABLED`)
+
+Identical contract to `V3_UPLOADS_ENABLED`, on its own switch (pausing one
+version never stops the other):
+
+- while disabled, ALL v4 traffic — including reconciliation and recovery
+  hints — gets `503 {code:'v4_uploads_disabled'}` after the IP limiter but
+  **before any per-owner RateLimiter DO call and before any Arweave POST**;
+- **fail-closed**: strictly `"true"` enables, anything else disables;
+- **source of truth = `worker/wrangler.toml`**; a dashboard override is
+  emergency-only and must be synced back. Verify after every worker deploy:
+  `curl <worker>/health` → `v4Uploads` matches the intended state;
+- the client pauses its whole v4 queue on the first 503 (persisted
+  `v4-uploads-paused` marker) and resumes only on
+  `ok && v4Uploads===true && versions∋'4'`, or via the manual banner button.
+  `versions` alone is NOT sufficient — it still lists '4' while the gate is off.
+
+### OPERATOR DECISION 2026-08-12: v4 ships WITHOUT staging
+
+> The operator confirmed that **there are still no real users — every account is
+> a test account**. On that basis the staging precondition below is waived for
+> the v4 rollout and the smoke runs against PRODUCTION, exactly as it did for
+> W3 and for the same reason.
+>
+> This is the escape hatch, invoked explicitly and recorded here as required.
+> What it costs: the first real exercise of the v4 acceptor happens on the
+> production worker and posts one real, tiny paid transaction. What it does NOT
+> waive: the smoke itself is still mandatory before the acceptor is tagged as
+> the floor, and `smoke-v4.mjs` still demands `ALLOW_PRODUCTION_SMOKE=true` so
+> the choice can never be made by accident.
+>
+> **The moment real users exist, this waiver expires** — provision staging
+> before the next version bump (checklist below).
+
+### STAGING IS A HARD PRECONDITION (operator, currently NOT provisioned)
+
+`[env.staging]` in `worker/wrangler.toml` still carries the KV **placeholder id**
+(`STAGING_KV_ID_PLACEHOLDER_CREATE_VIA_WRANGLER`), i.e. staging does not exist
+yet. W3 was smoked against PRODUCTION only because there were no users. **v4 has
+users**, so the operator must provision staging before the v4-acceptor deploy:
+
+1. `wrangler kv namespace create ALLOWLIST --env staging` → paste the id into
+   `[[env.staging.kv_namespaces]]`;
+2. `wrangler secret put ARWEAVE_JWK --env staging` (dedicated test wallet,
+   minimal AR balance — never the production wallet);
+3. `wrangler secret put ADMIN_SECRET --env staging`;
+4. `wrangler secret put RECOVERY_HMAC_SECRET --env staging`;
+5. seed an invite via `/admin/seed-invite` and register the smoke key through
+   `/register` (InviteManager is the source of truth — never hand-write `pk:`
+   entries into KV);
+6. `npm --prefix worker run deploy:staging:check`, then `deploy:staging`.
+
+A production smoke is an **escape hatch that requires a separate, explicit
+operator decision** and must be recorded here when used. `smoke-v4.mjs`
+enforces this: it refuses any `SMOKE_URL` host that is not localhost or a
+recognisable `staging` target unless `ALLOW_PRODUCTION_SMOKE=true` is set —
+the script posts real, paid Arweave transactions.
+
+Every staging command (`deploy:staging`, `deploy:staging:check`) is gated by
+`npm run check:staging-config`, which fails with the checklist above while the
+KV placeholder is still in `wrangler.toml`.
+
 ## Rollback rules
 
 - **Never roll back below the reader release R** once v2 writes are enabled: an
@@ -150,8 +247,12 @@ retry).
      on the fail-closed `Invalid recovery token` behaviour. Client and Worker
      must be rolled back **as a compatible pair**, never the Worker alone below
      the recovery protocol.
-  - On the first production deploy, tag it (e.g. `worker-r1`) and record it here:
-    `WORKER_FLOOR_TAG = worker-r1 (15b87d4cacbc19a3371a19b9141f1562b63781d8)`.
+  - On the first production deploy, tag it (e.g. `worker-r1`) and record it here.
+    **Current floor (raised when W3 shipped, 2026-08-09):**
+    `WORKER_FLOOR_TAG = worker-r2 (cd7524e)` — the v3-acceptor. The previous
+    value (`worker-r1`, 15b87d4cacbc19a3371a19b9141f1562b63781d8) is now BELOW
+    the floor and must never be redeployed: it does not know App-Version=3 or
+    the UUIDv8 namespace split.
   - **Allowed rollback targets = tags in this list that are descendants of
     `WORKER_FLOOR_TAG`** (verify with `git merge-base --is-ancestor`). Never
     deploy anything else once the floor Worker has run even once.
@@ -162,7 +263,12 @@ retry).
     - worker-r2 — cd7524e (2026-08-09, v3-acceptor: App-Version=3, UUIDv8
       namespace barrier, V3_UPLOADS_ENABLED kill switch, /health capability;
       prod /health verified: {ok, versions:[1,2,3], v3Uploads:true}).
-      **Becomes the worker rollback floor the moment W3 ships.**
+      **Became the worker rollback floor when W3 shipped (2026-08-09).**
+    - worker-r3 (v4-acceptor) — `<SHA once deployed>` (App-Version=4 split
+      envelope, V4_UPLOADS_ENABLED kill switch, /health `v4Uploads`).
+      **Becomes the worker rollback floor the moment it is deployed** (an older
+      worker 400s every safebox upload). Record the tag + SHA + the verified
+      `/health` output here at deploy time and raise `WORKER_FLOOR_TAG` above.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.

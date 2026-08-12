@@ -24,24 +24,52 @@ import {
   deriveKey,
   deriveOwnerHash,
   deriveSigningKeypair,
+  deriveSafeboxMetaKey,
+  deriveSafeboxSecretKey,
   signPayload,
   encrypt,
   encryptEnvelopeV3,
+  encryptSafeboxEntry,
   decryptNote,
+  decryptSafeboxMeta,
+  decryptSafeboxSecret,
   encryptWithPin,
   decryptWithPin,
+  createSafeboxPinBlob,
+  verifySafeboxPin,
+  isValidSafeboxPin,
   isPinKdfLegacy,
+  randomUuidV8,
   WrongPinError,
+  SafeboxWrongPinError,
+  PinUnlockUnavailableError,
   UnsupportedNoteVersionError,
   bufferToBase64,
-  type EncryptedNote,
+  base64ToBuffer,
+  type EncryptedSafeboxEntry,
   type NoteData,
   type NoteFormat,
   type PinEncryptedSeed,
+  type SafeboxEntryData,
+  type SafeboxEntryInput,
+  type SafeboxSecretData,
 } from './crypto';
-import { groupChains, type NoteChain } from './chains';
-import { V3_WRITER_ENABLED } from './flags';
-import { isNoteTooLong, noteJsonByteLength, NoteTooLongError } from './limits';
+import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } from './chains';
+import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from './flags';
+import {
+  isNoteTooLong,
+  noteJsonByteLength,
+  NoteTooLongError,
+  safeboxUploadByteLength,
+  MAX_UPLOAD_BODY_BYTES,
+  SafeboxEntryTooLargeError,
+} from './limits';
+import {
+  applySafeboxPatch,
+  snapshotSafeboxVersion,
+  matchesSafeboxQuery,
+  type SafeboxEntryPatch,
+} from './safebox';
 import {
   isArweaveOnline,
   checkRegistration,
@@ -50,19 +78,36 @@ import {
   fetchAllNotes,
   getTxStatus,
   getWorkerCapabilities,
+  UnsupportedSafeboxVersionError,
 } from './arweave';
 import {
   initStorage,
   getAllNotes,
   saveNote,
   mergeRestoredNote,
+  getAllSafeboxEntries,
+  getSafeboxEntryById,
+  countSafeboxEntries,
+  mergeRestoredSafeboxEntry,
+  commitSafeboxEntry,
+  readSafeboxPinConfig,
+  hasSafeboxPinConfig,
+  commitSafeboxPinFailure,
+  commitSafeboxPinSuccess,
+  commitSafeboxPinDelete,
+  commitSafeboxPinWrite,
+  safeboxLockSeconds,
+  SafeboxConfigChangedError,
   getAllSyncRecords,
   getRecordsByStatus,
   getSyncRecord,
   setSyncRecord,
   commitV3PausedFailure,
+  commitV4PausedFailure,
   readV3PauseMeta,
+  readV4PauseMeta,
   clearV3UploadsPaused,
+  clearV4UploadsPaused,
   getMeta,
   setMeta,
   deleteMeta,
@@ -72,10 +117,11 @@ import {
   recoverStorage,
   getDbGeneration,
   noteExternalReset,
+  isDbVersionError,
   type SyncRecord,
 } from './storage';
 import { afterPoll, claimRestoredForUi } from './sync-transitions';
-import { runUploadAttempt } from './upload-flow';
+import { runUploadAttempt, uploadItemId, MalformedRecordError, type UploadItem } from './upload-flow';
 import { DraftStore, dropLegacyPlaintextDraft, DRAFT_STORAGE_KEY } from './draft';
 import {
   consumeHiddenMarker,
@@ -87,9 +133,13 @@ import {
   type BootstrapNavigationType,
 } from './auto-lock';
 import { userFacingUploadError, userFacingRegistrationError } from './errors';
+import { copyTextToClipboard } from './clipboard';
 
 // Re-exported for callers that only need the storage key (reset paths, tests).
 export { DRAFT_STORAGE_KEY };
+// Re-exported so UI code has ONE import surface for safebox errors (this one
+// is raised inside storage.ts, but it reaches the user through store actions).
+export { SafeboxConfigChangedError } from './storage';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -126,11 +176,22 @@ export interface ArweaveState {
    *  app version). Settings shows a dedicated explainer instead of a lying
    *  «Ошибки: N — Повторить». */
   quarantinedCount: number;
-  /** STORAGE-BACKED reset risk: all EncryptedNote records minus confirmed ones.
-   *  The reset dialog must use THIS, not the visible `notes` — an invisible
-   *  quarantined/undecryptable record would otherwise let «всё подтверждено»
+  /** STORAGE-BACKED reset risk, SPLIT BY KIND: every stored record minus the
+   *  confirmed ones. The reset dialog must use THIS, not the visible `notes` —
+   *  an invisible quarantined/undecryptable record (or the whole safebox, which
+   *  is invisible while locked) would otherwise let «всё подтверждено»
    *  greenlight deleting data a newer client could still read. */
-  resetRiskCount: number;
+  resetRisk: { notes: number; safebox: number };
+  /** Safebox sync aggregates, kept SEPARATE from the notes ones: a shared
+   *  counter makes «Синхронизировано X из N» go negative (the notes formula is
+   *  allNotes − accepted − confirmed over the SAME record set). */
+  safebox: {
+    unsyncedCount: number;
+    acceptedCount: number;
+    confirmedCount: number;
+    errorCount: number;
+    quarantinedCount: number;
+  };
   lastSync: number | null;
   lastError: string | null;
 }
@@ -146,7 +207,14 @@ const INITIAL_ARWEAVE: ArweaveState = {
   acceptedCount: 0,
   confirmedCount: 0,
   quarantinedCount: 0,
-  resetRiskCount: 0,
+  resetRisk: { notes: 0, safebox: 0 },
+  safebox: {
+    unsyncedCount: 0,
+    acceptedCount: 0,
+    confirmedCount: 0,
+    errorCount: 0,
+    quarantinedCount: 0,
+  },
   lastSync: null,
   lastError: null,
 };
@@ -185,12 +253,76 @@ export class OperationInFlightError extends Error {
   }
 }
 
-/** editNote called while V3_WRITER_ENABLED=false (R3). A silent no-op is
- *  forbidden — the edit modal would read it as a successful save. */
+/** A writer action called while its build-time flag is false (R3 / R4). A
+ *  silent no-op is forbidden — the calling modal would read it as a successful
+ *  save. */
 export class WriterDisabledError extends Error {
-  constructor() {
-    super('Редактирование заметок недоступно в этой версии приложения.');
+  constructor(message = 'Редактирование заметок недоступно в этой версии приложения.') {
+    super(message);
     this.name = 'WriterDisabledError';
+  }
+}
+
+// ─── Safebox errors ─────────────────────────────────────────────────
+
+/** The safebox PIN is in its progressive lockout window. */
+export class SafeboxPinLockedError extends Error {
+  secondsLeft: number;
+  constructor(secondsLeft: number) {
+    super(`PIN сейфа заблокирован на ${secondsLeft} сек`);
+    this.name = 'SafeboxPinLockedError';
+    this.secondsLeft = secondsLeft;
+  }
+}
+
+/** Ten wrong PINs removed the safebox PIN CONFIGURATION. The entries are
+ *  untouched — access is restored by entering the full seed phrase. */
+export class SafeboxPinWipedError extends Error {
+  constructor() {
+    super('PIN сейфа удалён после 10 неудачных попыток. Восстановите доступ по seed-фразе.');
+    this.name = 'SafeboxPinWipedError';
+  }
+}
+
+/** No safebox PIN is configured (fresh device, post-wipe, after deactivation). */
+export class SafeboxNotConfiguredError extends Error {
+  constructor() {
+    super('PIN сейфа не установлен.');
+    this.name = 'SafeboxNotConfiguredError';
+  }
+}
+
+/** The safebox section is not unlocked (any more) — a lock, an app lock or a
+ *  config replacement won the race. NOTHING is published. */
+export class SafeboxLockedError extends Error {
+  constructor() {
+    super('Сейф заблокирован.');
+    this.name = 'SafeboxLockedError';
+  }
+}
+
+/** Setting a safebox PIN identical to the MAIN PIN defeats the whole gate. */
+export class SafeboxSamePinError extends Error {
+  constructor() {
+    super('PIN сейфа должен отличаться от основного PIN-кода.');
+    this.name = 'SafeboxSamePinError';
+  }
+}
+
+/** The seed phrase entered for a safebox PIN reset is not this vault's. */
+export class SafeboxSeedMismatchError extends Error {
+  constructor() {
+    super('Эта seed-фраза не подходит к хранилищу на устройстве.');
+    this.name = 'SafeboxSeedMismatchError';
+  }
+}
+
+/** Setting a PIN while safebox DATA exists but no config does — allowed only
+ *  through full seed entry (or the one-shot post-restore window). */
+export class SafeboxSeedRequiredError extends Error {
+  constructor() {
+    super('Введите полную seed-фразу, чтобы установить PIN для существующего сейфа.');
+    this.name = 'SafeboxSeedRequiredError';
   }
 }
 
@@ -211,6 +343,33 @@ interface NotesStore {
   /** v3 uploads are paused by the worker's kill switch (persisted marker).
    *  Shown as a standing banner with a manual resume button. */
   v3Paused: boolean;
+  /** Same, for safebox (v4) uploads — an independent switch and marker. */
+  v4Paused: boolean;
+
+  // ── Safebox (§6) ──────────────────────────────────────────────────
+  /** Per-tab, in memory only — never persisted. */
+  safeboxUnlocked: boolean;
+  /** Increments on EVERY section lock (including hidden/pagehide edges while
+   *  the section is already locked). The UI keys the whole safebox subtree on
+   *  it, so a lock discards every local secret state — the half-typed PIN and,
+   *  critically, the seed-reset grid. */
+  safeboxLockGeneration: number;
+  /** A safebox PIN configuration exists on this device. */
+  safeboxPinConfigured: boolean;
+  /** At least one safebox entry is stored locally (known while LOCKED). */
+  safeboxDataPresent: boolean;
+  /** Stored entry VERSIONS — powers «Найден сейф: N записей». */
+  safeboxEntryCount: number;
+  /** Decrypted META of every version (empty while locked). */
+  safeboxEntries: SafeboxEntryData[];
+  /** Version chains over the authenticated envelope fields. */
+  safeboxChains: SafeboxChain[];
+  /** Chains filtered by the safebox-only search (non-secret fields). */
+  filteredSafeboxChains: SafeboxChain[];
+  safeboxSearchQuery: string;
+  /** How many safebox entry versions the last restore recovered (null = none
+   *  yet). Deliberately NOT merged into the notes «Восстановлено M» counter. */
+  restoredSafeboxCount: number | null;
   arweave: ArweaveState;
   /** noteId → sync info, refreshed together with the aggregate counters. */
   syncStatuses: Record<string, NoteSyncInfo>;
@@ -228,6 +387,13 @@ interface NotesStore {
   /** Current auto-lock threshold (§1): null=never, 0=immediately, 300/1800 s. */
   autoLockTimeout: AutoLockTimeout;
   bootError: string | null;
+  /** Another tab still holds the previous IndexedDB schema, so the upgrade
+   *  cannot start — the user must close it (then this clears by itself). */
+  storageBlocked: boolean;
+  /** The stored database is NEWER than this build (a newer client migrated
+   *  it). The error screen must offer RELOAD ONLY — the data is intact and the
+   *  destructive reset would throw away everything unsynced. */
+  storageOutdated: boolean;
 
   // Actions
   createNewWallet: () => Promise<string>;
@@ -243,7 +409,45 @@ interface NotesStore {
   editNote: (rootId: string, newText: string, opts?: { fmt?: NoteFormat }) => Promise<void>;
   /** Manual resume of paused v3 uploads (clears the marker unconditionally). */
   resumeV3Uploads: () => Promise<void>;
+  /** Same, for the safebox queue. */
+  resumeV4Uploads: () => Promise<void>;
   setSearchQuery: (query: string) => void;
+
+  // ── Safebox actions (§6) ──────────────────────────────────────────
+  /** First activation, or re-activation on a device that already holds safebox
+   *  DATA. In the latter case the caller MUST pass the full seed phrase
+   *  (proof-by-decrypt) — the only exception is the one-shot post-restore
+   *  window in the same session. Writer-INDEPENDENT (works on R4). */
+  activateSafebox: (pin: string, opts?: { mnemonic?: string }) => Promise<void>;
+  /** Argon2id → verifier decrypt → metering → derive the meta key → decrypt all
+   *  metas → publish under BOTH epochs. */
+  unlockSafebox: (pin: string) => Promise<void>;
+  /** Synchronous: bumps the section epoch, drops the meta key and every
+   *  decrypted meta. Safe to call at any time. */
+  lockSafebox: () => void;
+  /** Re-arm the 5-minute idle lock (called on any safebox interaction). */
+  touchSafebox: () => void;
+  changeSafeboxPin: (currentPin: string, newPin: string) => Promise<void>;
+  deactivateSafebox: (currentPin: string) => Promise<void>;
+  /** Reset the PIN with the full seed phrase — WITHOUT touching the data. */
+  resetSafeboxPinWithSeed: (mnemonic: string, newPin: string) => Promise<void>;
+  getSafeboxPinLockState: () => Promise<{ lockedSeconds: number; attempts: number; configured: boolean }>;
+  /** Writer-gated (SAFEBOX_WRITER_ENABLED). */
+  addSafeboxEntry: (input: SafeboxNewEntry) => Promise<void>;
+  /** Writer-gated. Patch contract: anything not explicitly changed is carried
+   *  over from the previous version (§6). */
+  editSafeboxEntry: (rootId: string, patch: SafeboxEntryPatch) => Promise<void>;
+  /** Writer-gated. Creates a NEW version at the chain head holding the FULL
+   *  content of `versionId` (title/login/url/note/password/files). */
+  restoreSafeboxVersion: (rootId: string, versionId: string) => Promise<void>;
+  /** Decrypt one entry's password for a bounded on-screen reveal. */
+  revealSafeboxSecret: (entryId: string) => Promise<string>;
+  /** Copy straight from the decrypted string — the plaintext NEVER enters the
+   *  DOM. Resolves false when the clipboard write was refused. */
+  copySafeboxPassword: (entryId: string) => Promise<boolean>;
+  /** Decrypt one attachment and hand it to the browser as a download. */
+  downloadSafeboxAttachment: (entryId: string, fid: string) => Promise<void>;
+  setSafeboxSearchQuery: (query: string) => void;
   goToRestore: () => void;
   goToOnboarding: () => void;
   goToLanding: () => void;
@@ -274,6 +478,16 @@ interface NotesStore {
   retryRestore: () => Promise<void>;
   clearRestoreStatus: () => void;
   dismissError: () => void;
+}
+
+/** What the entry form submits for a brand-new safebox entry. */
+export interface SafeboxNewEntry {
+  title: string;
+  login: string;
+  url: string;
+  note: string;
+  password: string;
+  files: Array<{ name: string; mime: string; size: number; data: string }>;
 }
 
 const StoreContext = createContext<NotesStore | null>(null);
@@ -405,15 +619,45 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // v3 uploads paused by the worker kill switch. Authoritative state lives in
   // the shared IndexedDB marker (readV3PauseMeta) — this mirrors it for the UI.
   const [v3Paused, setV3Paused] = useState(false);
+  const [v4Paused, setV4Paused] = useState(false);
+  const [restoredSafeboxCount, setRestoredSafeboxCount] = useState<number | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [hasPin, setHasPin] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
+  // A tab holding the old schema is blocking the v1→v2 upgrade.
+  const [storageBlocked, setStorageBlocked] = useState(false);
+  // This build is OLDER than the stored database (a newer client migrated it).
+  const [storageOutdated, setStorageOutdated] = useState(false);
   const [autoLockTimeout, setAutoLockTimeoutState] = useState<AutoLockTimeout>(null);
   // Opaque privacy gate (review rounds 2–3): raised SYNCHRONOUSLY on the
   // hidden edge — or when a vault COMMITS into a hidden tab — and dropped only
   // by the lifecycle cycle that owns it, so no frame painted after a return
   // can show plaintext that the verdict then locks away.
-  const [lockGate, setLockGate] = useState(false);
+  //
+  // IMPERATIVE ON PURPOSE (review): the gate element is ALWAYS mounted and its
+  // `hidden`/`inert` attributes are flipped straight on the DOM nodes. React
+  // state would only reach the DOM on the next commit, which is NOT guaranteed
+  // to happen before the browser takes the BFCache snapshot inside `pagehide`
+  // — exactly the moment the gate exists for.
+  const gateElRef = useRef<HTMLDivElement | null>(null);
+  const gateContentRef = useRef<HTMLDivElement | null>(null);
+  const lockGateRef = useRef(false);
+  function setLockGate(up: boolean): void {
+    lockGateRef.current = up;
+    // ATTRIBUTES, not properties: attribute reflection is universal, whereas
+    // the `inert` IDL property is missing in some engines (and in jsdom), where
+    // the assignment would silently do nothing.
+    const gate = gateElRef.current;
+    const content = gateContentRef.current;
+    if (gate) {
+      if (up) gate.removeAttribute('hidden');
+      else gate.setAttribute('hidden', '');
+    }
+    if (content) {
+      if (up) content.setAttribute('inert', '');
+      else content.removeAttribute('inert');
+    }
+  }
   // Ownership of the pending return-verdict (review round 3): bumped on every
   // hidden edge, lock and vault commit. A verdict may apply itself — lock or
   // drop the gate — only if its generation (and vault epoch) is still current;
@@ -430,6 +674,78 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const ownerHashRef = useRef<string | null>(null);
   const signingKeyRef = useRef<Uint8Array | null>(null);
   const publicKeyRef = useRef<Uint8Array | null>(null);
+  // Synchronous mirror of the `mnemonic` state: the safebox derives its keys
+  // from the seed inside async flows that outlive their closure.
+  const mnemonicRef = useRef<string | null>(null);
+
+  // ─── Safebox slice (§3/§6) ────────────────────────────────────────
+  const [safeboxUnlocked, setSafeboxUnlocked] = useState(false);
+  const [safeboxPinConfigured, setSafeboxPinConfigured] = useState(false);
+  const [safeboxEntryCount, setSafeboxEntryCount] = useState(0);
+  const [safeboxEntries, setSafeboxEntries] = useState<SafeboxEntryData[]>([]);
+  const [safeboxSearchQuery, setSafeboxSearchQuery] = useState('');
+  /** Mirrors the section epoch for the UI: every lock bumps it, and the
+   *  safebox subtree is keyed on it so ALL local secret state is discarded. */
+  const [safeboxLockGeneration, setSafeboxLockGeneration] = useState(0);
+  // Mirror for async flows (edit/restore-version read the chain head from it).
+  const safeboxEntriesRef = useRef<SafeboxEntryData[]>([]);
+  /** META key — held ONLY while the section is unlocked. The SECRET key is
+   *  never stored anywhere: it is derived on demand and dropped. */
+  const safeboxMetaKeyRef = useRef<CryptoKey | null>(null);
+  /** The PIN configuration this unlocked session belongs to. Every secret
+   *  publication re-reads the config from IndexedDB and compares against it —
+   *  BroadcastChannel is a fast path, never the guarantee (§2). */
+  const safeboxConfigIdRef = useRef<string | null>(null);
+  /** Bumped by EVERY section lock — and by every vault lifecycle
+   *  invalidation. Async safebox flows capture BOTH this and vaultEpochRef and
+   *  re-check both before publishing anything. */
+  const safeboxSectionEpochRef = useRef(0);
+  const safeboxIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** One-shot permission to activate the safebox WITHOUT re-entering the seed,
+   *  valid only in the session that just performed a manual restore. Bound to
+   *  the vault epoch; consumed on use and dropped on lock/reset/failure. */
+  const freshRestoreRef = useRef<number | null>(null);
+  const safeboxAddInFlightRef = useRef(false);
+  const safeboxEditInFlightRef = useRef(new Set<string>());
+  /** Synchronous mirror of `safeboxUnlocked` for the lifecycle listeners (a
+   *  React state read inside an event handler would be stale). */
+  const safeboxUnlockedRef = useRef(false);
+
+  /** Fixed 5-minute idle lock (no setting in v1). */
+  const SAFEBOX_IDLE_MS = 5 * 60 * 1000;
+
+  // ── Clipboard auto-clear (honest semantics, §6) ────────────────────
+  // Best-effort: a clipboard write only works while the document has focus, so
+  // a background tab defers the attempt to the next focus/visible edge. The
+  // timer lives OUTSIDE every epoch gate — clearing is not a secret
+  // publication, and it must survive a safebox lock.
+  const CLIPBOARD_CLEAR_MS = 60_000;
+  const clipboardClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clipboardClearPendingRef = useRef(false);
+
+  function tryClearClipboard(): void {
+    if (!document.hasFocus()) {
+      clipboardClearPendingRef.current = true; // retry on the next focus edge
+      return;
+    }
+    clipboardClearPendingRef.current = false;
+    // Silent on failure: nagging about a clipboard we cannot touch helps nobody.
+    void navigator.clipboard?.writeText('').catch(() => {});
+  }
+
+  function armClipboardClear(): void {
+    if (clipboardClearTimerRef.current !== null) clearTimeout(clipboardClearTimerRef.current);
+    clipboardClearPendingRef.current = false;
+    clipboardClearTimerRef.current = setTimeout(() => {
+      clipboardClearTimerRef.current = null;
+      tryClearClipboard();
+    }, CLIPBOARD_CLEAR_MS);
+  }
+
+  function publishSafeboxEntries(apply: (prev: SafeboxEntryData[]) => SafeboxEntryData[]): void {
+    safeboxEntriesRef.current = apply(safeboxEntriesRef.current);
+    setSafeboxEntries(apply);
+  }
 
   // Auto-lock machinery. The epoch is the vault's identity in time: bumped by
   // every lock/reset, captured by every async flow, checked before every
@@ -472,8 +788,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // Per-note sync info (joined notes + syncRecords) for the card indicators
   const [syncStatuses, setSyncStatuses] = useState<Record<string, NoteSyncInfo>>({});
 
-  // Upload queue refs
-  const uploadQueueRef = useRef<EncryptedNote[]>([]);
+  // Upload queue refs. The queue is TYPED by kind (notes and safebox entries
+  // share one pipeline, one quota and one id space) — the kind travels WITH the
+  // item, so no downstream step has to shape-sniff a record read from
+  // IndexedDB to decide how to serialize it.
+  const uploadQueueRef = useRef<UploadItem[]>([]);
   const queuedIdsRef = useRef(new Set<string>());
   const isProcessingRef = useRef(false);
   // Bumped on lock/reset: the running processor stops taking iterations and
@@ -562,7 +881,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       markHidden(sessionStorage, Date.now());
       lockCheckGenerationRef.current++;
       lockCheckPendingRef.current = false;
-      if (vaultPresentInTab()) setLockGate(true);
+      // The safebox locks on EVERY hidden edge, with no grace period: a
+      // navigation/BFCache freeze can bypass the visibility edge and later
+      // restore the saved heap. Raise the opaque privacy gate BEFORE the
+      // section is torn down — a plain setState from `pagehide` is not
+      // guaranteed to remove already-painted plaintext before the BFCache
+      // snapshot; the gate (`lock-gate` + `inert`) is what actually covers it.
+      if (vaultPresentInTab() || safeboxUnlockedRef.current) setLockGate(true);
+      lockSafeboxNow();
     };
 
     const evaluateReturn = () => {
@@ -644,18 +970,60 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // BFCache restore resumes the app exactly where it was — same decision
       // as a visibility return. A non-persisted pageshow accompanies a normal
       // load, where bootstrap already decided.
-      if (e.persisted) evaluateReturn();
+      if (e.persisted) {
+        // Fail-closed control check: whatever the heap was restored to, the
+        // safebox section must be CLOSED after a BFCache return.
+        lockSafeboxNow();
+        evaluateReturn();
+      }
     };
+    // Chrome freezes background tabs without necessarily firing pagehide.
+    const onFreeze = () => onHiddenEdge();
 
     document.addEventListener('visibilitychange', onVisibility);
+    document.addEventListener('freeze', onFreeze);
     window.addEventListener('pagehide', onPageHide);
     window.addEventListener('pageshow', onPageShow);
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
+      document.removeEventListener('freeze', onFreeze);
       window.removeEventListener('pagehide', onPageHide);
       window.removeEventListener('pageshow', onPageShow);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Safebox config recheck on focus / pageshow (§2) ───────────────
+  // BroadcastChannel may be absent or lossy, so a returning tab re-reads the
+  // authoritative config the moment it becomes interactive again — before the
+  // user can touch anything — instead of waiting for the next secret action.
+  useEffect(() => {
+    const recheck = () => { void reconcileSafeboxConfig(); };
+    const onPageShow = () => recheck();
+    window.addEventListener('focus', recheck);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      window.removeEventListener('focus', recheck);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Deferred clipboard clear (retry on the next focus/visible edge) ──
+  useEffect(() => {
+    const retry = () => {
+      if (clipboardClearPendingRef.current) tryClearClipboard();
+    };
+    const onVisible = () => { if (document.visibilityState === 'visible') retry(); };
+    window.addEventListener('focus', retry);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', retry);
+      document.removeEventListener('visibilitychange', onVisible);
+      if (clipboardClearTimerRef.current !== null) clearTimeout(clipboardClearTimerRef.current);
+      // The safebox idle lock must not outlive the provider either.
+      if (safeboxIdleTimerRef.current !== null) clearTimeout(safeboxIdleTimerRef.current);
+    };
   }, []);
 
   // ─── Multi-tab vault channel (§8) ──────────────────────────────────
@@ -677,6 +1045,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
       } else if (msg.type === 'config') {
         void reconcileLockScreen();
+        // The `config` message covers BOTH PIN contours. The safebox half
+        // re-reads its own record and locks this tab whenever the config
+        // CHANGED OWNER (different configId) or disappeared — a plain
+        // attempts/lockout mutation keeps the same configId and needs no lock.
+        void reconcileSafeboxConfig();
       } else if (msg.type === 'reset') {
         // Another tab is DESTROYING the shared DB. Invalidate every write this
         // tab might still commit for the doomed vault (reset-exclusivity, P1),
@@ -737,14 +1110,105 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  /**
+   * Cross-tab safebox reaction. The broadcast is only the FAST path — the
+   * guarantee is the per-publication storage recheck (§2) — but reacting
+   * promptly keeps a stale unlocked section from lingering on screen.
+   *
+   * Locks when the config record vanished or its `configId` changed. An
+   * unreadable/malformed record fails CLOSED (lock): we cannot vouch for the
+   * session behind it.
+   */
+  async function reconcileSafeboxConfig(): Promise<void> {
+    let configured = false;
+    let currentId: string | null = null;
+    try {
+      const cfg = await readSafeboxPinConfig();
+      configured = cfg !== null;
+      currentId = cfg?.configId ?? null;
+    } catch {
+      configured = true;  // malformed record: present, but unusable
+      currentId = null;   // → treat as a foreign config and lock
+    }
+    setSafeboxPinConfigured(configured);
+    if (safeboxUnlockedRef.current && currentId !== safeboxConfigIdRef.current) {
+      lockSafeboxNow();
+    }
+    // A wipe/deactivation in another tab also invalidates the one-shot
+    // post-restore activation window.
+    if (!configured) freshRestoreRef.current = null;
+  }
+
   /** Everything a lock must invalidate, in one place (round 4): vault epoch,
    *  upload-queue generation, the lifecycle cycle that owns the privacy gate
    *  (pending return-verdict), the gate itself and the in-flight vault op.
    *  Shared by lockApp and resetApp — a reset that skipped any of these could
    *  leave an orphaned gate over the landing screen forever. */
+  /**
+   * SYNCHRONOUS section lock. Bumps the section epoch (every in-flight safebox
+   * flow re-checks it before publishing), drops the meta key, the captured
+   * configId and every decrypted meta, and cancels the idle timer.
+   *
+   * Deliberately does NOT touch notes state: locking the safebox is not
+   * locking the app.
+   */
+  function lockSafeboxNow(): void {
+    safeboxSectionEpochRef.current++;
+    // SYNCHRONOUS scrub of any secret still sitting in a safebox input — the
+    // activation PIN, the PIN pad, and above all the 12-word SEED-RESET grid.
+    // Those forms live OUTSIDE the unlocked session, so nothing else would
+    // clear them, and a BFCache snapshot taken inside `pagehide` captures the
+    // DOM as-is. React state is dropped separately, by the remount keyed on
+    // `safeboxLockGeneration` below.
+    // `.safebox-secret-field` additionally covers the safebox inputs that live
+    // OUTSIDE the section — the Settings PIN change/deactivation form and the
+    // seed-gate PIN — which no remount of the section would ever reach.
+    try {
+      const fields = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        '.safebox-section input, .safebox-section textarea, .safebox-secret-field',
+      );
+      for (const field of fields) field.value = '';
+    } catch { /* no DOM (SSR/test) — the remount below is the real guarantee */ }
+    safeboxMetaKeyRef.current = null;
+    safeboxConfigIdRef.current = null;
+    safeboxEntriesRef.current = [];
+    safeboxAddInFlightRef.current = false;
+    safeboxEditInFlightRef.current.clear();
+    // The post-restore activation window must not survive a lock (§2).
+    freshRestoreRef.current = null;
+    if (safeboxIdleTimerRef.current !== null) {
+      clearTimeout(safeboxIdleTimerRef.current);
+      safeboxIdleTimerRef.current = null;
+    }
+    safeboxUnlockedRef.current = false;
+    setSafeboxUnlocked(false);
+    setSafeboxEntries([]);
+    setSafeboxSearchQuery('');
+    // Published so the UI can REMOUNT the whole safebox subtree on every lock.
+    // Clearing only on `unlocked: true → false` is not enough: the activation,
+    // PIN-pad and seed-reset forms run while the section is LOCKED, so their
+    // local state (including a fully typed seed phrase) would otherwise
+    // survive a hidden/pagehide round-trip.
+    setSafeboxLockGeneration(safeboxSectionEpochRef.current);
+  }
+
+  /** (Re)arm the fixed 5-minute idle lock. Called on unlock and on every
+   *  safebox interaction. */
+  function armSafeboxIdleTimer(): void {
+    if (safeboxIdleTimerRef.current !== null) clearTimeout(safeboxIdleTimerRef.current);
+    safeboxIdleTimerRef.current = setTimeout(() => {
+      safeboxIdleTimerRef.current = null;
+      lockSafeboxNow();
+    }, SAFEBOX_IDLE_MS);
+  }
+
   function invalidateVaultLifecycle(): void {
     vaultEpochRef.current++;
     queueGenerationRef.current++;
+    // An app lock ALWAYS locks the safebox: the section epoch must move too, or
+    // an in-flight reveal captured before the lock could still publish
+    // plaintext behind the PIN screen.
+    lockSafeboxNow();
     lockCheckGenerationRef.current++;
     lockCheckPendingRef.current = false;
     // An in-flight reconcile read predates this invalidation — its snapshot
@@ -758,8 +1222,24 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   async function bootstrap() {
     try {
-      // 1. Init storage (IndexedDB + migrate localStorage)
-      await initStorage();
+      // 1. Init storage (IndexedDB + migrate localStorage). A tab still holding
+      //    the OLD schema blocks the v1→v2 upgrade: surface it instead of
+      //    spinning on 'loading' forever (the upgrade resumes by itself once
+      //    that tab closes).
+      await initStorage({
+        onBlocked: () => setStorageBlocked(true),
+        // THIS tab is in the way of a newer build's upgrade: our connection
+        // was just closed, so every later read here would throw. Drop the live
+        // vault (keys, decrypted notes, any open safebox — they can do nothing
+        // useful without a database, and this tab is now a dead end) and show
+        // the non-destructive «reload» screen instead of failing obscurely.
+        onBlocking: () => {
+          lockApp({ broadcast: false }); // no ping-pong: the other tab is fine
+          setStorageOutdated(true);
+          setScreen('error');            // AFTER lockApp — it sets its own screen
+        },
+      });
+      setStorageBlocked(false);
 
       // 2. Check init
       const isInit = await getMeta('init');
@@ -830,6 +1310,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         setScreen('restore');
       }
     } catch (err) {
+      // A NEWER client already migrated this database (R4+ ran in another tab
+      // or before a rollback). The data is intact and fully readable by that
+      // build — the ONLY correct action is «reload / update», never the
+      // destructive storage reset the generic error screen offers in two
+      // clicks (it would delete every unsynced record).
+      if (isDbVersionError(err)) {
+        console.error('bootstrap: database is newer than this build', err);
+        setStorageOutdated(true);
+        setScreen('error');
+        return;
+      }
       // Storage init/read failed (corrupted IndexedDB, quota, private-mode
       // restrictions). Without this catch the app would spin forever.
       console.error('bootstrap failed:', err);
@@ -860,6 +1351,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     ownerHashRef.current = snap.ownerHash;
     signingKeyRef.current = snap.privateKey;
     publicKeyRef.current = snap.publicKey;
+    mnemonicRef.current = snap.mnemonic;
     setMnemonic(snap.mnemonic);
     setNotes(snap.notes);
     // Mirror synchronously: a restore may start before React flushes the state
@@ -909,16 +1401,37 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // with the lock/reload, but the fail-closed pause itself must never look
     // like silently-stuck sync. Malformed marker = paused (fail closed).
     try {
-      const pause = await readV3PauseMeta();
-      if (vaultEpochRef.current === myEpoch) setV3Paused(pause !== null);
+      const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
+      if (vaultEpochRef.current === myEpoch) {
+        setV3Paused(pause3 !== null);
+        setV4Paused(pause4 !== null);
+      }
     } catch (err) {
       console.error('readV3PauseMeta at unlock failed:', err);
     }
+
+    // Safebox presence (§3 hydration): the PIN-config record + the encrypted
+    // entry COUNT. Both readable with the section locked — they drive the entry
+    // point, the «Найден сейф: N» banner and reset-safety.
+    await refreshSafeboxPresence(myEpoch);
 
     // Background: network-dependent parts only (online probe + queue kick).
     void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
 
     return myEpoch;
+  }
+
+  /** Re-read the two locked-safe safebox facts (config presence + entry count)
+   *  and publish them under the caller's epoch. */
+  async function refreshSafeboxPresence(epoch: number): Promise<void> {
+    try {
+      const [configured, count] = await Promise.all([hasSafeboxPinConfig(), countSafeboxEntries()]);
+      if (vaultEpochRef.current !== epoch) return;
+      setSafeboxPinConfigured(configured);
+      setSafeboxEntryCount(count);
+    } catch (err) {
+      console.error('safebox presence hydration failed:', err);
+    }
   }
 
   // ─── Lock (§3) ─────────────────────────────────────────────────────
@@ -932,6 +1445,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     ownerHashRef.current = null;
     signingKeyRef.current = null;
     publicKeyRef.current = null;
+    mnemonicRef.current = null;
+    // The safebox lives inside the vault's lifetime — never outlives it.
+    lockSafeboxNow();
+    setSafeboxPinConfigured(false);
+    setSafeboxEntryCount(0);
+    setRestoredSafeboxCount(null);
+    setV4Paused(false);
     setMnemonic(null);
     setNotes([]);
     notesRef.current = [];
@@ -1002,48 +1522,90 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }
 
   /** Epoch-aware (§4): reads storage first, then publishes to React state only
-   *  if the vault the caller saw is still the vault on screen. */
+   *  if the vault the caller saw is still the vault on screen.
+   *
+   *  Aggregates are computed PER KIND: the notes formula is
+   *  `allNotes − accepted − confirmed` over the SAME record set, so counting a
+   *  safebox record in the numerator drives «Синхронизировано X из N»
+   *  negative. `syncStatuses` stays ONE map (the ids share a namespace, and
+   *  `badgeFor` is keyed by NoteSyncInfo — safebox cards get badges for free).
+   *
+   *  The safebox contribution to reset-safety is computed from the ENCRYPTED
+   *  rows, so it is correct while the section is LOCKED — the normal case when
+   *  a user hits «Сбросить приложение». */
   async function refreshSyncCounts(epoch: number) {
     const allNotes = await getAllNotes();
+    const allSafebox = await getAllSafeboxEntries();
     const allSync = await getAllSyncRecords();
     if (vaultEpochRef.current !== epoch) return; // stale — never touch the UI
 
     // terminalError (permanent quarantine) is counted SEPARATELY from errors:
     // «Ошибки: N» implies «Повторить» can fix it, but the retry paths skip
     // quarantined records by design — showing them as retryable errors would
-    // be a lie the user can never resolve. They still count in resetRiskCount.
-    let accepted = 0, confirmed = 0, errors = 0, quarantined = 0;
-    for (const r of allSync) {
-      if (r.status === 'accepted') accepted++;
-      else if (r.status === 'confirmed') confirmed++;
-      else if (r.terminalError !== undefined) quarantined++;
-      else if (r.status === 'error') errors++;
-    }
-
-    const unsynced = allNotes.length - accepted - confirmed;
-    // Storage-backed: EVERY stored record that is not confirmed is at risk on a
-    // reset — including versions invisible in the UI (historical, quarantined,
-    // undecryptable). Never derived from the visible `notes`.
-    const resetRisk = allNotes.length - confirmed;
-
-    // Join notes ↔ sync records for the per-card indicator (+ txId for menus).
+    // be a lie the user can never resolve. They still count in the reset risk.
     const byId = new Map(allSync.map(r => [r.noteId, r]));
+
+    // Tally over the ACTUAL STORED RECORDS, looking their sync state up by id —
+    // never over `allSync` itself. Two things follow, both load-bearing:
+    //  - a sync row is attributed by which STORE its id lives in, so a `kind`
+    //    field corrupted to 'note' cannot subtract a safebox row from the notes
+    //    total and drive «Синхронизировано X из N» negative;
+    //  - an ORPHAN sync row (an id in neither store — a leftover from a partial
+    //    reset or a foreign writer) is IGNORED. Counting one would be actively
+    //    dangerous: an orphan `confirmed` row cancels out a real unsynced note
+    //    in `resetRisk` and makes the reset dialog claim everything is safely
+    //    on chain right before wiping it.
+    const zero = () => ({ accepted: 0, confirmed: 0, errors: 0, quarantined: 0 });
+    const tallyFor = (ids: string[]) => {
+      const t = zero();
+      for (const id of ids) {
+        const r = byId.get(id);
+        if (!r) continue; // no record yet = queued; counted by the formulas below
+        // `confirmed` is terminal SUCCESS and outranks everything. Quarantine
+        // outranks `accepted`: a record that can never be re-dispatched must
+        // not sit in «ожидают подтверждения» forever pretending progress.
+        if (r.status === 'confirmed') t.confirmed++;
+        else if (r.terminalError !== undefined) t.quarantined++;
+        else if (r.status === 'accepted') t.accepted++;
+        else if (r.status === 'error') t.errors++;
+      }
+      return t;
+    };
+    const tally = {
+      note: tallyFor(allNotes.map(n => n.noteId)),
+      safebox: tallyFor(allSafebox.map(e => e.entryId)),
+    };
+
+    // Join records ↔ sync state for the per-card indicator (+ txId for menus).
     const statuses: Record<string, NoteSyncInfo> = {};
-    for (const n of allNotes) {
-      const rec = byId.get(n.noteId);
-      statuses[n.noteId] = rec ? { status: rec.status, txId: rec.txId } : { status: 'queued' };
+    for (const id of [...allNotes.map(n => n.noteId), ...allSafebox.map(e => e.entryId)]) {
+      const rec = byId.get(id);
+      statuses[id] = rec ? { status: rec.status, txId: rec.txId } : { status: 'queued' };
     }
     setSyncStatuses(statuses);
 
     setArweave(prev => ({
       ...prev,
-      acceptedCount: accepted,
-      confirmedCount: confirmed,
-      unsyncedCount: unsynced,
+      acceptedCount: tally.note.accepted,
+      confirmedCount: tally.note.confirmed,
+      unsyncedCount: allNotes.length - tally.note.accepted - tally.note.confirmed,
       countsReady: true,
-      errorCount: errors,
-      quarantinedCount: quarantined,
-      resetRiskCount: resetRisk,
+      errorCount: tally.note.errors,
+      quarantinedCount: tally.note.quarantined,
+      // Storage-backed: EVERY stored record that is not confirmed is at risk on
+      // a reset — including versions invisible in the UI (historical,
+      // quarantined, undecryptable, or locked away in the safebox).
+      resetRisk: {
+        notes: allNotes.length - tally.note.confirmed,
+        safebox: allSafebox.length - tally.safebox.confirmed,
+      },
+      safebox: {
+        acceptedCount: tally.safebox.accepted,
+        confirmedCount: tally.safebox.confirmed,
+        unsyncedCount: allSafebox.length - tally.safebox.accepted - tally.safebox.confirmed,
+        errorCount: tally.safebox.errors,
+        quarantinedCount: tally.safebox.quarantined,
+      },
     }));
   }
 
@@ -1104,10 +1666,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     void processQueue().catch(err => console.error('processQueue error:', err));
   }
 
-  function enqueueUpload(note: EncryptedNote) {
-    if (queuedIdsRef.current.has(note.noteId)) return;
-    queuedIdsRef.current.add(note.noteId);
-    uploadQueueRef.current.push(note);
+  function enqueueUpload(item: UploadItem) {
+    const id = uploadItemId(item);
+    if (queuedIdsRef.current.has(id)) return;
+    queuedIdsRef.current.add(id);
+    uploadQueueRef.current.push(item);
     kickQueue();
   }
 
@@ -1126,18 +1689,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (queueGenerationRef.current !== myGen) break;
         if (!arweaveRef.current.enabled || !arweaveRef.current.online) break;
 
-        const note = uploadQueueRef.current[0];
+        const item = uploadQueueRef.current[0];
+        const itemId = uploadItemId(item);
 
-        // v3 pause is authoritative SHARED state: re-read the marker right
-        // before every v3 dispatch (another tab may have set it; our per-tab
-        // refs know nothing). At most one initial 503 per already-open tab —
-        // after that the marker short-circuits here without HTTP.
-        if (note.v === 3) {
+        // A pause marker is authoritative SHARED state: re-read it right before
+        // every gated dispatch (another tab may have set it; our per-tab refs
+        // know nothing). At most one initial 503 per already-open tab — after
+        // that the marker short-circuits here without HTTP. The two versions
+        // have INDEPENDENT markers: a v4 pause must not stall notes.
+        const gatedVersion = item.kind === 'safebox' ? 4 : (item.record.v === 3 ? 3 : null);
+        if (gatedVersion !== null) {
           let paused = false;
           try {
-            paused = (await readV3PauseMeta()) !== null;
+            const marker = gatedVersion === 3 ? await readV3PauseMeta() : await readV4PauseMeta();
+            paused = marker !== null;
           } catch (err) {
-            console.error('readV3PauseMeta failed — treating v3 as paused:', err);
+            console.error(`pause marker read failed — treating v${gatedVersion} as paused:`, err);
             paused = true; // fail closed
           }
           if (queueGenerationRef.current !== myGen) break;
@@ -1145,13 +1712,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
             // Drop from BOTH queue structures — a skipped id left in
             // queuedIdsRef would block its re-enqueue forever after resume.
             uploadQueueRef.current.shift();
-            queuedIdsRef.current.delete(note.noteId);
-            setV3Paused(true);
-            continue; // v1/v2 behind it keep uploading
+            queuedIdsRef.current.delete(itemId);
+            if (gatedVersion === 3) setV3Paused(true);
+            else setV4Paused(true);
+            continue; // other versions behind it keep uploading
           }
         }
 
-        const result = await uploadSingleNote(note);
+        const result = await uploadSingleItem(item);
 
         // Superseded mid-upload: the queue we see now belongs to the NEXT
         // generation (unlock refilled it) — it is not ours to shift.
@@ -1173,7 +1741,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
         // success or recoverable error → remove from queue
         uploadQueueRef.current.shift();
-        queuedIdsRef.current.delete(note.noteId);
+        queuedIdsRef.current.delete(itemId);
 
         // Throttle: 200ms between uploads
         if (uploadQueueRef.current.length > 0) {
@@ -1198,7 +1766,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  lock preempted the attempt before its point of no return. The state
    *  machine itself lives in upload-flow.ts; here we only capture the refs
    *  ONCE and gate the React/meta side-effects on the epoch (§7 step 5). */
-  async function uploadSingleNote(note: EncryptedNote): Promise<string> {
+  async function uploadSingleItem(item: UploadItem): Promise<string> {
+    const id = uploadItemId(item);
     const sk = signingKeyRef.current;
     const oh = ownerHashRef.current;
     const pk = publicKeyRef.current;
@@ -1213,7 +1782,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     let outcome;
     try {
       outcome = await runUploadAttempt(
-        note,
+        item,
         { signingKey: sk, ownerHash: oh, publicKey: pk },
         myEpoch,
         {
@@ -1228,26 +1797,38 @@ export function NotesProvider({ children }: { children: ReactNode }) {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
             await commitV3PausedFailure(record, pausedAt);
           },
+          commitV4PausedFailure: async (record, pausedAt) => {
+            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
+            await commitV4PausedFailure(record, pausedAt);
+          },
           signPayload,
           uploadViaProxy,
         },
       );
     } catch (err) {
-      if (err instanceof UnsupportedNoteVersionError) {
-        // The stored record carries a version this build cannot serialize
-        // (written by a newer client). PERMANENT local quarantine: terminalError
-        // keeps it out of every future queue pass (a plain 'error' would retry
-        // forever), no HTTP was made, and resetRiskCount still counts it.
-        const prev = await getSyncRecord(note.noteId);
+      const terminal =
+        err instanceof UnsupportedNoteVersionError || err instanceof UnsupportedSafeboxVersionError
+          ? 'unsupported_version'
+          : err instanceof MalformedRecordError
+            ? 'malformed_record'
+            : null;
+      if (terminal !== null) {
+        // Either the stored record carries a version this build cannot
+        // serialize (written by a newer client), or it failed runtime shape
+        // validation. PERMANENT local quarantine: terminalError keeps it out of
+        // every future queue pass (a plain 'error' would retry forever), no
+        // HTTP was made, and the reset risk still counts it.
+        const prev = await getSyncRecord(id);
         const quarantined: SyncRecord = {
-          noteId: note.noteId,
+          noteId: id,
+          kind: item.kind,
           txId: prev?.txId,
           status: 'error',
           transport: 'proxy',
-          lastError: 'unsupported_version',
+          lastError: terminal,
           updatedAt: Date.now(),
           recovery: prev?.recovery,
-          terminalError: 'unsupported_version',
+          terminalError: terminal,
         };
         if (getDbGeneration() !== myDbGen) return 'quarantined'; // reset won
         await setSyncRecord(quarantined);
@@ -1277,14 +1858,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (vaultEpochRef.current === myEpoch) {
           setArweave(prev => ({ ...prev, lastSync: Date.now() }));
         }
-      } else if (result.kind === 'v3_disabled') {
+      } else if (result.kind === 'v3_disabled' || result.kind === 'v4_disabled') {
         // The worker's kill switch answered: the pause marker is already
         // persisted (atomically with the failure record, in upload-flow).
-        // The STANDING pause banner (v3Paused) is the only UI surface —
-        // deliberately NOT lastError: that toast's «Повторить» (retrySync)
-        // cannot lift the pause, so it would sit next to the banner's working
-        // «Возобновить» as a contradicting dead control. NEVER markUnregistered.
-        setV3Paused(true);
+        // The STANDING pause banner is the only UI surface — deliberately NOT
+        // lastError: that toast's «Повторить» (retrySync) cannot lift the
+        // pause, so it would sit next to the banner's working «Возобновить» as
+        // a contradicting dead control. NEVER markUnregistered.
+        if (result.kind === 'v3_disabled') setV3Paused(true);
+        else setV4Paused(true);
       } else {
         // L13: a clock-skew rejection looks like a permanent mystery to the
         // user — surface the actionable «проверьте время» toast.
@@ -1299,19 +1881,28 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return result.kind;
   }
 
-  async function syncPendingNotes() {
+  async function syncPendingRecords() {
     const allNotes = await getAllNotes();
+    // Safebox entries MUST be enumerated here too: without this, a pending
+    // entry never returns to the queue after a reload/unlock/poll cycle.
+    const allSafebox = await getAllSafeboxEntries();
     const allSync = await getAllSyncRecords();
     const now = Date.now();
 
-    // v3 pause: don't even enqueue v3 records while the shared marker stands —
-    // the per-dispatch check in processQueue is the backstop, this avoids the
-    // churn. An unreadable marker counts as paused (fail closed).
+    // Pause markers: don't even enqueue a gated record while its shared marker
+    // stands — the per-dispatch check in processQueue is the backstop, this
+    // avoids the churn. An unreadable marker counts as paused (fail closed).
     let v3PausedNow = false;
     try {
       v3PausedNow = (await readV3PauseMeta()) !== null;
     } catch {
       v3PausedNow = true;
+    }
+    let v4PausedNow = false;
+    try {
+      v4PausedNow = (await readV4PauseMeta()) !== null;
+    } catch {
+      v4PausedNow = true;
     }
 
     // Skip: accepted-and-not-flagged + confirmed + fresh uploading (< 10 min) +
@@ -1328,15 +1919,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         (r.status === 'uploading' && (now - r.updatedAt) < STALE_UPLOADING_MS)
       ).map(r => r.noteId)
     );
-    const pending = allNotes.filter(n => !skipIds.has(n.noteId) && !(v3PausedNow && n.v === 3));
-    for (const note of pending) {
-      enqueueUpload(note);
+    for (const note of allNotes) {
+      if (skipIds.has(note.noteId)) continue;
+      if (v3PausedNow && note.v === 3) continue;
+      enqueueUpload({ kind: 'note', record: note });
+    }
+    if (!v4PausedNow) {
+      for (const entry of allSafebox) {
+        if (skipIds.has(entry.entryId)) continue;
+        enqueueUpload({ kind: 'safebox', record: entry });
+      }
     }
   }
 
   async function retryAllPending() {
     setArweave(prev => ({ ...prev, lastError: null }));
-    await syncPendingNotes();
+    await syncPendingRecords();
     kickQueue();
   }
 
@@ -1355,27 +1953,43 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // never erase a newer pause. A malformed marker is not auto-lifted at all
     // (manual retry only). 'disabled'/'unknown' verdicts leave everything as is.
     try {
-      const pause = await readV3PauseMeta();
+      const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
       if (vaultEpochRef.current !== myEpoch) return; // locked during the read
-      if (pause !== null) {
-        setV3Paused(true); // another tab may have set it since our last read
-        if (pause !== 'malformed') {
-          const capability = await getWorkerCapabilities();
-          if (capability === 'enabled' && await clearV3UploadsPaused(pause.pausedAt)) {
-            if (vaultEpochRef.current !== myEpoch) return;
-            setV3Paused(false);
-            await syncPendingNotes(); // re-enqueue the v3 backlog
-            kickQueue();
-          }
+      // Mirror both markers first (another tab may have set one since our last
+      // read); a marker that is GONE must clear the local banner too, or it
+      // would claim a pause forever while uploads actually work.
+      setV3Paused(pause3 !== null);
+      setV4Paused(pause4 !== null);
+
+      // ONE /health probe answers for both. Each version is lifted ONLY on the
+      // full condition (ok && versions∋N && vNUploads===true) via
+      // compare-and-delete on the pausedAt read BEFORE the probe — a stale
+      // success can never erase a newer pause. A malformed marker is never
+      // auto-lifted (manual retry only).
+      const liftable = (pause3 !== null && pause3 !== 'malformed')
+        || (pause4 !== null && pause4 !== 'malformed');
+      if (liftable) {
+        const capability = await getWorkerCapabilities();
+        let resumed = false;
+        if (pause3 !== null && pause3 !== 'malformed' && capability.v3 === 'enabled'
+            && await clearV3UploadsPaused(pause3.pausedAt)) {
+          if (vaultEpochRef.current !== myEpoch) return;
+          setV3Paused(false);
+          resumed = true;
         }
-      } else {
-        // The marker is GONE (another tab's /health probe or manual resume
-        // lifted it). Without this branch the local banner would claim a
-        // pause forever while this tab's uploads actually work.
-        setV3Paused(false);
+        if (pause4 !== null && pause4 !== 'malformed' && capability.v4 === 'enabled'
+            && await clearV4UploadsPaused(pause4.pausedAt)) {
+          if (vaultEpochRef.current !== myEpoch) return;
+          setV4Paused(false);
+          resumed = true;
+        }
+        if (resumed) {
+          await syncPendingRecords(); // re-enqueue the backlog
+          kickQueue();
+        }
       }
     } catch (err) {
-      console.error('v3 pause resume probe failed:', err);
+      console.error('upload pause resume probe failed:', err);
     }
     if (vaultEpochRef.current !== myEpoch) return;
 
@@ -1405,7 +2019,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // Drain any ready work each cycle (recheck notes past their backoff).
     if (vaultEpochRef.current !== myEpoch) return;
     if (arweaveRef.current.enabled && arweaveRef.current.online) {
-      await syncPendingNotes();
+      await syncPendingRecords();
       kickQueue();
     }
   }
@@ -1448,6 +2062,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       setRestoring(false);
     }
 
+    // ONE-SHOT post-restore window (§2): the user proved possession of the seed
+    // seconds ago, so re-typing all 12 words to set a safebox PIN would be
+    // theatre. Bound to THIS vault epoch and consumed on first use; a lock,
+    // pagehide, reset or failed activation drops it.
+    if (vaultEpochRef.current === epoch) freshRestoreRef.current = epoch;
+
     // Auto-recover stale uploads (gated on enabled; post-lock enabled=false)
     if (arweaveRef.current.enabled) {
       void retryAllPending().catch(err => console.error('retryAllPending after restore:', err));
@@ -1457,8 +2077,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   async function restoreFromArweaveInternal() {
     const key = cryptoKeyRef.current;
-    if (!key || !ownerHashRef.current) return;
+    const mn = mnemonicRef.current;
+    if (!key || !ownerHashRef.current || !mn) return;
     const myEpoch = vaultEpochRef.current;
+    const mySection = safeboxSectionEpochRef.current;
     const myDbGen = getDbGeneration(); // reset-exclusivity token (P1)
 
     // The sweep is abortable: lockApp() cancels every in-flight page/payload
@@ -1470,13 +2092,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setRestoreError(null);
     setRestoredCount(null);
     setRestoredUpdatedCount(null);
+    setRestoredSafeboxCount(null);
     setRestoreProgress(null);
     try {
-      // fetchAllNotes decrypts + validates (v1/v2/v3) and drops any TX not
-      // signed by a trusted owner or that fails to decrypt.
-      const { notes: remoteNotes, incomplete } = await fetchAllNotes(
+      // The safebox keys are derived HERE, on demand, straight from the
+      // mnemonic: restore must work with the section locked and NO PIN (the
+      // PIN is an access gate, not a crypto boundary). The secret key only
+      // proves a v4 candidate decrypts in both halves — its plaintext never
+      // leaves fetchAllNotes.
+      const [safeboxMeta, safeboxSecret] = await Promise.all([
+        deriveSafeboxMetaKey(mn),
+        deriveSafeboxSecretKey(mn),
+      ]);
+      if (vaultEpochRef.current !== myEpoch) return;
+
+      // fetchAllNotes decrypts + validates (v1–v4) and drops any TX not signed
+      // by a trusted owner or that fails to decrypt.
+      const { notes: remoteNotes, safeboxEntries: remoteSafebox, incomplete } = await fetchAllNotes(
         ownerHashRef.current,
-        key,
+        { note: key, safeboxMeta, safeboxSecret },
         (done, total) => {
           if (vaultEpochRef.current === myEpoch) setRestoreProgress({ done, total });
         },
@@ -1527,12 +2161,35 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         else newRoots.add(remote.meta.root);
       }
 
-      if (remoteNotes.length > 0) {
+      // ── Safebox half. Counted SEPARATELY from the notes counters («Найден
+      //    сейф: N записей» vs «Восстановлено M, обновлено K»). Merging is
+      //    upsert-repair, exactly like notes, and needs no PIN.
+      let safeboxMerged = 0;
+      for (const remote of remoteSafebox) {
+        if (vaultEpochRef.current !== myEpoch) return;
+        if (getDbGeneration() !== myDbGen) return;
+        await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now());
+        safeboxMerged++;
+        // If the section happens to be unlocked RIGHT NOW, publish the freshly
+        // decrypted meta so the list is complete without a re-unlock. Both
+        // epochs are re-checked: a lock mid-sweep must publish nothing.
+        if (safeboxUnlockedRef.current
+            && vaultEpochRef.current === myEpoch
+            && safeboxSectionEpochRef.current === mySection) {
+          const meta = remote.meta;
+          publishSafeboxEntries(prev =>
+            prev.some(e => e.id === meta.id) ? prev : [...prev, meta]);
+        }
+      }
+
+      if (remoteNotes.length > 0 || safeboxMerged > 0) {
         await refreshSyncCounts(myEpoch);
+        await refreshSafeboxPresence(myEpoch);
       }
       if (vaultEpochRef.current !== myEpoch) return;
       setRestoredCount(newRoots.size);
       setRestoredUpdatedCount(updatedRoots.size);
+      setRestoredSafeboxCount(safeboxMerged);
       if (incomplete) {
         // Some pages/payloads were unreachable — a "quiet partial restore" must
         // not look like a full one (the user could believe notes are lost).
@@ -1567,6 +2224,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setRestoreError(null);
     setRestoredCount(null);
     setRestoredUpdatedCount(null);
+    setRestoredSafeboxCount(null);
   }, []);
 
   const dismissError = useCallback(() => {
@@ -1628,7 +2286,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       //    create a duplicate.
       try {
         if (arweaveRef.current.enabled) {
-          enqueueUpload(encrypted); // sync is best-effort; the note is safe
+          enqueueUpload({ kind: 'note', record: encrypted }); // best-effort; the note is safe
         }
         await refreshSyncCounts(myEpoch);
       } catch (err) {
@@ -1696,7 +2354,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // Saved from here on — bookkeeping must not reject (same as addNote).
       try {
         if (arweaveRef.current.enabled) {
-          enqueueUpload(encrypted);
+          enqueueUpload({ kind: 'note', record: encrypted });
         }
         await refreshSyncCounts(myEpoch);
       } catch (err) {
@@ -1719,7 +2377,19 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (vaultEpochRef.current !== myEpoch) return;
     setV3Paused(false);
     setArweave(prev => ({ ...prev, lastError: null }));
-    await syncPendingNotes();
+    await syncPendingRecords();
+    kickQueue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Manual resume of the SAFEBOX queue — same unconditional contract. */
+  const resumeV4Uploads = useCallback(async () => {
+    const myEpoch = vaultEpochRef.current;
+    await clearV4UploadsPaused('any');
+    if (vaultEpochRef.current !== myEpoch) return;
+    setV4Paused(false);
+    setArweave(prev => ({ ...prev, lastError: null }));
+    await syncPendingRecords();
     kickQueue();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1989,6 +2659,605 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return { lockedSeconds, attempts };
   }, []);
 
+  // ─── Safebox actions (§6) ──────────────────────────────────────────
+
+  /** Everything an async safebox flow must capture BEFORE its first await. */
+  interface SafeboxSession {
+    epoch: number;    // vault epoch
+    section: number;  // safebox section epoch
+    configId: string; // the PIN configuration this session belongs to
+    mnemonic: string;
+  }
+
+  function captureSafeboxSession(): SafeboxSession {
+    const configId = safeboxConfigIdRef.current;
+    const mn = mnemonicRef.current;
+    if (!safeboxUnlockedRef.current || !configId || !mn || !safeboxMetaKeyRef.current) {
+      throw new SafeboxLockedError();
+    }
+    return {
+      epoch: vaultEpochRef.current,
+      section: safeboxSectionEpochRef.current,
+      configId,
+      mnemonic: mn,
+    };
+  }
+
+  /**
+   * The guarantee behind every secret publication (§2). BroadcastChannel is a
+   * fast path and may be absent or lossy, so STORAGE is the source of truth:
+   * re-read the PIN config and compare `configId` immediately before handing
+   * out a secret — plus the two epochs, which catch an app lock or a section
+   * lock that happened during the (slow) decrypt.
+   */
+  async function assertSafeboxSessionLive(session: SafeboxSession): Promise<void> {
+    let live = false;
+    try {
+      const cfg = await readSafeboxPinConfig();
+      live = cfg !== null && cfg.configId === session.configId;
+    } catch {
+      live = false; // malformed config → fail closed
+    }
+    if (!live) {
+      lockSafeboxNow();
+      throw new SafeboxConfigChangedError();
+    }
+    if (vaultEpochRef.current !== session.epoch
+        || safeboxSectionEpochRef.current !== session.section) {
+      throw new SafeboxLockedError();
+    }
+  }
+
+  /** Decrypt BOTH halves of one entry. The secret key is derived here and
+   *  dropped when this function returns — it is never stored in a ref. */
+  async function openSafeboxEntry(session: SafeboxSession, entryId: string): Promise<{
+    entry: EncryptedSafeboxEntry;
+    meta: SafeboxEntryData;
+    secret: SafeboxSecretData;
+  }> {
+    const entry = await getSafeboxEntryById(entryId);
+    if (!entry) throw new Error('Запись сейфа не найдена.');
+    const metaKey = safeboxMetaKeyRef.current;
+    if (!metaKey || safeboxSectionEpochRef.current !== session.section) throw new SafeboxLockedError();
+    const meta = await decryptSafeboxMeta(metaKey, entry);
+    const secretKey = await deriveSafeboxSecretKey(session.mnemonic);
+    const secret = await decryptSafeboxSecret(secretKey, entry, meta.files);
+    return { entry, meta, secret };
+  }
+
+  /**
+   * Publish an unlocked section: meta key + decrypted metas, under BOTH epochs
+   * AND a final storage recheck of the `configId`.
+   *
+   * Opening the section IS a secret publication (the decrypted metas reach the
+   * UI, and a resolved unlock is what the Settings seed gate accepts as proof
+   * of the PIN), so it obeys the same rule as reveal/copy/download: STORAGE is
+   * the source of truth, checked immediately before anything is written.
+   * Decrypting N entries takes real time, and without BroadcastChannel another
+   * tab can replace the configuration inside that window.
+   *
+   * Returns false when a LOCK won the race (nothing published); throws
+   * SafeboxConfigChangedError when the configuration moved under us.
+   */
+  async function publishUnlockedSafebox(
+    epoch: number,
+    section: number,
+    configId: string,
+    metaKey: CryptoKey,
+  ): Promise<boolean> {
+    const stored = await getAllSafeboxEntries();
+    const metas: SafeboxEntryData[] = [];
+    for (const e of stored) {
+      try {
+        metas.push(await decryptSafeboxMeta(metaKey, e));
+      } catch {
+        // A row that cannot be decrypted/validated is skipped individually —
+        // it stays counted in the storage-backed reset risk.
+      }
+    }
+    if (vaultEpochRef.current !== epoch || safeboxSectionEpochRef.current !== section) return false;
+
+    // FINAL storage recheck — the same guarantee assertSafeboxSessionLive gives
+    // every other secret path, applied to the session's own birth.
+    let stillOurs = false;
+    try {
+      const current = await readSafeboxPinConfig();
+      stillOurs = current !== null && current.configId === configId;
+    } catch {
+      stillOurs = false; // malformed config → fail closed
+    }
+    if (vaultEpochRef.current !== epoch || safeboxSectionEpochRef.current !== section) return false;
+    if (!stillOurs) {
+      lockSafeboxNow();
+      throw new SafeboxConfigChangedError();
+    }
+    safeboxMetaKeyRef.current = metaKey;
+    safeboxConfigIdRef.current = configId;
+    safeboxEntriesRef.current = metas;
+    safeboxUnlockedRef.current = true;
+    setSafeboxEntries(metas);
+    setSafeboxUnlocked(true);
+    setSafeboxEntryCount(stored.length);
+    setSafeboxPinConfigured(true);
+    armSafeboxIdleTimer();
+    return true;
+  }
+
+  /**
+   * Verify a safebox PIN through the METERED path (lockout + attempts + the
+   * 10-strike wipe). ONLY SafeboxWrongPinError counts; every environment
+   * failure passes through untouched.
+   */
+  async function meteredVerifySafeboxPin(
+    config: { blob: PinEncryptedSeed; configId: string; lockedUntil: number | null },
+    pin: string,
+    now: number,
+    myDbGen: number,
+  ): Promise<void> {
+    if (config.lockedUntil !== null && now < config.lockedUntil) {
+      throw new SafeboxPinLockedError(Math.ceil((config.lockedUntil - now) / 1000));
+    }
+    try {
+      await verifySafeboxPin(config.blob, pin);
+    } catch (err) {
+      if (!(err instanceof SafeboxWrongPinError)) throw err; // never meter env failures
+      const outcome = await commitSafeboxPinFailure(config.configId, now, myDbGen);
+      if (outcome.wiped) {
+        // The CONFIGURATION is gone; the entries are untouched.
+        lockSafeboxNow();
+        setSafeboxPinConfigured(false);
+        postVaultMessage('config');
+        throw new SafeboxPinWipedError();
+      }
+      if (outcome.lockedUntil !== null) throw new SafeboxPinLockedError(safeboxLockSeconds(outcome.attempts));
+      throw err;
+    }
+    // Also re-verifies the configId INSIDE its transaction: a config replaced
+    // during the (slow) KDF must not be unlocked by a proof for the old one.
+    await commitSafeboxPinSuccess(config.configId, myDbGen);
+  }
+
+  /**
+   * «Not the same as the main PIN» — a hygiene check, NOT a security boundary.
+   * Exactly ONE raw `decryptWithPin` against pin-seed, deliberately OUTSIDE the
+   * metered path: it must never read or write pin-attempts / pin-locked-until,
+   * or ten safebox PIN setups would wipe a perfectly good main PIN.
+   * WrongPinError is the EXPECTED, allowed outcome; "cannot verify" allows too.
+   */
+  async function assertDifferentFromMainPin(pin: string): Promise<void> {
+    let pinSeed: unknown;
+    try {
+      ({ pinSeed } = await getPinConfigMeta());
+    } catch {
+      return; // cannot read → cannot check → allow
+    }
+    if (!pinSeed) return; // no main PIN configured — nothing to collide with
+    try {
+      await decryptWithPin(pinSeed as PinEncryptedSeed, pin);
+    } catch (err) {
+      if (err instanceof WrongPinError) return;             // different → allow
+      if (err instanceof PinUnlockUnavailableError) return; // unverifiable → allow
+      return;                                               // any other failure → allow
+    }
+    throw new SafeboxSamePinError(); // it decrypted ⇒ the PINs are identical
+  }
+
+  /**
+   * Proof-by-decrypt for the seed paths (activation over existing data, PIN
+   * reset). PRIMARY check: the derived Ed25519 public key must equal this
+   * vault's identity. ADDITIONAL integrity check when entries exist: the meta
+   * key derived from the phrase must actually decrypt one of them.
+   */
+  async function verifySafeboxSeed(mn: string): Promise<void> {
+    if (!isValidMnemonic(mn)) throw new SafeboxSeedMismatchError();
+    const { publicKey } = await deriveSigningKeypair(mn);
+    const candidate = bufferToBase64(publicKey);
+    const current = publicKeyRef.current
+      ? bufferToBase64(publicKeyRef.current)
+      : await getMeta<string>('vault-public-key');
+    if (!current || current !== candidate) throw new SafeboxSeedMismatchError();
+
+    const stored = await getAllSafeboxEntries();
+    if (stored.length === 0) return; // pubkey check alone (nothing to decrypt)
+    const metaKey = await deriveSafeboxMetaKey(mn);
+    for (const e of stored) {
+      try {
+        await decryptSafeboxMeta(metaKey, e);
+        return;
+      } catch { /* try the next row — some may be genuinely corrupted */ }
+    }
+    throw new SafeboxSeedMismatchError();
+  }
+
+  function assertSafeboxPinFormat(pin: string): void {
+    if (!isValidSafeboxPin(pin)) {
+      throw new Error('PIN сейфа: только цифры, от 6 до 8 знаков.');
+    }
+  }
+
+  const activateSafebox = useCallback(async (pin: string, opts?: { mnemonic?: string }) => {
+    // Writer-INDEPENDENT on purpose: a user who just restored on a new device
+    // must be able to reach their passwords on R4.
+    assertSafeboxPinFormat(pin);
+    // BOTH epochs captured BEFORE the first await. The section epoch matters
+    // even though no section is open yet: a hidden/pagehide edge during the
+    // ~1 s Argon2 bumps it, and re-reading it afterwards would let a cancelled
+    // activation set a PIN and open the section inside a HIDDEN tab.
+    const myEpoch = vaultEpochRef.current;
+    const mySection = safeboxSectionEpochRef.current;
+    const myDbGen = getDbGeneration(); // reset-exclusivity token (P1)
+    const mn = mnemonicRef.current;
+    if (!mn) throw new SafeboxLockedError();
+    if (await hasSafeboxPinConfig()) {
+      throw new Error('PIN сейфа уже установлен — используйте смену PIN.');
+    }
+
+    const dataPresent = (await countSafeboxEntries()) > 0;
+    if (dataPresent) {
+      // Existing data + no config (new device, post-wipe, after deactivation):
+      // full seed entry is the ONLY way in — otherwise «деактивировать → свой
+      // PIN → открыть» would walk straight around the gate.
+      const freshRestore = freshRestoreRef.current === myEpoch;
+      try {
+        if (opts?.mnemonic !== undefined) await verifySafeboxSeed(opts.mnemonic);
+        else if (!freshRestore) throw new SafeboxSeedRequiredError();
+      } catch (err) {
+        freshRestoreRef.current = null; // a failed attempt burns the window
+        throw err;
+      }
+      freshRestoreRef.current = null;   // one-shot, consumed either way
+    }
+
+    await assertDifferentFromMainPin(pin);
+
+    const blob = await createSafeboxPinBlob(pin);
+    // A lock during the KDF CANCELS the activation outright: nothing is
+    // written, so the user is not left with a PIN they never finished setting.
+    if (vaultEpochRef.current !== myEpoch || safeboxSectionEpochRef.current !== mySection) {
+      throw new SafeboxLockedError();
+    }
+    // CREATE-IF-ABSENT inside one transaction: Argon2id takes ~1 s, and a
+    // racing activation in another tab must not be silently overwritten.
+    const configId = await commitSafeboxPinWrite(blob, 'absent', myDbGen);
+    setSafeboxPinConfigured(true);
+    postVaultMessage('config');
+
+    // Activation opens the section immediately — the user just proved the PIN.
+    // Published under the epochs captured UP FRONT, so a lock that landed
+    // after the write leaves the PIN configured but the section CLOSED.
+    const metaKey = await deriveSafeboxMetaKey(mn);
+    if (!await publishUnlockedSafebox(myEpoch, mySection, configId, metaKey)) {
+      throw new SafeboxLockedError();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Unlock the section. RESOLVES ONLY on a fully published, live session —
+   * a lock (app or section) at ANY point makes it throw SafeboxLockedError.
+   * Callers treat a resolved promise as proof that the PIN was verified AND is
+   * still valid right now (the Settings seed gate depends on exactly that).
+   */
+  const unlockSafebox = useCallback(async (pin: string) => {
+    const myEpoch = vaultEpochRef.current;
+    const section = safeboxSectionEpochRef.current;
+    const myDbGen = getDbGeneration();
+    const mn = mnemonicRef.current;
+    if (!mn) throw new SafeboxLockedError();
+
+    const config = await readSafeboxPinConfig(); // throws Unavailable on malformed
+    if (!config) throw new SafeboxNotConfiguredError();
+
+    await meteredVerifySafeboxPin(config, pin, Date.now(), myDbGen);
+    if (vaultEpochRef.current !== myEpoch || safeboxSectionEpochRef.current !== section) {
+      // A lock won the race during the KDF. Resolving here would let a caller
+      // read «the PIN was accepted» as «the session is open».
+      throw new SafeboxLockedError();
+    }
+
+    const metaKey = await deriveSafeboxMetaKey(mn);
+    if (!await publishUnlockedSafebox(myEpoch, section, config.configId, metaKey)) {
+      throw new SafeboxLockedError();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const lockSafeboxAction = useCallback(() => lockSafeboxNow(), []);
+
+  const touchSafebox = useCallback(() => {
+    if (safeboxUnlockedRef.current) armSafeboxIdleTimer();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const changeSafeboxPin = useCallback(async (currentPin: string, newPin: string) => {
+    // The unlocked section is NOT sufficient — changing the PIN requires the
+    // current one (otherwise an open screen is a free PIN reset).
+    assertSafeboxPinFormat(newPin);
+    const myDbGen = getDbGeneration();
+    const config = await readSafeboxPinConfig();
+    if (!config) throw new SafeboxNotConfiguredError();
+    await meteredVerifySafeboxPin(config, currentPin, Date.now(), myDbGen);
+    await assertDifferentFromMainPin(newPin);
+
+    const blob = await createSafeboxPinBlob(newPin);
+    // REPLACE-IF-STILL-OURS: between the verification above and this write
+    // (two Argon2id runs apart) another tab may have installed its own config.
+    const configId = await commitSafeboxPinWrite(blob, { configId: config.configId }, myDbGen);
+    // OUR session survives its own change (we just re-authenticated); every
+    // other tab sees a different configId and locks.
+    if (safeboxUnlockedRef.current) safeboxConfigIdRef.current = configId;
+    setSafeboxPinConfigured(true);
+    postVaultMessage('config');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const deactivateSafebox = useCallback(async (currentPin: string) => {
+    const myDbGen = getDbGeneration();
+    const config = await readSafeboxPinConfig();
+    if (!config) throw new SafeboxNotConfiguredError();
+    await meteredVerifySafeboxPin(config, currentPin, Date.now(), myDbGen);
+    await commitSafeboxPinDelete(config.configId, myDbGen);
+    lockSafeboxNow();
+    setSafeboxPinConfigured(false);
+    postVaultMessage('config');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const resetSafeboxPinWithSeed = useCallback(async (mn: string, newPin: string) => {
+    // The ONLY way back in after a wipe / on a new device. DATA IS NOT TOUCHED.
+    assertSafeboxPinFormat(newPin);
+    const myDbGen = getDbGeneration();
+    await verifySafeboxSeed(mn);
+    await assertDifferentFromMainPin(newPin);
+    const blob = await createSafeboxPinBlob(newPin);
+    // Unconditional by design — proof of the seed outranks any existing
+    // configuration — but still refused if the vault was reset meanwhile.
+    await commitSafeboxPinWrite(blob, 'seed-authorized', myDbGen);
+    // Any session under the OLD config is over — including this tab's: the new
+    // PIN was proven by the SEED, not by unlocking, so the user re-enters it.
+    lockSafeboxNow();
+    safeboxConfigIdRef.current = null;
+    setSafeboxPinConfigured(true);
+    postVaultMessage('config');
+  }, []);
+
+  const getSafeboxPinLockState = useCallback(async () => {
+    try {
+      const config = await readSafeboxPinConfig();
+      if (!config) return { lockedSeconds: 0, attempts: 0, configured: false };
+      const lockedSeconds = config.lockedUntil !== null && Date.now() < config.lockedUntil
+        ? Math.ceil((config.lockedUntil - Date.now()) / 1000)
+        : 0;
+      return { lockedSeconds, attempts: config.attempts, configured: true };
+    } catch {
+      // Malformed config: present but unusable — report it as configured with
+      // no lockout so the UI offers the seed-reset path.
+      return { lockedSeconds: 0, attempts: 0, configured: true };
+    }
+  }, []);
+
+  // ── Writer actions (all three gated by SAFEBOX_WRITER_ENABLED) ──────
+
+  /** Encrypt + size-check + persist ONE new version. The configId recheck and
+   *  the write happen in ONE readwrite transaction (§6) — between a separate
+   *  `getMeta()` and a separate write another tab could replace the config. */
+  async function commitSafeboxVersion(
+    session: SafeboxSession,
+    myDbGen: number,
+    input: SafeboxEntryInput,
+  ): Promise<EncryptedSafeboxEntry> {
+    const metaKey = safeboxMetaKeyRef.current;
+    if (!metaKey) throw new SafeboxLockedError();
+    const secretKey = await deriveSafeboxSecretKey(session.mnemonic);
+    const entry = await encryptSafeboxEntry(metaKey, secretKey, input);
+
+    // Measure the WHOLE worst-case signed body BEFORE persisting: an
+    // over-limit entry would pass locally and then be stuck on the recheck
+    // path forever (the retry body is strictly larger).
+    const bytes = safeboxUploadByteLength(entry, ownerHashRef.current ?? undefined);
+    if (bytes > MAX_UPLOAD_BODY_BYTES) throw new SafeboxEntryTooLargeError(bytes);
+
+    // BOTH epochs, synchronously, right before the write. A lock changes
+    // neither the config nor the dbGeneration, so without this check a version
+    // encrypted before the lock would still land on disk — invisible to the
+    // user whose form was torn down, and later dispatched as a paid upload.
+    // (Notes deliberately DO persist across a lock; the safebox does not —
+    // its form is destroyed by the lock instead of being saved.)
+    if (vaultEpochRef.current !== session.epoch
+        || safeboxSectionEpochRef.current !== session.section) {
+      throw new SafeboxLockedError();
+    }
+    await commitSafeboxEntry(entry, session.configId, myDbGen);
+    return entry;
+  }
+
+  function metaFromInput(entry: EncryptedSafeboxEntry, input: SafeboxEntryInput): SafeboxEntryData {
+    return {
+      id: entry.entryId,
+      createdAt: entry.createdAt,
+      title: input.title,
+      login: input.login,
+      url: input.url,
+      note: input.note,
+      files: input.files.map(f => ({ fid: f.fid, name: f.name, mime: f.mime, size: f.size })),
+      rev: input.rev,
+      root: input.root ?? entry.entryId,
+      ...(input.prev !== undefined ? { prev: input.prev } : {}),
+    };
+  }
+
+  /** Post-write bookkeeping shared by all three writer actions. Must not
+   *  reject: the version is already on disk. */
+  async function afterSafeboxWrite(
+    session: SafeboxSession,
+    entry: EncryptedSafeboxEntry,
+    meta: SafeboxEntryData,
+  ): Promise<void> {
+    if (vaultEpochRef.current !== session.epoch
+        || safeboxSectionEpochRef.current !== session.section) return;
+    publishSafeboxEntries(prev => [meta, ...prev.filter(e => e.id !== meta.id)]);
+    try {
+      if (arweaveRef.current.enabled) enqueueUpload({ kind: 'safebox', record: entry });
+      await refreshSyncCounts(session.epoch);
+      await refreshSafeboxPresence(session.epoch);
+      armSafeboxIdleTimer();
+    } catch (err) {
+      console.error('post-save safebox bookkeeping failed (entry IS saved):', err);
+    }
+  }
+
+  const addSafeboxEntry = useCallback(async (input: SafeboxNewEntry) => {
+    if (!SAFEBOX_WRITER_ENABLED) {
+      throw new WriterDisabledError('Добавление записей в сейф недоступно в этой версии приложения.');
+    }
+    const session = captureSafeboxSession();
+    const myDbGen = getDbGeneration();
+    if (safeboxAddInFlightRef.current) throw new OperationInFlightError();
+    safeboxAddInFlightRef.current = true;
+    setIsEncrypting(true);
+    try {
+      const entryInput: SafeboxEntryInput = {
+        title: input.title,
+        login: input.login,
+        url: input.url,
+        note: input.note,
+        password: input.password,
+        files: input.files.map(f => ({ ...f, fid: randomUuidV8() })),
+        rev: 1,
+      };
+      const entry = await commitSafeboxVersion(session, myDbGen, entryInput);
+      await afterSafeboxWrite(session, entry, metaFromInput(entry, entryInput));
+    } finally {
+      safeboxAddInFlightRef.current = false;
+      setIsEncrypting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Resolve the chain head for a writer action (fresh, from the ref). */
+  function safeboxChainHead(rootId: string): SafeboxEntryData {
+    const chain = groupSafeboxChains(safeboxEntriesRef.current).find(c => c.root === rootId);
+    if (!chain) throw new Error('Запись сейфа не найдена.');
+    if (chain.current.rev >= Number.MAX_SAFE_INTEGER) {
+      throw new Error('Достигнут предел числа версий этой записи.');
+    }
+    return chain.current;
+  }
+
+  const editSafeboxEntry = useCallback(async (rootId: string, patch: SafeboxEntryPatch) => {
+    if (!SAFEBOX_WRITER_ENABLED) {
+      throw new WriterDisabledError('Редактирование записей сейфа недоступно в этой версии приложения.');
+    }
+    const session = captureSafeboxSession();
+    const myDbGen = getDbGeneration();
+    const head = safeboxChainHead(rootId);
+    if (safeboxEditInFlightRef.current.has(rootId)) throw new OperationInFlightError();
+    safeboxEditInFlightRef.current.add(rootId);
+    setIsEncrypting(true);
+    try {
+      // The CURRENT secret is decrypted only NOW, on submit — never when the
+      // form opens (it must not sit in memory or the DOM while typing).
+      const current = await openSafeboxEntry(session, head.id);
+      const patched = applySafeboxPatch({ meta: current.meta, secret: current.secret }, patch);
+      const entryInput: SafeboxEntryInput = {
+        ...patched,
+        rev: head.rev + 1,
+        root: rootId,
+        prev: head.id,
+      };
+      const entry = await commitSafeboxVersion(session, myDbGen, entryInput);
+      await afterSafeboxWrite(session, entry, metaFromInput(entry, entryInput));
+    } finally {
+      safeboxEditInFlightRef.current.delete(rootId);
+      setIsEncrypting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const restoreSafeboxVersion = useCallback(async (rootId: string, versionId: string) => {
+    // A FULL writer action, not a read: same gate, single-flight, epochs,
+    // configId recheck, size limit and dbGeneration discipline as add/edit.
+    if (!SAFEBOX_WRITER_ENABLED) {
+      throw new WriterDisabledError('Возврат версий сейфа недоступен в этой версии приложения.');
+    }
+    const session = captureSafeboxSession();
+    const myDbGen = getDbGeneration();
+    const head = safeboxChainHead(rootId);
+    if (safeboxEditInFlightRef.current.has(rootId)) throw new OperationInFlightError();
+    safeboxEditInFlightRef.current.add(rootId);
+    setIsEncrypting(true);
+    try {
+      const source = await openSafeboxEntry(session, versionId);
+      if (source.meta.root !== rootId) throw new Error('Версия не принадлежит этой записи.');
+      // A version is a FULL snapshot: title/login/url/note/password/files.
+      const snapshot = snapshotSafeboxVersion(source.meta, source.secret);
+      const entryInput: SafeboxEntryInput = {
+        ...snapshot,
+        rev: head.rev + 1,
+        root: rootId,
+        prev: head.id,
+      };
+      const entry = await commitSafeboxVersion(session, myDbGen, entryInput);
+      await afterSafeboxWrite(session, entry, metaFromInput(entry, entryInput));
+    } finally {
+      safeboxEditInFlightRef.current.delete(rootId);
+      setIsEncrypting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Reveal / copy / download (secret publication paths) ─────────────
+
+  const revealSafeboxSecret = useCallback(async (entryId: string): Promise<string> => {
+    const session = captureSafeboxSession();
+    const { secret } = await openSafeboxEntry(session, entryId);
+    // Storage-backed recheck IMMEDIATELY before the secret leaves this call.
+    await assertSafeboxSessionLive(session);
+    armSafeboxIdleTimer();
+    return secret.password;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const copySafeboxPassword = useCallback(async (entryId: string): Promise<boolean> => {
+    const session = captureSafeboxSession();
+    const { secret } = await openSafeboxEntry(session, entryId);
+    await assertSafeboxSessionLive(session);
+    armSafeboxIdleTimer();
+    // Straight from the string — the plaintext NEVER enters the DOM.
+    const ok = await copyTextToClipboard(secret.password);
+    if (ok) armClipboardClear();
+    return ok;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const downloadSafeboxAttachment = useCallback(async (entryId: string, fid: string) => {
+    const session = captureSafeboxSession();
+    const { meta, secret } = await openSafeboxEntry(session, entryId);
+    const descriptor = meta.files.find(f => f.fid === fid);
+    const content = secret.files.find(f => f.fid === fid);
+    if (!descriptor || !content) throw new Error('Вложение не найдено.');
+    await assertSafeboxSessionLive(session);
+    armSafeboxIdleTimer();
+
+    const bytes = base64ToBuffer(content.data);
+    const blob = new Blob([bytes as BlobPart], { type: descriptor.mime || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = descriptor.name;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } finally {
+      // Revoke on the NEXT task: a synchronous revoke aborts the download in
+      // several browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ─── Auto-lock timeout setting (§6) ────────────────────────────────
 
   const setAutoLockTimeoutAction = useCallback(async (t: AutoLockTimeout) => {
@@ -2029,6 +3298,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return chains.filter(c => c.current.text.toLowerCase().includes(q));
   }, [chains, searchQuery]);
 
+  // Safebox chains, grouped over the AUTHENTICATED envelope fields. Search is
+  // scoped to the safebox and to NON-SECRET fields only — this code path never
+  // holds the secret key, so a password can never be indexed by construction.
+  const safeboxChains = useMemo(() => groupSafeboxChains(safeboxEntries), [safeboxEntries]);
+  const filteredSafeboxChains = useMemo(() => {
+    const q = safeboxSearchQuery.trim();
+    if (!q) return safeboxChains;
+    return safeboxChains.filter(c => matchesSafeboxQuery(c.current, q));
+  }, [safeboxChains, safeboxSearchQuery]);
+
   // ─── Context Value ──────────────────────────────────────────────────
 
   // L4: memoized — otherwise every provider render handed consumers a fresh
@@ -2045,6 +3324,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     chains,
     filteredChains,
     v3Paused,
+    v4Paused,
+    safeboxUnlocked,
+    safeboxLockGeneration,
+    safeboxPinConfigured,
+    safeboxDataPresent: safeboxEntryCount > 0,
+    safeboxEntryCount,
+    safeboxEntries,
+    safeboxChains,
+    filteredSafeboxChains,
+    safeboxSearchQuery,
+    restoredSafeboxCount,
     arweave: arweaveState,
     syncStatuses,
     restoring,
@@ -2056,6 +3346,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     hasPin,
     autoLockTimeout,
     bootError,
+    storageBlocked,
+    storageOutdated,
 
     createNewWallet,
     confirmMnemonic,
@@ -2063,7 +3355,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     addNote,
     editNote,
     resumeV3Uploads,
+    resumeV4Uploads,
     setSearchQuery,
+    activateSafebox,
+    unlockSafebox,
+    lockSafebox: lockSafeboxAction,
+    touchSafebox,
+    changeSafeboxPin,
+    deactivateSafebox,
+    resetSafeboxPinWithSeed,
+    getSafeboxPinLockState,
+    addSafeboxEntry,
+    editSafeboxEntry,
+    restoreSafeboxVersion,
+    revealSafeboxSecret,
+    copySafeboxPassword,
+    downloadSafeboxAttachment,
+    setSafeboxSearchQuery,
     goToRestore,
     goToOnboarding,
     goToLanding,
@@ -2088,11 +3396,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     dismissError,
   }), [
     screen, isReady, mnemonic, notes, isEncrypting, searchQuery, filteredNotes,
-    chains, filteredChains, v3Paused,
+    chains, filteredChains, v3Paused, v4Paused,
+    safeboxUnlocked, safeboxLockGeneration, safeboxPinConfigured, safeboxEntryCount, safeboxEntries,
+    safeboxChains, filteredSafeboxChains, safeboxSearchQuery, restoredSafeboxCount,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
     restoredCount, restoredUpdatedCount, vaultError, hasPin, autoLockTimeout, bootError,
+    storageBlocked, storageOutdated,
     createNewWallet, confirmMnemonic, restoreFromMnemonic, addNote,
-    editNote, resumeV3Uploads,
+    editNote, resumeV3Uploads, resumeV4Uploads,
+    activateSafebox, unlockSafebox, lockSafeboxAction, touchSafebox,
+    changeSafeboxPin, deactivateSafebox, resetSafeboxPinWithSeed,
+    getSafeboxPinLockState, addSafeboxEntry, editSafeboxEntry, restoreSafeboxVersion,
+    revealSafeboxSecret, copySafeboxPassword, downloadSafeboxAttachment,
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
@@ -2106,18 +3421,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       {/* display:contents keeps the wrapper layout-neutral; `inert` while the
           gate is up removes the underlying UI from focus, pointer events and
           the accessibility tree — the visual overlay alone would leave
-          keyboard/AT access to the plaintext behind it. */}
-      <div style={{ display: 'contents' }} inert={lockGate || undefined}>
+          keyboard/AT access to the plaintext behind it.
+          NOTE: `inert`/`hidden` here are driven IMPERATIVELY via the refs (see
+          setLockGate), never as React props — a React commit is not guaranteed
+          to land before the BFCache snapshot is taken on `pagehide`. */}
+      <div ref={gateContentRef} style={{ display: 'contents' }}>
         {children}
       </div>
-      {/* Rendered by the PROVIDER, not a screen: the gate must exist wherever
-          the vault state does and can never be forgotten by a route. Fully
-          opaque and above every modal. */}
-      {lockGate && (
-        <div className="lock-gate" role="status" aria-live="polite" aria-label="Проверка авто-блокировки">
-          <span className="lock-gate-icon" aria-hidden="true">🔒</span>
-        </div>
-      )}
+      {/* Rendered by the PROVIDER (never a screen) and ALWAYS MOUNTED, so
+          raising it is a synchronous attribute flip rather than a render. */}
+      <div
+        ref={gateElRef}
+        className="lock-gate"
+        role="status"
+        aria-live="polite"
+        aria-label="Проверка авто-блокировки"
+        hidden
+      >
+        <span className="lock-gate-icon" aria-hidden="true">🔒</span>
+      </div>
     </StoreContext.Provider>
   );
 }

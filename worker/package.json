@@ -5,9 +5,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "check:staging-config": "node scripts/check-staging-config.mjs",
+    "predeploy:staging": "npm run check:staging-config",
     "deploy:staging": "wrangler deploy --env staging",
+    "predeploy:staging:check": "npm run check:staging-config",
     "deploy:staging:check": "wrangler deploy --env staging --dry-run",
     "smoke:v3": "node scripts/smoke-v3.mjs",
+    "smoke:v4": "node scripts/smoke-v4.mjs",
     "seed-invite": "wrangler dev --test-scheduled",
     "test": "vitest run && vitest run -c vitest.direct.config.mts",
     "test:watch": "vitest",

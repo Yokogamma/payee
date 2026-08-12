@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNotes } from '../lib/store';
 
 export function ErrorScreen() {
-  const { bootError, resetBrokenStorage } = useNotes();
+  const { bootError, storageOutdated, resetBrokenStorage } = useNotes();
   const [resetting, setResetting] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
 
@@ -20,6 +20,31 @@ export function ErrorScreen() {
       setResetting(false);
       setConfirmReset(false);
     }
+  }
+
+  // A NEWER client already migrated this database. The data is intact and
+  // fully readable by that build, so the ONLY offer here is «reload»: the
+  // destructive reset below would delete every unsynced note and safebox
+  // entry, and it is reachable in two clicks on the generic screen.
+  if (storageOutdated) {
+    return (
+      <div className="screen-center">
+        <div className="card onboarding">
+          <div className="logo-icon">∞</div>
+          <h1>Приложение обновилось</h1>
+          <p className="subtitle">
+            Данные на устройстве уже обновлены более новой версией приложения —
+            возможно, в другой вкладке. <strong>Ничего не потеряно.</strong>
+            Перезагрузите страницу, чтобы продолжить в новой версии; если
+            открыта старая вкладка, закройте её и обновите установленное
+            приложение.
+          </p>
+          <button className="btn btn-primary" onClick={() => window.location.reload()}>
+            Перезагрузить
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (

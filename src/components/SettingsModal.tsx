@@ -3,6 +3,7 @@ import { useNotes } from '../lib/store';
 import type { AutoLockTimeout } from '../lib/auto-lock';
 import type { ThemePref } from '../lib/theme';
 import { useModalA11y } from '../lib/useModalA11y';
+import { SECRET_PASSWORD_FIELD_PROPS } from './secretFieldProps';
 
 /** Settings modal (7.3/L8) — extracted from the 500-line Main screen.
  *  Reorganised into collapsible blocks (all collapsed by default); each block
@@ -88,12 +89,29 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     showMnemonic,
     autoLockTimeout,
     setAutoLockTimeout,
+    safeboxPinConfigured,
+    safeboxDataPresent,
+    safeboxUnlocked,
+    safeboxLockGeneration,
+    unlockSafebox,
+    changeSafeboxPin,
+    deactivateSafebox,
   } = useNotes();
 
   const [showSeed, setShowSeed] = useState(false);
+  // Seed gate (§2): with a safebox configured, the phrase is shown only after
+  // the SAFEBOX PIN is entered here — otherwise the 10-strike wipe would make
+  // reaching the seed EASIER than keeping the safebox.
+  const [seedGatePin, setSeedGatePin] = useState('');
+  const [seedGateError, setSeedGateError] = useState('');
+  const [seedGateBusy, setSeedGateBusy] = useState(false);
+  const [seedGatePassed, setSeedGatePassed] = useState(false);
 
   function close() {
     setShowSeed(false);
+    setSeedGatePin('');
+    setSeedGateError('');
+    setSeedGatePassed(false);
     onClose();
   }
 
@@ -105,12 +123,60 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     // closed — incl. the reset flow, where Main flips `open` directly and the
     // internal close() is bypassed (round-13 finding: Settings → показать seed
     // → Reset → отмена → Settings снова показывал фразу без запроса).
-    else setShowSeed(false);
+    else { setShowSeed(false); setSeedGatePassed(false); setSeedGatePin(''); setSeedGateError(''); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  // A SECTION LOCK (idle timer, hidden/pagehide, app lock, another tab) must
+  // clear this modal's own safebox secrets too — it sits OUTSIDE the subtree
+  // Main remounts on `safeboxLockGeneration`. Adjusted during render, so the
+  // typed PIN is gone before the next paint.
+  const [prevLockGeneration, setPrevLockGeneration] = useState(safeboxLockGeneration);
+  if (safeboxLockGeneration !== prevLockGeneration) {
+    setPrevLockGeneration(safeboxLockGeneration);
+    setSeedGatePassed(false);
+    setSeedGatePin('');
+    setSeedGateError('');
+  }
+
   if (!open) return null;
-  const mnemonic = showSeed ? showMnemonic() : null;
+
+  // Gate matrix (§2):
+  //  - no safebox config, no safebox data → the seed is shown as before;
+  //  - safebox configured                 → behind the SAFEBOX PIN;
+  //  - safebox DATA but no config (wiped / new device / deactivated)
+  //                                       → forbidden, with a pointer to the
+  //                                         seed-based PIN reset (otherwise the
+  //                                         wipe would be a shortcut TO the seed).
+  const seedBlockedByMissingConfig = !safeboxPinConfigured && safeboxDataPresent;
+  // The gate is LIVE, not a one-time flag: the phrase is shown only while the
+  // safebox session that proved the PIN is still open. An idle lock, an app
+  // lock, a hidden edge or a config replaced in another tab all close the
+  // section — and with it this gate — on the very next render.
+  const seedGateOpen = seedGatePassed && safeboxUnlocked;
+  const seedNeedsSafeboxPin = safeboxPinConfigured && !seedGateOpen;
+  const mnemonic = showSeed && !seedBlockedByMissingConfig && !seedNeedsSafeboxPin
+    ? showMnemonic()
+    : null;
+
+  async function passSeedGate() {
+    if (seedGatePin.length < 6) { setSeedGateError('Минимум 6 цифр'); return; }
+    setSeedGateBusy(true);
+    setSeedGateError('');
+    try {
+      // Unlocking the safebox IS the proof: it runs the metered PIN path and
+      // RESOLVES ONLY on a fully published, still-live session (a lock during
+      // the KDF makes it throw SafeboxLockedError instead of resolving).
+      await unlockSafebox(seedGatePin);
+      setSeedGatePassed(true);
+      setSeedGatePin('');
+    } catch (err) {
+      setSeedGatePassed(false);
+      setSeedGateError(err instanceof Error ? err.message : 'Неверный PIN сейфа');
+    } finally {
+      setSeedGateBusy(false);
+    }
+  }
 
   const arweaveChip = !arweave.enabled
     ? 'выключено'
@@ -153,6 +219,43 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               {showSeed ? 'Скрыть seed-фразу' : 'Показать seed-фразу'}
             </button>
 
+            {showSeed && seedBlockedByMissingConfig && (
+              <div className="seed-warning" role="alert">
+                На устройстве есть записи сейфа, но PIN сейфа не установлен.
+                Просмотр seed-фразы закрыт — сначала восстановите PIN сейфа по
+                seed-фразе в разделе «Защищённый сейф».
+              </div>
+            )}
+
+            {showSeed && !seedBlockedByMissingConfig && seedNeedsSafeboxPin && (
+              <div className="pin-setup">
+                <div className="settings-hint">
+                  Просмотр seed-фразы защищён PIN-кодом сейфа.
+                </div>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  className="pin-input safebox-secret-field"
+                  name="sbx-gate-seed"
+                  id="sbx-gate-seed"
+                  placeholder="PIN сейфа"
+                  value={seedGatePin}
+                  maxLength={8}
+                  onChange={e => { setSeedGatePin(e.target.value.replace(/\D/g, '')); setSeedGateError(''); }}
+                  {...SECRET_PASSWORD_FIELD_PROPS}
+                />
+                {seedGateError && <div className="error-msg" role="alert">{seedGateError}</div>}
+                <button
+                  className="btn btn-primary full-width"
+                  disabled={seedGateBusy}
+                  onClick={() => void passSeedGate()}
+                >
+                  {seedGateBusy ? 'Проверяем...' : 'Показать после ввода PIN'}
+                </button>
+              </div>
+            )}
+
             {mnemonic && (
               <div className="seed-reveal">
                 <div className="seed-warning">
@@ -185,6 +288,23 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               />
             )}
           </SettingsBlock>
+
+          {(safeboxPinConfigured || safeboxDataPresent) && (
+            <SettingsBlock
+              icon={<IconShield />}
+              title="Защищённый сейф"
+              chip={safeboxPinConfigured ? 'PIN установлен' : 'PIN не установлен'}
+            >
+              <SafeboxSettingsSection
+                // Remounted on every section lock: its current/new PIN fields
+                // would otherwise survive a hidden/pagehide round-trip.
+                key={safeboxLockGeneration}
+                configured={safeboxPinConfigured}
+                changeSafeboxPin={changeSafeboxPin}
+                deactivateSafebox={deactivateSafebox}
+              />
+            </SettingsBlock>
+          )}
 
           <SettingsBlock
             icon={<IconInfinity />}
@@ -287,6 +407,129 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
   );
 }
 
+/** Safebox PIN management. BOTH destructive-ish operations demand the CURRENT
+ *  safebox PIN — an unlocked section is deliberately NOT sufficient, or
+ *  «деактивировать → поставить свой PIN → открыть» would walk around the gate.
+ *  The seed-based reset lives in the safebox section itself (it needs the
+ *  12-word grid). */
+function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebox }: {
+  configured: boolean;
+  changeSafeboxPin: (currentPin: string, newPin: string) => Promise<void>;
+  deactivateSafebox: (currentPin: string) => Promise<void>;
+}) {
+  const [mode, setMode] = useState<'idle' | 'change' | 'deactivate'>('idle');
+  const [currentPin, setCurrentPin] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState('');
+
+  function reset() {
+    setMode('idle'); setCurrentPin(''); setNewPin(''); setConfirmPin(''); setError('');
+  }
+
+  async function submit() {
+    setError('');
+    if (currentPin.length < 6) { setError('Введите текущий PIN сейфа'); return; }
+    if (mode === 'change') {
+      if (newPin.length < 6) { setError('Новый PIN: минимум 6 цифр'); return; }
+      if (newPin !== confirmPin) { setError('PIN-коды не совпадают'); return; }
+    }
+    setBusy(true);
+    try {
+      if (mode === 'change') {
+        await changeSafeboxPin(currentPin, newPin);
+        setDone('PIN сейфа изменён.');
+      } else {
+        await deactivateSafebox(currentPin);
+        setDone('Сейф деактивирован. Записи сохранены — чтобы снова открыть их, установите PIN по seed-фразе.');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось выполнить операцию.');
+      return;
+    } finally {
+      setBusy(false);
+    }
+    reset();
+  }
+
+  if (!configured) {
+    return (
+      <div className="settings-hint">
+        На устройстве есть записи сейфа, но PIN не установлен. Откройте раздел
+        «🔐 Сейф» и восстановите доступ, введя полную seed-фразу — записи не
+        пострадали.
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="settings-hint">
+        PIN сейфа — отдельный код доступа к паролям. Он защищает от взгляда
+        через плечо и короткого доступа к открытому экрану, но не является
+        крипто-границей. Сброс возможен только полной seed-фразой; записи при
+        этом сохраняются.
+      </div>
+      {done && <div className="settings-info text-green">{done}</div>}
+
+      {mode === 'idle' ? (
+        <div className="pin-actions">
+          <button className="btn btn-outline full-width" onClick={() => { setDone(''); setMode('change'); }}>
+            Сменить PIN сейфа
+          </button>
+          <button className="btn btn-ghost full-width" onClick={() => { setDone(''); setMode('deactivate'); }}>
+            Деактивировать сейф (записи сохранятся)
+          </button>
+        </div>
+      ) : (
+        <div className="pin-setup">
+          <input
+            type="password" inputMode="numeric" pattern="[0-9]*"
+            className="pin-input safebox-secret-field"
+            name="sbx-cur-code" id="sbx-cur-code"
+            placeholder="Текущий PIN сейфа" value={currentPin} maxLength={8}
+            onChange={e => { setCurrentPin(e.target.value.replace(/\D/g, '')); setError(''); }}
+            {...SECRET_PASSWORD_FIELD_PROPS}
+          />
+          {mode === 'change' && (
+            <>
+              <input
+                type="password" inputMode="numeric" pattern="[0-9]*"
+                className="pin-input safebox-secret-field"
+                name="sbx-next-code" id="sbx-next-code"
+                placeholder="Новый PIN (6–8 цифр)" value={newPin} maxLength={8}
+                onChange={e => { setNewPin(e.target.value.replace(/\D/g, '')); setError(''); }}
+                {...SECRET_PASSWORD_FIELD_PROPS}
+              />
+              <input
+                type="password" inputMode="numeric" pattern="[0-9]*"
+                className="pin-input safebox-secret-field"
+                name="sbx-next-code-2" id="sbx-next-code-2"
+                placeholder="Повторите новый PIN" value={confirmPin} maxLength={8}
+                onChange={e => { setConfirmPin(e.target.value.replace(/\D/g, '')); setError(''); }}
+                {...SECRET_PASSWORD_FIELD_PROPS}
+              />
+            </>
+          )}
+          {mode === 'deactivate' && (
+            <div className="seed-warning">
+              Записи сейфа НЕ удаляются. Чтобы открыть их снова, потребуется
+              установить PIN, введя полную seed-фразу.
+            </div>
+          )}
+          {error && <div className="error-msg" role="alert">{error}</div>}
+          <button className="btn btn-primary full-width" onClick={() => void submit()} disabled={busy}>
+            {busy ? '...' : mode === 'change' ? 'Сменить PIN' : 'Деактивировать'}
+          </button>
+          <button className="btn btn-ghost full-width" onClick={reset} disabled={busy}>Отмена</button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function PinSection({ hasPin, setupPin, removePin }: {
   hasPin: boolean;
   setupPin: (pin: string) => Promise<void>;
@@ -346,20 +589,24 @@ function PinSection({ hasPin, setupPin, removePin }: {
             inputMode="numeric"
             pattern="[0-9]*"
             className="pin-input"
+            name="app-code" id="app-code"
             placeholder={hasPin ? 'Новый PIN (мин. 6 цифр)' : 'PIN (мин. 6 цифр)'}
             value={pinInput}
             maxLength={8}
             onChange={e => { setPinInput(e.target.value.replace(/\D/g, '')); setPinError(''); }}
+            {...SECRET_PASSWORD_FIELD_PROPS}
           />
           <input
             type="password"
             inputMode="numeric"
             pattern="[0-9]*"
             className="pin-input"
+            name="app-code-2" id="app-code-2"
             placeholder="Повторите PIN"
             value={pinConfirm}
             maxLength={8}
             onChange={e => { setPinConfirm(e.target.value.replace(/\D/g, '')); setPinError(''); }}
+            {...SECRET_PASSWORD_FIELD_PROPS}
           />
           {pinError && <div className="error-msg">{pinError}</div>}
           <button className="btn btn-primary full-width" onClick={handleSave}>

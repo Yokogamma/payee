@@ -20,3 +20,27 @@
  * branch into unreachable dead code under TS narrowing.
  */
 export const V3_WRITER_ENABLED: boolean = true;
+
+/**
+ * Safebox (v4) writer gate (release W4 flips this to true in a dedicated
+ * commit/tag).
+ *
+ * Contract (enforced in the store, not just hidden UI):
+ * - false (R4): `addSafeboxEntry` / `editSafeboxEntry` / `restoreSafeboxVersion`
+ *   throw WriterDisabledError; their UI (composer, edit, «Вернуть эту версию»)
+ *   is hidden. EVERYTHING ELSE WORKS: the section is visible when data or a PIN
+ *   config exists, unlocking, viewing, copying, downloading, version history,
+ *   activation (including the post-restore seed path — a restored user must not
+ *   be cut off from their passwords), PIN change/deactivation and the seed
+ *   reset are all writer-INDEPENDENT.
+ * - true (W4): all three writer actions work and the entry point is offered to
+ *   everyone (otherwise flipping the flag would not reveal the safebox to new
+ *   users).
+ *
+ * Entry-point visibility: `SAFEBOX_WRITER_ENABLED || safeboxDataPresent ||
+ * safeboxPinConfigured`.
+ *
+ * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
+ * branch into unreachable dead code under TS narrowing.
+ */
+export const SAFEBOX_WRITER_ENABLED: boolean = false;

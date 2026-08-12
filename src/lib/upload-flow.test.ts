@@ -13,9 +13,11 @@ const NOW = 1_750_000_000_000;
 const NOTE: EncryptedNote = {
   noteId: 'note-1',
   ciphertext: 'Y2lwaGVy',
-  iv: 'aXZpdml2aXZpdg==',
+  iv: 'AAAAAAAAAAAAAAAA', // canonical base64 of exactly 12 bytes
   createdAt: NOW - 60_000,
 };
+
+const NOTE_ITEM = { kind: 'note', record: NOTE } as const;
 
 const KEYS: UploadKeys = {
   signingKey: new Uint8Array(32).fill(7),
@@ -59,6 +61,9 @@ function makeHarness(opts?: {
     commitV3PausedFailure: async (record, pausedAt) => {
       pausedCommits.push({ record, pausedAt });
     },
+    commitV4PausedFailure: async (record, pausedAt) => {
+      pausedCommits.push({ record, pausedAt });
+    },
     signPayload: async () => {
       if (opts?.lockDuringSign) epoch.value++;
       return 'signature-b64';
@@ -75,7 +80,7 @@ function makeHarness(opts?: {
 describe('runUploadAttempt — before the point of no return', () => {
   it('lock DURING the signature: no HTTP, no writes, outcome cancelled', async () => {
     const h = makeHarness({ lockDuringSign: true });
-    const outcome = await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome).toEqual({ kind: 'cancelled' });
     expect(h.httpCalls).toBe(0);
     expect(h.writes).toEqual([]); // no 'uploading' record left behind
@@ -83,7 +88,7 @@ describe('runUploadAttempt — before the point of no return', () => {
 
   it('epoch already stale at entry: cancelled before anything happens', async () => {
     const h = makeHarness();
-    const outcome = await runUploadAttempt(NOTE, KEYS, 0, h.deps); // captured epoch ≠ current
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 0, h.deps); // captured epoch ≠ current
     expect(outcome).toEqual({ kind: 'cancelled' });
     expect(h.httpCalls).toBe(0);
     expect(h.writes).toEqual([]);
@@ -93,7 +98,7 @@ describe('runUploadAttempt — before the point of no return', () => {
 describe('runUploadAttempt — past the point of no return (committed)', () => {
   it('lock during toUploading: the request STILL dispatches and the result persists', async () => {
     const h = makeHarness({ lockDuringToUploading: true, result: ACCEPTED });
-    const outcome = await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome).toEqual({ kind: 'committed', result: ACCEPTED });
     expect(h.httpCalls).toBe(1);
     expect(h.writes.map(w => w.status)).toEqual(['uploading', 'accepted']);
@@ -102,7 +107,7 @@ describe('runUploadAttempt — past the point of no return (committed)', () => {
 
   it('accepted after a mid-dispatch lock is persisted (never stranded uploading)', async () => {
     const h = makeHarness({ lockDuringDispatch: true, result: ACCEPTED });
-    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(h.writes.map(w => w.status)).toEqual(['uploading', 'accepted']);
   });
 
@@ -111,7 +116,7 @@ describe('runUploadAttempt — past the point of no return (committed)', () => {
       lockDuringDispatch: true,
       result: { kind: 'unavailable', error: '503' },
     });
-    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     const final = h.writes.at(-1)!;
     expect(final.status).toBe('error'); // no prior txId → retryable hard error
     expect(final.lastError).toBe('503');
@@ -119,14 +124,14 @@ describe('runUploadAttempt — past the point of no return (committed)', () => {
 
   it('in_progress after a mid-dispatch lock is persisted', async () => {
     const prev: SyncRecord = {
-      noteId: 'note-1', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
       updatedAt: NOW - 100_000, needsRecheck: true,
     };
     const h = makeHarness({
       prev, lockDuringDispatch: true,
       result: { kind: 'in_progress', error: '409' },
     });
-    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     const final = h.writes.at(-1)!;
     expect(final.status).toBe('accepted'); // prior accepted TX restored
     expect(final.txId).toBe('TX-old');
@@ -136,7 +141,7 @@ describe('runUploadAttempt — past the point of no return (committed)', () => {
 describe('runUploadAttempt — in_progress WITHOUT a prior record (round-5 #1)', () => {
   it('records a RETRYABLE failure, never a stranded uploading', async () => {
     const h = makeHarness({ result: { kind: 'in_progress', error: '409 reservation' } });
-    const outcome = await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome.kind).toBe('committed');
     const final = h.writes.at(-1)!;
     expect(final.status).toBe('error');      // syncPendingNotes re-enqueues 'error'
@@ -150,7 +155,7 @@ describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)
 
   it('commits the failure record + pause via commitV3PausedFailure, NOT setSyncRecord', async () => {
     const h = makeHarness({ result: V3_DISABLED });
-    const outcome = await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome.kind).toBe('committed');
     // Only the toUploading write went through setSyncRecord — the final record
     // travelled through the atomic sync+meta path exactly once.
@@ -164,12 +169,12 @@ describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)
 
   it('preserves txId/recovery/needsRecheck from the prior record (afterFailure semantics)', async () => {
     const prev: SyncRecord = {
-      noteId: 'note-1', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
       updatedAt: NOW - 100_000, needsRecheck: true,
       recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
     };
     const h = makeHarness({ prev, result: V3_DISABLED });
-    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     const rec = h.pausedCommits[0].record;
     expect(rec.txId).toBe('TX-old');           // accepted TX never downgraded away
     expect(rec.recovery).toEqual(prev.recovery); // recovery hint survives the pause
@@ -178,7 +183,7 @@ describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)
 
   it('persists even when a lock lands mid-dispatch (no epoch gate after the point of no return)', async () => {
     const h = makeHarness({ lockDuringDispatch: true, result: V3_DISABLED });
-    await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(h.pausedCommits).toHaveLength(1); // pause not lost to the lock
   });
 });
@@ -186,7 +191,7 @@ describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)
 describe('runUploadAttempt — happy path', () => {
   it('accepted: uploading → accepted, txId recorded, one HTTP call', async () => {
     const h = makeHarness({ result: ACCEPTED });
-    const outcome = await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome).toEqual({ kind: 'committed', result: ACCEPTED });
     expect(h.httpCalls).toBe(1);
     expect(h.writes.map(w => w.status)).toEqual(['uploading', 'accepted']);
@@ -203,7 +208,7 @@ describe('runUploadAttempt — happy path', () => {
     ];
     for (const result of kinds) {
       const h = makeHarness({ result });
-      await runUploadAttempt(NOTE, KEYS, 1, h.deps);
+      await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
       expect(h.writes.at(-1)!.status).not.toBe('uploading');
     }
   });
