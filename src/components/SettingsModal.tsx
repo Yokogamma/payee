@@ -79,6 +79,9 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     notes,
     chains,
     arweave,
+    syncStatuses,
+    updateCheck,
+    checkForUpdates,
     toggleArweave,
     retrySync,
     registerWithInvite,
@@ -182,6 +185,32 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     ? 'выключено'
     : arweave.online ? '● Онлайн' : '○ Оффлайн';
   const arweaveChipClass = arweave.enabled && arweave.online ? 'text-green' : '';
+
+  // ─── Storage counters, per NOTE (chain) and per VERSION (transaction) ───
+  //
+  // «В блокчейне» is `confirmed`-ONLY, deliberately: the reset warning treats
+  // exactly that status as recoverable, and a counter that called an `accepted`
+  // note "saved" would contradict the dialog that is about to wipe it.
+  //
+  // A chain qualifies only when EVERY version does (`every`, not `some`) — a
+  // half-uploaded note must not look finished. The two lines are disjoint by
+  // construction, and a chain that still holds a queued/errored version falls
+  // into NEITHER: it is neither stored nor fully transmitted, and its versions
+  // are already visible in «Ожидают загрузки» / «Ошибки».
+  const versionStatus = (id: string) => syncStatuses[id]?.status;
+  const confirmedChains = chains.filter(
+    c => c.versions.every(v => versionStatus(v.id) === 'confirmed'),
+  ).length;
+  const pendingChains = chains.filter(c =>
+    c.versions.every(v => versionStatus(v.id) === 'confirmed' || versionStatus(v.id) === 'accepted')
+    && c.versions.some(v => versionStatus(v.id) === 'accepted'),
+  ).length;
+  // Storage-backed, NOT notes.length: the aggregates count every stored record,
+  // including versions this build cannot decrypt (invisible in chains/notes).
+  const totalVersions = arweave.confirmedCount + arweave.acceptedCount + arweave.unsyncedCount;
+
+  const checking = updateCheck.status === 'checking';
+  const checkProgress = updateCheck.status === 'checking' ? updateCheck.progress : null;
 
   return (
     <div className="modal-overlay" onClick={close}>
@@ -325,16 +354,31 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               <div>Статус: <strong className={arweave.online ? 'text-green' : 'text-red'}>
                 {arweave.online ? '● Онлайн' : '○ Оффлайн'}
               </strong></div>
-              {/* Per-version accounting: every version is its own transaction. */}
-              <div>Синхронизировано записей: <strong>{arweave.acceptedCount + arweave.confirmedCount}</strong> из <strong>{notes.length}</strong></div>
-              {arweave.confirmedCount > 0 && (
-                <div className="text-green">✓ Подтверждено в блокчейне: <strong>{arweave.confirmedCount}</strong></div>
+              {/* Per-NOTE headline (a note edited 3 times is one note), with the
+                  per-VERSION truth right under it — every version is its own
+                  transaction, and the two legitimately disagree. */}
+              {!arweave.countsReady ? (
+                // syncStatuses is still empty here, so the formulas would render
+                // an honest-looking «0 из N» lie.
+                <div>Синхронизировано: <strong>загружается…</strong></div>
+              ) : (
+                <>
+                  <div className={confirmedChains === chains.length ? 'text-green' : undefined}>
+                    Заметки в блокчейне: <strong>{confirmedChains}</strong> из <strong>{chains.length}</strong>
+                  </div>
+                  {pendingChains > 0 && (
+                    <div>⏳ Передано, ждёт подтверждения: <strong>{pendingChains}</strong></div>
+                  )}
+                  <div className="settings-hint">
+                    версий (транзакций): {arweave.confirmedCount} из {totalVersions}
+                  </div>
+                </>
               )}
               {arweave.acceptedCount > 0 && (
-                <div>⏳ Ожидают подтверждения: <strong>{arweave.acceptedCount}</strong></div>
+                <div>⏳ Ожидают подтверждения версий: <strong>{arweave.acceptedCount}</strong></div>
               )}
               {arweave.unsyncedCount > 0 && (
-                <div>⏳ Ожидают загрузки: <strong>{arweave.unsyncedCount}</strong></div>
+                <div>⏳ Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>
               )}
               {arweave.errorCount > 0 && (
                 <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
@@ -354,6 +398,49 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
 
             {arweave.lastError && (
               <div className="error-msg">{arweave.lastError}</div>
+            )}
+
+            {/* Reading Arweave needs neither the sync toggle nor a registered
+                key — those gate UPLOADS. Gating this button on `enabled` would
+                strand a read-only device with no way to see its own notes. */}
+            <button
+              className="btn btn-outline full-width"
+              onClick={() => void checkForUpdates()}
+              disabled={checking}
+            >
+              {checking
+                ? (checkProgress ? `⏳ Проверяем… ${checkProgress.done}/${checkProgress.total}` : '⏳ Проверяем…')
+                : '↻ Проверить обновления'}
+            </button>
+            <div className="settings-hint">
+              Забирает заметки и записи сейфа, созданные на других устройствах.
+            </div>
+
+            {updateCheck.status === 'error' && (
+              <div className="settings-info text-red">⚠ Не удалось проверить обновления</div>
+            )}
+            {updateCheck.status === 'done' && (
+              <div className="settings-info">
+                {updateCheck.addedNotes + updateCheck.updatedNotes + updateCheck.changedSafebox > 0 ? (
+                  <div className="text-green">
+                    ✓ Получено с других устройств: <strong>{updateCheck.addedNotes}</strong>
+                    {updateCheck.updatedNotes > 0 && <> · обновлено: <strong>{updateCheck.updatedNotes}</strong></>}
+                    {updateCheck.changedSafebox > 0 && <> · в сейфе: <strong>{updateCheck.changedSafebox}</strong></>}
+                  </div>
+                ) : (
+                  <div>
+                    ✓ Проверено в {new Date(updateCheck.at).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })}
+                    {' '}— новых заметок нет
+                  </div>
+                )}
+                {/* A partial sweep is NOT a failure: what arrived is merged. It
+                    only means the next check may still bring something. */}
+                {updateCheck.partial && (
+                  <div className="text-red">
+                    ⚠ Проверка прошла не полностью — часть данных недоступна, повторите позже
+                  </div>
+                )}
+              </div>
             )}
 
             {arweave.enabled && (arweave.unsyncedCount > 0 || arweave.lastError) && (

@@ -14,8 +14,12 @@ beforeEach(() => {
     arweave: {
       enabled: true, online: true, syncing: false, registered: true,
       acceptedCount: 0, confirmedCount: 0, unsyncedCount: 0, errorCount: 0,
+      quarantinedCount: 0, countsReady: true,
       lastSync: null, lastError: null,
     },
+    syncStatuses: {},
+    updateCheck: { status: 'idle' },
+    checkForUpdates: vi.fn(),
     toggleArweave: vi.fn(),
     retrySync: vi.fn(),
     registerWithInvite: vi.fn(),
@@ -272,5 +276,154 @@ describe('SettingsModal — a section lock clears ITS safebox secrets too', () =
 
     expect(h.store.showMnemonic).not.toHaveBeenCalled();
     expect((document.querySelector('#sbx-gate-seed') as HTMLInputElement).value).toBe('');
+  });
+});
+
+// ─── «Вечное хранилище»: проверка обновлений и счётчики ─────────────
+
+/** Only one block is ever expanded in these tests, so its body is unambiguous. */
+function storageBlockText(): string {
+  return (document.querySelector('.settings-block.is-open .settings-block-body') as HTMLElement).textContent ?? '';
+}
+function openStorageBlock() {
+  fireEvent.click(screen.getByText('Вечное хранилище'));
+}
+/** A chain fixture: only `versions[].id` and the chain count are read here. */
+function chainOf(root: string, versionIds: string[]) {
+  const versions = versionIds.map(id => ({ id, root, rev: 1, createdAt: 1 }));
+  return { root, current: versions[0], versions };
+}
+
+describe('SettingsModal — «Проверить обновления»', () => {
+  it('кнопка вызывает checkForUpdates', () => {
+    renderModal();
+    openStorageBlock();
+    fireEvent.click(screen.getByText('↻ Проверить обновления'));
+    expect(h.store.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('остаётся доступной при ВЫКЛЮЧЕННОЙ автосинхронизации — чтение не требует записи', () => {
+    h.store.arweave = { ...(h.store.arweave as object), enabled: false, registered: false };
+    renderModal();
+    openStorageBlock();
+    const btn = screen.getByText('↻ Проверить обновления') as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    expect(h.store.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('во время проверки кнопка заблокирована и показывает прогресс', () => {
+    h.store.updateCheck = { status: 'checking', progress: { done: 12, total: 40 } };
+    renderModal();
+    openStorageBlock();
+    const btn = screen.getByText('⏳ Проверяем… 12/40') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('результат: сколько получено с других устройств', () => {
+    h.store.updateCheck = {
+      status: 'done', at: Date.now(), addedNotes: 2, updatedNotes: 1, changedSafebox: 3, partial: false,
+    };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Получено с других устройств: 2');
+    expect(text).toContain('обновлено: 1');
+    expect(text).toContain('в сейфе: 3');
+  });
+
+  it('результат: пустая проверка отличается от «не запускалась»', () => {
+    h.store.updateCheck = {
+      status: 'done', at: Date.now(), addedNotes: 0, updatedNotes: 0, changedSafebox: 0, partial: false,
+    };
+    renderModal();
+    openStorageBlock();
+    expect(storageBlockText()).toContain('новых заметок нет');
+  });
+
+  it('partial — предупреждение, но НЕ ошибка: полученное всё равно показано', () => {
+    h.store.updateCheck = {
+      status: 'done', at: Date.now(), addedNotes: 1, updatedNotes: 0, changedSafebox: 0, partial: true,
+    };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Получено с других устройств: 1');
+    expect(text).toContain('не полностью');
+    expect(text).not.toContain('Не удалось проверить обновления');
+  });
+
+  it('error — отдельная формулировка, без «не полностью»', () => {
+    h.store.updateCheck = { status: 'error', at: Date.now() };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Не удалось проверить обновления');
+    expect(text).not.toContain('не полностью');
+  });
+});
+
+describe('SettingsModal — счётчик по заметкам, а не по версиям', () => {
+  it('одна заметка из трёх подтверждённых версий — это «1 из 1»', () => {
+    h.store.chains = [chainOf('r1', ['v1', 'v2', 'v3'])];
+    h.store.notes = [{}, {}, {}];
+    h.store.syncStatuses = {
+      v1: { status: 'confirmed' }, v2: { status: 'confirmed' }, v3: { status: 'confirmed' },
+    };
+    h.store.arweave = { ...(h.store.arweave as object), confirmedCount: 3 };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Заметки в блокчейне: 1 из 1');
+    expect(text).toContain('версий (транзакций): 3 из 3');
+  });
+
+  it('цепочка confirmed+accepted НЕ «в блокчейне», а «ждёт подтверждения»', () => {
+    // The reset dialog treats only `confirmed` as recoverable — this counter
+    // must not promise more than the wipe warning does.
+    h.store.chains = [chainOf('r1', ['v1', 'v2'])];
+    h.store.syncStatuses = { v1: { status: 'confirmed' }, v2: { status: 'accepted' } };
+    h.store.arweave = { ...(h.store.arweave as object), confirmedCount: 1, acceptedCount: 1 };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Заметки в блокчейне: 0 из 1');
+    expect(text).toContain('Передано, ждёт подтверждения: 1');
+    expect(text).toContain('версий (транзакций): 1 из 2');
+  });
+
+  it('цепочка accepted+queued не попадает НИ В ОДНУ из двух строк', () => {
+    h.store.chains = [chainOf('r1', ['v1', 'v2'])];
+    h.store.syncStatuses = { v1: { status: 'accepted' } }; // v2 ещё не выгружалась
+    h.store.arweave = { ...(h.store.arweave as object), acceptedCount: 1, unsyncedCount: 1 };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Заметки в блокчейне: 0 из 1');
+    expect(text).not.toContain('Передано, ждёт подтверждения');
+    expect(text).toContain('версий (транзакций): 0 из 2');
+  });
+
+  it('знаменатель версий берётся из хранилища — нерасшифровываемая версия тоже считается', () => {
+    // One visible confirmed chain, plus a stored version that this build cannot
+    // decrypt: it is absent from `chains`/`notes` but present in the aggregates.
+    h.store.chains = [chainOf('r1', ['v1'])];
+    h.store.notes = [{}];
+    h.store.syncStatuses = { v1: { status: 'confirmed' } };
+    h.store.arweave = { ...(h.store.arweave as object), confirmedCount: 1, unsyncedCount: 1 };
+    renderModal();
+    openStorageBlock();
+    expect(storageBlockText()).toContain('версий (транзакций): 1 из 2');
+  });
+
+  it('пока агрегаты не прочитаны — «загружается», а не честно выглядящий ноль', () => {
+    h.store.chains = [chainOf('r1', ['v1'])];
+    h.store.syncStatuses = {};
+    h.store.arweave = { ...(h.store.arweave as object), countsReady: false };
+    renderModal();
+    openStorageBlock();
+    const text = storageBlockText();
+    expect(text).toContain('Синхронизировано: загружается…');
+    expect(text).not.toContain('Заметки в блокчейне');
   });
 });
