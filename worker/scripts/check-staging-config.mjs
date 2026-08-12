@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 /**
- * Pre-flight for every staging command.
+ * Pre-flight for the REAL staging deploy (`predeploy:staging`) only.
  *
  * `[env.staging]` ships with a PLACEHOLDER KV id, so an un-provisioned staging
  * fails deep inside wrangler with a message that says nothing about what the
  * operator actually has to do. Fail here instead, with the checklist.
  *
- * Runs as a `pre*` script — no way to skip it accidentally.
+ * Deliberately NOT hooked to `deploy:staging:check` (`wrangler deploy --env
+ * staging --dry-run`): that one validates wrangler.toml WITHOUT deploying and
+ * without auth, so CI runs it on every Pages build to catch config drift. It
+ * must keep working BEFORE staging exists — gating it on provisioning would
+ * (and briefly did) break the client deploy for no safety gain.
  */
 
 import { readFileSync } from 'node:fs';
