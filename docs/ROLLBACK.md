@@ -263,14 +263,17 @@ KV placeholder is still in `wrangler.toml`.
     `WORKER_FLOOR_TAG = worker-r3 (9319491)` — the v4-acceptor. Everything below
     it (`worker-r2` cd7524e, `worker-r1` 15b87d4c) must never be redeployed once
     safebox data exists: those builds 400 every App-Version=4 upload.
-    **Bounded exception, valid ONLY right now:** the client ships with
-    `SAFEBOX_WRITER_ENABLED=false`, so there is not a single v4 record on chain
-    yet. Until W4 ships (or any v4 upload succeeds), an emergency rollback to
-    `worker-r2` is still DATA-safe — it would only stop a format nobody is
-    writing. The moment W4 goes live this exception is void and the floor is
-    absolute. This note exists because the v4-acceptor shipped WITHOUT a signed
-    smoke (see below): keeping the rollback door open is the compensating
-    control.
+    ~~**Bounded exception, valid ONLY right now:** … rollback to `worker-r2` is
+    still DATA-safe while no v4 record exists.~~
+    **THE EXCEPTION IS VOID as of 2026-08-12**, the same day it was written.
+    Its stated precondition — "not a single v4 record on chain" — was retired
+    by the signed production smoke, which posted a real v4 record
+    (`Ry0Nhrrz…`) under the smoke account's Owner-Hash. That record is operator
+    test data, so no *user* data is at stake in it; the exception is
+    nonetheless closed rather than reinterpreted, because W4 follows
+    immediately and a floor that depends on a shifting precondition is not a
+    floor. **The floor is now absolute:** `worker-r2` and below 400 every
+    App-Version=4 upload and would silently stop safebox sync.
   - **Allowed rollback targets = tags in this list that are descendants of
     `WORKER_FLOOR_TAG`** (verify with `git merge-base --is-ancestor`). Never
     deploy anything else once the floor Worker has run even once.
@@ -287,17 +290,22 @@ KV placeholder is still in `wrangler.toml`.
       `v4Uploads`). **DEPLOYED 2026-08-12**, Cloudflare version
       `5fcbe329-60d8-4676-9715-96c49e81453b`, prod /health verified:
       `{ok:true, versions:['1','2','3','4'], v3Uploads:true, v4Uploads:true}`.
-      **Is the worker rollback floor** (see the bounded exception above).
-      ⚠️ **The signed v4 smoke was SKIPPED** by explicit operator decision
-      (2026-08-12, no real users). What was actually verified: the deployed
-      `/health` surface, plus CI (typecheck + 130 worker tests, including the
-      v4 e2e idempotency test that posts through a real signable wallet in
-      miniflare and asserts exactly one paid POST, and the gate test asserting
-      zero per-owner DO calls while disabled). What was NOT verified against
-      the real deployment: a signed end-to-end upload, real Arweave
-      acceptance, and the live per-owner rate-limiter path. **Run
-      `npm --prefix worker run smoke:v4` before W4** — it is the last cheap
-      moment to catch this.
+      **Is the worker rollback floor** (absolute — see above).
+      **Signed v4 smoke: PASSED against PRODUCTION on 2026-08-12**, before W4,
+      discharging the waiver under which this worker shipped. All 8 checks
+      green (`npm --prefix worker run smoke:v4`, `ALLOW_PRODUCTION_SMOKE=true`):
+      `/health` ok + `versions∋'4'` + `v4Uploads:true`; a signed v4 upload
+      accepted (`txId Ry0NhrrzhQM7EBrJ5yMc7w0LCmB_z_O2bI4NRvlTOxs`,
+      `committed:true`); the repeat returned the SAME txId (idempotency holds on
+      the real DO, not just in miniflare); a UUIDv4 `Note-Id` rejected 400; the
+      v2/v3 data-key set rejected 400; and v3 still accepted (`txId
+      ku07BASgrlY3tCo0EgxL1vdoebVpFmbnESWndHLNWNM`) — no regression for the
+      format users were already writing. This closes the three gaps the waiver
+      left open: signed end-to-end upload, real Arweave acceptance, and the
+      live per-owner rate-limiter path.
+      ⚠️ Both txIds are **permanent, paid** records under the smoke account's
+      Owner-Hash. They are operator test data — never garbage-collect logic
+      around them, and expect them in that account's chain listing.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
