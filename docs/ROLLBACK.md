@@ -151,7 +151,18 @@ Deploy order is **strictly worker-first**: **Worker v4-acceptor → R4 → W4.**
    *Tag it on its OWN worker commit* — do not reuse `worker-r2`/`client-r3`
    (both point at `cd7524e`).
 2. **R4 client** (tag `client-r4`): the complete safebox code with
-   `SAFEBOX_WRITER_ENABLED=false`. Reader + PIN + viewing + activation +
+   `SAFEBOX_WRITER_ENABLED=false`.
+   **DEPLOYED 2026-08-12** (tag `client-r4` = f43e503) on notes.matamata.dev,
+   run 31584259549, smoke-headers passed. Verified against the live site:
+   CSP `connect-src` pins the worker origin; IndexedDB migrated to **version 2**
+   with stores `meta/notes/safebox/sync`; the privacy gate is mounted and
+   `hidden` (`display:none` — the `.lock-gate[hidden]` specificity rule holds in
+   production); «+ Запись» is absent from the bundle (tree-shaken, so the flag
+   really is `false`); and a brand-new user sees **no** safebox entry point in
+   the header — the R4 visibility formula end to end.
+   Release note published with this tag: *«закройте старые вкладки Eternal Notes
+   и обновите установленные PWA»* — the v1→v2 migration runs on first launch and
+   is irreversible. Reader + PIN + viewing + activation +
    PIN change/deactivation/seed-reset all work; `addSafeboxEntry` /
    `editSafeboxEntry` / `restoreSafeboxVersion` throw `WriterDisabledError` and
    their UI is hidden.
