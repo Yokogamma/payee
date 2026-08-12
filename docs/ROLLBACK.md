@@ -248,11 +248,18 @@ KV placeholder is still in `wrangler.toml`.
      must be rolled back **as a compatible pair**, never the Worker alone below
      the recovery protocol.
   - On the first production deploy, tag it (e.g. `worker-r1`) and record it here.
-    **Current floor (raised when W3 shipped, 2026-08-09):**
-    `WORKER_FLOOR_TAG = worker-r2 (cd7524e)` — the v3-acceptor. The previous
-    value (`worker-r1`, 15b87d4cacbc19a3371a19b9141f1562b63781d8) is now BELOW
-    the floor and must never be redeployed: it does not know App-Version=3 or
-    the UUIDv8 namespace split.
+    **Current floor (raised when the v4-acceptor shipped, 2026-08-12):**
+    `WORKER_FLOOR_TAG = worker-r3 (9319491)` — the v4-acceptor. Everything below
+    it (`worker-r2` cd7524e, `worker-r1` 15b87d4c) must never be redeployed once
+    safebox data exists: those builds 400 every App-Version=4 upload.
+    **Bounded exception, valid ONLY right now:** the client ships with
+    `SAFEBOX_WRITER_ENABLED=false`, so there is not a single v4 record on chain
+    yet. Until W4 ships (or any v4 upload succeeds), an emergency rollback to
+    `worker-r2` is still DATA-safe — it would only stop a format nobody is
+    writing. The moment W4 goes live this exception is void and the floor is
+    absolute. This note exists because the v4-acceptor shipped WITHOUT a signed
+    smoke (see below): keeping the rollback door open is the compensating
+    control.
   - **Allowed rollback targets = tags in this list that are descendants of
     `WORKER_FLOOR_TAG`** (verify with `git merge-base --is-ancestor`). Never
     deploy anything else once the floor Worker has run even once.
@@ -264,11 +271,22 @@ KV placeholder is still in `wrangler.toml`.
       namespace barrier, V3_UPLOADS_ENABLED kill switch, /health capability;
       prod /health verified: {ok, versions:[1,2,3], v3Uploads:true}).
       **Became the worker rollback floor when W3 shipped (2026-08-09).**
-    - worker-r3 (v4-acceptor) — `<SHA once deployed>` (App-Version=4 split
-      envelope, V4_UPLOADS_ENABLED kill switch, /health `v4Uploads`).
-      **Becomes the worker rollback floor the moment it is deployed** (an older
-      worker 400s every safebox upload). Record the tag + SHA + the verified
-      `/health` output here at deploy time and raise `WORKER_FLOOR_TAG` above.
+    - worker-r3 — 9319491 (2026-08-12, v4-acceptor: App-Version=4 split
+      envelope `{id,mc,miv,sc,siv}`, V4_UPLOADS_ENABLED kill switch, /health
+      `v4Uploads`). **DEPLOYED 2026-08-12**, Cloudflare version
+      `5fcbe329-60d8-4676-9715-96c49e81453b`, prod /health verified:
+      `{ok:true, versions:['1','2','3','4'], v3Uploads:true, v4Uploads:true}`.
+      **Is the worker rollback floor** (see the bounded exception above).
+      ⚠️ **The signed v4 smoke was SKIPPED** by explicit operator decision
+      (2026-08-12, no real users). What was actually verified: the deployed
+      `/health` surface, plus CI (typecheck + 130 worker tests, including the
+      v4 e2e idempotency test that posts through a real signable wallet in
+      miniflare and asserts exactly one paid POST, and the gate test asserting
+      zero per-owner DO calls while disabled). What was NOT verified against
+      the real deployment: a signed end-to-end upload, real Arweave
+      acceptance, and the live per-owner rate-limiter path. **Run
+      `npm --prefix worker run smoke:v4` before W4** — it is the last cheap
+      moment to catch this.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
