@@ -7,8 +7,9 @@ import { NoteComposer } from '../components/NoteComposer';
 import { NoteMarkdown } from '../components/NoteMarkdown';
 import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
+import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
-import { V3_WRITER_ENABLED } from '../lib/flags';
+import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from '../lib/flags';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
@@ -51,7 +52,18 @@ export function Main() {
     clearDraft,
     v3Paused,
     resumeV3Uploads,
+    safeboxPinConfigured,
+    safeboxDataPresent,
+    safeboxUnlocked,
+    safeboxLockGeneration,
+    lockSafebox,
   } = useNotes();
+
+  // Local view switch — the safebox lives INSIDE Main, not on its own route.
+  const [view, setView] = useState<'notes' | 'safebox'>('notes');
+  // Entry-point visibility (R4 contract): on W4 everyone can activate; on R4
+  // only devices that already hold safebox data or a PIN configuration.
+  const safeboxVisible = SAFEBOX_WRITER_ENABLED || safeboxDataPresent || safeboxPinConfigured;
 
   const [text, setText] = useState('');
   // Blocks the persist mirror from CLEARING the stored draft while the initial
@@ -252,16 +264,22 @@ export function Main() {
   // record that is not confirmed — visible or not (historical versions,
   // quarantined/undecryptable records) — is unrecoverable after a wipe. The
   // visible `notes` list undercounts exactly the records most at risk.
+  // The safebox contribution is derived from the ENCRYPTED rows, so the
+  // warning is correct with the section LOCKED — the normal case here.
+  const resetRiskTotal = arweave.resetRisk.notes + arweave.resetRisk.safebox;
   const resetWarningMessage = !arweave.countsReady
     // Until the first sync-count read completes we cannot know what is safe.
     ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
       + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
       + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
-    : arweave.resetRiskCount > 0
-      // Only CONFIRMED notes are recoverable: an `accepted` transaction can
+    : resetRiskTotal > 0
+      // Only CONFIRMED records are recoverable: an `accepted` transaction can
       // still be dropped, and after a wipe there is no local ciphertext left.
-      ? `⚠️ ${arweave.resetRiskCount} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+      ? `⚠️ ${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
         + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
+        + (arweave.resetRisk.safebox > 0
+          ? `Из них в защищённом сейфе: ${arweave.resetRisk.safebox} — пароли и вложения.\n`
+          : '')
         + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
       : 'Все локальные данные будут удалены. Все записи подтверждены в блокчейне — их можно вернуть по seed-фразе.';
 
@@ -349,6 +367,27 @@ export function Main() {
           )}
         </div>
         <div className="header-right">
+          {safeboxVisible && (
+            <button
+              className={`icon-btn ${view === 'safebox' ? 'icon-btn--active' : ''}`}
+              onClick={() => setView(v => (v === 'safebox' ? 'notes' : 'safebox'))}
+              title="Защищённый сейф"
+              aria-label="Защищённый сейф"
+              aria-pressed={view === 'safebox'}
+            >
+              🔐
+            </button>
+          )}
+          {safeboxUnlocked && (
+            <button
+              className="icon-btn"
+              onClick={lockSafebox}
+              title="Закрыть сейф"
+              aria-label="Закрыть сейф"
+            >
+              🔒
+            </button>
+          )}
           <button
             className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
             onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
@@ -370,8 +409,16 @@ export function Main() {
         </div>
       </header>
 
+      {/* KEYED ON THE LOCK GENERATION: every section lock (including a
+          hidden/pagehide edge with the section already locked) remounts the
+          whole subtree, so no local secret state — a half-typed PIN, or the
+          seed-reset grid holding all 12 words — can survive it. */}
+      {view === 'safebox' && (
+        <SafeboxSection key={safeboxLockGeneration} formatDate={formatDate} />
+      )}
+
       {/* Search */}
-      {showSearch && (
+      {view === 'notes' && showSearch && (
         <div className="search-bar">
           <input
             type="text"
@@ -396,7 +443,7 @@ export function Main() {
 
       {/* Input — the shared controlled composer; draft
           hydration/persistence stays HERE (value/onChange above). */}
-      <div className="note-input-wrap">
+      <div className="note-input-wrap" hidden={view !== 'notes'}>
         <NoteComposer
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
@@ -415,7 +462,7 @@ export function Main() {
       </div>
 
       {/* Feed — one card per version chain; fields come from chain.current. */}
-      <div className="notes-feed">
+      <div className="notes-feed" hidden={view !== 'notes'}>
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
             <div className="empty-icon">📝</div>

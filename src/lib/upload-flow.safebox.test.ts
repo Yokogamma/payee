@@ -1,0 +1,176 @@
+import { describe, it, expect } from 'vitest';
+import {
+  runUploadAttempt,
+  assertUploadableItem,
+  uploadItemId,
+  MalformedRecordError,
+  type UploadAttemptDeps,
+  type UploadItem,
+  type UploadKeys,
+} from './upload-flow';
+import type { UploadResult } from './arweave';
+import type { SyncRecord } from './storage';
+import type { EncryptedSafeboxEntry } from './crypto';
+
+// The queue is kind-tagged: the payload builder and the pause marker are chosen
+// from the ITEM, never sniffed off a record read back from IndexedDB. And every
+// transition must carry `kind` (and `terminalError`) through untouched.
+
+const NOW = 1_750_000_000_000;
+const IV12 = 'AAAAAAAAAAAAAAAA';
+
+const SB: EncryptedSafeboxEntry = {
+  entryId: '11111111-2222-8333-8444-555555555555',
+  metaCiphertext: 'AAAA', metaIv: IV12,
+  secretCiphertext: 'BBBB', secretIv: IV12,
+  createdAt: NOW - 60_000, v: 4,
+};
+const SB_ITEM: UploadItem = { kind: 'safebox', record: SB };
+const NOTE_ITEM: UploadItem = {
+  kind: 'note',
+  record: { noteId: 'n1', ciphertext: 'Y2lwaGVy', iv: IV12, createdAt: NOW - 1000, v: 3 },
+};
+
+const KEYS: UploadKeys = {
+  signingKey: new Uint8Array(32).fill(7),
+  ownerHash: 'A'.repeat(44),
+  publicKey: new Uint8Array(32).fill(9),
+};
+
+function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
+  const writes: SyncRecord[] = [];
+  const v3Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
+  const v4Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
+  let bodyText = '';
+  let httpCalls = 0;
+  const deps: UploadAttemptDeps = {
+    now: () => NOW,
+    currentEpoch: () => 1,
+    getSyncRecord: async () => opts.prev,
+    setSyncRecord: async r => { writes.push(r); },
+    commitV3PausedFailure: async (record, pausedAt) => { v3Pauses.push({ record, pausedAt }); },
+    commitV4PausedFailure: async (record, pausedAt) => { v4Pauses.push({ record, pausedAt }); },
+    signPayload: async () => 'sig',
+    uploadViaProxy: async body => {
+      httpCalls++;
+      bodyText = body;
+      return opts.result ?? { kind: 'accepted', txId: 'TX', committed: true };
+    },
+  };
+  return { deps, writes, v3Pauses, v4Pauses, calls: () => httpCalls, body: () => bodyText };
+}
+
+describe('uploadItemId', () => {
+  it('reads the right primary key per kind', () => {
+    expect(uploadItemId(NOTE_ITEM)).toBe('n1');
+    expect(uploadItemId(SB_ITEM)).toBe(SB.entryId);
+  });
+});
+
+describe('kind-driven serialization', () => {
+  it('a safebox item is sent as App-Version=4 with the split-envelope data', async () => {
+    const h = harness();
+    await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
+    const payload = JSON.parse(h.body()) as { tags: Array<{ name: string; value: string }>; data: string };
+    expect(payload.tags.find(t => t.name === 'App-Version')?.value).toBe('4');
+    expect(Object.keys(JSON.parse(payload.data)).sort()).toEqual(['id', 'mc', 'miv', 'sc', 'siv']);
+  });
+
+  it('a note item is still sent as its own version', async () => {
+    const h = harness();
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    const payload = JSON.parse(h.body()) as { tags: Array<{ name: string; value: string }>; data: string };
+    expect(payload.tags.find(t => t.name === 'App-Version')?.value).toBe('3');
+    expect(Object.keys(JSON.parse(payload.data)).sort()).toEqual(['c', 'id', 'iv']);
+  });
+
+  it('EVERY persisted transition carries kind:safebox', async () => {
+    for (const result of [
+      { kind: 'accepted', txId: 'T', committed: true },
+      { kind: 'unavailable', error: 'ua' },
+      { kind: 'in_progress', error: '409' },
+    ] as UploadResult[]) {
+      const h = harness({ result });
+      await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
+      expect(h.writes.length).toBeGreaterThan(0);
+      for (const w of h.writes) expect(w.kind).toBe('safebox');
+    }
+  });
+
+  it('terminalError survives a transition (it used to be silently dropped)', async () => {
+    const prev: SyncRecord = {
+      noteId: SB.entryId, kind: 'safebox', status: 'error', transport: 'proxy',
+      updatedAt: NOW - 1, terminalError: 'unsupported_version',
+    };
+    const h = harness({ prev, result: { kind: 'unavailable', error: 'ua' } });
+    await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
+    for (const w of h.writes) expect(w.terminalError).toBe('unsupported_version');
+  });
+});
+
+describe('v4 kill switch routing', () => {
+  it('a v4_disabled result commits the V4 pause marker, never the v3 one', async () => {
+    const h = harness({ result: { kind: 'v4_disabled', error: '{"code":"v4_uploads_disabled"}' } });
+    await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
+    expect(h.v4Pauses).toHaveLength(1);
+    expect(h.v3Pauses).toHaveLength(0);
+    expect(h.v4Pauses[0].record.kind).toBe('safebox');
+    expect(h.v4Pauses[0].record.status).toBe('error');
+    expect(h.writes.map(w => w.status)).toEqual(['uploading']); // final record went atomically
+  });
+
+  it('a v3_disabled result still commits the V3 marker', async () => {
+    const h = harness({ result: { kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}' } });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.v3Pauses).toHaveLength(1);
+    expect(h.v4Pauses).toHaveLength(0);
+  });
+
+  it('the pause preserves txId/recovery/needsRecheck from the prior record', async () => {
+    const prev: SyncRecord = {
+      noteId: SB.entryId, kind: 'safebox', txId: 'TX-OLD', status: 'accepted',
+      transport: 'proxy', updatedAt: NOW - 100, needsRecheck: true,
+      recovery: { txId: 'TX-OLD', postedAt: NOW - 200, token: 'tok' },
+    };
+    const h = harness({ prev, result: { kind: 'v4_disabled', error: 'x' } });
+    await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
+    const rec = h.v4Pauses[0].record;
+    expect(rec.txId).toBe('TX-OLD');
+    expect(rec.recovery).toEqual(prev.recovery);
+    expect(rec.status).not.toBe('uploading');
+  });
+});
+
+describe('malformed-record quarantine (no HTTP, no writes)', () => {
+  it('rejects a safebox row with a non-12-byte IV BEFORE anything is sent', async () => {
+    const h = harness();
+    await expect(runUploadAttempt(
+      { kind: 'safebox', record: { ...SB, secretIv: 'AAAA' } }, KEYS, 1, h.deps,
+    )).rejects.toBeInstanceOf(MalformedRecordError);
+    expect(h.calls()).toBe(0);
+    expect(h.writes).toEqual([]); // no stranded 'uploading'
+  });
+
+  it('assertUploadableItem enforces the whole shape', () => {
+    expect(() => assertUploadableItem(SB_ITEM)).not.toThrow();
+    const bad: Array<Partial<EncryptedSafeboxEntry>> = [
+      { v: 3 as unknown as 4 },
+      { entryId: 'not-a-uuid' },
+      { entryId: '11111111-2222-4333-8444-555555555555' }, // UUIDv4 → wrong namespace
+      { metaCiphertext: '' },
+      { metaIv: 'AAAA' },
+      { secretCiphertext: '' },
+      { createdAt: -1 },
+    ];
+    for (const patch of bad) {
+      expect(() => assertUploadableItem({ kind: 'safebox', record: { ...SB, ...patch } }),
+        JSON.stringify(patch)).toThrow(MalformedRecordError);
+    }
+  });
+
+  it('also guards note rows (a corrupted iv can never be posted)', () => {
+    expect(() => assertUploadableItem({
+      kind: 'note', record: { noteId: 'n', ciphertext: 'AAAA', iv: 'AAAA', createdAt: 1 },
+    })).toThrow(MalformedRecordError);
+  });
+});

@@ -7,7 +7,7 @@ import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-libra
 
 // Writer-OFF (R3) UI matrix — flag pinned explicitly; the ON surface lives in
 // Main.v3.test.tsx. Keeps the W3 flip a pure one-line change.
-vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: false }));
+vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false }));
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({
@@ -36,6 +36,33 @@ function baseStore() {
     chains,
     filteredChains: chains,
     v3Paused: false,
+    v4Paused: false,
+    resumeV4Uploads: vi.fn(async () => {}),
+    // Safebox slice (R4 defaults: no data, no PIN → entry point hidden)
+    safeboxUnlocked: false,
+    safeboxPinConfigured: false,
+    safeboxDataPresent: false,
+    safeboxEntryCount: 0,
+    safeboxEntries: [],
+    safeboxChains: [],
+    filteredSafeboxChains: [],
+    safeboxSearchQuery: '',
+    restoredSafeboxCount: null,
+    setSafeboxSearchQuery: vi.fn(),
+    activateSafebox: vi.fn(async () => {}),
+    unlockSafebox: vi.fn(async () => {}),
+    lockSafebox: vi.fn(),
+    touchSafebox: vi.fn(),
+    changeSafeboxPin: vi.fn(async () => {}),
+    deactivateSafebox: vi.fn(async () => {}),
+    resetSafeboxPinWithSeed: vi.fn(async () => {}),
+    getSafeboxPinLockState: vi.fn(async () => ({ lockedSeconds: 0, attempts: 0, configured: false })),
+    addSafeboxEntry: vi.fn(async () => {}),
+    editSafeboxEntry: vi.fn(async () => {}),
+    restoreSafeboxVersion: vi.fn(async () => {}),
+    revealSafeboxSecret: vi.fn(async () => 'secret'),
+    copySafeboxPassword: vi.fn(async () => true),
+    downloadSafeboxAttachment: vi.fn(async () => {}),
     isEncrypting: false,
     searchQuery: '',
     addNote: vi.fn(),
@@ -53,7 +80,12 @@ function baseStore() {
       unsyncedCount: 0,
       countsReady: true,
       errorCount: 0,
-      resetRiskCount: 0,
+      quarantinedCount: 0,
+      resetRisk: { notes: 0, safebox: 0 },
+      safebox: {
+        unsyncedCount: 0, acceptedCount: 0, confirmedCount: 0,
+        errorCount: 0, quarantinedCount: 0,
+      },
       lastSync: null,
       lastError: null,
     },
@@ -169,7 +201,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
   it('reset warns when ANY stored record is unconfirmed (storage-backed resetRiskCount)', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
-    s.arweave.resetRiskCount = 1; // e.g. accepted-but-unconfirmed — can still drop
+    s.arweave.resetRisk = { notes: 1, safebox: 0 }; // e.g. accepted-but-unconfirmed — can still drop
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
@@ -190,7 +222,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.enabled = true;
     s.arweave.countsReady = true;
     s.syncStatuses = { n1: { status: 'confirmed' as const, txId: 'TX123' } }; // visible looks safe
-    s.arweave.resetRiskCount = 1; // …but storage says otherwise
+    s.arweave.resetRisk = { notes: 1, safebox: 0 }; // …but storage says otherwise
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
@@ -206,7 +238,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
     s.arweave.countsReady = true;
-    s.arweave.resetRiskCount = 0;
+    s.arweave.resetRisk = { notes: 0, safebox: 0 };
     render(<Main />);
 
     fireEvent.click(screen.getByLabelText('Настройки'));
@@ -395,5 +427,73 @@ describe('Main — R3 (writer OFF) surface', () => {
     render(<Main />);
     fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
     expect(screen.getByText('1 из 1')).toBeTruthy(); // one chain either side
+  });
+});
+
+describe('Main — safebox entry point (R4 visibility formula)', () => {
+  it('is HIDDEN on R4 when the device has neither data nor a PIN config', () => {
+    render(<Main />);
+    expect(screen.queryByLabelText('Защищённый сейф')).toBeNull();
+  });
+
+  it('appears when safebox DATA exists (a restored/rolled-back device)', () => {
+    h.store.safeboxDataPresent = true;
+    render(<Main />);
+    expect(screen.getByLabelText('Защищённый сейф')).toBeTruthy();
+  });
+
+  it('appears when a PIN CONFIG exists even with no entries yet', () => {
+    h.store.safeboxPinConfigured = true;
+    render(<Main />);
+    expect(screen.getByLabelText('Защищённый сейф')).toBeTruthy();
+  });
+
+  it('switching to the safebox hides the notes composer and feed', () => {
+    h.store.safeboxDataPresent = true;
+    const { container } = render(<Main />);
+    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    expect(container.querySelector('.note-input-wrap')?.hasAttribute('hidden')).toBe(true);
+    expect(container.querySelector('.notes-feed')?.hasAttribute('hidden')).toBe(true);
+  });
+
+  it('offers a one-tap safebox lock while the section is unlocked', () => {
+    h.store.safeboxDataPresent = true;
+    h.store.safeboxUnlocked = true;
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Закрыть сейф'));
+    expect(h.store.lockSafebox).toHaveBeenCalled();
+  });
+
+  it('the reset warning counts LOCKED safebox entries as at risk', () => {
+    h.store.arweave.resetRisk = { notes: 0, safebox: 2 };
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByText('Сброс приложения'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+    expect(screen.getByText(/2 записей ещё НЕ подтверждены/)).toBeTruthy();
+    expect(screen.getByText(/в защищённом сейфе: 2/)).toBeTruthy();
+  });
+});
+
+describe('Main — the safebox subtree is remounted on every lock', () => {
+  it('a lock-generation bump clears whatever was typed into the safebox forms', () => {
+    h.store.safeboxDataPresent = true;      // activation form (with the seed grid)
+    h.store.safeboxLockGeneration = 1;
+    const { rerender } = render(<Main />);
+    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+
+    const pin = document.querySelector('#sbx-new-code') as HTMLInputElement;
+    fireEvent.change(pin, { target: { value: '135790' } });
+    const firstWord = screen.getAllByLabelText(/Слово \d+ из 12/)[0] as HTMLInputElement;
+    fireEvent.change(firstWord, { target: { value: 'abandon' } });
+    expect((document.querySelector('#sbx-new-code') as HTMLInputElement).value).toBe('135790');
+
+    // A hidden edge / idle lock / app lock bumps the generation.
+    h.store.safeboxLockGeneration = 2;
+    rerender(<Main />);
+
+    // Remounted from scratch: no PIN and no seed word survives.
+    expect((document.querySelector('#sbx-new-code') as HTMLInputElement).value).toBe('');
+    expect((screen.getAllByLabelText(/Слово \d+ из 12/)[0] as HTMLInputElement).value).toBe('');
   });
 });

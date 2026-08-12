@@ -6,7 +6,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 // controls, markdown rendering, the search plain-fallback and the composer
 // preview toggle. Separate file: the flag is a build-time constant.
 
-vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true }));
+vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false }));
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({
@@ -33,6 +33,32 @@ function makeStore(notes: NoteData[]) {
     chains,
     filteredChains: chains,
     v3Paused: false,
+    v4Paused: false,
+    resumeV4Uploads: vi.fn(async () => {}),
+    safeboxUnlocked: false,
+    safeboxPinConfigured: false,
+    safeboxDataPresent: false,
+    safeboxEntryCount: 0,
+    safeboxEntries: [],
+    safeboxChains: [],
+    filteredSafeboxChains: [],
+    safeboxSearchQuery: '',
+    restoredSafeboxCount: null,
+    setSafeboxSearchQuery: vi.fn(),
+    activateSafebox: vi.fn(async () => {}),
+    unlockSafebox: vi.fn(async () => {}),
+    lockSafebox: vi.fn(),
+    touchSafebox: vi.fn(),
+    changeSafeboxPin: vi.fn(async () => {}),
+    deactivateSafebox: vi.fn(async () => {}),
+    resetSafeboxPinWithSeed: vi.fn(async () => {}),
+    getSafeboxPinLockState: vi.fn(async () => ({ lockedSeconds: 0, attempts: 0, configured: false })),
+    addSafeboxEntry: vi.fn(async () => {}),
+    editSafeboxEntry: vi.fn(async () => {}),
+    restoreSafeboxVersion: vi.fn(async () => {}),
+    revealSafeboxSecret: vi.fn(async () => 'secret'),
+    copySafeboxPassword: vi.fn(async () => true),
+    downloadSafeboxAttachment: vi.fn(async () => {}),
     isEncrypting: false,
     searchQuery: '',
     addNote: vi.fn(async () => {}),
@@ -43,7 +69,13 @@ function makeStore(notes: NoteData[]) {
     arweave: {
       enabled: true, online: true, syncing: false, registered: true,
       acceptedCount: 0, confirmedCount: 0, unsyncedCount: 0, countsReady: true,
-      errorCount: 0, resetRiskCount: 0, lastSync: null, lastError: null,
+      errorCount: 0, quarantinedCount: 0,
+      resetRisk: { notes: 0, safebox: 0 },
+      safebox: {
+        unsyncedCount: 0, acceptedCount: 0, confirmedCount: 0,
+        errorCount: 0, quarantinedCount: 0,
+      },
+      lastSync: null, lastError: null,
     },
     retrySync: vi.fn(),
     restoring: false,

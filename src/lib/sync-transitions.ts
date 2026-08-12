@@ -9,23 +9,39 @@
  *  - an accepted txId is never downgraded or lost by a transient failure;
  *  - `confirmed` becomes terminal ONLY after server reconciliation finished
  *    (needsRecheck cleared by an authoritative committed:true).
+ *
+ * EVERY transition below rebuilds the record FROM SCRATCH. Any field that is
+ * not threaded through explicitly is therefore silently dropped — which is why
+ * `kind` is a REQUIRED parameter (a safebox record demoted to a note would
+ * corrupt both sets of counters) and `terminalError` is carried over
+ * explicitly (it used to be lost here; harmless only because quarantined
+ * records never re-enter the queue).
  */
 
 import type { SyncRecord } from './storage';
 import type { RecoveryHint, TxStatusResult } from './arweave';
 
+export type SyncKind = SyncRecord['kind'];
+
 /** Transition into 'uploading' before a proxy attempt. Preserves the prior
  *  txId + recheck intent + recovery proof — a crash or aborted request mid-
  *  recheck must not lose the accepted TX or its only signed recovery hint. */
-export function toUploading(noteId: string, prev: SyncRecord | undefined, now: number): SyncRecord {
+export function toUploading(
+  noteId: string,
+  kind: SyncKind,
+  prev: SyncRecord | undefined,
+  now: number,
+): SyncRecord {
   return {
     noteId,
+    kind,
     txId: prev?.txId,
     status: 'uploading',
     transport: 'proxy',
     updatedAt: now,
     needsRecheck: prev?.needsRecheck === true,
     recovery: prev?.recovery,
+    terminalError: prev?.terminalError,
   };
 }
 
@@ -33,34 +49,44 @@ export function toUploading(noteId: string, prev: SyncRecord | undefined, now: n
  *  server commit; recovery persists until committed (fresh hint wins). */
 export function toAccepted(
   noteId: string,
+  kind: SyncKind,
   prev: SyncRecord | undefined,
   result: { txId: string; committed: boolean; recovery?: RecoveryHint },
   now: number,
 ): SyncRecord {
   return {
     noteId,
+    kind,
     txId: result.txId,
     status: 'accepted',
     transport: 'proxy',
     updatedAt: now,
     needsRecheck: !result.committed,
     recovery: result.committed ? undefined : (result.recovery ?? prev?.recovery),
+    terminalError: prev?.terminalError,
   };
 }
 
 /** 409 — a server reservation is alive. Restore the prior accepted state so
  *  txId/recovery aren't stranded in 'uploading' if the app closes now.
  *  Returns null when there is nothing to restore (never accepted). */
-export function afterInProgress(noteId: string, prev: SyncRecord | undefined, now: number): SyncRecord | null {
+export function afterInProgress(
+  noteId: string,
+  kind: SyncKind,
+  prev: SyncRecord | undefined,
+  now: number,
+): SyncRecord | null {
   if (!prev?.txId) return null;
   return {
     noteId,
+    kind,
     txId: prev.txId,
     status: 'accepted',
     transport: 'proxy',
     updatedAt: now,
     needsRecheck: true,
     recovery: prev.recovery,
+    terminalError: prev.terminalError,
   };
 }
 
@@ -69,6 +95,7 @@ export function afterInProgress(noteId: string, prev: SyncRecord | undefined, no
  *  recheck loop; only a never-accepted note becomes a hard 'error'. */
 export function afterFailure(
   noteId: string,
+  kind: SyncKind,
   prev: SyncRecord | undefined,
   wasRecheck: boolean,
   errText: string | undefined,
@@ -77,6 +104,7 @@ export function afterFailure(
   if (prev?.txId) {
     return {
       noteId,
+      kind,
       txId: prev.txId,
       status: 'accepted',
       transport: 'proxy',
@@ -84,16 +112,19 @@ export function afterFailure(
       needsRecheck: true,
       lastError: errText,
       recovery: prev.recovery,
+      terminalError: prev.terminalError,
     };
   }
   return {
     noteId,
+    kind,
     status: 'error',
     transport: 'proxy',
     lastError: errText,
     updatedAt: now,
     needsRecheck: wasRecheck,
     recovery: prev?.recovery,
+    terminalError: prev?.terminalError,
   };
 }
 

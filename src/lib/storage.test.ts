@@ -32,7 +32,7 @@ describe('saveNoteWithSync', () => {
   it('persists the note and its sync record together', async () => {
     await saveNoteWithSync(
       { noteId: 'n1', ciphertext: 'c', iv: 'iv', createdAt: 1, v: 2 },
-      { noteId: 'n1', txId: 'tx1', status: 'confirmed', transport: 'proxy', updatedAt: 2 },
+      { noteId: 'n1', kind: 'note', txId: 'tx1', status: 'confirmed', transport: 'proxy', updatedAt: 2 },
     );
 
     const note = await getNoteById('n1');
@@ -47,7 +47,7 @@ describe('saveNoteWithSync', () => {
   it('marks a restored note confirmed so it is not counted as pending', async () => {
     await saveNoteWithSync(
       { noteId: 'n2', ciphertext: 'c', iv: 'iv', createdAt: 1 },
-      { noteId: 'n2', txId: 'tx2', status: 'confirmed', transport: 'proxy', updatedAt: 2 },
+      { noteId: 'n2', kind: 'note', txId: 'tx2', status: 'confirmed', transport: 'proxy', updatedAt: 2 },
     );
     const all = await getAllSyncRecords();
     const rec = all.find(r => r.noteId === 'n2');
@@ -58,7 +58,7 @@ describe('saveNoteWithSync', () => {
   it('rolls back the note if the sync write fails (atomic — both or neither)', async () => {
     // The sync store has keyPath 'noteId'; a record without it makes the second
     // put fail, which must abort the whole transaction and roll back the note.
-    const badRecord = { txId: 'tx3', status: 'confirmed', transport: 'proxy', updatedAt: 2 } as unknown as SyncRecord;
+    const badRecord = { kind: 'note', txId: 'tx3', status: 'confirmed', transport: 'proxy', updatedAt: 2 } as unknown as SyncRecord;
     await expect(
       saveNoteWithSync({ noteId: 'n3', ciphertext: 'c', iv: 'iv', createdAt: 1 }, badRecord),
     ).rejects.toBeDefined();
@@ -99,7 +99,7 @@ describe('mergeRestoredNote (restore repair)', () => {
     // must replace the payload with the known-good on-chain copy while keeping
     // the ORIGINAL confirmed record (txId untouched).
     await saveNoteWithSync({ noteId: 'm3', ciphertext: 'CORRUPTED', iv: 'iv', createdAt: 1 },
-      { noteId: 'm3', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
+      { noteId: 'm3', kind: 'note', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
 
     await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100);
 
@@ -110,7 +110,7 @@ describe('mergeRestoredNote (restore repair)', () => {
 
   it('upgrades a non-terminal sync record (e.g. error) to confirmed', async () => {
     await saveNoteWithSync({ ...NOTE, noteId: 'm4' },
-      { noteId: 'm4', status: 'error', transport: 'proxy', updatedAt: 1 });
+      { noteId: 'm4', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 1 });
     await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100);
     expect((await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm4')?.txId).toBe('tx-m4');
   });
@@ -129,7 +129,7 @@ describe('recoverStorage', () => {
 
   it('waits out a blocking tab (onBlocked fires) and completes once it closes — never pretends cancelled', async () => {
     // Simulate another tab: an independent connection that ignores versionchange.
-    const otherTab = await openDB('eternal-notes', 1);
+    const otherTab = await openDB('eternal-notes', 2);
 
     let blockedSignalled = false;
     const recovery = recoverStorage({ onBlocked: () => { blockedSignalled = true; } });
@@ -262,7 +262,7 @@ import {
 describe('commitV3PausedFailure (atomic sync+meta)', () => {
   it('a successful commit writes the SyncRecord AND the pause marker together', async () => {
     const record: SyncRecord = {
-      noteId: 'p1', status: 'error', transport: 'proxy', updatedAt: 5,
+      noteId: 'p1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 5,
       lastError: 'v3_uploads_disabled',
     };
     await commitV3PausedFailure(record, 12345);
@@ -272,7 +272,7 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
 
   it('preserves txId/recovery/needsRecheck fields on the committed record', async () => {
     const record: SyncRecord = {
-      noteId: 'p2', txId: 'TX-KEEP', status: 'accepted', transport: 'proxy',
+      noteId: 'p2', kind: 'note', txId: 'TX-KEEP', status: 'accepted', transport: 'proxy',
       updatedAt: 5, needsRecheck: true,
       recovery: { txId: 'TX-KEEP', postedAt: 1, token: 'tok' },
     };
@@ -285,7 +285,7 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
 
   it('aborts BOTH writes when the record is invalid (rollback, no half-commit)', async () => {
     // sync store keyPath is noteId — a record without it fails the first put.
-    const bad = { status: 'error', transport: 'proxy', updatedAt: 5 } as unknown as SyncRecord;
+    const bad = { kind: 'note', status: 'error', transport: 'proxy', updatedAt: 5 } as unknown as SyncRecord;
     await expect(commitV3PausedFailure(bad, 777)).rejects.toBeDefined();
     expect(await readV3PauseMeta()).toBeNull(); // pause marker NOT written
   });
@@ -337,7 +337,7 @@ describe('clearV3UploadsPaused (compare-and-delete)', () => {
 describe('SyncRecord.terminalError round-trip', () => {
   it('persists the quarantine reason', async () => {
     await setSyncRecord({
-      noteId: 'q1', status: 'error', transport: 'proxy', updatedAt: 1,
+      noteId: 'q1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 1,
       terminalError: 'unsupported_version',
     });
     expect((await getSyncRecord('q1'))?.terminalError).toBe('unsupported_version');

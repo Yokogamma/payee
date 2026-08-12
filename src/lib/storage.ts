@@ -4,19 +4,33 @@
  * Single source of truth for all persistent data.
  * Replaces localStorage for notes/sync/meta.
  *
- * Schema: DB "eternal-notes", version 1
- *   - notes: { noteId (PK), ciphertext, iv, createdAt } + index by-timestamp
- *   - sync:  { noteId (PK), txId?, status, transport, lastError?, updatedAt } + index by-status
- *   - meta:  { key (PK), value }
+ * Schema: DB "eternal-notes", version 2
+ *   - notes:   { noteId (PK), ciphertext, iv, createdAt } + index by-timestamp
+ *   - sync:    { noteId (PK), kind, txId?, status, transport, lastError?, updatedAt } + index by-status
+ *   - meta:    { key (PK), value }
+ *   - safebox: { entryId (PK), metaCiphertext, metaIv, secretCiphertext,
+ *                secretIv, createdAt, v } + index by-timestamp        (v2)
  */
 
 import { openDB, deleteDB, type IDBPDatabase } from 'idb';
-import type { EncryptedNote } from './crypto';
+import type { EncryptedNote, EncryptedSafeboxEntry, PinEncryptedSeed } from './crypto';
+import { SafeboxPinUnavailableError, assertValidPinBlob } from './crypto';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface SyncRecord {
+  /** Primary key. For safebox records this holds the entryId (one id space —
+   *  both are UUIDv8 — so ONE sync store and ONE status map serve both). */
   noteId: string;
+  /**
+   * WHICH store the record belongs to. Required on every transition so a
+   * from-scratch reconstruction cannot silently drop it (the transitions in
+   * sync-transitions.ts build a NEW object each time). Legacy rows written
+   * before v4 have no field and are normalized to 'note' at the READ boundary.
+   * Aggregate counters are computed per kind — mixing them drives the notes
+   * «синхронизировано X из N» counter negative.
+   */
+  kind: 'note' | 'safebox';
   txId?: string;
   /** 'uploading' with updatedAt > 10 min = stale → retryable */
   status: 'uploading' | 'accepted' | 'confirmed' | 'error';
@@ -39,48 +53,134 @@ export interface SyncRecord {
    * PERMANENT local quarantine reason. A plain status:'error' is retryable —
    * the queue re-enqueues it on every poll/reload; a record with terminalError
    * is NEVER enqueued again (no HTTP). 'unsupported_version': the stored
-   * EncryptedNote carries a `v` this build cannot serialize — uploading it
-   * would risk committing garbage under the permanent noteId idempotency.
+   * record carries a `v` this build cannot serialize — uploading it would risk
+   * committing garbage under the permanent noteId idempotency.
+   * 'malformed_record': the stored row failed runtime validation right before
+   * serialization (IndexedDB is an untrusted boundary) — retrying can only
+   * ever produce the same rejection.
    * Still counted by reset-safety (a newer build might read it).
    */
-  terminalError?: 'unsupported_version';
+  terminalError?: 'unsupported_version' | 'malformed_record';
+}
+
+/**
+ * Normalize a row read from IndexedDB, at the READ boundary, so no downstream
+ * code has to cope with the optional field.
+ *
+ * Two DIFFERENT cases, deliberately not collapsed:
+ *  - `kind` ABSENT — every record written before v4. Those are all notes, and
+ *    defaulting them is the whole point of the normalization.
+ *  - `kind` PRESENT but not one of the two valid values — a corrupted row.
+ *    Silently calling it a note would be fail-OPEN: it would re-enter the
+ *    upload queue and be counted in the notes aggregates. It is QUARANTINED
+ *    instead (`terminalError`), which keeps it out of every retry path while
+ *    still counting it as at-risk data on reset. Nothing is written back here:
+ *    a read must not mutate storage.
+ */
+function normalizeSyncRecord(raw: SyncRecord | undefined): SyncRecord | undefined {
+  if (!raw) return undefined;
+  if (raw.kind === 'safebox' || raw.kind === 'note') return raw;
+  // `Object.hasOwn`, not `=== undefined`: the structured clone IndexedDB uses
+  // PRESERVES a key explicitly stored as `undefined`, so the two are otherwise
+  // indistinguishable. A legacy row predates the field entirely — it has no
+  // such key. A row that stored `kind: undefined` was written by something that
+  // knew about the field and got it wrong, which is corruption, not history.
+  if (!Object.hasOwn(raw, 'kind')) return { ...raw, kind: 'note' }; // legacy row
+  return { ...raw, kind: 'note', terminalError: 'malformed_record' };
 }
 
 // ─── Database ────────────────────────────────────────────────────────
 
 const DB_NAME = 'eternal-notes';
-const DB_VERSION = 1;
+/** v2 adds the `safebox` store. The bump happens on the FIRST launch of R4,
+ *  independently of the writer flag — which is exactly why R4 is an
+ *  irreversible client floor (docs/ROLLBACK.md). */
+const DB_VERSION = 2;
 
 let db: IDBPDatabase | null = null;
 let initPromise: Promise<void> | null = null;
 
-export async function initStorage(): Promise<void> {
+export interface InitStorageOptions {
+  /** Another tab still holds a connection at the OLD version, so the upgrade
+   *  cannot start. Without surfacing this the first R4 tab spins on 'loading'
+   *  forever. The upgrade proceeds automatically once that tab closes. */
+  onBlocked?: () => void;
+  /** THIS tab is the one in the way: a newer build in another tab wants to
+   *  upgrade the schema. Our connection is closed first (so the other tab can
+   *  proceed), then this fires — every later read here would throw, so the
+   *  caller MUST move the app to a non-destructive «reload» screen. */
+  onBlocking?: () => void;
+}
+
+export async function initStorage(opts: InitStorageOptions = {}): Promise<void> {
   // Single-flight guard. On rejection the promise is cleared so the NEXT call
   // retries a clean init instead of sticking to the rejected promise forever.
-  initPromise ??= doInit().catch(err => {
+  initPromise ??= doInit(opts).catch(err => {
     initPromise = null;
     throw err;
   });
   return initPromise;
 }
 
-async function doInit(): Promise<void> {
+/**
+ * True for the DOMException IndexedDB raises when the STORED database is newer
+ * than the version this build asks for — i.e. an older client opened after an
+ * R4+ tab already migrated. The caller must show a "reload / update" screen and
+ * MUST NOT offer the destructive storage reset (the data is intact and fully
+ * readable by the newer build; deleting it would throw away everything
+ * unsynced).
+ */
+export function isDbVersionError(err: unknown): boolean {
+  return (typeof DOMException !== 'undefined' && err instanceof DOMException && err.name === 'VersionError')
+    || (err instanceof Error && err.name === 'VersionError');
+}
+
+async function doInit(opts: InitStorageOptions): Promise<void> {
   if (db) return;
 
+  // Captured for the `blocking` callback: it may fire before `db` is published
+  // (or after another init replaced it), so closing the module-level handle is
+  // not the same thing as closing THIS connection.
+  let opened: IDBPDatabase | null = null;
+
   const database = await openDB(DB_NAME, DB_VERSION, {
-    upgrade(database) {
-      // Notes store
-      const notesStore = database.createObjectStore('notes', { keyPath: 'noteId' });
-      notesStore.createIndex('by-timestamp', 'createdAt');
+    // GUARDED per-version steps: `upgrade` also runs for a v1→v2 migration on
+    // an EXISTING database, where the v1 stores already exist and an
+    // unconditional createObjectStore would throw ConstraintError.
+    upgrade(database, oldVersion) {
+      if (oldVersion < 1) {
+        // Notes store
+        const notesStore = database.createObjectStore('notes', { keyPath: 'noteId' });
+        notesStore.createIndex('by-timestamp', 'createdAt');
 
-      // Sync state store
-      const syncStore = database.createObjectStore('sync', { keyPath: 'noteId' });
-      syncStore.createIndex('by-status', 'status');
+        // Sync state store
+        const syncStore = database.createObjectStore('sync', { keyPath: 'noteId' });
+        syncStore.createIndex('by-status', 'status');
 
-      // Meta KV store
-      database.createObjectStore('meta');
+        // Meta KV store
+        database.createObjectStore('meta');
+      }
+      if (oldVersion < 2) {
+        // Safebox entries (v4). Existing notes/sync/meta data is untouched.
+        const safeboxStore = database.createObjectStore('safebox', { keyPath: 'entryId' });
+        safeboxStore.createIndex('by-timestamp', 'createdAt');
+      }
+    },
+    blocked() {
+      opts.onBlocked?.();
+    },
+    blocking() {
+      // A NEWER version wants to upgrade and we are the connection in the way.
+      // Close THIS connection immediately (not merely whatever `db` currently
+      // points at) so the other tab can proceed; our own reads then fail
+      // loudly instead of silently serving a stale schema.
+      try { (opened ?? db)?.close(); } catch { /* already closed */ }
+      if (opened === null || db === opened) db = null;
+      initPromise = null;
+      opts.onBlocking?.();
     },
   });
+  opened = database;
 
   // Run migration from localStorage (idempotent). `db` is published only after
   // the migration settles, so a failed init never leaves a half-ready handle.
@@ -187,7 +287,7 @@ export async function mergeRestoredNote(
   const sync = await getSyncRecord(note.noteId);
   const record: SyncRecord = sync?.status === 'confirmed'
     ? sync
-    : { noteId: note.noteId, txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+    : { noteId: note.noteId, kind: 'note', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
   await saveNoteWithSync(note, record);
 }
 
@@ -201,10 +301,345 @@ export async function getNoteById(noteId: string): Promise<EncryptedNote | undef
   return getDB().get('notes', noteId) as Promise<EncryptedNote | undefined>;
 }
 
+// ─── Safebox entries (v4) ────────────────────────────────────────────
+
+/** All safebox entries, newest first (outer createdAt — index order only;
+ *  «currentness» always comes from the authenticated envelope fields). */
+export async function getAllSafeboxEntries(): Promise<EncryptedSafeboxEntry[]> {
+  const all = await getDB().getAllFromIndex('safebox', 'by-timestamp');
+  return all.reverse() as EncryptedSafeboxEntry[];
+}
+
+export async function getSafeboxEntryById(entryId: string): Promise<EncryptedSafeboxEntry | undefined> {
+  return getDB().get('safebox', entryId) as Promise<EncryptedSafeboxEntry | undefined>;
+}
+
+/** Cheap count for hydration + reset-safety — works with the safebox LOCKED
+ *  (no decryption, no keys). */
+export async function countSafeboxEntries(): Promise<number> {
+  return getDB().count('safebox');
+}
+
+/** Persist an entry and its sync record together in a SINGLE transaction —
+ *  same contract as saveNoteWithSync. Used by the restore merge, which records
+ *  the already-on-chain TX as `confirmed`. */
+export async function saveSafeboxEntryWithSync(
+  entry: EncryptedSafeboxEntry,
+  record: SyncRecord,
+): Promise<void> {
+  const tx = getDB().transaction(['safebox', 'sync'], 'readwrite');
+  try {
+    await tx.objectStore('safebox').put(entry);
+    await tx.objectStore('sync').put(record);
+    await tx.done;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/** Restore-merge upsert-repair, mirroring mergeRestoredNote: the on-chain copy
+ *  is known-good (it just decrypted in BOTH halves) while the local ciphertext
+ *  may be corrupted, and a missing confirmed record would re-queue an entry
+ *  that is already on chain. An existing CONFIRMED record is preserved as-is. */
+export async function mergeRestoredSafeboxEntry(
+  entry: EncryptedSafeboxEntry,
+  txId: string,
+  now: number,
+): Promise<void> {
+  const sync = await getSyncRecord(entry.entryId);
+  const record: SyncRecord = sync?.status === 'confirmed'
+    ? sync
+    : { noteId: entry.entryId, kind: 'safebox', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+  await saveSafeboxEntryWithSync(entry, record);
+}
+
+/** The safebox PIN configuration was replaced or removed between the start of
+ *  an operation and its commit (another tab, a wipe, a re-activation). The
+ *  operation is abandoned: a secret must never be published — and a failed
+ *  attempt must never be charged — against a config we no longer own. */
+export class SafeboxConfigChangedError extends Error {
+  constructor() {
+    super('Конфигурация PIN сейфа изменилась — повторите операцию.');
+    this.name = 'SafeboxConfigChangedError';
+  }
+}
+
+/**
+ * Write ONE safebox entry version, re-verifying the PIN config INSIDE the same
+ * readwrite transaction (§6). A separate `getMeta()` followed by a separate
+ * write leaves a window in which another tab replaces/deletes the config — and
+ * the version lands anyway, behind a PIN that is no longer the one the user
+ * unlocked with.
+ */
+export async function commitSafeboxEntry(
+  entry: EncryptedSafeboxEntry,
+  expectedConfigId: string,
+  expectedDbGeneration: number,
+): Promise<void> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction(['meta', 'safebox'], 'readwrite');
+  try {
+    const raw: unknown = await tx.objectStore('meta').get(SAFEBOX_PIN_META_KEY);
+    if (raw === undefined) throw new SafeboxConfigChangedError();
+    const config = assertValidSafeboxPinConfig(raw);
+    if (config.configId !== expectedConfigId) throw new SafeboxConfigChangedError();
+    await tx.objectStore('safebox').put(entry);
+    await tx.done;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+// ─── Safebox PIN configuration (single record, transactional) ────────
+//
+// ONE meta record holds the blob AND its metering state. Every mutation runs
+// inside a single readwrite `meta` transaction that RE-READS the record —
+// IndexedDB serializes readwrite transactions per store, so two tabs failing a
+// PIN concurrently can never lose an increment (the getMeta/setMeta pattern the
+// MAIN PIN still uses does lose them; that is a separate, known issue).
+
+export const SAFEBOX_PIN_META_KEY = 'safebox-pin';
+
+export interface SafeboxPinConfig {
+  blob: PinEncryptedSeed;
+  /** Opaque nonce, regenerated on EVERY create/replace of the blob. Any change
+   *  of ownership is observable without a persistent tombstone: a
+   *  delete→recreate cycle cannot land on the same value (unlike a monotonic
+   *  counter living inside the deleted record). */
+  configId: string;
+  attempts: number;          // 0..9 — 10 triggers the wipe
+  lockedUntil: number | null;
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_TIMESTAMP_MS = 8_640_000_000_000_000;
+export const SAFEBOX_MAX_PIN_ATTEMPTS = 10;
+
+/**
+ * Runtime-validate the WHOLE config on every read — IndexedDB is an untrusted
+ * runtime boundary (same reasoning as assertValidPinBlob). Extra AND missing
+ * fields are rejected.
+ *
+ * Throws SafeboxPinUnavailableError, which callers must treat fail-closed: the
+ * attempt is NOT spent and the lockout is NOT touched (a corrupted record may
+ * neither disable the lockout nor block seed recovery).
+ */
+export function assertValidSafeboxPinConfig(raw: unknown): SafeboxPinConfig {
+  const fail = (why: string): never => {
+    throw new SafeboxPinUnavailableError(`Malformed safebox PIN config: ${why}`);
+  };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('shape');
+  const o = raw as Record<string, unknown>;
+  const keys = Object.keys(o);
+  const expected = ['blob', 'configId', 'attempts', 'lockedUntil'];
+  if (keys.length !== expected.length || keys.some(k => !expected.includes(k))) fail('keys');
+  if (typeof o.configId !== 'string' || !UUID_REGEX.test(o.configId)) fail('configId');
+  if (!Number.isSafeInteger(o.attempts) || (o.attempts as number) < 0
+      || (o.attempts as number) >= SAFEBOX_MAX_PIN_ATTEMPTS) {
+    fail('attempts');
+  }
+  if (o.lockedUntil !== null
+      && (!Number.isSafeInteger(o.lockedUntil) || (o.lockedUntil as number) < 0
+          || (o.lockedUntil as number) > MAX_TIMESTAMP_MS)) {
+    fail('lockedUntil');
+  }
+  if (typeof o.blob !== 'object' || o.blob === null || Array.isArray(o.blob)) fail('blob');
+  const blob = o.blob as PinEncryptedSeed;
+  // The FULL blob check — the same one the KDF path runs (base64, 12-byte IV,
+  // 16-byte salt, ciphertext ≥ tag length, known kdf, pinned Argon2 profile).
+  // A shallow "three strings are present" test here would let a hostile blob
+  // reach Argon2 with arbitrary parameters.
+  try {
+    assertValidPinBlob(blob);
+  } catch (e) {
+    fail(`blob: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return {
+    blob,
+    configId: o.configId as string,
+    attempts: o.attempts as number,
+    lockedUntil: o.lockedUntil as number | null,
+  };
+}
+
+/** Read + validate the config. `null` = not configured; a malformed record
+ *  THROWS SafeboxPinUnavailableError (never silently "not configured" — that
+ *  would present the activation flow and let a wipe look like a fresh start). */
+export async function readSafeboxPinConfig(): Promise<SafeboxPinConfig | null> {
+  const raw = await getMeta<unknown>(SAFEBOX_PIN_META_KEY);
+  if (raw === undefined) return null;
+  return assertValidSafeboxPinConfig(raw);
+}
+
+/** Presence check for hydration/UI visibility — never throws. A malformed
+ *  record still COUNTS as configured (fail closed: show the safebox with its
+ *  «сбросить PIN по seed-фразе» path rather than the first-activation flow). */
+export async function hasSafeboxPinConfig(): Promise<boolean> {
+  return (await getMeta<unknown>(SAFEBOX_PIN_META_KEY)) !== undefined;
+}
+
+/** Progressive lockout — identical schedule to the main PIN. */
+export function safeboxLockSeconds(attempts: number): number {
+  if (attempts <= 3) return 0;
+  if (attempts <= 5) return 30;
+  if (attempts <= 7) return 300;
+  return 1800;
+}
+
+/** The subset of the meta object store the mutators need. */
+interface MetaStoreWriter {
+  put(value: unknown, key: string): Promise<unknown>;
+  delete(key: string): Promise<void>;
+}
+
+/**
+ * The vault this operation belongs to was DESTROYED (resetAll / another tab's
+ * reset) while the operation was in flight. Writing now would resurrect the PIN
+ * configuration inside a wiped database — or, worse, attach it to whatever
+ * vault is opened next.
+ */
+export class StorageResetError extends Error {
+  constructor() {
+    super('Приложение было сброшено — операция отменена.');
+    this.name = 'StorageResetError';
+  }
+}
+
+/** Synchronous reset-exclusivity check, to be called IMMEDIATELY before the
+ *  transaction is created (single-threaded JS ⇒ no TOCTOU window). */
+function assertDbGeneration(expected: number): void {
+  if (dbGeneration !== expected) throw new StorageResetError();
+}
+
+/** One readwrite `meta` transaction: re-read, verify ownership, mutate. */
+async function mutateSafeboxPinConfig<T>(
+  expectedConfigId: string,
+  expectedDbGeneration: number,
+  apply: (config: SafeboxPinConfig, store: MetaStoreWriter) => Promise<T> | T,
+): Promise<T> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const raw: unknown = await tx.store.get(SAFEBOX_PIN_META_KEY);
+    if (raw === undefined) throw new SafeboxConfigChangedError();
+    const config = assertValidSafeboxPinConfig(raw);
+    // The blob may have been replaced since this operation started: a failure
+    // must not be charged to — and a success must not unlock — a config we no
+    // longer own.
+    if (config.configId !== expectedConfigId) throw new SafeboxConfigChangedError();
+    const result = await apply(config, tx.store);
+    await tx.done;
+    return result;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+export interface SafeboxPinFailureOutcome {
+  attempts: number;
+  lockedUntil: number | null;
+  /** The 10th strike removed the PIN CONFIGURATION. Entries are untouched —
+   *  the section switches to «восстановите доступ по seed-фразе». */
+  wiped: boolean;
+}
+
+/** Count one wrong-PIN attempt (and wipe the configuration on the 10th). */
+export async function commitSafeboxPinFailure(
+  expectedConfigId: string,
+  now: number,
+  expectedDbGeneration: number,
+): Promise<SafeboxPinFailureOutcome> {
+  return mutateSafeboxPinConfig(expectedConfigId, expectedDbGeneration, async (config, store) => {
+    const attempts = config.attempts + 1;
+    if (attempts >= SAFEBOX_MAX_PIN_ATTEMPTS) {
+      await store.delete(SAFEBOX_PIN_META_KEY);
+      return { attempts, lockedUntil: null, wiped: true };
+    }
+    const lockSeconds = safeboxLockSeconds(attempts);
+    const lockedUntil = lockSeconds > 0 ? now + lockSeconds * 1000 : null;
+    await store.put({ ...config, attempts, lockedUntil }, SAFEBOX_PIN_META_KEY);
+    return { attempts, lockedUntil, wiped: false };
+  });
+}
+
+/** Successful unlock: clear the metering (the blob and configId stay). */
+export async function commitSafeboxPinSuccess(
+  expectedConfigId: string,
+  expectedDbGeneration: number,
+): Promise<void> {
+  await mutateSafeboxPinConfig(expectedConfigId, expectedDbGeneration, async (config, store) => {
+    if (config.attempts === 0 && config.lockedUntil === null) return;
+    await store.put({ ...config, attempts: 0, lockedUntil: null }, SAFEBOX_PIN_META_KEY);
+  });
+}
+
+/** Deactivation / explicit removal. Ownership-checked like every mutation. */
+export async function commitSafeboxPinDelete(
+  expectedConfigId: string,
+  expectedDbGeneration: number,
+): Promise<void> {
+  await mutateSafeboxPinConfig(expectedConfigId, expectedDbGeneration, async (_config, store) => {
+    await store.delete(SAFEBOX_PIN_META_KEY);
+  });
+}
+
+/**
+ * Write a new configuration under a precondition, inside ONE readwrite
+ * transaction. A brand-new `configId` is minted here — that is what makes the
+ * change observable to every other tab, with or without BroadcastChannel.
+ *
+ * The precondition matters because Argon2id takes ~1 s: between reading the
+ * config and writing the new blob, another tab can create or replace one.
+ *  - 'absent'          — first activation. Fails if a config already exists,
+ *                        so a racing activation cannot be silently clobbered.
+ *  - <configId>        — PIN change. Fails unless THAT exact config is still
+ *                        the current one.
+ *  - 'seed-authorized' — the seed-phrase reset. Deliberately unconditional:
+ *                        proof of the seed outranks any configuration, which
+ *                        is the whole point of the recovery path.
+ */
+export async function commitSafeboxPinWrite(
+  blob: PinEncryptedSeed,
+  precondition: 'absent' | 'seed-authorized' | { configId: string },
+  expectedDbGeneration: number,
+): Promise<string> {
+  assertDbGeneration(expectedDbGeneration);
+  const configId = crypto.randomUUID();
+  const next: SafeboxPinConfig = { blob, configId, attempts: 0, lockedUntil: null };
+
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    if (precondition !== 'seed-authorized') {
+      const raw: unknown = await tx.store.get(SAFEBOX_PIN_META_KEY);
+      if (precondition === 'absent') {
+        if (raw !== undefined) throw new SafeboxConfigChangedError();
+      } else {
+        if (raw === undefined) throw new SafeboxConfigChangedError();
+        if (assertValidSafeboxPinConfig(raw).configId !== precondition.configId) {
+          throw new SafeboxConfigChangedError();
+        }
+      }
+    }
+    await tx.store.put(next, SAFEBOX_PIN_META_KEY);
+    await tx.done;
+    return configId;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
 // ─── Sync Records ────────────────────────────────────────────────────
 
 export async function getSyncRecord(noteId: string): Promise<SyncRecord | undefined> {
-  return getDB().get('sync', noteId) as Promise<SyncRecord | undefined>;
+  return normalizeSyncRecord(await getDB().get('sync', noteId) as SyncRecord | undefined);
 }
 
 export async function setSyncRecord(record: SyncRecord): Promise<void> {
@@ -212,11 +647,13 @@ export async function setSyncRecord(record: SyncRecord): Promise<void> {
 }
 
 export async function getRecordsByStatus(status: SyncRecord['status']): Promise<SyncRecord[]> {
-  return getDB().getAllFromIndex('sync', 'by-status', status) as Promise<SyncRecord[]>;
+  const all = await getDB().getAllFromIndex('sync', 'by-status', status) as SyncRecord[];
+  return all.map(r => normalizeSyncRecord(r)!);
 }
 
 export async function getAllSyncRecords(): Promise<SyncRecord[]> {
-  return getDB().getAll('sync') as Promise<SyncRecord[]>;
+  const all = await getDB().getAll('sync') as SyncRecord[];
+  return all.map(r => normalizeSyncRecord(r)!);
 }
 
 // ─── Meta ────────────────────────────────────────────────────────────
@@ -234,15 +671,19 @@ export async function getMeta<T = unknown>(key: string): Promise<T | undefined> 
 // unlock bursts the whole v3 backlog again.
 
 export const V3_PAUSE_META_KEY = 'v3-uploads-paused';
+/** Independent marker for the SAFEBOX kill switch: pausing one version must
+ *  never stop the other, so the two never share a key or a lift condition. */
+export const V4_PAUSE_META_KEY = 'v4-uploads-paused';
 
 export interface V3PauseMeta {
   pausedAt: number;
 }
+export type PauseMeta = V3PauseMeta;
 
 /** Runtime-validated read. 'malformed' = a value is PRESENT but unreadable —
  *  fail closed: treat as paused (clearable via manual retry / valid health). */
-export async function readV3PauseMeta(): Promise<V3PauseMeta | 'malformed' | null> {
-  const raw = await getMeta<unknown>(V3_PAUSE_META_KEY);
+async function readPauseMeta(key: string): Promise<PauseMeta | 'malformed' | null> {
+  const raw = await getMeta<unknown>(key);
   if (raw === undefined) return null;
   if (typeof raw === 'object' && raw !== null) {
     const pausedAt = (raw as { pausedAt?: unknown }).pausedAt;
@@ -253,20 +694,28 @@ export async function readV3PauseMeta(): Promise<V3PauseMeta | 'malformed' | nul
   return 'malformed';
 }
 
+export function readV3PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
+  return readPauseMeta(V3_PAUSE_META_KEY);
+}
+export function readV4PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
+  return readPauseMeta(V4_PAUSE_META_KEY);
+}
+
 /**
- * Persist a v3_disabled upload failure AND the pause marker in ONE transaction
+ * Persist a vN_disabled upload failure AND the pause marker in ONE transaction
  * over sync+meta. Called from the committed part of runUploadAttempt INSTEAD
  * of the final setSyncRecord (never in addition — two writes reopen the crash
  * window this exists to close).
  */
-export async function commitV3PausedFailure(
+async function commitPausedFailure(
+  key: string,
   record: SyncRecord,
   pausedAt: number,
 ): Promise<void> {
   const tx = getDB().transaction(['sync', 'meta'], 'readwrite');
   try {
     await tx.objectStore('sync').put(record);
-    await tx.objectStore('meta').put({ pausedAt } satisfies V3PauseMeta, V3_PAUSE_META_KEY);
+    await tx.objectStore('meta').put({ pausedAt } satisfies PauseMeta, key);
     await tx.done;
   } catch (e) {
     // Same rollback discipline as saveNoteWithSync: an error on the SECOND put
@@ -277,6 +726,13 @@ export async function commitV3PausedFailure(
   }
 }
 
+export function commitV3PausedFailure(record: SyncRecord, pausedAt: number): Promise<void> {
+  return commitPausedFailure(V3_PAUSE_META_KEY, record, pausedAt);
+}
+export function commitV4PausedFailure(record: SyncRecord, pausedAt: number): Promise<void> {
+  return commitPausedFailure(V4_PAUSE_META_KEY, record, pausedAt);
+}
+
 /**
  * Conditionally lift the pause (compare-and-delete): the marker is removed only
  * while its pausedAt still equals `expectedPausedAt` — a stale successful
@@ -284,13 +740,14 @@ export async function commitV3PausedFailure(
  * Pass 'any' for the unconditional manual-retry path. Returns whether the
  * marker was removed.
  */
-export async function clearV3UploadsPaused(
+async function clearUploadsPaused(
+  key: string,
   expectedPausedAt: number | 'any',
 ): Promise<boolean> {
   const tx = getDB().transaction('meta', 'readwrite');
   try {
     const meta = tx.objectStore('meta');
-    const raw: unknown = await meta.get(V3_PAUSE_META_KEY);
+    const raw: unknown = await meta.get(key);
     if (raw === undefined) {
       await tx.done;
       return false;
@@ -304,7 +761,7 @@ export async function clearV3UploadsPaused(
         return false; // a newer (or malformed) marker — leave it
       }
     }
-    await meta.delete(V3_PAUSE_META_KEY);
+    await meta.delete(key);
     await tx.done;
     return true;
   } catch (e) {
@@ -312,6 +769,13 @@ export async function clearV3UploadsPaused(
     try { tx.abort(); } catch { /* already aborting/aborted */ }
     throw e;
   }
+}
+
+export function clearV3UploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
+  return clearUploadsPaused(V3_PAUSE_META_KEY, expectedPausedAt);
+}
+export function clearV4UploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
+  return clearUploadsPaused(V4_PAUSE_META_KEY, expectedPausedAt);
 }
 
 export async function setMeta(key: string, value: unknown): Promise<void> {
@@ -490,15 +954,16 @@ export function noteExternalReset(): void {
   dbGeneration++;
 }
 
-/** Clear ALL IndexedDB data (notes, sync, meta). Used for app reset. */
+/** Clear ALL IndexedDB data (notes, safebox, sync, meta). Used for app reset. */
 export async function resetAll(): Promise<void> {
   // Bump FIRST: any generation check that runs after this line refuses to
   // write; any write whose check passed earlier lost the transaction-order
   // race and gets cleared below.
   dbGeneration++;
   const database = getDB();
-  const tx = database.transaction(['notes', 'sync', 'meta'], 'readwrite');
+  const tx = database.transaction(['notes', 'safebox', 'sync', 'meta'], 'readwrite');
   await tx.objectStore('notes').clear();
+  await tx.objectStore('safebox').clear();
   await tx.objectStore('sync').clear();
   await tx.objectStore('meta').clear();
   await tx.done;

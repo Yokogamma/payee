@@ -1186,6 +1186,15 @@ mark {
   background: var(--bg); /* fully opaque: no plaintext may shine through */
 }
 
+/* LOAD-BEARING. The gate element is ALWAYS mounted so raising it is a
+   synchronous attribute flip (a React commit is not guaranteed before the
+   BFCache snapshot on `pagehide`). `display:flex` above would otherwise beat
+   the UA's `[hidden] { display: none }` on specificity and leave the gate
+   covering the entire app forever. Never drop this rule. */
+.lock-gate[hidden] {
+  display: none;
+}
+
 .lock-gate-icon {
   font-size: 28px;
   opacity: 0.6;
@@ -1590,3 +1599,113 @@ mark {
 }
 .history-row-body .note-text { padding-top: 10px; }
 .history-restore-btn { margin-top: 10px; }
+
+/* ─── Safebox (v4) ─────────────────────────────────────────────────── */
+
+.safebox-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+}
+.safebox-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.safebox-topbar h2 { margin: 0; font-size: 1.05rem; }
+
+/* Locked gate / activation share the centered card look */
+.safebox-gate,
+.safebox-activation,
+.safebox-seed-reset {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
+  max-width: 520px;
+  margin: 0 auto;
+  text-align: center;
+}
+.safebox-gate h2,
+.safebox-activation h2,
+.safebox-seed-reset h2 { margin: 0; }
+.safebox-facts {
+  text-align: left;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.safebox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.safebox-card { display: flex; flex-direction: column; gap: 6px; }
+.safebox-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.safebox-card-title { font-size: 0.95rem; }
+.safebox-card-login,
+.safebox-card-url {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+.safebox-card-actions,
+.safebox-card-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.safebox-card-actions .btn,
+.safebox-card-files .btn {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  width: auto;
+}
+.safebox-revealed {
+  padding: 8px 10px;
+  border: 1px dashed var(--border-focus);
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+}
+.safebox-revealed code { font-family: var(--font-mono, monospace); }
+
+/* Entry form */
+.safebox-form { width: min(560px, 94vw); display: flex; flex-direction: column; gap: 6px; }
+.safebox-password-row { display: flex; gap: 6px; align-items: center; }
+.safebox-password-row .invite-input { flex: 1; }
+.safebox-files { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.safebox-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+.safebox-file-name { flex: 1; word-break: break-all; }
+.safebox-file-size { color: var(--text-muted); flex-shrink: 0; }
+.safebox-size { font-size: 0.8rem; color: var(--text-muted); margin-top: 6px; }
+.safebox-field { font-size: 0.85rem; padding-top: 6px; }
+.safebox-field span { color: var(--text-muted); }
+
+/* Password generator */
+.pwgen {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.pwgen-modes { display: flex; gap: 6px; }
+.pwgen-sets { display: flex; gap: 12px; flex-wrap: wrap; }
+.pwgen-length { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }

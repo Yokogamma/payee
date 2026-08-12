@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useNotes, PinLockedError, PinWipedError, VaultMismatchError } from '../lib/store';
 import { PinUnlockUnavailableError } from '../lib/crypto';
+import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
 
 export function PinUnlock() {
   const { unlockWithPin, getPinLockState, goToRestore } = useNotes();
@@ -130,8 +131,10 @@ export function PinUnlock() {
           maxLength={8}
           onChange={e => { setPin(e.target.value.replace(/\D/g, '')); setError(''); }}
           onKeyDown={handleKeyDown}
-          autoComplete="off"
           disabled={isLocked}
+          // Back-applied anti-autofill set: a manager that silently saves the
+          // master PIN to a third-party cloud breaks the E2E model.
+          {...SECRET_PASSWORD_FIELD_PROPS}
         />
 
         {error && <div className="error-msg" role="alert">{error}</div>}

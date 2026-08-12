@@ -114,6 +114,13 @@ export function isValidMnemonic(mnemonic: string): boolean {
  * Deterministic: same mnemonic always produces same key.
  */
 export async function deriveKey(mnemonic: string): Promise<CryptoKey> {
+  return deriveAesKey(mnemonic, 'aes-256-gcm-encryption');
+}
+
+/** Shared HKDF→AES-256-GCM derivation. The SALT is fixed forever
+ *  ('eternal-notes-v1'); only `info` separates the domains. Changing either
+ *  constant orphans every existing record — treat as a breaking migration. */
+async function deriveAesKey(mnemonic: string, info: string): Promise<CryptoKey> {
   const seed = mnemonicToSeedSync(mnemonic);
 
   const keyMaterial = await crypto.subtle.importKey(
@@ -125,15 +132,35 @@ export async function deriveKey(mnemonic: string): Promise<CryptoKey> {
   );
 
   const salt = new TextEncoder().encode('eternal-notes-v1');
-  const info = new TextEncoder().encode('aes-256-gcm-encryption');
 
   return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt, info },
+    { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode(info) },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
+}
+
+/**
+ * Safebox META key (`info: "safebox-meta-v1"`) — title/login/url/note and the
+ * attachment DESCRIPTORS. Held in a ref only while the safebox section is
+ * unlocked; restore derives it on demand straight from the mnemonic (no PIN
+ * involved — correct per the threat model: the PIN is an access gate, not a
+ * crypto boundary).
+ */
+export async function deriveSafeboxMetaKey(mnemonic: string): Promise<CryptoKey> {
+  return deriveAesKey(mnemonic, 'safebox-meta-v1');
+}
+
+/**
+ * Safebox SECRET key (`info: "safebox-secret-v1"`) — the password and the
+ * attachment CONTENTS. Derived on demand inside reveal/copy/download/edit (and
+ * in restore, to validate a candidate) and dropped immediately: it must NEVER
+ * be cached in a ref, and the search path must never be able to reach it.
+ */
+export async function deriveSafeboxSecretKey(mnemonic: string): Promise<CryptoKey> {
+  return deriveAesKey(mnemonic, 'safebox-secret-v1');
 }
 
 // ─── Ed25519 Signing ────────────────────────────────────────────────
@@ -442,6 +469,389 @@ export async function decrypt(
   return (await decryptNote(key, encrypted)).text;
 }
 
+// ─── Safebox (v4) — split envelope ───────────────────────────────────
+//
+// One on-chain record per entry VERSION, carrying TWO independently-keyed
+// AES-GCM blobs:
+//   meta   (deriveSafeboxMetaKey)   — title/login/url/note + attachment
+//                                     DESCRIPTORS + chain metadata; decrypted
+//                                     for the whole unlocked section (search).
+//   secret (deriveSafeboxSecretKey) — password + attachment CONTENTS; decrypted
+//                                     ONLY at the moment of an explicit action.
+// Both carry `id === entryId` and BOTH decryptors cross-check it: that is what
+// defeats mix-and-match (grafting record A's secret blob onto record B's meta).
+
+/** Attachment metadata — visible inside the unlocked section, never indexed. */
+export interface SafeboxAttachmentDescriptor {
+  fid: string;   // canonical UUID, unique within the entry
+  name: string;
+  mime: string;
+  size: number;  // raw byte length; cross-checked against the decoded content
+}
+
+/** Attachment payload — lives ONLY in the secret envelope. */
+export interface SafeboxAttachmentContent {
+  fid: string;
+  data: string; // canonical base64 of the raw bytes
+}
+
+interface SafeboxMetaEnvelope {
+  v: 1;
+  id: string;    // === entryId (GCM-bound)
+  t: number;     // createdAt of THIS version
+  title: string;
+  login: string;
+  url: string;
+  note: string;
+  files: SafeboxAttachmentDescriptor[];
+  rev: number;   // integer >= 1
+  root: string;  // entryId of the chain's FIRST version
+  prev?: string;
+}
+
+interface SafeboxSecretEnvelope {
+  v: 1;
+  id: string;    // === entryId (GCM-bound)
+  password: string;
+  files: SafeboxAttachmentContent[];
+  // Reserved for a future stage (NOT implemented): totp?: {...}
+}
+
+/** The stored/on-chain record. Deliberately its OWN type with its OWN `v: 4`:
+ *  `EncryptedNote.v` stays 1|2|3 so the notes fail-closed guards keep rejecting
+ *  unknown note versions. */
+export interface EncryptedSafeboxEntry {
+  entryId: string;
+  metaCiphertext: string;
+  metaIv: string;
+  secretCiphertext: string;
+  secretIv: string;
+  /** Outer timestamp — index/ordering ONLY. Currentness always comes from the
+   *  authenticated `t`/`rev` inside the meta envelope. */
+  createdAt: number;
+  v: 4;
+}
+
+/** Decrypted meta — what the unlocked section renders and searches. */
+export interface SafeboxEntryData {
+  id: string;
+  createdAt: number; // authenticated `t` from the envelope
+  title: string;
+  login: string;
+  url: string;
+  note: string;
+  files: SafeboxAttachmentDescriptor[];
+  rev: number;
+  root: string;
+  prev?: string;
+}
+
+/** Decrypted secret — never stored, never published to React state. */
+export interface SafeboxSecretData {
+  password: string;
+  files: SafeboxAttachmentContent[];
+}
+
+/** Plaintext input for a new entry version (both envelopes at once). */
+export interface SafeboxEntryInput {
+  title: string;
+  login: string;
+  url: string;
+  note: string;
+  password: string;
+  files: Array<SafeboxAttachmentDescriptor & { data: string }>;
+  rev: number;
+  root?: string;
+  prev?: string;
+}
+
+/** Hard caps on envelope shape. The real size gate is the worker body cap
+ *  (limits.ts); these only stop absurd/hostile values from reaching the UI. */
+export const MAX_SAFEBOX_FILES = 20;
+export const MAX_SAFEBOX_FILENAME_CHARS = 200;
+export const MAX_SAFEBOX_MIME_CHARS = 120;
+/** No attachment can exceed the worker's whole-body cap, so anything larger is
+ *  structurally impossible and treated as malformed. */
+const MAX_SAFEBOX_ATTACHMENT_BYTES = 51_200;
+
+export class SafeboxEnvelopeError extends Error {
+  constructor(why: string) {
+    super(`safebox envelope integrity check failed: ${why}`);
+    this.name = 'SafeboxEnvelopeError';
+  }
+}
+
+/** Base64 that round-trips EXACTLY — a non-canonical spelling of the same bytes
+ *  must not pass (it would break the size cross-check and the wire contract). */
+function isCanonicalBase64(s: unknown): s is string {
+  if (typeof s !== 'string') return false;
+  try {
+    return bufferToBase64(base64ToBuffer(s)) === s;
+  } catch {
+    return false;
+  }
+}
+
+function isPlainObject(x: unknown): x is Record<string, unknown> {
+  return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+/** Exact key set — extra OR missing fields are malformed (no smuggling). */
+function hasExactKeys(o: Record<string, unknown>, keys: string[]): boolean {
+  const actual = Object.keys(o);
+  return actual.length === keys.length && actual.every(k => keys.includes(k));
+}
+
+function assertDescriptors(raw: unknown): SafeboxAttachmentDescriptor[] {
+  if (!Array.isArray(raw)) throw new SafeboxEnvelopeError('files');
+  if (raw.length > MAX_SAFEBOX_FILES) throw new SafeboxEnvelopeError('files count');
+  const seen = new Set<string>();
+  const out: SafeboxAttachmentDescriptor[] = [];
+  for (const f of raw) {
+    if (!isPlainObject(f) || !hasExactKeys(f, ['fid', 'name', 'mime', 'size'])) {
+      throw new SafeboxEnvelopeError('file descriptor shape');
+    }
+    const { fid, name, mime, size } = f;
+    if (typeof fid !== 'string' || !UUID_ANY_REGEX.test(fid)) throw new SafeboxEnvelopeError('file fid');
+    // Duplicate fids make the descriptor↔content mapping ambiguous — exactly
+    // the confusion that could bind a name to someone else's bytes.
+    if (seen.has(fid)) throw new SafeboxEnvelopeError('duplicate file fid');
+    seen.add(fid);
+    if (typeof name !== 'string' || name.length === 0 || name.length > MAX_SAFEBOX_FILENAME_CHARS) {
+      throw new SafeboxEnvelopeError('file name');
+    }
+    if (typeof mime !== 'string' || mime.length > MAX_SAFEBOX_MIME_CHARS) {
+      throw new SafeboxEnvelopeError('file mime');
+    }
+    if (!Number.isSafeInteger(size) || (size as number) < 0 || (size as number) > MAX_SAFEBOX_ATTACHMENT_BYTES) {
+      throw new SafeboxEnvelopeError('file size');
+    }
+    out.push({ fid, name, mime, size: size as number });
+  }
+  return out;
+}
+
+function assertContents(raw: unknown): SafeboxAttachmentContent[] {
+  if (!Array.isArray(raw)) throw new SafeboxEnvelopeError('secret files');
+  if (raw.length > MAX_SAFEBOX_FILES) throw new SafeboxEnvelopeError('secret files count');
+  const seen = new Set<string>();
+  const out: SafeboxAttachmentContent[] = [];
+  for (const f of raw) {
+    if (!isPlainObject(f) || !hasExactKeys(f, ['fid', 'data'])) {
+      throw new SafeboxEnvelopeError('secret file shape');
+    }
+    const { fid, data } = f;
+    if (typeof fid !== 'string' || !UUID_ANY_REGEX.test(fid)) throw new SafeboxEnvelopeError('secret file fid');
+    if (seen.has(fid)) throw new SafeboxEnvelopeError('duplicate secret file fid');
+    seen.add(fid);
+    if (!isCanonicalBase64(data)) throw new SafeboxEnvelopeError('secret file data');
+    out.push({ fid, data });
+  }
+  return out;
+}
+
+/** AES-GCM decrypt of one safebox half → UTF-8 string. */
+async function aesDecryptRaw(key: CryptoKey, ciphertextB64: string, ivB64: string): Promise<string> {
+  const ciphertext = base64ToBuffer(ciphertextB64);
+  const iv = base64ToBuffer(ivB64);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    key,
+    ciphertext as BufferSource,
+  );
+  return new TextDecoder().decode(decrypted);
+}
+
+async function aesEncryptRaw(key: CryptoKey, plaintext: string): Promise<{ c: string; iv: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const buf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(plaintext),
+  );
+  return { c: bufferToBase64(buf), iv: bufferToBase64(iv) };
+}
+
+/**
+ * Build + encrypt BOTH halves of a new entry version. A fresh UUIDv8 `entryId`
+ * per version (worker idempotency is permanent per id); the chain identity is
+ * `root` inside the meta envelope.
+ */
+export async function encryptSafeboxEntry(
+  metaKey: CryptoKey,
+  secretKey: CryptoKey,
+  input: SafeboxEntryInput,
+): Promise<EncryptedSafeboxEntry> {
+  const entryId = randomUuidV8();
+  const createdAt = Date.now();
+
+  const meta: SafeboxMetaEnvelope = {
+    v: 1,
+    id: entryId,
+    t: createdAt,
+    title: input.title,
+    login: input.login,
+    url: input.url,
+    note: input.note,
+    files: input.files.map(f => ({ fid: f.fid, name: f.name, mime: f.mime, size: f.size })),
+    rev: input.rev,
+    root: input.root ?? entryId,
+    ...(input.prev !== undefined ? { prev: input.prev } : {}),
+  };
+  const secret: SafeboxSecretEnvelope = {
+    v: 1,
+    id: entryId,
+    password: input.password,
+    files: input.files.map(f => ({ fid: f.fid, data: f.data })),
+  };
+
+  // Validate what we are about to make PERMANENT: an entry that violates the
+  // fid/linkage contract would be undecryptable-by-contract forever on-chain.
+  assertDescriptors(meta.files);
+  assertContents(secret.files);
+  assertFileCorrespondence(meta.files, secret.files);
+  if (!Number.isSafeInteger(meta.rev) || meta.rev < 1) throw new SafeboxEnvelopeError('rev');
+  // Same v8 namespace rule as the decrypt path — never MAKE a record the
+  // reader would (correctly) refuse.
+  if (!UUID_V8_REGEX.test(meta.root)) throw new SafeboxEnvelopeError('root namespace');
+  if (meta.prev !== undefined && !UUID_V8_REGEX.test(meta.prev)) {
+    throw new SafeboxEnvelopeError('prev namespace');
+  }
+  if (meta.rev === 1 && (meta.root !== meta.id || meta.prev !== undefined)) {
+    throw new SafeboxEnvelopeError('rev-1 linkage');
+  }
+  if (meta.rev > 1 && (meta.prev === undefined || meta.root === meta.id)) {
+    throw new SafeboxEnvelopeError('rev-n linkage');
+  }
+
+  const [m, s] = await Promise.all([
+    aesEncryptRaw(metaKey, JSON.stringify(meta)),
+    aesEncryptRaw(secretKey, JSON.stringify(secret)),
+  ]);
+
+  return {
+    entryId,
+    metaCiphertext: m.c,
+    metaIv: m.iv,
+    secretCiphertext: s.c,
+    secretIv: s.iv,
+    createdAt,
+    v: 4,
+  };
+}
+
+/**
+ * Decrypt + fail-closed validate the META half. Throws on a wrong key, tamper,
+ * an id mismatch (mix-and-match defense) or any shape violation.
+ */
+export async function decryptSafeboxMeta(
+  key: CryptoKey,
+  entry: EncryptedSafeboxEntry,
+): Promise<SafeboxEntryData> {
+  if (entry.v !== 4) throw new SafeboxEnvelopeError(`unsupported version: ${String(entry.v)}`);
+  const raw = await aesDecryptRaw(key, entry.metaCiphertext, entry.metaIv);
+
+  let env: unknown;
+  try {
+    env = JSON.parse(raw);
+  } catch {
+    throw new SafeboxEnvelopeError('meta json');
+  }
+  if (!isPlainObject(env)) throw new SafeboxEnvelopeError('meta shape');
+  if (!hasExactKeys(env, env.prev === undefined
+    ? ['v', 'id', 't', 'title', 'login', 'url', 'note', 'files', 'rev', 'root']
+    : ['v', 'id', 't', 'title', 'login', 'url', 'note', 'files', 'rev', 'root', 'prev'])) {
+    throw new SafeboxEnvelopeError('meta keys');
+  }
+  if (env.v !== 1) throw new SafeboxEnvelopeError('meta v');
+  // GCM-BOUND ID: the single check that makes a (meta, secret) pair unforgeable.
+  if (typeof env.id !== 'string' || env.id !== entry.entryId) throw new SafeboxEnvelopeError('meta id mismatch');
+  if (!UUID_V8_REGEX.test(env.id)) throw new SafeboxEnvelopeError('meta id namespace');
+  if (!isValidTimestamp(env.t)) throw new SafeboxEnvelopeError('meta t');
+  for (const field of ['title', 'login', 'url', 'note'] as const) {
+    if (typeof env[field] !== 'string') throw new SafeboxEnvelopeError(`meta ${field}`);
+  }
+  const files = assertDescriptors(env.files);
+  if (!Number.isSafeInteger(env.rev) || (env.rev as number) < 1) throw new SafeboxEnvelopeError('meta rev');
+  // UUIDv8, not "any UUID": `root`/`prev` are entryIds of OTHER versions of the
+  // same chain, and every safebox entryId is v8 (the worker enforces it per
+  // App-Version). Notes legitimately use the looser check — a v3 note version
+  // can be rooted at a legacy v1/v2 note whose id is a UUIDv4 — but the safebox
+  // has no legacy predecessor, so anything outside the v8 namespace is forged
+  // or corrupt.
+  if (typeof env.root !== 'string' || !UUID_V8_REGEX.test(env.root)) throw new SafeboxEnvelopeError('meta root');
+  if (env.prev !== undefined && (typeof env.prev !== 'string' || !UUID_V8_REGEX.test(env.prev))) {
+    throw new SafeboxEnvelopeError('meta prev');
+  }
+  const rev = env.rev as number;
+  if (rev === 1 && (env.root !== env.id || env.prev !== undefined)) throw new SafeboxEnvelopeError('rev-1 linkage');
+  if (rev > 1 && (env.prev === undefined || env.prev === env.id || env.root === env.id)) {
+    throw new SafeboxEnvelopeError('rev-n linkage');
+  }
+
+  return {
+    id: env.id,
+    createdAt: env.t as number,
+    title: env.title as string,
+    login: env.login as string,
+    url: env.url as string,
+    note: env.note as string,
+    files,
+    rev,
+    root: env.root,
+    ...(env.prev !== undefined ? { prev: env.prev as string } : {}),
+  };
+}
+
+/** Descriptors ↔ contents must be a strict one-to-one mapping, and each
+ *  declared size must equal the decoded byte length. */
+function assertFileCorrespondence(
+  descriptors: SafeboxAttachmentDescriptor[],
+  contents: SafeboxAttachmentContent[],
+): void {
+  if (descriptors.length !== contents.length) throw new SafeboxEnvelopeError('file cardinality');
+  const byFid = new Map(contents.map(c => [c.fid, c]));
+  if (byFid.size !== contents.length) throw new SafeboxEnvelopeError('duplicate secret file fid');
+  for (const d of descriptors) {
+    const c = byFid.get(d.fid);
+    if (!c) throw new SafeboxEnvelopeError('file fid mismatch');
+    if (base64ToBuffer(c.data).byteLength !== d.size) throw new SafeboxEnvelopeError('file size mismatch');
+  }
+}
+
+/**
+ * Decrypt + fail-closed validate the SECRET half against the ALREADY-VALIDATED
+ * descriptors from the meta half. Same GCM-bound id cross-check, plus the
+ * one-to-one fid correspondence and the per-file size check.
+ *
+ * The returned plaintext must be used immediately and dropped — never stored,
+ * never published to React state.
+ */
+export async function decryptSafeboxSecret(
+  key: CryptoKey,
+  entry: EncryptedSafeboxEntry,
+  descriptors: SafeboxAttachmentDescriptor[],
+): Promise<SafeboxSecretData> {
+  if (entry.v !== 4) throw new SafeboxEnvelopeError(`unsupported version: ${String(entry.v)}`);
+  const raw = await aesDecryptRaw(key, entry.secretCiphertext, entry.secretIv);
+
+  let env: unknown;
+  try {
+    env = JSON.parse(raw);
+  } catch {
+    throw new SafeboxEnvelopeError('secret json');
+  }
+  if (!isPlainObject(env)) throw new SafeboxEnvelopeError('secret shape');
+  if (!hasExactKeys(env, ['v', 'id', 'password', 'files'])) throw new SafeboxEnvelopeError('secret keys');
+  if (env.v !== 1) throw new SafeboxEnvelopeError('secret v');
+  if (typeof env.id !== 'string' || env.id !== entry.entryId) throw new SafeboxEnvelopeError('secret id mismatch');
+  if (typeof env.password !== 'string') throw new SafeboxEnvelopeError('secret password');
+  const files = assertContents(env.files);
+  assertFileCorrespondence(descriptors, files);
+
+  return { password: env.password, files };
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 export function bufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
@@ -547,8 +957,13 @@ export class PinUnlockUnavailableError extends Error {
  * Validate a stored PIN blob BEFORE running the KDF. A corrupted/hostile blob
  * must not be able to drive Argon2 into an OOM/hang via huge params, and an
  * unknown kdf must fail loudly (not silently fall back to PBKDF2).
+ *
+ * EXPORTED (as assertValidPinBlob) so storage.ts can apply the SAME check to
+ * the blob nested inside the safebox PIN config — a shallow "three strings"
+ * shape test there would accept non-base64, a wrong IV/salt length, an unknown
+ * KDF or arbitrary Argon2 parameters.
  */
-function assertValidPinBlob(e: PinEncryptedSeed): void {
+export function assertValidPinBlob(e: PinEncryptedSeed): void {
   if (typeof e.ciphertext !== 'string' || e.ciphertext.length === 0 ||
       typeof e.iv !== 'string' || typeof e.salt !== 'string') {
     throw new Error('Malformed PIN blob');
@@ -577,14 +992,16 @@ function assertValidPinBlob(e: PinEncryptedSeed): void {
   }
 }
 
-/** Encrypt mnemonic with PIN using Argon2id (current KDF). */
-export async function encryptWithPin(mnemonic: string, pin: string): Promise<PinEncryptedSeed> {
+/** Encrypt raw BYTES with a PIN using Argon2id (current KDF). The string
+ *  variants below are thin wrappers — one implementation, so the safebox
+ *  verifier and the mnemonic blob can never drift apart. */
+export async function encryptBytesWithPin(plaintext: Uint8Array, pin: string): Promise<PinEncryptedSeed> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await derivePinKeyArgon2(pin, salt, ARGON2_PARAMS);
 
   const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv }, key, new TextEncoder().encode(mnemonic),
+    { name: 'AES-GCM', iv }, key, plaintext as BufferSource,
   );
 
   return {
@@ -597,16 +1014,33 @@ export async function encryptWithPin(mnemonic: string, pin: string): Promise<Pin
   };
 }
 
-/**
- * Decrypt mnemonic with PIN, dispatching on the blob's KDF. A missing `kdf`
- * field means a legacy PBKDF2-600k blob.
- *
- * Errors are TYPED so callers can meter the attempt limit correctly:
- *  - WrongPinError — GCM auth failure after a successful KDF (a wrong PIN);
- *  - PinUnlockUnavailableError — anything else (corrupt blob, unknown
- *    kdf/version/profile, KDF/WASM/memory failure). Never attempt-countable.
- */
-export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<string> {
+/** Encrypt mnemonic with PIN using Argon2id (current KDF). */
+export async function encryptWithPin(mnemonic: string, pin: string): Promise<PinEncryptedSeed> {
+  return encryptBytesWithPin(new TextEncoder().encode(mnemonic), pin);
+}
+
+/** Which typed errors a PIN decrypt reports. The MAIN vault and the SAFEBOX
+ *  have separate error classes (their attempt counters are separate), but the
+ *  classification rule is ONE implementation — a copy could drift and start
+ *  metering an environment failure as a wrong PIN. */
+interface PinErrorFactory {
+  wrong(): Error;
+  unavailable(message: string): Error;
+}
+const MAIN_PIN_ERRORS: PinErrorFactory = {
+  wrong: () => new WrongPinError(),
+  unavailable: m => new PinUnlockUnavailableError(m),
+};
+const SAFEBOX_PIN_ERRORS: PinErrorFactory = {
+  wrong: () => new SafeboxWrongPinError(),
+  unavailable: m => new SafeboxPinUnavailableError(m),
+};
+
+async function decryptBytesWithPinInternal(
+  encrypted: PinEncryptedSeed,
+  pin: string,
+  errors: PinErrorFactory,
+): Promise<Uint8Array> {
   let salt: Uint8Array, iv: Uint8Array, ciphertext: Uint8Array;
   try {
     assertValidPinBlob(encrypted);
@@ -614,7 +1048,7 @@ export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): 
     iv = base64ToBuffer(encrypted.iv);
     ciphertext = base64ToBuffer(encrypted.ciphertext);
   } catch (e) {
-    throw new PinUnlockUnavailableError(e instanceof Error ? e.message : String(e));
+    throw errors.unavailable(e instanceof Error ? e.message : String(e));
   }
 
   let key: CryptoKey;
@@ -625,25 +1059,104 @@ export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): 
   } catch (e) {
     // Argon2 WASM failed to load / ran out of memory / WebCrypto error — the
     // PIN was never actually checked.
-    throw new PinUnlockUnavailableError(`KDF failed: ${e instanceof Error ? e.message : String(e)}`);
+    throw errors.unavailable(`KDF failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   try {
     const decrypted = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: iv as BufferSource }, key, ciphertext as BufferSource,
     );
-    return new TextDecoder().decode(decrypted);
+    return new Uint8Array(decrypted);
   } catch (e) {
     // GCM authentication failure surfaces as OperationError. It means either a
     // wrong PIN or a corrupted GCM tag — the two are cryptographically
     // indistinguishable (documented limitation), so OperationError is counted
     // as a wrong PIN. Any OTHER WebCrypto failure is an environment problem
     // and must never spend an attempt.
-    if (e instanceof DOMException && e.name === 'OperationError') {
-      throw new WrongPinError();
-    }
-    throw new PinUnlockUnavailableError(
-      `decrypt failed: ${e instanceof Error ? e.message : String(e)}`,
-    );
+    if (isOperationError(e)) throw errors.wrong();
+    throw errors.unavailable(`decrypt failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** WebCrypto reports a failed GCM tag as a DOMException named 'OperationError'.
+ *  The NAME is the contract, not the class: when WebCrypto lives in another
+ *  realm (Node's webcrypto under jsdom, an iframe) `instanceof DOMException`
+ *  is false for the very same error — and misclassifying a wrong PIN as an
+ *  environment failure would silently disable the attempt limiter. */
+function isOperationError(e: unknown): boolean {
+  return (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'OperationError')
+    || (e instanceof Error && e.name === 'OperationError');
+}
+
+/** Decrypt raw BYTES with a PIN (main-vault error classes). */
+export async function decryptBytesWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<Uint8Array> {
+  return decryptBytesWithPinInternal(encrypted, pin, MAIN_PIN_ERRORS);
+}
+
+/**
+ * Decrypt mnemonic with PIN, dispatching on the blob's KDF. A missing `kdf`
+ * field means a legacy PBKDF2-600k blob.
+ *
+ * Errors are TYPED so callers can meter the attempt limit correctly:
+ *  - WrongPinError — GCM auth failure after a successful KDF (a wrong PIN);
+ *  - PinUnlockUnavailableError — anything else (corrupt blob, unknown
+ *    kdf/version/profile, KDF/WASM/memory failure). Never attempt-countable.
+ */
+export async function decryptWithPin(encrypted: PinEncryptedSeed, pin: string): Promise<string> {
+  return new TextDecoder().decode(await decryptBytesWithPin(encrypted, pin));
+}
+
+// ─── Safebox PIN (separate contour — see the naming rule) ────────────
+
+/** Wrong SAFEBOX PIN: a GCM OperationError AFTER the KDF ran. ONLY this may
+ *  count against the safebox attempt limit / trigger the 10-strike wipe. */
+export class SafeboxWrongPinError extends Error {
+  constructor() {
+    super('Wrong safebox PIN');
+    this.name = 'SafeboxWrongPinError';
+  }
+}
+
+/** The safebox PIN blob or the KDF runtime is unusable. NEVER attempt-countable
+ *  — a correct PIN must not be wiped by 10 environment hiccups. Also raised for
+ *  a malformed PIN CONFIG record (see storage.assertValidSafeboxPinConfig): a
+ *  corrupted config may neither disable the lockout nor block seed recovery. */
+export class SafeboxPinUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SafeboxPinUnavailableError';
+  }
+}
+
+/** Digits only, 6..8 — enforced in the store AND the UI. */
+export const SAFEBOX_PIN_MIN_LENGTH = 6;
+export const SAFEBOX_PIN_MAX_LENGTH = 8;
+export function isValidSafeboxPin(pin: string): boolean {
+  return /^[0-9]+$/.test(pin)
+    && pin.length >= SAFEBOX_PIN_MIN_LENGTH
+    && pin.length <= SAFEBOX_PIN_MAX_LENGTH;
+}
+
+/** Bytes wrapped by the safebox PIN blob. NOT a key and NOT the mnemonic — a
+ *  random verifier, so a successful offline brute force yields nothing but
+ *  «the PIN was right» (see the disclosed oracle risk in security-guidance). */
+const SAFEBOX_VERIFIER_BYTES = 32;
+
+/** Fresh verifier + blob for a new/replaced safebox PIN. */
+export async function createSafeboxPinBlob(pin: string): Promise<PinEncryptedSeed> {
+  const verifier = crypto.getRandomValues(new Uint8Array(SAFEBOX_VERIFIER_BYTES));
+  return encryptBytesWithPin(verifier, pin);
+}
+
+/**
+ * Check a safebox PIN against its blob. Resolves on success; throws
+ * SafeboxWrongPinError (attempt-countable) or SafeboxPinUnavailableError
+ * (never countable). A blob that decrypts to the wrong verifier LENGTH is a
+ * storage problem, not a wrong PIN.
+ */
+export async function verifySafeboxPin(encrypted: PinEncryptedSeed, pin: string): Promise<void> {
+  const verifier = await decryptBytesWithPinInternal(encrypted, pin, SAFEBOX_PIN_ERRORS);
+  if (verifier.byteLength !== SAFEBOX_VERIFIER_BYTES) {
+    throw new SafeboxPinUnavailableError('Malformed safebox verifier');
   }
 }
