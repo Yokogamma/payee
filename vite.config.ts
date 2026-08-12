@@ -70,6 +70,16 @@ export default defineConfig(({ command, mode }) => {
     build: {
       outDir: "dist",
       sourcemap: false,
+      // NEVER inline fonts as data: URIs. The CSP pins `font-src 'self'`
+      // deliberately — allowing `data:` there would have to be a blanket
+      // permission — so an inlined font is simply BLOCKED at runtime and that
+      // glyph range silently falls back to a system font. Small @fontsource
+      // subsets sit under the default 4 KB threshold, which is exactly how 9
+      // of them ended up inlined and blocked in production.
+      // `false` = never inline this file; `undefined` = keep the default rule
+      // for everything else (images, etc.).
+      assetsInlineLimit: (filePath: string) =>
+        /\.(woff2?|ttf|otf|eot)$/i.test(filePath) ? false : undefined,
     },
   };
 });
