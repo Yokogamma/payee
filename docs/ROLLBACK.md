@@ -410,6 +410,51 @@ the pull. Both are covered by tests — including a mutation check proving the
 safebox counter would otherwise re-announce the entire history on every run —
 but no production run has confirmed them.
 
+### Hotfix on top of Phase 0 — the stuck privacy gate
+
+**DEPLOYED 2026-08-13** (tag `client-sync0-hotfix1` = 66b35c0) on
+notes.matamata.dev, run 31690638225 — all gates green (lint, `tsc -b`,
+**643 client tests / 34 files**, worker typecheck + tests, staging config check,
+bundle budget), smoke-headers passed. Client-only; the Worker is untouched.
+
+**Reported from production on `client-sync0`:** after a long idle the app opens
+as a blank page with a lone padlock, no PIN prompt, and ONLY a full close +
+relaunch clears it. The padlock is `.lock-gate` — the opaque full-screen privacy
+overlay at `z-index: 100`. The PIN screen is rendered underneath it, unreachable.
+
+Two defects, both of the invariant *a locked app holds no plaintext, so no gate
+may cover it*:
+
+1. **The bootstrap lock branch never lowered the gate.** A page that wakes up
+   HIDDEN (Android reloads a backgrounded PWA) raises the gate on mount, because
+   the session seed still makes `vaultPresentInTab()` true. The bootstrap lock
+   decision then drops that seed, sets screen `'pin'` and returns — leaving the
+   gate up with nothing left that could lower it.
+2. **`lockApp()` silently broke its own contract.** It returns on its first line
+   when `vaultPresentInTab()` is false, while THREE call sites in
+   `evaluateReturn` delegate the gate to it on the strength of its comment
+   («the locked UI is non-sensitive, so no gate may be left covering it»). Once
+   defect 1 removed the seed, that promise no longer held.
+
+Both now lower the gate explicitly; `lockApp` also force-closes the safebox
+first, defensively.
+
+Tests (`privacy gate never outlives the screen it covers` in `store.test.tsx`):
+the production scenario (hidden bootstrap + lock), the foreground return, and a
+contract test pinning `lockApp`. The first and third FAILED before their
+respective fix — each was verified in reverse.
+
+Verified on the live site: new bundle `index-CqiIswKu.js`, CSP and
+`X-Frame-Options: DENY` intact.
+**NOT verified in production:** the lifecycle itself. Reproducing it needs a real
+device that backgrounds the PWA long enough for the OS to reload it — that is the
+operator's manual check. Everything asserted above is proven by tests, not by a
+production run.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the buggy build until
+«Обновить». A user currently stuck behind the gate must relaunch the app — which
+is exactly the workaround they already found.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
