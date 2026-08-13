@@ -352,6 +352,58 @@ KV placeholder is still in `wrangler.toml`.
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
   the new origin is allowed while a stranger origin is rejected.
 
+## Multi-device sync — Phase 0 (manual «Проверить обновления»)
+
+Client-only release: the Worker is untouched, so the roll-forward «worker first»
+step does not apply. No new on-chain format, no new endpoint, no feature flag —
+the client simply calls the EXISTING restore sweep on demand instead of only on
+seed entry. Rollback is a plain redeploy of the previous client tag; nothing
+about it is a floor.
+
+**DEPLOYED 2026-08-13** (tag `client-sync0` = 2edec7e) on notes.matamata.dev,
+run 31687866818 — all gates green (lint, 640 client tests, worker
+typecheck + tests, staging config check, bundle budget 181.7 KB gz of 186 KB),
+smoke-headers passed against the deployment URL.
+
+Verified against the live site: `https://notes.matamata.dev/` returns 200 with
+the CSP intact, and the deployed bundle (`index-IAnsTq5S.js`) CONTAINS
+«Проверить обновления», «Получено с других устройств», «Заметки в блокчейне» and
+«Передано, ждёт подтверждения» — direct evidence the new code is in the artifact,
+not merely in the source.
+
+What shipped:
+
+- `checkForUpdates()` runs the SAME sweep restore runs (`runArweaveSweep(mode)`),
+  reporting into its own `updateCheck` state so the restore banners stay
+  untouched. Both modes share one `restoringRef` — two concurrent sweeps would
+  double-fetch and race their merges.
+- Reading Arweave needs neither the sync toggle nor a registered key (those gate
+  UPLOADS), so the button works on a read-only device.
+- `fetchAllNotes` throws `ArweaveIndexUnavailableError` when the FIRST GraphQL
+  page fails **and the caller did not abort**. An offline device used to be told
+  «часть данных недоступна» instead of «не удалось». The abort carve-out is
+  load-bearing: `requestSignal` composes the caller's signal with the timeout via
+  `AbortSignal.any`, so a lock and a timeout are indistinguishable by error type.
+- Settings counters moved from versions to notes. «В блокчейне» counts only
+  `confirmed` — the reset warning treats exactly that status as recoverable, and
+  the counter must not promise more than the dialog that is about to wipe it.
+  `accepted` gets its own line; the version denominator comes from the
+  storage-backed aggregates, which include versions this build cannot decrypt.
+- **P1 fixed in `storage.ts`**: `mergeRestoredNote` / `mergeRestoredSafeboxEntry`
+  awaited `getSyncRecord()` between the caller's generation check and the write
+  transaction. A reset landing in that window created its clear transaction
+  FIRST, so the record reappeared in a just-wiped database. Both now re-assert
+  the generation immediately before the write, exactly like `commitSafeboxEntry`.
+  Reproduced before the fix and covered by a test in each store.
+
+⚠️ **The update is prompt-gated** (same as W4): already-loaded tabs keep running
+the previous build until «Обновить» in the update toast. Expect a tail of old
+clients — by design, not a failed deploy.
+
+NOT verified: the two-device acceptance itself (create on desktop → wait for
+«Подтверждено в блокчейне» → `↻` on the phone → repeat check returns «в сейфе: 0»).
+It needs two real devices and is left to the operator.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
