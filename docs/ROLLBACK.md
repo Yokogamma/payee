@@ -400,9 +400,15 @@ What shipped:
 the previous build until «Обновить» in the update toast. Expect a tail of old
 clients — by design, not a failed deploy.
 
-NOT verified: the two-device acceptance itself (create on desktop → wait for
-«Подтверждено в блокчейне» → `↻` on the phone → repeat check returns «в сейфе: 0»).
-It needs two real devices and is left to the operator.
+**Two-device acceptance PASSED** (operator, 2026-08-13): notes created on one
+device are pulled onto another with the `↻` button. That is the whole point of
+the release and it works in production.
+
+Still unexercised, deliberately: the repeat-check idempotency counters
+(«новых заметок нет» / «в сейфе: 0» on a second press) and the safebox half of
+the pull. Both are covered by tests — including a mutation check proving the
+safebox counter would otherwise re-announce the entire history on every run —
+but no production run has confirmed them.
 
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
