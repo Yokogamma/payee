@@ -244,6 +244,10 @@ export async function saveNote(note: EncryptedNote): Promise<void> {
  * crash can never leave a note without its sync state (or vice versa). Used on
  * restore to record the already-on-chain TX as `confirmed`, which stops
  * syncPendingNotes from re-uploading it (and, for v2 notes, mis-serializing).
+ *
+ * CONTRACT: the transaction is created SYNCHRONOUSLY on entry. Callers that
+ * guard against a concurrent reset rely on it — an await added before the
+ * `transaction(...)` line would silently reopen the resurrection window.
  */
 export async function saveNoteWithSync(
   note: EncryptedNote,
@@ -283,11 +287,18 @@ export async function mergeRestoredNote(
   note: EncryptedNote,
   txId: string,
   now: number,
+  expectedDbGeneration: number,
 ): Promise<void> {
   const sync = await getSyncRecord(note.noteId);
   const record: SyncRecord = sync?.status === 'confirmed'
     ? sync
     : { noteId: note.noteId, kind: 'note', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+  // The CALLER's pre-merge check is not enough (P1): the getSyncRecord await
+  // above is a real suspension point, and a reset landing inside it would create
+  // its clear transaction BEFORE the write below — resurrecting the note in a
+  // database the user just wiped. Re-assert here, with nothing awaited between
+  // this line and the transaction saveNoteWithSync creates on entry.
+  assertDbGeneration(expectedDbGeneration);
   await saveNoteWithSync(note, record);
 }
 
@@ -321,8 +332,9 @@ export async function countSafeboxEntries(): Promise<number> {
 }
 
 /** Persist an entry and its sync record together in a SINGLE transaction —
- *  same contract as saveNoteWithSync. Used by the restore merge, which records
- *  the already-on-chain TX as `confirmed`. */
+ *  same contract as saveNoteWithSync, including the synchronous creation of the
+ *  transaction on entry. Used by the restore merge, which records the
+ *  already-on-chain TX as `confirmed`. */
 export async function saveSafeboxEntryWithSync(
   entry: EncryptedSafeboxEntry,
   record: SyncRecord,
@@ -347,11 +359,14 @@ export async function mergeRestoredSafeboxEntry(
   entry: EncryptedSafeboxEntry,
   txId: string,
   now: number,
+  expectedDbGeneration: number,
 ): Promise<void> {
   const sync = await getSyncRecord(entry.entryId);
   const record: SyncRecord = sync?.status === 'confirmed'
     ? sync
     : { noteId: entry.entryId, kind: 'safebox', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+  // Same P1 window as mergeRestoredNote — see the comment there.
+  assertDbGeneration(expectedDbGeneration);
   await saveSafeboxEntryWithSync(entry, record);
 }
 

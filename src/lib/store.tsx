@@ -98,6 +98,7 @@ import {
   commitSafeboxPinWrite,
   safeboxLockSeconds,
   SafeboxConfigChangedError,
+  StorageResetError,
   getAllSyncRecords,
   getRecordsByStatus,
   getSyncRecord,
@@ -326,6 +327,33 @@ export class SafeboxSeedRequiredError extends Error {
   }
 }
 
+/**
+ * Manual «Проверить обновления» — the SAME Arweave sweep restore runs, reported
+ * separately so it never borrows the restore banners («Восстанавливаем…»,
+ * «Восстановлено N»), which belong to a different, seed-driven scenario.
+ *
+ * Counts are CHAINS, not versions: a note edited three times is one note.
+ * `changedSafebox` counts safebox ROOTS that received at least one previously
+ * unknown version — new and updated chains together, because a local root is
+ * not knowable without decrypting the whole local safebox (the root lives
+ * inside the encrypted meta envelope).
+ *
+ * `partial` = the sweep ran but some pages/payloads were unreachable. A total
+ * failure is `error` instead — see ArweaveIndexUnavailableError.
+ */
+export type UpdateCheckState =
+  | { status: 'idle' }
+  | { status: 'checking'; progress: { done: number; total: number } | null }
+  | {
+      status: 'done';
+      at: number;
+      addedNotes: number;
+      updatedNotes: number;
+      changedSafebox: number;
+      partial: boolean;
+    }
+  | { status: 'error'; at: number };
+
 interface NotesStore {
   screen: AppScreen;
   isReady: boolean;
@@ -382,6 +410,8 @@ interface NotesStore {
   restoredCount: number | null;
   /** How many EXISTING chains gained new versions in that restore. */
   restoredUpdatedCount: number | null;
+  /** Outcome of the manual «Проверить обновления» run (see UpdateCheckState). */
+  updateCheck: UpdateCheckState;
   vaultError: string | null;
   hasPin: boolean;
   /** Current auto-lock threshold (§1): null=never, 0=immediately, 300/1800 s. */
@@ -476,6 +506,10 @@ interface NotesStore {
   clearDraft: () => void;
   resetBrokenStorage: () => Promise<void>;
   retryRestore: () => Promise<void>;
+  /** Manual «Проверить обновления»: pulls whatever other devices published,
+   *  merging it into this vault. No seed entry, no upload — read-only, so it
+   *  works with sync disabled and with an unregistered key. */
+  checkForUpdates: () => Promise<void>;
   clearRestoreStatus: () => void;
   dismissError: () => void;
 }
@@ -616,6 +650,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoredCount, setRestoredCount] = useState<number | null>(null);
   const [restoredUpdatedCount, setRestoredUpdatedCount] = useState<number | null>(null);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({ status: 'idle' });
   // v3 uploads paused by the worker kill switch. Authoritative state lives in
   // the shared IndexedDB marker (readV3PauseMeta) — this mirrors it for the UI.
   const [v3Paused, setV3Paused] = useState(false);
@@ -1464,6 +1499,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setRestoredCount(null);
     setRestoredUpdatedCount(null);
     setRestoreProgress(null);
+    // Same for the manual update check — and a sweep KILLED by this very lock
+    // would otherwise leave 'checking' pinned forever (its own state writes are
+    // gated on the epoch it no longer owns).
+    setUpdateCheck({ status: 'idle' });
     // The persisted marker survives; the mirror re-reads on next unlock.
     setV3Paused(false);
 
@@ -2075,7 +2114,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function restoreFromArweaveInternal() {
+  /**
+   * ONE sweep, two reports. Both modes run the SAME fetch → decrypt → merge
+   * pipeline — there is deliberately no second restore path — and differ only
+   * in where the outcome lands:
+   *   'restore' — the seed-driven scenario; owns the restore banners.
+   *   'check'   — manual «Проверить обновления»; owns `updateCheck` and must
+   *               never touch a restore banner (a different screen shows it).
+   * Both are serialized by the SAME `restoringRef`: two concurrent sweeps would
+   * double-fetch and race each other's merges.
+   */
+  async function runArweaveSweep(mode: 'restore' | 'check') {
     const key = cryptoKeyRef.current;
     const mn = mnemonicRef.current;
     if (!key || !ownerHashRef.current || !mn) return;
@@ -2089,11 +2138,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = abort;
 
-    setRestoreError(null);
-    setRestoredCount(null);
-    setRestoredUpdatedCount(null);
-    setRestoredSafeboxCount(null);
-    setRestoreProgress(null);
+    if (mode === 'restore') {
+      setRestoreError(null);
+      setRestoredCount(null);
+      setRestoredUpdatedCount(null);
+      setRestoredSafeboxCount(null);
+      setRestoreProgress(null);
+    } else {
+      setUpdateCheck({ status: 'checking', progress: null });
+    }
     try {
       // The safebox keys are derived HERE, on demand, straight from the
       // mnemonic: restore must work with the section locked and NO PIN (the
@@ -2112,7 +2165,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         ownerHashRef.current,
         { note: key, safeboxMeta, safeboxSecret },
         (done, total) => {
-          if (vaultEpochRef.current === myEpoch) setRestoreProgress({ done, total });
+          if (vaultEpochRef.current !== myEpoch) return;
+          if (mode === 'restore') setRestoreProgress({ done, total });
+          else setUpdateCheck({ status: 'checking', progress: { done, total } });
         },
         { signal: abort.signal },
       );
@@ -2142,7 +2197,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Upsert the note payload + confirmed sync state atomically. The
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
-        await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
+        await mergeRestoredNote(remote.encrypted, remote.txId, Date.now(), myDbGen);
 
         if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
         if (vaultEpochRef.current !== myEpoch) return;
@@ -2164,12 +2219,32 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // ── Safebox half. Counted SEPARATELY from the notes counters («Найден
       //    сейф: N записей» vs «Восстановлено M, обновлено K»). Merging is
       //    upsert-repair, exactly like notes, and needs no PIN.
+      //
+      // TWO different counts, deliberately:
+      //  - `safeboxMerged` — every remote version seen, what restore reports
+      //    («Найден сейф: N записей»);
+      //  - `changedSafeboxRoots` — roots that received at least one version we
+      //    did NOT already hold, what the update check reports. Without the
+      //    known-id snapshot the check would re-announce the entire safebox
+      //    history on EVERY run, since the merge is an idempotent upsert.
+      // The snapshot is taken from STORAGE, not from state: the section may be
+      // locked, and then no decrypted entry is in memory at all.
+      const knownSafeboxIds = new Set(
+        remoteSafebox.length > 0 ? (await getAllSafeboxEntries()).map(e => e.entryId) : [],
+      );
+      const changedSafeboxRoots = new Set<string>();
       let safeboxMerged = 0;
       for (const remote of remoteSafebox) {
         if (vaultEpochRef.current !== myEpoch) return;
         if (getDbGeneration() !== myDbGen) return;
-        await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now());
+        await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now(), myDbGen);
         safeboxMerged++;
+        // Claim BEFORE the id joins the known set, so several new versions of
+        // one root still count their root exactly once.
+        if (!knownSafeboxIds.has(remote.encrypted.entryId)) {
+          changedSafeboxRoots.add(remote.meta.root);
+          knownSafeboxIds.add(remote.encrypted.entryId);
+        }
         // If the section happens to be unlocked RIGHT NOW, publish the freshly
         // decrypted meta so the list is complete without a re-unlock. Both
         // epochs are re-checked: a lock mid-sweep must publish nothing.
@@ -2187,23 +2262,48 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         await refreshSafeboxPresence(myEpoch);
       }
       if (vaultEpochRef.current !== myEpoch) return;
-      setRestoredCount(newRoots.size);
-      setRestoredUpdatedCount(updatedRoots.size);
-      setRestoredSafeboxCount(safeboxMerged);
-      if (incomplete) {
-        // Some pages/payloads were unreachable — a "quiet partial restore" must
-        // not look like a full one (the user could believe notes are lost).
-        setRestoreError('Восстановление прошло не полностью — часть заметок могла не загрузиться.');
+      if (mode === 'restore') {
+        setRestoredCount(newRoots.size);
+        setRestoredUpdatedCount(updatedRoots.size);
+        setRestoredSafeboxCount(safeboxMerged);
+        if (incomplete) {
+          // Some pages/payloads were unreachable — a "quiet partial restore" must
+          // not look like a full one (the user could believe notes are lost).
+          setRestoreError('Восстановление прошло не полностью — часть заметок могла не загрузиться.');
+        }
+      } else {
+        // `partial` is NOT an error: the sweep ran and merged what it reached.
+        // A total failure never gets here — fetchAllNotes throws instead.
+        setUpdateCheck({
+          status: 'done',
+          at: Date.now(),
+          addedNotes: newRoots.size,
+          updatedNotes: updatedRoots.size,
+          changedSafebox: changedSafeboxRoots.size,
+          partial: incomplete,
+        });
       }
     } catch (err) {
-      console.error('restoreFromArweave failed:', err);
-      if (vaultEpochRef.current === myEpoch) {
-        setRestoreError('Не удалось восстановить заметки из Arweave.');
-      }
+      // A wipe is not a failed sweep: the merge refused to write because the
+      // database this run belonged to no longer exists. Stand down silently,
+      // exactly like an aborted sweep — reporting an error here would blame the
+      // network for the user's own «Удалить всё».
+      if (err instanceof StorageResetError) return;
+      // A lock does NOT land here either: fetchAllNotes stays silent when the
+      // caller's signal aborted, and every state write below is epoch-gated.
+      console.error(mode === 'restore' ? 'restoreFromArweave failed:' : 'checkForUpdates failed:', err);
+      if (vaultEpochRef.current !== myEpoch) return;
+      if (mode === 'restore') setRestoreError('Не удалось восстановить заметки из Arweave.');
+      else setUpdateCheck({ status: 'error', at: Date.now() });
     } finally {
       if (vaultOpAbortRef.current === abort) vaultOpAbortRef.current = null;
-      if (vaultEpochRef.current === myEpoch) setRestoreProgress(null);
+      if (mode === 'restore' && vaultEpochRef.current === myEpoch) setRestoreProgress(null);
     }
+  }
+
+  /** Restore-mode sweep — the seed-entry and «Повторить» paths. */
+  function restoreFromArweaveInternal() {
+    return runArweaveSweep('restore');
   }
 
   /** Re-run the Arweave restore sweep (banner button after an error/partial). */
@@ -2216,6 +2316,26 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     } finally {
       restoringRef.current = false;
       setRestoring(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Manual «Проверить обновления» — pull whatever other devices published.
+   *
+   * Requires an OPEN vault and nothing else: the sweep only READS Arweave
+   * (arweave.net/graphql directly), so neither the sync toggle nor a registered
+   * key is involved — those gate uploads. Shares `restoringRef` with restore,
+   * but never sets `setRestoring`: that flag owns the restore banner.
+   */
+  const checkForUpdates = useCallback(async () => {
+    if (!cryptoKeyRef.current || !ownerHashRef.current || !mnemonicRef.current) return;
+    if (restoringRef.current) return; // a sweep is already running
+    restoringRef.current = true;
+    try {
+      await runArweaveSweep('check');
+    } finally {
+      restoringRef.current = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -3342,6 +3462,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     restoreError,
     restoredCount,
     restoredUpdatedCount,
+    updateCheck,
     vaultError,
     hasPin,
     autoLockTimeout,
@@ -3392,6 +3513,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     clearDraft: clearDraftAction,
     resetBrokenStorage,
     retryRestore,
+    checkForUpdates,
     clearRestoreStatus,
     dismissError,
   }), [
@@ -3400,7 +3522,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     safeboxUnlocked, safeboxLockGeneration, safeboxPinConfigured, safeboxEntryCount, safeboxEntries,
     safeboxChains, filteredSafeboxChains, safeboxSearchQuery, restoredSafeboxCount,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
-    restoredCount, restoredUpdatedCount, vaultError, hasPin, autoLockTimeout, bootError,
+    restoredCount, restoredUpdatedCount, updateCheck, vaultError, hasPin, autoLockTimeout, bootError,
     storageBlocked, storageOutdated,
     createNewWallet, confirmMnemonic, restoreFromMnemonic, addNote,
     editNote, resumeV3Uploads, resumeV4Uploads,
@@ -3413,7 +3535,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
     setAutoLockTimeoutAction, lockAppAction, persistDraftAction,
     readDraftAction, clearDraftAction,
-    resetBrokenStorage, retryRestore, clearRestoreStatus, dismissError,
+    resetBrokenStorage, retryRestore, checkForUpdates, clearRestoreStatus, dismissError,
   ]);
 
   return (

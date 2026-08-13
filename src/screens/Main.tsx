@@ -45,6 +45,8 @@ export function Main() {
     restoredUpdatedCount,
     retryRestore,
     clearRestoreStatus,
+    updateCheck,
+    checkForUpdates,
     syncStatuses,
     dismissError,
     persistDraft,
@@ -80,6 +82,14 @@ export function Main() {
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
+  // How many notes/entries the last update check brought in, while that news is
+  // still worth a toast. `null` = nothing to announce.
+  const [receivedCount, setReceivedCount] = useState<number | null>(null);
+  // The `at` of the last check whose result was already dealt with. A finished
+  // run is marked handled EVEN WHEN no toast is shown — the settings panel
+  // reported it there, and without this the toast would pop later, out of
+  // context, the moment the modal closes.
+  const handledCheckAtRef = useRef<number | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
@@ -102,6 +112,22 @@ export function Main() {
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // A finished update check: announce it once, and only out here on the feed —
+  // inside the settings panel the result line already says the same thing.
+  useEffect(() => {
+    if (updateCheck.status !== 'done') return;
+    if (handledCheckAtRef.current === updateCheck.at) return;
+    handledCheckAtRef.current = updateCheck.at;
+    const total = updateCheck.addedNotes + updateCheck.updatedNotes + updateCheck.changedSafebox;
+    if (total > 0 && !showSettings) setReceivedCount(total);
+  }, [updateCheck, showSettings]);
+
+  useEffect(() => {
+    if (receivedCount === null) return;
+    const t = setTimeout(() => setReceivedCount(null), 4000);
+    return () => clearTimeout(t);
+  }, [receivedCount]);
 
   // Global search hotkey (8.1): Ctrl/Cmd+K toggles the search bar.
   useEffect(() => {
@@ -388,6 +414,17 @@ export function Main() {
               🔒
             </button>
           )}
+          {/* Shown unconditionally: the check works with sync disabled too, so
+              hiding it behind the toggle would contradict the settings button. */}
+          <button
+            className="icon-btn"
+            onClick={() => void checkForUpdates()}
+            disabled={updateCheck.status === 'checking'}
+            title="Проверить обновления"
+            aria-label="Проверить обновления"
+          >
+            {updateCheck.status === 'checking' ? '⏳' : '↻'}
+          </button>
           <button
             className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
             onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
@@ -615,6 +652,12 @@ export function Main() {
       {justSaved && (
         <div className="toast toast--success" role="status">
           ✓ Сохранено и зашифровано
+        </div>
+      )}
+
+      {receivedCount !== null && (
+        <div className="toast toast--success" role="status">
+          ✓ Получено с других устройств: {receivedCount}
         </div>
       )}
 

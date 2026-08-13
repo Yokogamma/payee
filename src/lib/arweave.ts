@@ -549,10 +549,30 @@ export interface RestoreKeyring {
   safeboxSecret: CryptoKey;
 }
 
+/**
+ * The GraphQL index could not be reached AT ALL: the very FIRST page failed
+ * while the caller was still interested. Nothing was retrieved, so reporting a
+ * PARTIAL sweep would be a lie — a plain offline device would be told «часть
+ * данных недоступна» instead of «не удалось».
+ *
+ * Deliberately NOT raised on `signal.aborted`: a lock/reset cancels the sweep
+ * through the SAME signal a timeout uses (requestSignal composes both with
+ * AbortSignal.any), so the two are indistinguishable by error type. An aborted
+ * sweep keeps the silent path — its caller already stood down, and turning that
+ * into a throw would log a failure for a perfectly normal lock.
+ */
+export class ArweaveIndexUnavailableError extends Error {
+  constructor() {
+    super('Arweave GraphQL index unreachable');
+    this.name = 'ArweaveIndexUnavailableError';
+  }
+}
+
 /** Result of a restore sweep. `incomplete` = some pages or payloads could not
  *  be FETCHED (network/gateway) — real records may be missing, tell the user.
  *  Garbage/replay candidates that fail validation or decryption are intentional
- *  skips and do NOT set the flag. */
+ *  skips and do NOT set the flag. A total failure of the FIRST page is NOT
+ *  reported here at all — it throws ArweaveIndexUnavailableError. */
 export interface FetchAllNotesResult {
   notes: RestoredNote[];
   safeboxEntries: RestoredSafeboxEntry[];
@@ -605,6 +625,11 @@ export async function fetchAllNotes(
       edges = page.edges;
       hasNextPage = page.hasNextPage;
     } catch {
+      // FIRST page + the caller still wants the answer → the index is simply
+      // unreachable and NOTHING was collected. Hard failure, not «partial».
+      // `cursor === null` identifies the first iteration; the abort check keeps
+      // a lock/reset on the old silent path (see ArweaveIndexUnavailableError).
+      if (cursor === null && !signal?.aborted) throw new ArweaveIndexUnavailableError();
       incomplete = true; // pagination failed — remaining pages unreachable
       break;
     }
