@@ -1317,6 +1317,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         sessionStorage.removeItem(SESSION_STORAGE_KEY);
         dropLegacyPlaintextDraft(sessionStorage);
         setScreen('pin');
+        // A page that WOKE UP HIDDEN raised the gate on mount (the session seed
+        // made vaultPresentInTab() true). This branch just took that seed away,
+        // so nothing can lower the gate afterwards: lockApp() returns on its
+        // first line without a vault. Lower it here — a locked app holds no
+        // plaintext, so no gate may cover it. Without this the user meets a
+        // blank page with a lone padlock and only a full restart clears it.
+        setLockGate(false);
         return;
       }
 
@@ -1528,7 +1535,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // in flight (PIN unlock / restore preparing, not yet committed) COUNTS:
     // ignoring the lock would let the open complete right after it, publishing
     // a vault the user just ordered locked everywhere.
-    if (!vaultPresentInTab()) return;
+    if (!vaultPresentInTab()) {
+      // Nothing to lock — but the gate may still be UP from a hidden edge
+      // whose vault has since gone away. Every caller in evaluateReturn
+      // delegates the gate to this function, so returning silently here
+      // strands the user behind an opaque overlay that only a full restart
+      // clears. Close the section first (defensive — an unlocked safebox
+      // without a vault should be impossible), then uncover.
+      if (safeboxUnlockedRef.current) lockSafeboxNow();
+      setLockGate(false);
+      return;
+    }
 
     // Supersedes any pending return-verdict and owns the gate: the locked UI
     // is non-sensitive, so no gate may be left covering it.

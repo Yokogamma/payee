@@ -297,6 +297,84 @@ describe('decideBootstrapLock wiring', () => {
   });
 });
 
+// ─── Regression: a gate left covering the screen it was meant to guard ──
+//
+// Reported from production: after a long idle the app opens as a blank page
+// with a single padlock, and ONLY a full restart clears it. That padlock is
+// the privacy gate — nobody lowered it.
+//
+// The sequence needs the page to WAKE UP HIDDEN (Android reloads a
+// backgrounded PWA): the mount block sees `hidden` plus a session seed and
+// raises the gate, then the bootstrap lock decision drops the seed and lands
+// on 'pin' — without touching the gate. From that point `lockApp()` cannot
+// rescue it either: it returns on its first line, because `vaultPresentInTab()`
+// is no longer true once the seed is gone.
+//
+// The invariant both halves must keep: a LOCKED app holds no plaintext, so no
+// gate may cover it.
+describe('privacy gate never outlives the screen it covers', () => {
+  // Visibility is restored by the file-level afterEach — which resets the
+  // property WITHOUT dispatching, so no teardown event reaches a half-unmounted
+  // provider.
+
+  async function seedLockedWakeup() {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 300);
+    sessionStorage.setItem(SESSION_KEY, MN);
+    sessionStorage.setItem(HIDDEN_AT_KEY, String(Date.now() - 301_000));
+    setVisibility('hidden'); // no listeners yet — this is the pre-render state
+  }
+
+  it('bootstrap locks while hidden: PIN screen is reachable, gate is down', async () => {
+    await seedLockedWakeup();
+
+    renderStore();
+    await untilReady();
+
+    expect(store.screen).toBe('pin');
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull(); // seed dropped by the lock
+    await waitFor(() => expect(gateUp()).toBe(false));
+  });
+
+  it('and the gate is still down after the user brings the app forward', async () => {
+    await seedLockedWakeup();
+
+    renderStore();
+    await untilReady();
+
+    await act(async () => { setVisibility('visible'); });
+
+    await waitFor(() => expect(gateUp()).toBe(false));
+    expect(store.screen).toBe('pin');
+  });
+
+  // Contract test, not a reproduction. Three call sites in `evaluateReturn`
+  // delegate the gate to lockApp() on the strength of its own comment — «the
+  // locked UI is non-sensitive, so no gate may be left covering it». That
+  // promise silently lapses when the vault is already gone, because lockApp
+  // returns on its first line. Pin the promise so the next path that clears a
+  // vault under a raised gate cannot re-create the production lockout above.
+  it('lockApp() lowers the gate even when there is no vault left to lock', async () => {
+    await setMeta('init', true);
+    renderStore();
+    await untilReady();
+    expect(store.screen).toBe('restore'); // no session, no PIN — nothing open
+
+    // A session seed alone makes vaultPresentInTab() true, which is what lets
+    // the hidden edge raise the gate (same condition the mount block uses).
+    sessionStorage.setItem(SESSION_KEY, MN);
+    await act(async () => { setVisibility('hidden'); });
+    expect(gateUp()).toBe(true);
+
+    // …and now the seed goes away, exactly as the bootstrap lock branch does.
+    sessionStorage.removeItem(SESSION_KEY);
+    act(() => { store.lockApp(); });
+
+    expect(gateUp()).toBe(false);
+  });
+});
+
 // ─── Lifecycle: hidden → visible with «Сразу» (§5) ──────────────────
 
 describe('auto-lock on return to foreground', () => {
