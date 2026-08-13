@@ -98,6 +98,7 @@ import {
   commitSafeboxPinWrite,
   safeboxLockSeconds,
   SafeboxConfigChangedError,
+  StorageResetError,
   getAllSyncRecords,
   getRecordsByStatus,
   getSyncRecord,
@@ -2196,7 +2197,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Upsert the note payload + confirmed sync state atomically. The
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
-        await mergeRestoredNote(remote.encrypted, remote.txId, Date.now());
+        await mergeRestoredNote(remote.encrypted, remote.txId, Date.now(), myDbGen);
 
         if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
         if (vaultEpochRef.current !== myEpoch) return;
@@ -2236,7 +2237,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       for (const remote of remoteSafebox) {
         if (vaultEpochRef.current !== myEpoch) return;
         if (getDbGeneration() !== myDbGen) return;
-        await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now());
+        await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now(), myDbGen);
         safeboxMerged++;
         // Claim BEFORE the id joins the known set, so several new versions of
         // one root still count their root exactly once.
@@ -2283,7 +2284,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         });
       }
     } catch (err) {
-      // A lock/reset does NOT land here: fetchAllNotes stays silent when the
+      // A wipe is not a failed sweep: the merge refused to write because the
+      // database this run belonged to no longer exists. Stand down silently,
+      // exactly like an aborted sweep — reporting an error here would blame the
+      // network for the user's own «Удалить всё».
+      if (err instanceof StorageResetError) return;
+      // A lock does NOT land here either: fetchAllNotes stays silent when the
       // caller's signal aborted, and every state write below is epoch-gated.
       console.error(mode === 'restore' ? 'restoreFromArweave failed:' : 'checkForUpdates failed:', err);
       if (vaultEpochRef.current !== myEpoch) return;

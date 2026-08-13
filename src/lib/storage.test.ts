@@ -17,6 +17,8 @@ import {
   setMeta,
   getPinConfigMeta,
   clearPinConfigMeta,
+  getDbGeneration,
+  StorageResetError,
   type SyncRecord,
 } from './storage';
 
@@ -75,7 +77,7 @@ describe('mergeRestoredNote (restore repair)', () => {
   it('repairs an EXISTING note that has no SyncRecord: writes confirmed', async () => {
     // The old-version-restore scenario: note present, sync state missing.
     await saveNote(NOTE);
-    await mergeRestoredNote(NOTE, 'tx-m1', 100);
+    await mergeRestoredNote(NOTE, 'tx-m1', 100, getDbGeneration());
 
     // Now confirmed → syncPendingNotes' skip-set covers it (no re-upload).
     const confirmed = await getRecordsByStatus('confirmed');
@@ -89,7 +91,7 @@ describe('mergeRestoredNote (restore repair)', () => {
   });
 
   it('writes a brand-new note atomically with its confirmed record', async () => {
-    await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100);
+    await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100, getDbGeneration());
     expect(await getNoteById('m2')).toBeDefined();
     expect((await getRecordsByStatus('confirmed')).some(r => r.noteId === 'm2')).toBe(true);
   });
@@ -101,7 +103,7 @@ describe('mergeRestoredNote (restore repair)', () => {
     await saveNoteWithSync({ noteId: 'm3', ciphertext: 'CORRUPTED', iv: 'iv', createdAt: 1 },
       { noteId: 'm3', kind: 'note', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
 
-    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100);
+    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100, getDbGeneration());
 
     expect((await getNoteById('m3'))?.ciphertext).toBe('GOOD-ONCHAIN'); // payload repaired
     const rec = (await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm3');
@@ -111,8 +113,28 @@ describe('mergeRestoredNote (restore repair)', () => {
   it('upgrades a non-terminal sync record (e.g. error) to confirmed', async () => {
     await saveNoteWithSync({ ...NOTE, noteId: 'm4' },
       { noteId: 'm4', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 1 });
-    await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100);
+    await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100, getDbGeneration());
     expect((await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm4')?.txId).toBe('tx-m4');
+  });
+
+  it('a reset landing INSIDE the merge (between the sync read and the write) writes nothing', async () => {
+    // The caller's pre-merge generation check cannot cover this: `await
+    // getSyncRecord()` is a real suspension point. Starting the merge and then
+    // resetting hits exactly that window — resetAll bumps the generation and
+    // creates its clear transaction while the merge is parked on the read.
+    const gen = getDbGeneration();
+    // The handler is attached SYNCHRONOUSLY: the rejection lands during the
+    // resetAll below, and a bare pending promise would surface as an unhandled
+    // rejection before the assertion ever gets to look at it.
+    const merge = mergeRestoredNote({ ...NOTE, noteId: 'm5' }, 'tx-m5', 100, gen)
+      .then(() => null, (e: unknown) => e);
+    await resetAll();
+
+    // Data first: «nothing was resurrected» is the invariant; the typed error
+    // is only the mechanism that enforces it.
+    expect(await getNoteById('m5')).toBeUndefined();
+    expect(await getAllSyncRecords()).toHaveLength(0);
+    expect(await merge).toBeInstanceOf(StorageResetError);
   });
 });
 
@@ -347,7 +369,7 @@ describe('SyncRecord.terminalError round-trip', () => {
 describe('v3 EncryptedNote round-trip', () => {
   it('stores and merges a v3 record like any other version', async () => {
     const note = { noteId: 'v3n', ciphertext: 'c', iv: 'iv', createdAt: 9, v: 3 as const };
-    await mergeRestoredNote(note, 'TX-V3', 10);
+    await mergeRestoredNote(note, 'TX-V3', 10, getDbGeneration());
     expect((await getNoteById('v3n'))?.v).toBe(3);
     expect((await getSyncRecord('v3n'))?.status).toBe('confirmed');
   });
