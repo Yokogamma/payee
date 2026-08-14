@@ -91,12 +91,13 @@ body {
   overflow: hidden;
 }
 
+/* Width lives on the SCREENS, not here: the main screen grows to fit a side
+   rail on a wide viewport, and widening .app would drag the landing, the
+   onboarding, the restore flow and the PIN screen along with it. */
 .app {
   height: 100%;
   /* iOS PWA: dynamic viewport height tracks the collapsing browser chrome */
   height: 100dvh;
-  max-width: 640px;
-  margin: 0 auto;
   display: flex;
   flex-direction: column;
   /* Keep content out of the notch / home-indicator (viewport-fit=cover) */
@@ -108,8 +109,12 @@ body {
 
 /* ─── Shared ────────────────────────────────────────────────── */
 
+/* Every non-main screen. Carries the width .app used to own. */
 .screen-center {
   height: 100%;
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -419,11 +424,39 @@ h1 {
 
 /* ─── Main Screen ───────────────────────────────────────────── */
 
+/* Grid, not a flex column. On a wide viewport the nav becomes a full-height
+   left rail; with three loose flex siblings `flex-direction: row` would turn
+   the header into a column of its own instead. Toasts and modal overlays are
+   position:fixed, so they never become grid items. */
 .main-screen {
+  display: grid;
+  grid-template-areas: "top" "content" "nav";
+  grid-template-rows: auto 1fr auto;
+  height: 100%;
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  overflow: hidden;
+}
+
+.main-top { grid-area: top; min-width: 0; }
+
+.main-content {
+  grid-area: content;
   display: flex;
   flex-direction: column;
-  height: 100%;
+  min-height: 0; /* let .notes-feed scroll instead of stretching the grid row */
+  min-width: 0;
   overflow: hidden;
+}
+
+@media (min-width: 768px) {
+  .main-screen {
+    grid-template-areas: "nav top" "nav content";
+    grid-template-columns: 220px 1fr;
+    grid-template-rows: auto 1fr;
+    max-width: 980px;
+  }
 }
 
 .main-header {
@@ -1712,3 +1745,74 @@ mark {
 .pwgen-modes { display: flex; gap: 6px; }
 .pwgen-sets { display: flex; gap: 12px; flex-wrap: wrap; }
 .pwgen-length { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+
+/* ─── Section navigation (bottom bar / side rail) ───────────── */
+
+/* A GRID CHILD, never position:fixed — two reasons.
+   1. A fixed bottom bar on iOS is covered or displaced by the software
+      keyboard the moment the composer takes focus.
+   2. No z-index at all: .lock-gate sits at z-index 100 and beats
+      .modal-overlay ONLY on source order (see the LOAD-BEARING note there).
+      Anything here at >= 100 would paint over the privacy gate — a silent
+      security regression. */
+.app-nav {
+  grid-area: nav;
+  display: flex;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  min-width: 0;
+}
+
+.app-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  /* a11y: ≥44px touch target, same floor as .icon-btn */
+  min-height: 44px;
+  padding: 8px 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--text-dim);
+  transition: color 0.15s;
+}
+
+.app-nav-item svg {
+  width: 20px;
+  height: 20px;
+}
+
+.app-nav-item:hover { color: var(--text); }
+.app-nav-item--active { color: var(--accent); }
+
+/* Nothing behind this section yet. DIMMED, never `disabled`: it is the only
+   route into activation, and the state is in the accessible name too. */
+.app-nav-item--dim { opacity: 0.55; }
+
+.app-nav-label { white-space: nowrap; }
+
+@media (min-width: 768px) {
+  .app-nav {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    padding: 12px 8px;
+    border-top: none;
+    border-right: 1px solid var(--border);
+  }
+  .app-nav-item {
+    flex: 0 0 auto;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+  }
+  .app-nav-item--active { background: var(--bg-hover); }
+}

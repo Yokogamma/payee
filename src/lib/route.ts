@@ -24,7 +24,7 @@
 
 import { useSyncExternalStore } from 'react';
 
-export const SECTIONS = ['notes', 'safebox'] as const;
+export const SECTIONS = ['notes', 'safebox', 'settings'] as const;
 export type Section = (typeof SECTIONS)[number];
 export const DEFAULT_SECTION: Section = 'notes';
 
@@ -100,6 +100,31 @@ export function navigate(section: Section, opts: { replace?: boolean } = {}): vo
   if (opts.replace) window.history.replaceState(state, '', next);
   else window.history.pushState(state, '', next);
   emit();
+}
+
+/**
+ * Leave a section that behaves like an overlay (settings), returning the user
+ * where they actually came from.
+ *
+ * An unconditional `navigate(fallback, {replace:true})` would look right and
+ * quietly break Back: after `notes → settings`, replacing leaves the stack as
+ * `notes → notes`, so the next system Back appears to do nothing.
+ *
+ * So: if THIS app pushed the current entry, step back over it — which also
+ * returns to the previous SECTION (came from the safebox, land in the safebox)
+ * rather than always dumping the user in notes. If the entry is not ours — a
+ * deep link or a reload straight onto `#/settings` — there is nothing behind
+ * it and `back()` would leave the app entirely, so replace instead.
+ *
+ * Known edge, accepted: if the user reached settings by pressing system Back
+ * (over an entry we pushed earlier), the marker still says "ours" and `back()`
+ * moves somewhere other than where they opened it from. Rare enough not to
+ * warrant synthetic history entries.
+ */
+export function leaveSection(fallback: Section = DEFAULT_SECTION): void {
+  const state = window.history.state as RouteHistoryState | null;
+  if (state?.enSection) window.history.back();
+  else navigate(fallback, { replace: true });
 }
 
 /**
