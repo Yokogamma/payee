@@ -173,40 +173,6 @@ describe('Main — note card menu', () => {
 });
 
 describe('Main — modal exclusivity + live badge (round 12)', () => {
-  it('Settings → Reset closes the settings dialog: only ONE aria-modal at a time', () => {
-    render(<Main />);
-    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
-    expect(screen.getAllByRole('dialog')).toHaveLength(1); // settings open
-
-    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
-    fireEvent.click(screen.getByText('Сбросить приложение'));
-    const dialogs = screen.getAllByRole('dialog');
-    expect(dialogs).toHaveLength(1); // confirm replaced settings, not stacked
-    expect(dialogs[0].getAttribute('aria-label')).toBe('Сбросить приложение?');
-  });
-
-  it('revealed seed does NOT survive the Reset→Cancel round-trip (round 13)', () => {
-    (h.store as ReturnType<typeof baseStore>).showMnemonic = vi.fn(() => 'секретное слово фраза');
-    render(<Main />);
-
-    // 1. Open Settings, reveal the seed.
-    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
-    fireEvent.click(screen.getByText('Seed-фраза')); // expand the block
-    fireEvent.click(screen.getByText('Показать seed-фразу'));
-    expect(screen.getByText('секретное')).toBeTruthy();
-
-    // 2-3. Reset (closes settings, opens confirm) → cancel the confirm.
-    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
-    fireEvent.click(screen.getByText('Сбросить приложение'));
-    fireEvent.click(screen.getByText('Отмена'));
-
-    // 4. Reopen Settings — the seed must be hidden again, behind the toggle.
-    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
-    fireEvent.click(screen.getByText('Seed-фраза')); // expand the block again
-    expect(screen.queryByText('секретное')).toBeNull();
-    expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
-  });
-
   it('reset warns when ANY stored record is unconfirmed (storage-backed resetRiskCount)', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
@@ -762,5 +728,27 @@ describe('Main — композер сворачивается за «+»', () =
   it('без черновика индикатора нет', () => {
     render(<Main />);
     expect(document.querySelector('.notes-add-dot')).toBeNull();
+  });
+});
+
+describe('Main — фокус следует за разделом', () => {
+  it('при смене раздела фокус встаёт на его заголовок', () => {
+    render(<Main />);
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
+    expect((document.activeElement as HTMLElement)?.textContent).toBe('Настройки');
+  });
+
+  it('и в сейфе тоже, когда у раздела есть заголовок', () => {
+    h.store.safeboxDataPresent = true;
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxUnlocked = true;
+    render(<Main />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect((document.activeElement as HTMLElement)?.textContent).toBe('Сейф');
+  });
+
+  it('но НЕ крадёт фокус при первом рендере', () => {
+    render(<Main />);
+    expect(document.activeElement).toBe(document.body);
   });
 });

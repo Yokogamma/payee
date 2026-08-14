@@ -149,7 +149,7 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
   return (
     <div className="safebox-section" onPointerDown={touchSafebox} onKeyDown={touchSafebox}>
       <div className="safebox-topbar">
-        <h2>🔐 Сейф</h2>
+        <h2 className="section-title" tabIndex={-1}>Сейф</h2>
         <div className="header-right">
           {SAFEBOX_WRITER_ENABLED && (
             <button
