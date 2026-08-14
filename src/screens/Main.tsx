@@ -9,8 +9,9 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
-import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from '../lib/flags';
-import { useRoute, navigate, canonicalHash } from '../lib/route';
+import { V3_WRITER_ENABLED } from '../lib/flags';
+import { useRoute, navigate, canonicalHash, leaveSection } from '../lib/route';
+import { AppNav } from '../components/AppNav';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
@@ -59,9 +60,7 @@ export function Main() {
     resumeV3Uploads,
     safeboxPinConfigured,
     safeboxDataPresent,
-    safeboxUnlocked,
     safeboxLockGeneration,
-    lockSafebox,
   } = useNotes();
 
   // The section lives in the address, not in local state: the Android system
@@ -70,9 +69,14 @@ export function Main() {
   // change that `view` alone would hide (`#/notes` → `#/garbage` parses to the
   // same section).
   const { hash, section: view } = useRoute();
-  // Entry-point visibility (R4 contract): on W4 everyone can activate; on R4
-  // only devices that already hold safebox data or a PIN configuration.
-  const safeboxVisible = SAFEBOX_WRITER_ENABLED || safeboxDataPresent || safeboxPinConfigured;
+  // The safebox item is ALWAYS in the nav — the visibility formula is gone.
+  // A section that appears and disappears makes the layout jump the moment a
+  // user activates it, and it hid the only route to activation. It is dimmed
+  // (never disabled) while there is nothing behind it yet.
+  const safeboxDimmed = !safeboxPinConfigured && !safeboxDataPresent;
+  // Settings is a section now, so notes stay mounted behind its overlay.
+  const notesVisible = view !== 'safebox';
+  const settingsOpen = view === 'settings';
 
   const [text, setText] = useState('');
   // Blocks the persist mirror from CLEARING the stored draft while the initial
@@ -83,7 +87,6 @@ export function Main() {
   // composer from «набрал и стёр» — hydration must lose to both (§2 dirty guard).
   const draftDirtyRef = useRef(false);
   const [showSearch, setShowSearch] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -127,8 +130,8 @@ export function Main() {
     if (handledCheckAtRef.current === updateCheck.at) return;
     handledCheckAtRef.current = updateCheck.at;
     const total = updateCheck.addedNotes + updateCheck.updatedNotes + updateCheck.changedSafebox;
-    if (total > 0 && !showSettings) setReceivedCount(total);
-  }, [updateCheck, showSettings]);
+    if (total > 0 && !settingsOpen) setReceivedCount(total);
+  }, [updateCheck, settingsOpen]);
 
   useEffect(() => {
     if (receivedCount === null) return;
@@ -332,6 +335,11 @@ export function Main() {
 
   return (
     <div className="main-screen">
+      {/* Grid areas, not a flat flex column: on a wide screen the nav becomes a
+          full-height left rail, and three loose siblings would each turn into a
+          column instead. Toasts and modal overlays are position:fixed, so they
+          never become grid items. */}
+      <div className="main-top">
       {/* Restoring Banner */}
       {restoring && (
         <div className="restoring-banner" role="status" aria-live="polite">
@@ -436,27 +444,10 @@ export function Main() {
           )}
         </div>
         <div className="header-right">
-          {safeboxVisible && (
-            <button
-              className={`icon-btn ${view === 'safebox' ? 'icon-btn--active' : ''}`}
-              onClick={() => navigate(view === 'safebox' ? 'notes' : 'safebox')}
-              title="Защищённый сейф"
-              aria-label="Защищённый сейф"
-              aria-pressed={view === 'safebox'}
-            >
-              🔐
-            </button>
-          )}
-          {safeboxUnlocked && (
-            <button
-              className="icon-btn"
-              onClick={lockSafebox}
-              title="Закрыть сейф"
-              aria-label="Закрыть сейф"
-            >
-              🔒
-            </button>
-          )}
+          {/* The 🔐 entry point and the duplicate 🔒 lock are gone: the section
+              lives in the nav, and «Закрыть сейф» stays where it belongs —
+              inside the section it locks. Two near-identical padlocks in one
+              header is what made «locked» and «left» indistinguishable. */}
           {/* Shown unconditionally: the check works with sync disabled too, so
               hiding it behind the toggle would contradict the settings button. */}
           <button
@@ -478,17 +469,11 @@ export function Main() {
           >
             🔍
           </button>
-          <button
-            className="icon-btn"
-            onClick={() => setShowSettings(true)}
-            title="Настройки"
-            aria-label="Настройки"
-          >
-            ⚙️
-          </button>
         </div>
       </header>
+      </div>
 
+      <div className="main-content">
       {/* KEYED ON THE LOCK GENERATION: every section lock (including a
           hidden/pagehide edge with the section already locked) remounts the
           whole subtree, so no local secret state — a half-typed PIN, or the
@@ -523,7 +508,7 @@ export function Main() {
 
       {/* Input — the shared controlled composer; draft
           hydration/persistence stays HERE (value/onChange above). */}
-      <div className="note-input-wrap" hidden={view !== 'notes'}>
+      <div className="note-input-wrap" hidden={!notesVisible}>
         <NoteComposer
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
@@ -542,7 +527,7 @@ export function Main() {
       </div>
 
       {/* Feed — one card per version chain; fields come from chain.current. */}
-      <div className="notes-feed" hidden={view !== 'notes'}>
+      <div className="notes-feed" hidden={!notesVisible}>
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
             <div className="empty-icon">📝</div>
@@ -674,6 +659,7 @@ export function Main() {
           })
         )}
       </div>
+      </div>
 
       {/* PWA update toast (Phase 8): controlled activation, never silent */}
       {updateReady && !updateDismissed && (
@@ -715,7 +701,7 @@ export function Main() {
       )}
 
       {/* Global sync-error toast (visible outside the settings modal) */}
-      {arweave.enabled && arweave.lastError && !showSettings && (
+      {arweave.enabled && arweave.lastError && !settingsOpen && (
         <div className="toast toast--error" role="alert">
           <span>⚠️ {arweave.lastError}</span>
           <button className="banner-btn" onClick={retrySync} disabled={arweave.syncing}>
@@ -733,15 +719,24 @@ export function Main() {
       )}
 
       {/* Settings Modal (extracted — 7.3) */}
+      {/* Derived from the route, not from its own boolean: with two sources of
+          truth the address, the Back gesture and the panel drift apart, which
+          is the very confusion this redesign removes. Becomes a real section in
+          stage 4; the modal is the intermediate. */}
       <SettingsModal
-        open={showSettings}
-        onClose={() => setShowSettings(false)}
+        open={view === 'settings'}
+        onClose={() => leaveSection()}
         theme={theme}
         onThemeChange={setTheme}
         onRequestReset={() => {
           // Never two aria-modal dialogs at once: their Escape handlers and
           // focus traps would compete. Settings closes before the confirm opens.
-          setShowSettings(false);
+          //
+          // `replace`, not leaveSection(): history.back() resolves on a later
+          // task, so the confirm would open while settings is still up. This
+          // path is not «go back» anyway — it hands the user to a destructive
+          // flow that ends on the landing screen.
+          navigate('notes', { replace: true });
           setShowResetConfirm(true);
         }}
       />
@@ -781,6 +776,8 @@ export function Main() {
         onConfirm={confirmRestore}
         onCancel={cancelRestore}
       />
+
+      <AppNav safeboxDimmed={safeboxDimmed} />
     </div>
   );
 }

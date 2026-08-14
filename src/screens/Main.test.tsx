@@ -170,7 +170,7 @@ describe('Main — note card menu', () => {
 describe('Main — modal exclusivity + live badge (round 12)', () => {
   it('Settings → Reset closes the settings dialog: only ONE aria-modal at a time', () => {
     render(<Main />);
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     expect(screen.getAllByRole('dialog')).toHaveLength(1); // settings open
 
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
@@ -185,7 +185,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     render(<Main />);
 
     // 1. Open Settings, reveal the seed.
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Seed-фраза')); // expand the block
     fireEvent.click(screen.getByText('Показать seed-фразу'));
     expect(screen.getByText('секретное')).toBeTruthy();
@@ -196,7 +196,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     fireEvent.click(screen.getByText('Отмена'));
 
     // 4. Reopen Settings — the seed must be hidden again, behind the toggle.
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Seed-фраза')); // expand the block again
     expect(screen.queryByText('секретное')).toBeNull();
     expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
@@ -208,7 +208,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.resetRisk = { notes: 1, safebox: 0 }; // e.g. accepted-but-unconfirmed — can still drop
     render(<Main />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -229,7 +229,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.resetRisk = { notes: 1, safebox: 0 }; // …but storage says otherwise
     render(<Main />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -245,7 +245,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.resetRisk = { notes: 0, safebox: 0 };
     render(<Main />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -258,7 +258,7 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.countsReady = false;   // placeholder state right after bootstrap
     render(<Main />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -434,44 +434,85 @@ describe('Main — R3 (writer OFF) surface', () => {
   });
 });
 
-describe('Main — safebox entry point (R4 visibility formula)', () => {
-  it('is HIDDEN on R4 when the device has neither data nor a PIN config', () => {
+describe('Main — пункт сейфа в навигации', () => {
+  // The old visibility formula (SAFEBOX_WRITER_ENABLED || data || pinConfig) is
+  // gone: a section that appears and disappears made the layout jump the moment
+  // a user activated it, and it hid the only route INTO activation.
+  it('присутствует всегда — даже без данных и без PIN', () => {
     render(<Main />);
-    expect(screen.queryByLabelText('Защищённый сейф')).toBeNull();
+    expect(screen.getByRole('button', { name: /Сейф/ })).toBeTruthy();
   });
 
-  it('appears when safebox DATA exists (a restored/rolled-back device)', () => {
+  it('приглушён, когда за ним ничего нет, но НИКОГДА не disabled', () => {
+    render(<Main />);
+    const item = screen.getByRole('button', { name: /Сейф/ });
+    expect(item.className).toContain('app-nav-item--dim');
+    // `disabled` would strand a new user: this is the only way into activation.
+    expect((item as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('состояние читается вслух, а не только видно', () => {
+    render(<Main />);
+    expect(screen.getByRole('button', { name: 'Сейф, не настроен' })).toBeTruthy();
+  });
+
+  it('не приглушён, когда есть данные', () => {
     h.store.safeboxDataPresent = true;
     render(<Main />);
-    expect(screen.getByLabelText('Защищённый сейф')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Сейф/ }).className).not.toContain('app-nav-item--dim');
   });
 
-  it('appears when a PIN CONFIG exists even with no entries yet', () => {
+  it('не приглушён, когда настроен PIN, даже без записей', () => {
     h.store.safeboxPinConfigured = true;
     render(<Main />);
-    expect(screen.getByLabelText('Защищённый сейф')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Сейф/ }).className).not.toContain('app-nav-item--dim');
   });
 
   it('switching to the safebox hides the notes composer and feed', () => {
     h.store.safeboxDataPresent = true;
     const { container } = render(<Main />);
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
     expect(container.querySelector('.note-input-wrap')?.hasAttribute('hidden')).toBe(true);
     expect(container.querySelector('.notes-feed')?.hasAttribute('hidden')).toBe(true);
   });
 
-  it('offers a one-tap safebox lock while the section is unlocked', () => {
+  it('«Закрыть сейф» живёт ВНУТРИ раздела — в шапке дубля больше нет', () => {
     h.store.safeboxDataPresent = true;
+    h.store.safeboxPinConfigured = true; // otherwise the section shows activation
     h.store.safeboxUnlocked = true;
     render(<Main />);
-    fireEvent.click(screen.getByLabelText('Закрыть сейф'));
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    fireEvent.click(screen.getByText('🔒 Закрыть сейф'));
     expect(h.store.lockSafebox).toHaveBeenCalled();
+  });
+
+  // ── СООБЩЁННЫЙ С ПРОДА БАГ ──
+  // «Закрыть сейф» запирал раздел и не выпускал: PIN-пад без единого выхода,
+  // потому что замок и навигация были одной осью. Этот тест — граница.
+  it('после «Закрыть сейф» навигация на месте и «Заметки» открываются', () => {
+    h.store.safeboxDataPresent = true;
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxUnlocked = true;
+    const { container, rerender } = render(<Main />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    fireEvent.click(screen.getByText('🔒 Закрыть сейф'));
+
+    // The store spy does not flip the flag on its own — model the lock landing.
+    h.store.safeboxUnlocked = false;
+    rerender(<Main />);
+    expect(container.querySelector('.safebox-section')).toBeTruthy(); // PIN-пад
+
+    // The exit survived the lock.
+    const notesItem = screen.getByRole('button', { name: 'Заметки' });
+    expect((notesItem as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(notesItem);
+    expect(container.querySelector('.notes-feed')?.hasAttribute('hidden')).toBe(false);
   });
 
   it('the reset warning counts LOCKED safebox entries as at risk', () => {
     h.store.arweave.resetRisk = { notes: 0, safebox: 2 };
     render(<Main />);
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения'));
     fireEvent.click(screen.getByText('Сбросить приложение'));
     expect(screen.getByText(/2 записей ещё НЕ подтверждены/)).toBeTruthy();
@@ -484,7 +525,7 @@ describe('Main — the safebox subtree is remounted on every lock', () => {
     h.store.safeboxDataPresent = true;      // activation form (with the seed grid)
     h.store.safeboxLockGeneration = 1;
     const { rerender } = render(<Main />);
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
 
     const pin = document.querySelector('#sbx-new-code') as HTMLInputElement;
     fireEvent.change(pin, { target: { value: '135790' } });
@@ -539,7 +580,7 @@ describe('Main — «Проверить обновления» в шапке', (
 
   it('проверка, завершившаяся при ОТКРЫТЫХ настройках, не всплывает тостом после их закрытия', () => {
     const { rerender } = render(<Main />);
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
 
     // Finishes while the panel is open — the panel's own result line reports it.
     h.store.updateCheck = done({ addedNotes: 2 });
@@ -564,12 +605,13 @@ describe('Main — раздел в адресе', () => {
     expect(inSafebox(container)).toBe(true);
   });
 
-  it('переключатель пишет адрес, а не локальный стейт', () => {
+  it('навигация пишет адрес, а не локальный стейт', () => {
     h.store.safeboxDataPresent = true;
     render(<Main />);
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
     expect(window.location.hash).toBe('#/safebox');
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    // A nav item navigates; it does not toggle back on a second press.
+    fireEvent.click(screen.getByRole('button', { name: 'Заметки' }));
     expect(window.location.hash).toBe('#/notes');
   });
 
@@ -595,7 +637,7 @@ describe('Main — раздел в адресе', () => {
   it('системная «назад» из сейфа возвращает в заметки', async () => {
     h.store.safeboxDataPresent = true;
     const { container } = render(<Main />);
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
     expect(inSafebox(container)).toBe(true);
 
     // jsdom's history.back() is async and flaky; the mechanism under test is
@@ -608,7 +650,7 @@ describe('Main — раздел в адресе', () => {
   });
 
   it('неизвестный раздел из БУДУЩЕЙ сборки не рисует пустоту (случай отката)', async () => {
-    window.history.replaceState(null, '', '#/settings');
+    window.history.replaceState(null, '', '#/feed');
     const { container } = render(<Main />);
     await waitFor(() => expect(window.location.hash).toBe('#/notes'));
     expect(container.querySelector('.notes-feed')).toBeTruthy();
