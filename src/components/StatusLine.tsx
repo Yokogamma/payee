@@ -152,7 +152,15 @@ export function StatusLine() {
   return (
     <div className={`status-line status-line--${rung.tone}`}>
       <span className="status-dot" aria-hidden="true" />
-      <span className="status-text" role={rung.tone === 'error' ? 'alert' : 'status'} aria-live="polite">
+      {/* An explicit aria-live OVERRIDES the implicit `assertive` that comes
+          with role="alert", so setting both would announce errors politely —
+          the exact flattening this ladder must not do. Only the non-error
+          rungs get the polite hint. */}
+      <span
+        className="status-text"
+        role={rung.tone === 'error' ? 'alert' : 'status'}
+        aria-live={rung.tone === 'error' ? undefined : 'polite'}
+      >
         {rung.text}
       </span>
       {rung.action && (

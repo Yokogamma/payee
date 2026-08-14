@@ -87,6 +87,18 @@ describe('StatusLine — срочность не сглажена', () => {
   it('обычное состояние — вежливый status', () => {
     render(<StatusLine />);
     expect(text().getAttribute('role')).toBe('status');
+    expect(text().getAttribute('aria-live')).toBe('polite');
+  });
+
+  it('у ошибки НЕТ aria-live: явный polite перекрыл бы assertive от role="alert"', () => {
+    // role="alert" implies aria-live="assertive"; an explicit aria-live on the
+    // SAME element wins. Setting both would announce errors politely — the
+    // flattening this ladder exists to avoid. Asserting only the role would
+    // pass while the announcement stayed wrong.
+    s().arweave.lastError = 'сеть недоступна';
+    render(<StatusLine />);
+    expect(text().getAttribute('role')).toBe('alert');
+    expect(text().getAttribute('aria-live')).toBeNull();
   });
 
   it('partial — ПРЕДУПРЕЖДЕНИЕ, а не ошибка: что дошло, то смержено', () => {

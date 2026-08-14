@@ -132,12 +132,13 @@ describe('SafeboxSection — unlocked list', () => {
     expect(h.store.setSafeboxSearchQuery).toHaveBeenCalledWith('git');
   });
 
-  it('shows the standing v4-pause banner with a working resume button', async () => {
+  // The v4-pause banner MOVED to the status line: keeping it here as well
+  // showed the same sentence twice inside the safebox, and hid the pause from
+  // every other section. Covered by StatusLine.test.tsx («пауза v4 тоже»).
+  it('пауза v4 больше НЕ дублируется внутри секции', () => {
     h.store = { ...baseStore(), v4Paused: true };
     render(<SafeboxSection formatDate={formatDate} />);
-    expect(screen.getByText(/приостановлена/)).toBeDefined();
-    await act(async () => { fireEvent.click(screen.getByText('Возобновить')); });
-    expect(h.store.resumeV4Uploads).toHaveBeenCalled();
+    expect(screen.queryByText(/приостановлена/)).toBeNull();
   });
 
   it('warns when «Вечное хранилище» is inactive (entries are LOCAL only)', () => {
