@@ -20,6 +20,7 @@ vi.mock('../lib/store', () => ({
 vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
 
 import { Main } from './Main';
+import { resetRoute } from '../test-stubs/route-reset';
 import { groupChains } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
 
@@ -128,6 +129,7 @@ function stubClipboard(writeText: (t: string) => Promise<void>) {
 beforeEach(() => {
   h.store = baseStore();
   sessionStorage.clear();
+  resetRoute(); // the section is in location.hash and jsdom keeps one per file
 });
 afterEach(cleanup);
 
@@ -547,5 +549,68 @@ describe('Main — «Проверить обновления» в шапке', (
     // Closing must NOT resurrect the news out of context.
     fireEvent.click(screen.getByLabelText('Закрыть настройки'));
     expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
+  });
+});
+
+// ─── Stage 1: the section lives in the address ──────────────────────
+
+describe('Main — раздел в адресе', () => {
+  const inSafebox = (c: HTMLElement) => c.querySelector('.note-input-wrap')?.hasAttribute('hidden') === true;
+
+  it('открывается на разделе из адреса — перезагрузка не теряет место', () => {
+    h.store.safeboxDataPresent = true;
+    window.history.replaceState(null, '', '#/safebox');
+    const { container } = render(<Main />);
+    expect(inSafebox(container)).toBe(true);
+  });
+
+  it('переключатель пишет адрес, а не локальный стейт', () => {
+    h.store.safeboxDataPresent = true;
+    render(<Main />);
+    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    expect(window.location.hash).toBe('#/safebox');
+    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    expect(window.location.hash).toBe('#/notes');
+  });
+
+  it('мусорный хеш канонизируется, а не оставляет пустой экран', async () => {
+    window.history.replaceState(null, '', '#/zzz');
+    const { container } = render(<Main />);
+    await waitFor(() => expect(window.location.hash).toBe('#/notes'));
+    expect(inSafebox(container)).toBe(false);
+  });
+
+  it('мусор, введённый поверх АКТИВНОГО раздела, тоже канонизируется', async () => {
+    // Both hashes parse to 'notes'; only the raw hash moves. A parsed-value
+    // snapshot would skip the render and leave the junk in the address bar.
+    const { container } = render(<Main />);
+    await act(async () => {
+      window.history.replaceState(null, '', '#/zzz');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    await waitFor(() => expect(window.location.hash).toBe('#/notes'));
+    expect(inSafebox(container)).toBe(false);
+  });
+
+  it('системная «назад» из сейфа возвращает в заметки', async () => {
+    h.store.safeboxDataPresent = true;
+    const { container } = render(<Main />);
+    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    expect(inSafebox(container)).toBe(true);
+
+    // jsdom's history.back() is async and flaky; the mechanism under test is
+    // "does the app follow popstate", which this drives directly.
+    await act(async () => {
+      window.history.replaceState(null, '', '#/notes');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+    expect(inSafebox(container)).toBe(false);
+  });
+
+  it('неизвестный раздел из БУДУЩЕЙ сборки не рисует пустоту (случай отката)', async () => {
+    window.history.replaceState(null, '', '#/settings');
+    const { container } = render(<Main />);
+    await waitFor(() => expect(window.location.hash).toBe('#/notes'));
+    expect(container.querySelector('.notes-feed')).toBeTruthy();
   });
 });
