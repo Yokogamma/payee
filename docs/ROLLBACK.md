@@ -457,11 +457,12 @@ is exactly the workaround they already found.
 
 ### PIN on restore + persistent storage (client-only)
 
-**NOT DEPLOYED YET** — branch `feat/restore-pin-and-persistent-storage`.
-Local gates green: `npm run lint`, **704 client tests / 36 files** (baseline was
-643/34), production-like `npm run build` (`VITE_BASE=/`,
-`VITE_PROXY_URL=http://localhost:8787`, `VITE_TRUSTED_OWNERS=<prod owner>`).
-CI remains authoritative. Client-only; **the Worker is untouched**.
+**DEPLOYED 2026-08-14** (main `7fcc595`, PR #31) on notes.matamata.dev,
+run 31790744299 — all gates green (lint, **704 client tests / 36 files**, baseline
+was 643/34; worker typecheck + tests, staging config check, bundle budget
+182.7/186 KB gz), smoke-headers passed. Live bundle `index-B5AX2wGH.js`; CSP and
+`X-Frame-Options: DENY` verified on the origin. Client-only; **the Worker is
+untouched**.
 
 **Reported from production (desktop Chrome):** the app asks for the seed phrase
 every day instead of a PIN. Two independent causes, both fixed here:
@@ -520,7 +521,7 @@ Firefox may therefore show its permission doorhanger once, always after a button
 the user pressed; a refusal is remembered per tab (`sessionStorage`) so reloads
 do not re-ask.
 
-**Operator checks before/after rollout (NOT covered by tests):**
+**Operator checks — STILL PENDING after the rollout (NOT covered by tests):**
 - on a clean Chrome profile, BEFORE the first `persist()`, record
   `await navigator.permissions.query({name:'persistent-storage'})` → `state`,
   then after an unlock record `await navigator.storage.persisted()`. Write both
