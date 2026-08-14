@@ -1678,7 +1678,10 @@ mark {
   border-radius: var(--radius-sm);
   word-break: break-all;
 }
-.safebox-revealed code { font-family: var(--font-mono, monospace); }
+/* --mono, not --font-mono: the latter never existed, so revealed passwords
+   rendered in the UA default monospace and lost the 0/O and 1/l/I
+   disambiguation that matters most here. Guarded by check-css-vars.test.mjs. */
+.safebox-revealed code { font-family: var(--mono); }
 
 /* Entry form */
 .safebox-form { width: min(560px, 94vw); display: flex; flex-direction: column; gap: 6px; }

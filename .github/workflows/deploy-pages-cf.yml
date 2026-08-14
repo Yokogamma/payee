@@ -56,6 +56,10 @@ jobs:
       # Bundle budget: fail before deploying if the gzipped JS quietly grew
       # past the declared ceiling (see scripts/check-bundle-budget.mjs).
       - run: node scripts/check-bundle-budget.mjs
+      # Font pipeline: an inlined font is BLOCKED by `font-src 'self'` and
+      # falls back silently, and a per-weight @fontsource import silently drags
+      # in every subset. Both are invisible at runtime — hence a build gate.
+      - run: node scripts/check-no-inlined-fonts.mjs
       # ── Deploy ──
       - id: deploy
         uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
