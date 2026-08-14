@@ -60,6 +60,13 @@ export function AppNav({ safeboxDimmed }: Props) {
 
   return (
     <nav className="app-nav" aria-label="Разделы">
+      {/* The wordmark lost its home when the header went. On a wide screen the
+          rail has room for it; on a phone the section title carries the
+          context and a second title would just eat a row. */}
+      <div className="app-nav-brand" aria-hidden="true">
+        <span className="app-nav-mark">∞</span>
+        <span>Eternal Notes</span>
+      </div>
       {(Object.keys(LABELS) as Section[]).map(id => {
         const active = section === id;
         const dim = id === 'safebox' && safeboxDimmed;
