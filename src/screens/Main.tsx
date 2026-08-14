@@ -10,6 +10,7 @@ import { VersionHistoryModal, RestoreVersionDialog } from '../components/Version
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from '../lib/flags';
+import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
@@ -63,8 +64,12 @@ export function Main() {
     lockSafebox,
   } = useNotes();
 
-  // Local view switch — the safebox lives INSIDE Main, not on its own route.
-  const [view, setView] = useState<'notes' | 'safebox'>('notes');
+  // The section lives in the address, not in local state: the Android system
+  // Back gesture and a reload both have to land where the user was. `hash` is
+  // kept alongside `view` because the canonicaliser below needs to see a
+  // change that `view` alone would hide (`#/notes` → `#/garbage` parses to the
+  // same section).
+  const { hash, section: view } = useRoute();
   // Entry-point visibility (R4 contract): on W4 everyone can activate; on R4
   // only devices that already hold safebox data or a PIN configuration.
   const safeboxVisible = SAFEBOX_WRITER_ENABLED || safeboxDataPresent || safeboxPinConfigured;
@@ -130,6 +135,20 @@ export function Main() {
     const t = setTimeout(() => setReceivedCount(null), 4000);
     return () => clearTimeout(t);
   }, [receivedCount]);
+
+  // Canonicalise the address. An empty hash (first load, or an old build that
+  // never wrote one) and an unknown hash (typo, or a section a newer build had
+  // and this one does not) both PARSE to the default — this rewrites the bar to
+  // match what is actually on screen, so the two can never disagree.
+  //
+  // Keyed on the RAW hash: `#/notes → #/garbage` leaves `view` unchanged, and
+  // an effect watching only `view` would never run.
+  //
+  // `replace`, not push: a junk entry the user never chose must not become a
+  // stop on the way back.
+  useEffect(() => {
+    if (hash !== canonicalHash(view)) navigate(view, { replace: true });
+  }, [hash, view]);
 
   // Global search hotkey (8.1): Ctrl/Cmd+K toggles the search bar.
   useEffect(() => {
@@ -420,7 +439,7 @@ export function Main() {
           {safeboxVisible && (
             <button
               className={`icon-btn ${view === 'safebox' ? 'icon-btn--active' : ''}`}
-              onClick={() => setView(v => (v === 'safebox' ? 'notes' : 'safebox'))}
+              onClick={() => navigate(view === 'safebox' ? 'notes' : 'safebox')}
               title="Защищённый сейф"
               aria-label="Защищённый сейф"
               aria-pressed={view === 'safebox'}

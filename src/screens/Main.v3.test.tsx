@@ -18,6 +18,7 @@ vi.mock('../lib/store', () => ({
 vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
 
 import { Main } from './Main';
+import { resetRoute } from '../test-stubs/route-reset';
 import { groupChains } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
 
@@ -115,6 +116,7 @@ function chainNotes(): NoteData[] {
 beforeEach(() => {
   h.store = makeStore(chainNotes());
   sessionStorage.clear();
+  resetRoute(); // the section is in location.hash and jsdom keeps one per file
 });
 afterEach(cleanup);
 
