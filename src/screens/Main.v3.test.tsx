@@ -113,6 +113,11 @@ function chainNotes(): NoteData[] {
   ];
 }
 
+/** The composer is collapsed by default now — open it before typing. */
+function openComposer() {
+  fireEvent.click(screen.getByRole('button', { name: /\+ Заметка/ }));
+}
+
 beforeEach(() => {
   h.store = makeStore(chainNotes());
   sessionStorage.clear();
@@ -151,6 +156,7 @@ describe('Main W3 — markdown rendering', () => {
 describe('Main W3 — composer toolbar/preview', () => {
   it('shows the toolbar; a bold click wraps the selection', async () => {
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'слово' } });
     input.setSelectionRange(0, 5);
@@ -160,6 +166,7 @@ describe('Main W3 — composer toolbar/preview', () => {
 
   it('preview toggle renders the draft as markdown and back', () => {
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: '# Черновик' } });
     fireEvent.click(screen.getByText('Превью'));
@@ -296,6 +303,7 @@ describe('Main W3 — Ctrl+Enter works in preview mode (review fix)', () => {
   it('submits from the preview surface where the textarea is unmounted', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'из превью' } });
     fireEvent.click(screen.getByText('Превью'));

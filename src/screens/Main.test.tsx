@@ -119,6 +119,11 @@ function baseStore() {
   };
 }
 
+/** The composer is collapsed by default now — open it before typing. */
+function openComposer() {
+  fireEvent.click(screen.getByRole('button', { name: /\+ Заметка/ }));
+}
+
 function stubClipboard(writeText: (t: string) => Promise<void>) {
   Object.defineProperty(navigator, 'clipboard', {
     value: { writeText },
@@ -301,6 +306,7 @@ describe('Main — draft hydration dirty guard (§2)', () => {
     (h.store as ReturnType<typeof baseStore>).readDraft =
       vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
 
     // The user types and deletes everything while the read is in flight —
@@ -317,6 +323,7 @@ describe('Main — draft hydration dirty guard (§2)', () => {
     (h.store as ReturnType<typeof baseStore>).readDraft =
       vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
 
     fireEvent.change(input, { target: { value: 'свежий ввод' } });
@@ -326,22 +333,26 @@ describe('Main — draft hydration dirty guard (§2)', () => {
 });
 
 describe('Main — search UX', () => {
-  it('Ctrl+K opens the search bar, Escape closes it and clears the query', () => {
+  // Ctrl+K is gone with the toggle it drove: the field is part of the section
+  // now, so there is nothing to open.
+  it('поле поиска всегда на экране, без хоткея и без переключателя', () => {
     render(<Main />);
-    expect(screen.queryByPlaceholderText('Найти заметку...')).toBeNull();
-
-    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
-    const input = screen.getByPlaceholderText('Найти заметку...');
-
-    fireEvent.keyDown(input, { key: 'Escape' });
-    expect(screen.queryByPlaceholderText('Найти заметку...')).toBeNull();
-    expect((h.store as ReturnType<typeof baseStore>).setSearchQuery).toHaveBeenCalledWith('');
+    expect(screen.getByLabelText('Поиск по заметкам')).toBeTruthy();
+    expect(screen.queryByLabelText('Поиск')).toBeNull(); // старая кнопка в шапке
   });
 
-  it('Cmd+K works too (macOS)', () => {
+  it('Ctrl+K больше ничего не делает', () => {
     render(<Main />);
-    fireEvent.keyDown(window, { key: 'k', metaKey: true });
-    expect(screen.getByPlaceholderText('Найти заметку...')).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    expect(screen.getByLabelText('Поиск по заметкам')).toBeTruthy(); // ничего не изменилось
+  });
+
+  it('Escape в поле очищает запрос, а не прячет поле', () => {
+    render(<Main />);
+    const input = screen.getByLabelText('Поиск по заметкам');
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect((h.store as ReturnType<typeof baseStore>).setSearchQuery).toHaveBeenCalledWith('');
+    expect(screen.getByLabelText('Поиск по заметкам')).toBeTruthy(); // поле на месте
   });
 });
 
@@ -385,6 +396,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.addNote = vi.fn(async () => { throw new NoteTooLongError(31_000); });
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'длинный текст' } });
     fireEvent.click(screen.getByText('🔐 Сохранить'));
@@ -404,6 +416,7 @@ describe('Main — R3 (writer OFF) surface', () => {
       await new Promise(r => setTimeout(r, 30)); // first call still running
     });
     render(<Main />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'двойной клик' } });
 
@@ -414,8 +427,13 @@ describe('Main — R3 (writer OFF) surface', () => {
     // The second call must not leave a false error…
     await act(async () => { await new Promise(r => setTimeout(r, 50)); });
     expect(document.querySelector('.error-msg')).toBeNull();
-    // …and the composer is cleared exactly once — by the FIRST call's success.
-    expect(input.value).toBe('');
+    // …and the FIRST call's success both clears the text and collapses the
+    // composer, so re-opening shows an empty field rather than a resurrected
+    // draft. (`input` is detached by then — assert against the live DOM.)
+    expect(document.querySelector('.note-input')).toBeNull();
+    expect(s.clearDraft).toHaveBeenCalledTimes(1);
+    openComposer();
+    expect((document.querySelector('.note-input') as HTMLTextAreaElement).value).toBe('');
   });
 
   it('search count reflects CHAINS, not raw versions', () => {
@@ -468,12 +486,32 @@ describe('Main — пункт сейфа в навигации', () => {
     expect(screen.getByRole('button', { name: /Сейф/ }).className).not.toContain('app-nav-item--dim');
   });
 
-  it('switching to the safebox hides the notes composer and feed', () => {
+  it('переключение в сейф РАЗМОНТИРУЕТ ленту заметок, а не прячет её', () => {
     h.store.safeboxDataPresent = true;
     const { container } = render(<Main />);
+    expect(container.querySelector('.notes-feed')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
-    expect(container.querySelector('.note-input-wrap')?.hasAttribute('hidden')).toBe(true);
-    expect(container.querySelector('.notes-feed')?.hasAttribute('hidden')).toBe(true);
+    expect(container.querySelector('.notes-feed')).toBeNull();
+    expect(container.querySelector('.note-input-wrap')).toBeNull();
+  });
+
+  // The half the old `hidden` hack was really protecting, and which was never
+  // actually covered: the draft lives in the shell, so a round-trip through
+  // another section must not touch it.
+  it('черновик переживает круг в сейф и обратно', () => {
+    h.store.safeboxDataPresent = true;
+    const { container } = render(<Main />);
+    openComposer();
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'не потеряй меня' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect(container.querySelector('.note-input')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Заметки' }));
+    // Auto-expanded because a draft exists, and the text is intact.
+    expect((document.querySelector('.note-input') as HTMLTextAreaElement).value)
+      .toBe('не потеряй меня');
   });
 
   it('«Закрыть сейф» живёт ВНУТРИ раздела — в шапке дубля больше нет', () => {
@@ -596,7 +634,7 @@ describe('Main — «Проверить обновления» в шапке', (
 // ─── Stage 1: the section lives in the address ──────────────────────
 
 describe('Main — раздел в адресе', () => {
-  const inSafebox = (c: HTMLElement) => c.querySelector('.note-input-wrap')?.hasAttribute('hidden') === true;
+  const inSafebox = (c: HTMLElement) => c.querySelector('.notes-feed') === null;
 
   it('открывается на разделе из адреса — перезагрузка не теряет место', () => {
     h.store.safeboxDataPresent = true;
@@ -654,5 +692,80 @@ describe('Main — раздел в адресе', () => {
     const { container } = render(<Main />);
     await waitFor(() => expect(window.location.hash).toBe('#/notes'));
     expect(container.querySelector('.notes-feed')).toBeTruthy();
+  });
+});
+
+// ─── Stage 3: the collapsed composer ────────────────────────────────
+
+describe('Main — композер сворачивается за «+»', () => {
+  const field = () => document.querySelector('.note-input') as HTMLTextAreaElement | null;
+
+  it('по умолчанию свёрнут — лента получает всю высоту', () => {
+    render(<Main />);
+    expect(field()).toBeNull();
+    expect(screen.getByRole('button', { name: /\+ Заметка/ })).toBeTruthy();
+  });
+
+  it('гидратация, завершившаяся ПОСЛЕ первого рендера, раскрывает его', async () => {
+    // The transition that only shows up in practice: readDraft is async, so on
+    // the first render `text` is still empty and the effect has to fire again.
+    let resolveDraft!: (v: string | null) => void;
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
+    render(<Main />);
+    expect(field()).toBeNull();
+
+    await act(async () => { resolveDraft('восстановленный черновик'); });
+    expect(field()?.value).toBe('восстановленный черновик');
+  });
+
+  it('РУЧНОЕ сворачивание не отменяется автораскрытием', async () => {
+    // The sequence has to make `hasDraft` flip AFTER the collapse, or the
+    // effect never re-runs and the test would pass without the flag existing:
+    // open an EMPTY composer, collapse it, and only then let hydration land.
+    // (Typing first would arm the dirty guard, hydration would be refused,
+    // `hasDraft` would never change, and nothing would be exercised.)
+    let resolveDraft!: (v: string | null) => void;
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
+    render(<Main />);
+    openComposer();
+    fireEvent.click(screen.getByText('Свернуть'));
+    expect(field()).toBeNull();
+
+    await act(async () => { resolveDraft('восстановленный черновик'); });
+    expect(field()).toBeNull(); // stayed shut despite a draft arriving
+    // …and the draft is not lost, just not forced onto the user.
+    expect(document.querySelector('.notes-add-dot')).toBeTruthy();
+  });
+
+  it('сворачивание НЕ стирает черновик и не вызывает persistDraft("")', () => {
+    const s = h.store as ReturnType<typeof baseStore>;
+    render(<Main />);
+    openComposer();
+    fireEvent.change(field()!, { target: { value: 'текст' } });
+    fireEvent.click(screen.getByText('Свернуть'));
+
+    expect(s.persistDraft).not.toHaveBeenCalledWith('');
+    openComposer();
+    expect(field()?.value).toBe('текст'); // collapsing hides, it does not discard
+  });
+
+  it('черновик из ОДНИХ ПРОБЕЛОВ виден индикатору', () => {
+    // DraftStore clears storage only on an exactly-empty string, so whitespace
+    // really is stored. `text.trim()` would leave the indicator dark over a
+    // draft that exists.
+    render(<Main />);
+    openComposer();
+    fireEvent.change(field()!, { target: { value: '   ' } });
+    fireEvent.click(screen.getByText('Свернуть'));
+
+    expect(screen.getByRole('button', { name: '+ Заметка, есть несохранённый черновик' })).toBeTruthy();
+    expect(document.querySelector('.notes-add-dot')).toBeTruthy();
+  });
+
+  it('без черновика индикатора нет', () => {
+    render(<Main />);
+    expect(document.querySelector('.notes-add-dot')).toBeNull();
   });
 });
