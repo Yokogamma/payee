@@ -801,6 +801,62 @@ export async function deleteMeta(key: string): Promise<void> {
   await getDB().delete('meta', key);
 }
 
+// ─── Vault identity ─────────────────────────────────────────────────
+
+/** Outcome of binding a seed's public key to THIS database. */
+export type VaultBindResult = 'bound' | 'same' | 'foreign';
+
+/**
+ * Bind the vault identity — and, optionally, mark the database initialized — in
+ * ONE readwrite `meta` transaction:
+ *   no key yet    → write the key (+ `init` when initialize) → 'bound'
+ *   same key      → (+ `init` when initialize)               → 'same'
+ *   foreign key   → write NOTHING                            → 'foreign'
+ *
+ * First-writer-wins. A plain `setMeta('vault-public-key', pk)` after the
+ * read-only guard in prepareVaultSnapshot leaves a window in which two tabs
+ * opening DIFFERENT seeds against an EMPTY database both pass the guard and
+ * then overwrite each other — one tab's key with the other tab's PIN. Inside
+ * one transaction that cannot happen, and `init` can never be written apart
+ * from the key it belongs to.
+ *
+ * Returns 'foreign' instead of throwing: VaultMismatchError lives in the store
+ * (importing it here would be a cycle), and the caller owns the user-facing
+ * error text.
+ *
+ * BOUNDARY: like every reset-exclusivity check in this file, this sees only
+ * resets THIS tab knows about (dbGeneration). A database cleared by another tab
+ * whose 'reset' broadcast has not arrived yet is indistinguishable from a
+ * never-initialized one — the accepted residual window (see the dbGeneration
+ * comment below).
+ */
+export async function bindVaultIdentity(
+  pkB64: string,
+  opts: { initialize: boolean },
+  expectedDbGeneration: number,
+): Promise<VaultBindResult> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const saved = await meta.get('vault-public-key') as string | undefined;
+    if (saved !== undefined && saved !== pkB64) {
+      await tx.done;
+      return 'foreign';
+    }
+    if (saved === undefined) await meta.put(pkB64, 'vault-public-key');
+    if (opts.initialize) await meta.put(true, 'init');
+    await tx.done;
+    return saved === undefined ? 'bound' : 'same';
+  } catch (e) {
+    // Same rollback discipline as saveNoteWithSync: a failure on the second put
+    // must not let the transaction auto-commit with only the first written.
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
 /**
  * Atomically clear the ENTIRE PIN configuration in ONE transaction over the
  * meta store: delete pin-seed, pin-attempts and pin-locked-until, and reset
@@ -837,6 +893,43 @@ export async function clearPinConfigMeta(): Promise<void> {
     // Same rollback discipline as saveNoteWithSync: an error after the first
     // delete must not let the transaction auto-commit half the cleanup.
     tx.done.catch(() => {}); // swallow the resulting abort rejection (we rethrow e)
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/**
+ * First-writer-wins PIN write for the RESTORE flow. ONE readwrite `meta`
+ * transaction: `pin-seed` is written ONLY when absent, and the metering is
+ * cleared in the same commit so a fresh configuration can never inherit a
+ * stale lockout.
+ *
+ * `false` = another tab configured a PIN first; its blob is left ALONE. The
+ * restore flow must not silently replace a PIN the user set elsewhere —
+ * replacing one is an explicit action, and it lives in the settings screen.
+ *
+ * `auto-lock-timeout` is untouched, exactly like the onboarding `setupPin`.
+ */
+export async function commitPinSeedIfAbsent(
+  blob: PinEncryptedSeed,
+  expectedDbGeneration: number,
+): Promise<boolean> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const existing: unknown = await meta.get('pin-seed');
+    if (existing !== undefined) {
+      await tx.done;
+      return false;
+    }
+    await meta.put(blob, 'pin-seed');
+    await meta.delete('pin-attempts');
+    await meta.delete('pin-locked-until');
+    await tx.done;
+    return true;
+  } catch (e) {
+    tx.done.catch(() => {});
     try { tx.abort(); } catch { /* already aborting/aborted */ }
     throw e;
   }

@@ -392,3 +392,92 @@ describe('dbGeneration', () => {
     expect(getDbGeneration()).toBe(before + 1);
   });
 });
+
+// ─── Vault identity + first-writer-wins PIN write ───────────────────
+
+import { bindVaultIdentity, commitPinSeedIfAbsent } from './storage';
+import type { PinEncryptedSeed } from './crypto';
+
+const PK_A = 'pk-aaa';
+const PK_B = 'pk-bbb';
+const BLOB_A = { ciphertext: 'ctA', iv: 'iv', salt: 's' } as PinEncryptedSeed;
+const BLOB_B = { ciphertext: 'ctB', iv: 'iv', salt: 's' } as PinEncryptedSeed;
+
+describe('bindVaultIdentity', () => {
+  it('binds the key on an empty database', async () => {
+    expect(await bindVaultIdentity(PK_A, { initialize: false }, getDbGeneration())).toBe('bound');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+    expect(await getMeta('init')).toBeUndefined(); // initialize:false writes no init
+  });
+
+  it('writes `init` in the SAME commit when asked', async () => {
+    expect(await bindVaultIdentity(PK_A, { initialize: true }, getDbGeneration())).toBe('bound');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+    expect(await getMeta('init')).toBe(true);
+  });
+
+  it('accepts the same key again and can initialize an already-bound vault', async () => {
+    await bindVaultIdentity(PK_A, { initialize: false }, getDbGeneration());
+    expect(await bindVaultIdentity(PK_A, { initialize: true }, getDbGeneration())).toBe('same');
+    expect(await getMeta('init')).toBe(true);
+  });
+
+  it('refuses a FOREIGN key and writes nothing — not the key, not init', async () => {
+    await bindVaultIdentity(PK_A, { initialize: false }, getDbGeneration());
+    expect(await bindVaultIdentity(PK_B, { initialize: true }, getDbGeneration())).toBe('foreign');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+    expect(await getMeta('init')).toBeUndefined();
+  });
+
+  it('two tabs, EMPTY database, different seeds: first-writer-wins', async () => {
+    // The whole point of doing this in one transaction: the loser can never
+    // leave its own key (or init) behind next to the winner's PIN.
+    expect(await bindVaultIdentity(PK_A, { initialize: true }, getDbGeneration())).toBe('bound');
+    expect(await bindVaultIdentity(PK_B, { initialize: true }, getDbGeneration())).toBe('foreign');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+  });
+
+  it('throws StorageResetError on a stale generation (wiped meanwhile)', async () => {
+    const stale = getDbGeneration();
+    await resetAll(); // bumps the generation
+    await expect(bindVaultIdentity(PK_A, { initialize: true }, stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('vault-public-key')).toBeUndefined();
+    expect(await getMeta('init')).toBeUndefined();
+  });
+});
+
+describe('commitPinSeedIfAbsent (first-writer-wins)', () => {
+  it('writes the blob when none is configured', async () => {
+    expect(await commitPinSeedIfAbsent(BLOB_A, getDbGeneration())).toBe(true);
+    expect(await getMeta('pin-seed')).toEqual(BLOB_A);
+  });
+
+  it('clears stale metering in the SAME commit', async () => {
+    await setMeta('pin-attempts', 7);
+    await setMeta('pin-locked-until', Date.now() + 60_000);
+    expect(await commitPinSeedIfAbsent(BLOB_A, getDbGeneration())).toBe(true);
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  it('refuses to overwrite a PIN another tab configured first', async () => {
+    await setMeta('pin-seed', BLOB_A);
+    expect(await commitPinSeedIfAbsent(BLOB_B, getDbGeneration())).toBe(false);
+    expect(await getMeta('pin-seed')).toEqual(BLOB_A); // foreign blob untouched
+  });
+
+  it('leaves the metering alone when it refuses', async () => {
+    await setMeta('pin-seed', BLOB_A);
+    await setMeta('pin-attempts', 3);
+    expect(await commitPinSeedIfAbsent(BLOB_B, getDbGeneration())).toBe(false);
+    expect(await getMeta('pin-attempts')).toBe(3);
+  });
+
+  it('throws StorageResetError on a stale generation', async () => {
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitPinSeedIfAbsent(BLOB_A, stale)).rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+});
