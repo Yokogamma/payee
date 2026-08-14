@@ -455,6 +455,85 @@ production run.
 «Обновить». A user currently stuck behind the gate must relaunch the app — which
 is exactly the workaround they already found.
 
+### PIN on restore + persistent storage (client-only)
+
+**NOT DEPLOYED YET** — branch `feat/restore-pin-and-persistent-storage`.
+Local gates green: `npm run lint`, **704 client tests / 36 files** (baseline was
+643/34), production-like `npm run build` (`VITE_BASE=/`,
+`VITE_PROXY_URL=http://localhost:8787`, `VITE_TRUSTED_OWNERS=<prod owner>`).
+CI remains authoritative. Client-only; **the Worker is untouched**.
+
+**Reported from production (desktop Chrome):** the app asks for the seed phrase
+every day instead of a PIN. Two independent causes, both fixed here:
+
+1. **The restore screen never offered a PIN.** A PIN could only be set during
+   onboarding or in settings, so everyone who entered a device «by seed phrase»
+   (second device, reinstall, local data loss) stayed with no `pin-seed` at all
+   — and the session lives in `sessionStorage`, which dies when the last Chrome
+   window closes. `Restore.tsx` is now two steps (phrase → PIN offer, skippable,
+   hidden when a PIN already exists).
+2. **The app never requested persistent storage.** `navigator.storage.persist()`
+   was called nowhere, so IndexedDB stayed best-effort and could be evicted —
+   taking `meta.init` with it, which is what makes the app look like it never
+   had a vault (`src/lib/persistence.ts`).
+
+Storage-side invariants added on the way (both в одной readwrite-транзакции
+`meta`, both first-writer-wins):
+
+- `bindVaultIdentity(pk, { initialize }, gen)` replaces the unconditional
+  `setMeta('vault-public-key', …)` and writes `meta.init` in the SAME commit.
+  Two tabs opening DIFFERENT seeds against an EMPTY database can no longer end
+  up with one tab's key next to the other tab's PIN, and `init` can never be
+  written into a database that was cleared in between.
+- `commitPinSeedIfAbsent(blob, gen)` writes the restore-flow PIN only when none
+  exists (and clears stale `pin-attempts`/`pin-locked-until` in the same
+  commit). A PIN configured elsewhere is never replaced behind the user's back;
+  the main screen says so instead (`pinSetupNotice`).
+
+`openVault` now runs the identity transaction BEFORE `commitVaultSnapshot()` and
+the session write, so a rejected open cannot leave a decrypted vault or the seed
+in the tab.
+
+**Both PIN-setting flows follow the same rule**: the PIN is an argument of the
+identity-checked operation (`confirmMnemonic(mn, { pin })` /
+`restoreFromMnemonic(mn, { pin })`), never a `setupPin()` before it with a
+`removePin()` to undo. The old onboarding shape left a mixed race with restore:
+a tab that lost the identity race could leave `vault-public-key(B)` next to
+`pin-seed(A)`, or delete the PIN — and the auto-lock setting — of the vault that
+won. Unconditional `setupPin`/`removePin` now live only where replacing a PIN is
+the user's explicit intent: the settings screen.
+
+Three facts were verified in reverse (each test fails against the old code):
+publishing the snapshot before the identity verdict, broadcasting `config`
+without the post-commit guard, and the PIN-first/undo onboarding shape.
+
+**Accepted, unchanged residual risk:** cross-tab reset exclusivity still rests on
+the `'reset'` broadcast plus each tab's own `dbGeneration` — a database cleared
+by a tab whose broadcast has not arrived is indistinguishable from a
+never-initialized one. This release neither widens nor narrows that window; a
+persistent reset token would be a separate, project-wide change.
+
+**Firefox compromise:** `persist()` is called (skipped only on an already-denied
+permission) because gating it on a `'granted'` permission state risked never
+requesting persistence in Chromium at all — the browser this fix exists for.
+Firefox may therefore show its permission doorhanger once, always after a button
+the user pressed; a refusal is remembered per tab (`sessionStorage`) so reloads
+do not re-ask.
+
+**Operator checks before/after rollout (NOT covered by tests):**
+- on a clean Chrome profile, BEFORE the first `persist()`, record
+  `await navigator.permissions.query({name:'persistent-storage'})` → `state`,
+  then after an unlock record `await navigator.storage.persisted()`. Write both
+  values here — they are the only real evidence that cause №2 is fixed on a
+  fresh origin;
+- remove the PIN, close all Chrome windows, reopen: the restore screen must
+  offer the PIN step, and the next launch must show the PIN screen;
+- Firefox: at most one permission prompt per tab, never after a refusal.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the previous build until
+«Обновить». No IndexedDB schema change (existing `meta` keys only) → no client
+floor; rollback = redeploy the previous client build.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
