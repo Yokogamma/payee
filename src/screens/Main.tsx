@@ -86,7 +86,14 @@ export function Main() {
   // True after ANY user edit. `text === ''` alone cannot distinguish a pristine
   // composer from «набрал и стёр» — hydration must lose to both (§2 dirty guard).
   const draftDirtyRef = useRef(false);
-  const [showSearch, setShowSearch] = useState(false);
+  // The composer is collapsed by default — it used to occupy the top of the
+  // screen permanently, competing with the feed for the only vertical space a
+  // phone has.
+  const [composerOpen, setComposerOpen] = useState(false);
+  // Set by an explicit «Свернуть». Blocks auto-expansion until the user LEAVES
+  // and re-enters the section; without it a manually collapsed composer would
+  // re-open by itself as soon as hydration resolves.
+  const userCollapsedRef = useRef(false);
   const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -118,11 +125,6 @@ export function Main() {
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
 
-  // Autofocus on mount
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
   // A finished update check: announce it once, and only out here on the feed —
   // inside the settings panel the result line already says the same thing.
   useEffect(() => {
@@ -139,6 +141,42 @@ export function Main() {
     return () => clearTimeout(t);
   }, [receivedCount]);
 
+  // ── Composer open/collapse ──────────────────────────────────────
+  //
+  // Presence of a draft is `text.length > 0`, NOT `text.trim()`: DraftStore
+  // clears storage only on an exactly-empty string, so a draft of whitespace
+  // really is stored. With trim() the indicator would go dark and the composer
+  // would stay shut over a draft that exists.
+  const hasDraft = text.length > 0;
+  const wasNotesVisible = useRef(notesVisible);
+
+  useEffect(() => {
+    const entered = notesVisible && !wasNotesVisible.current;
+    wasNotesVisible.current = notesVisible;
+    // Re-entering the section is a fresh intent — an earlier «Свернуть» does
+    // not follow the user around forever.
+    if (entered) userCollapsedRef.current = false;
+    // Covers BOTH the return-with-a-draft case and the one that only shows up
+    // in practice: hydration is async, so on the first render `text` is still
+    // empty and this effect has to fire again when the draft lands.
+    if (notesVisible && hasDraft && !userCollapsedRef.current) setComposerOpen(true);
+  }, [notesVisible, hasDraft]);
+
+  function openComposer() {
+    userCollapsedRef.current = false;
+    setComposerOpen(true);
+    // Focus ONLY on an explicit press. Doing it on auto-expansion would pop the
+    // mobile keyboard every time the user merely returns to the section.
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
+  function collapseComposer() {
+    // Never clears `text`: collapsing hides, it does not discard. Clearing here
+    // would let the debounced mirror persist '' and DELETE the stored draft.
+    userCollapsedRef.current = true;
+    setComposerOpen(false);
+  }
+
   // Canonicalise the address. An empty hash (first load, or an old build that
   // never wrote one) and an unknown hash (typo, or a section a newer build had
   // and this one does not) both PARSE to the default — this rewrites the bar to
@@ -152,20 +190,6 @@ export function Main() {
   useEffect(() => {
     if (hash !== canonicalHash(view)) navigate(view, { replace: true });
   }, [hash, view]);
-
-  // Global search hotkey (8.1): Ctrl/Cmd+K toggles the search bar.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        if (showSearch) closeSearch();
-        else setShowSearch(true);
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showSearch]);
 
   // Hydrate the encrypted draft on mount — dirty-guarded (§2): it only fills a
   // composer the user has NOT touched (typing and deleting counts as touched),
@@ -211,7 +235,8 @@ export function Main() {
     clearDraft(); // don't wait out the debounce (also invalidates in-flight persists)
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
-    inputRef.current?.focus();
+    setComposerOpen(false);
+    userCollapsedRef.current = false; // saved, not dismissed
   }
 
   function formatDate(ts: number): string {
@@ -229,11 +254,6 @@ export function Main() {
 
     if (isThisYear) return `${day} ${month}`;
     return `${day} ${month} ${d.getFullYear()}`;
-  }
-
-  function closeSearch() {
-    setShowSearch(false);
-    setSearchQuery('');
   }
 
   /** Clipboard write with visible success/error feedback — a rejected promise
@@ -459,16 +479,6 @@ export function Main() {
           >
             {updateCheck.status === 'checking' ? '⏳' : '↻'}
           </button>
-          <button
-            className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
-            onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
-            title="Поиск (Ctrl+K)"
-            aria-label="Поиск"
-            aria-pressed={showSearch}
-            aria-keyshortcuts="Control+K"
-          >
-            🔍
-          </button>
         </div>
       </header>
       </div>
@@ -482,33 +492,58 @@ export function Main() {
         <SafeboxSection key={safeboxLockGeneration} formatDate={formatDate} />
       )}
 
-      {/* Search */}
-      {view === 'notes' && showSearch && (
-        <div className="search-bar">
-          <input
-            type="text"
-            placeholder="Найти заметку..."
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Escape') closeSearch(); }}
-            autoFocus
-          />
-          {searchQuery && (
-            <>
-              <span className="search-count">
-                {filteredChains.length} из {chains.length}
-              </span>
-              <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
-                ✕
-              </button>
-            </>
-          )}
-        </div>
-      )}
+      {/* The notes section is UNMOUNTED when another section is open, not
+          hidden. It could stay mounted safely — the draft lives in this shell,
+          not in the composer — but a mounted feed keeps re-rendering markdown
+          behind a section the user is not looking at. */}
+      {notesVisible && (
+      <>
+      <div className="notes-topbar">
+        <h2 className="section-title">Заметки</h2>
+        {composerOpen ? (
+          <button className="btn btn-ghost notes-add" onClick={collapseComposer}>
+            Свернуть
+          </button>
+        ) : (
+          <button
+            className="btn btn-primary notes-add"
+            onClick={openComposer}
+            aria-label={hasDraft ? '+ Заметка, есть несохранённый черновик' : undefined}
+          >
+            + Заметка
+            {/* A collapsed composer must not hide an unsaved draft silently. */}
+            {hasDraft && <span className="notes-add-dot" aria-hidden="true" />}
+          </button>
+        )}
+      </div>
 
-      {/* Input — the shared controlled composer; draft
-          hydration/persistence stays HERE (value/onChange above). */}
-      <div className="note-input-wrap" hidden={!notesVisible}>
+      {/* Always on screen — its own field, scoped to this section. The old
+          Ctrl+K toggle is gone with the toggle it drove. */}
+      <div className="search-bar">
+        <input
+          type="text"
+          placeholder="Поиск по заметкам"
+          aria-label="Поиск по заметкам"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Escape') setSearchQuery(''); }}
+        />
+        {searchQuery && (
+          <>
+            <span className="search-count">
+              {filteredChains.length} из {chains.length}
+            </span>
+            <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
+              ✕
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Draft hydration/persistence stays in the shell (value/onChange above),
+          so collapsing or unmounting the composer never touches the draft. */}
+      {composerOpen && (
+      <div className="note-input-wrap">
         <NoteComposer
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
@@ -525,9 +560,10 @@ export function Main() {
             : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
         />
       </div>
+      )}
 
       {/* Feed — one card per version chain; fields come from chain.current. */}
-      <div className="notes-feed" hidden={!notesVisible}>
+      <div className="notes-feed">
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
             <div className="empty-icon">📝</div>
@@ -659,6 +695,8 @@ export function Main() {
           })
         )}
       </div>
+      </>
+      )}
       </div>
 
       {/* PWA update toast (Phase 8): controlled activation, never silent */}

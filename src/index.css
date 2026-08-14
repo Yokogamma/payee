@@ -1816,3 +1816,43 @@ mark {
   }
   .app-nav-item--active { background: var(--bg-hover); }
 }
+
+/* ─── Notes section topbar + collapsed composer ─────────────── */
+
+.notes-topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 16px 9px;
+  flex: 0 0 auto;
+}
+
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  flex: 1;
+  margin: 0;
+}
+
+/* Mirrors «+ Запись» in the safebox topbar — the two sections offer creation
+   in the same place and the same shape. */
+.notes-add {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  font-size: 13px;
+  position: relative;
+}
+
+/* A collapsed composer must not hide an unsaved draft. The state is in the
+   button's accessible name too, not only in this dot. */
+.notes-add-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--yellow);
+}
