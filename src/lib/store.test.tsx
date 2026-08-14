@@ -35,8 +35,17 @@ vi.mock('./crypto', async importOriginal => {
     // Overridable per-test (wipe path / reset races) — default to the real impl.
     decryptWithPin: vi.fn(actual.decryptWithPin),
     encrypt: vi.fn(actual.encrypt),
+    // Overridable to land a lock INSIDE the (slow) PIN derivation.
+    encryptWithPin: vi.fn(actual.encryptWithPin),
   };
 });
+
+// The persistence request is a side-effect on the browser, not on the vault:
+// mocked everywhere so the tests can assert WHERE it is (and is not) triggered.
+vi.mock('./persistence', () => ({
+  ensurePersistentStorage: vi.fn(async () => 'unsupported' as const),
+  resetPersistenceAttemptForTests: vi.fn(),
+}));
 
 vi.mock('./storage', async importOriginal => {
   const actual = await importOriginal<typeof import('./storage')>();
@@ -48,6 +57,10 @@ vi.mock('./storage', async importOriginal => {
     saveNote: vi.fn(actual.saveNote),
     getPinConfigMeta: vi.fn(actual.getPinConfigMeta),
     clearPinConfigMeta: vi.fn(actual.clearPinConfigMeta),
+    // Overridable per-test: the vault-identity transaction and the conditional
+    // PIN write are exactly where the restore-with-PIN races live.
+    bindVaultIdentity: vi.fn(actual.bindVaultIdentity),
+    commitPinSeedIfAbsent: vi.fn(actual.commitPinSeedIfAbsent),
   };
 });
 
@@ -1261,5 +1274,287 @@ describe('exclusive reset — post-point-of-no-return persists are refused', () 
     expect(getDbGeneration()).toBe(genBefore + 1); // local writes invalidated
     await waitFor(() => expect(store.screen).not.toBe('main')); // locked out
     expect(store.mnemonic).toBeNull();
+  });
+});
+
+// ─── Restore with a PIN + the persistence request ───────────────────
+//
+// REALM CAVEAT: every "other tab" here is simulated inside ONE JS realm, which
+// shares this module's `dbGeneration` and IndexedDB. That is enough for the
+// properties below (ordering, conditional writes, epoch/generation guards) but
+// it CANNOT model a reset by a real second tab whose 'reset' broadcast never
+// arrived — the project's accepted residual window (see storage.ts).
+
+import { bindVaultIdentity, commitPinSeedIfAbsent, StorageResetError } from './storage';
+import { encryptWithPin, type PinEncryptedSeed } from './crypto';
+import { ensurePersistentStorage } from './persistence';
+import { VaultMismatchError } from './store';
+
+// A second BIP39-valid phrase — a DIFFERENT vault, not a typo of MN.
+const MN_B = 'legal winner thank year wave sausage worth useful legal winner thank yellow';
+const PIN = '123456';
+
+async function storedPinSeed(): Promise<PinEncryptedSeed | undefined> {
+  return getMeta<PinEncryptedSeed>('pin-seed');
+}
+
+describe('restoreFromMnemonic({ pin })', () => {
+  it('stores a PIN that unwraps the very seed that was restored', async () => {
+    renderStore();
+    await untilReady();
+
+    await act(async () => { await store.restoreFromMnemonic(MN, { pin: PIN }); });
+
+    const blob = await storedPinSeed();
+    expect(blob).toBeDefined();
+    expect(await decryptWithPin(blob!, PIN)).toBe(MN);
+    await waitFor(() => expect(store.hasPin).toBe(true));
+    expect(store.pinSetupNotice).toBeNull();
+    expect(await getMeta('init')).toBe(true);
+  });
+
+  it('without a pin nothing is configured', async () => {
+    renderStore();
+    await untilReady();
+
+    await act(async () => { await store.restoreFromMnemonic(MN); });
+
+    expect(await storedPinSeed()).toBeUndefined();
+    expect(store.hasPin).toBe(false);
+  });
+
+  it('a FOREIGN vault leaves no PIN behind (the guard runs first)', async () => {
+    // The scenario the PIN must never survive: a checksum-valid phrase for a
+    // DIFFERENT vault. Writing the PIN before this check would leave a PIN that
+    // unlocks a vault this device does not have.
+    await setMeta('init', true);
+    await setMeta('vault-public-key', 'someone-elses-key');
+    renderStore();
+    await untilReady();
+
+    await act(async () => {
+      await expect(store.restoreFromMnemonic(MN_B, { pin: PIN }))
+        .rejects.toBeInstanceOf(VaultMismatchError);
+    });
+
+    expect(await storedPinSeed()).toBeUndefined();
+  });
+
+  it('another tab bound the vault mid-open: nothing is published, no PIN', async () => {
+    // openVault's own read-only guard passed (the key appeared while we were
+    // preparing) — the transaction is what catches it. Everything sensitive is
+    // published AFTER it, so a rejection cannot strand a decrypted vault here.
+    vi.mocked(bindVaultIdentity).mockResolvedValueOnce('foreign');
+    renderStore();
+    await untilReady();
+
+    await act(async () => {
+      await expect(store.restoreFromMnemonic(MN, { pin: PIN }))
+        .rejects.toBeInstanceOf(VaultMismatchError);
+    });
+
+    expect(store.mnemonic).toBeNull();
+    expect(store.notes).toEqual([]);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).not.toBe('main');
+    expect(await getMeta('init')).toBeUndefined();
+    expect(await storedPinSeed()).toBeUndefined();
+  });
+
+  it('a reset this tab already knows about stands down silently', async () => {
+    vi.mocked(bindVaultIdentity).mockRejectedValueOnce(new StorageResetError());
+    renderStore();
+    await untilReady();
+
+    // No throw: the vault the user asked for is gone, and the reset already
+    // owns the screen.
+    await act(async () => { await store.restoreFromMnemonic(MN, { pin: PIN }); });
+
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).not.toBe('main');
+    expect(await getMeta('init')).toBeUndefined();
+    expect(await storedPinSeed()).toBeUndefined();
+  });
+
+  it('a PIN configured by another tab is NOT replaced — and the user is told', async () => {
+    const foreignBlob = await encryptWithPin(MN, '999999');
+    await setMeta('pin-seed', foreignBlob);
+    renderStore();
+    await untilReady();
+
+    await act(async () => { await store.restoreFromMnemonic(MN, { pin: PIN }); });
+
+    expect(await storedPinSeed()).toEqual(foreignBlob); // untouched
+    await waitFor(() => expect(store.pinSetupNotice).toBe('already-set'));
+    expect(store.hasPin).toBe(true); // a PIN exists — just not this one
+  });
+
+  it('a lock during the PIN derivation writes nothing at all', async () => {
+    renderStore();
+    await untilReady();
+    vi.mocked(encryptWithPin).mockImplementationOnce(async () => {
+      store.lockApp();
+      return { ciphertext: 'ct', iv: 'iv', salt: 's' } as PinEncryptedSeed;
+    });
+
+    await act(async () => { await store.restoreFromMnemonic(MN, { pin: PIN }); });
+
+    expect(await storedPinSeed()).toBeUndefined();
+    expect(store.hasPin).toBe(false);
+    expect(store.pinSetupNotice).toBeNull();
+  });
+
+  it('a reset INSIDE the PIN transaction publishes nothing — not even the broadcast', async () => {
+    // A generation bump cannot abort a transaction that is already running, so
+    // the guarantee is not an exception: it is that everything leaving this tab
+    // (cross-tab signal, React state) happens after the post-commit guard.
+    renderStore();
+    await untilReady();
+    const { received } = listenOnChannel();
+    vi.mocked(commitPinSeedIfAbsent).mockImplementationOnce(async () => {
+      await store.resetApp();
+      return true;
+    });
+
+    await act(async () => { await store.restoreFromMnemonic(MN, { pin: PIN }); });
+
+    expect(received.filter(m => m.type === 'config')).toHaveLength(0);
+    expect(store.hasPin).toBe(false);
+    expect(store.pinSetupNotice).toBeNull();
+    expect(await storedPinSeed()).toBeUndefined(); // the wipe is the final state
+  });
+
+  it('a reconcile that started BEFORE the write cannot undo it', async () => {
+    renderStore();
+    await untilReady();
+
+    // A foreign `config` starts a reconcile; its read hangs until we release it.
+    const gate = deferred<{ pinSeed: unknown; autoLockTimeout: unknown }>();
+    vi.mocked(getPinConfigMeta).mockImplementationOnce(() => gate.promise);
+    const { channel } = listenOnChannel();
+    await act(async () => {
+      channel.postMessage({ type: 'config', originId: 'other-tab', messageId: crypto.randomUUID() });
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    await act(async () => { await store.restoreFromMnemonic(MN, { pin: PIN }); });
+    await waitFor(() => expect(store.hasPin).toBe(true));
+
+    // The stale snapshot (taken when no PIN existed) must discard itself.
+    await act(async () => {
+      gate.resolve({ pinSeed: undefined, autoLockTimeout: undefined });
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    expect(store.hasPin).toBe(true);
+    expect(store.screen).toBe('main');
+  });
+});
+
+describe('confirmMnemonic({ pin }) — creation and restore follow ONE rule', () => {
+  it('stores a PIN that unwraps the seed that was just created', async () => {
+    renderStore();
+    await untilReady();
+
+    await act(async () => { await store.confirmMnemonic(MN, { pin: PIN }); });
+
+    const blob = await storedPinSeed();
+    expect(await decryptWithPin(blob!, PIN)).toBe(MN);
+    await waitFor(() => expect(store.hasPin).toBe(true));
+    expect(await getMeta('init')).toBe(true);
+    expect(store.pinSetupNotice).toBeNull();
+  });
+
+  it('losing the identity race writes NO pin — and deletes nobody else’s', async () => {
+    // The mixed Onboarding × Restore race: another tab bound this device to a
+    // different vault and configured ITS PIN while this onboarding was running.
+    // Writing first and «undoing» on mismatch would delete the winner's PIN
+    // (and its auto-lock setting with it).
+    const winnersBlob = await encryptWithPin(MN_B, '999999');
+    await setMeta('vault-public-key', 'someone-elses-key');
+    await setMeta('init', true);
+    await setMeta('pin-seed', winnersBlob);
+    await setMeta('auto-lock-timeout', 300);
+    renderStore();
+    await untilReady();
+
+    await act(async () => {
+      await expect(store.confirmMnemonic(MN, { pin: PIN }))
+        .rejects.toBeInstanceOf(VaultMismatchError);
+    });
+
+    expect(await storedPinSeed()).toEqual(winnersBlob); // untouched, not wiped
+    expect(await getMeta('auto-lock-timeout')).toBe(300);
+  });
+
+  it('a PIN already configured for the SAME vault is never replaced', async () => {
+    renderStore();
+    await untilReady();
+    await act(async () => { await store.confirmMnemonic(MN, { pin: PIN }); });
+    const first = await storedPinSeed();
+
+    // The other tab finishes its own creation of the same vault, own PIN.
+    await act(async () => { await store.confirmMnemonic(MN, { pin: '999999' }); });
+
+    expect(await storedPinSeed()).toEqual(first);
+    await waitFor(() => expect(store.pinSetupNotice).toBe('already-set'));
+  });
+
+  it('creation without a pin configures nothing', async () => {
+    renderStore();
+    await untilReady();
+    await act(async () => { await store.confirmMnemonic(MN); });
+    expect(await storedPinSeed()).toBeUndefined();
+    expect(store.hasPin).toBe(false);
+  });
+});
+
+describe('persistent-storage request', () => {
+  beforeEach(() => { vi.mocked(ensurePersistentStorage).mockClear(); });
+
+  it('is made when the user creates a vault', async () => {
+    renderStore();
+    await untilReady();
+    await openMain();
+    expect(ensurePersistentStorage).toHaveBeenCalled();
+  });
+
+  it('is made when the user restores by seed', async () => {
+    renderStore();
+    await untilReady();
+    await act(async () => { await store.restoreFromMnemonic(MN); });
+    expect(ensurePersistentStorage).toHaveBeenCalled();
+  });
+
+  it('is made when the user unlocks with a PIN', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', await encryptWithPin(MN, PIN));
+    renderStore();
+    await untilReady();
+    vi.mocked(ensurePersistentStorage).mockClear();
+
+    await act(async () => { await store.unlockWithPin(PIN); });
+
+    expect(ensurePersistentStorage).toHaveBeenCalled();
+  });
+
+  it('is NOT made by a silent session resume — there is no user gesture there', async () => {
+    await setMeta('init', true);
+    sessionStorage.setItem(SESSION_KEY, MN);
+    renderStore();
+    await untilReady();
+    await waitFor(() => expect(store.screen).toBe('main'));
+
+    expect(ensurePersistentStorage).not.toHaveBeenCalled();
+  });
+});
+
+describe('setupPin without an open vault', () => {
+  it('rejects instead of silently doing nothing', async () => {
+    renderStore();
+    await untilReady();
+    await expect(store.setupPin(PIN)).rejects.toBeDefined();
+    expect(await storedPinSeed()).toBeUndefined();
   });
 });

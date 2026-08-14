@@ -114,13 +114,17 @@ import {
   deleteMeta,
   getPinConfigMeta,
   clearPinConfigMeta,
+  bindVaultIdentity,
+  commitPinSeedIfAbsent,
   resetAll,
   recoverStorage,
   getDbGeneration,
   noteExternalReset,
   isDbVersionError,
   type SyncRecord,
+  type VaultBindResult,
 } from './storage';
+import { ensurePersistentStorage } from './persistence';
 import { afterPoll, claimRestoredForUi } from './sync-transitions';
 import { runUploadAttempt, uploadItemId, MalformedRecordError, type UploadItem } from './upload-flow';
 import { DraftStore, dropLegacyPlaintextDraft, DRAFT_STORAGE_KEY } from './draft';
@@ -354,6 +358,14 @@ export type UpdateCheckState =
     }
   | { status: 'error'; at: number };
 
+/**
+ * Why a PIN offered during RESTORE is not the PIN of this device:
+ *  'already-set' — another tab configured one first (first-writer-wins: its
+ *                  blob is never replaced behind the user's back);
+ *  'failed'      — the write itself failed. The vault IS open either way.
+ */
+export type PinSetupNotice = 'already-set' | 'failed';
+
 interface NotesStore {
   screen: AppScreen;
   isReady: boolean;
@@ -414,6 +426,10 @@ interface NotesStore {
   updateCheck: UpdateCheckState;
   vaultError: string | null;
   hasPin: boolean;
+  /** Outcome of a PIN requested from the RESTORE flow, when it did NOT end up
+   *  set: the restore screen is already unmounted by then, so the main screen
+   *  reports it. Never «success» — a set PIN speaks for itself. */
+  pinSetupNotice: PinSetupNotice | null;
   /** Current auto-lock threshold (§1): null=never, 0=immediately, 300/1800 s. */
   autoLockTimeout: AutoLockTimeout;
   bootError: string | null;
@@ -427,8 +443,16 @@ interface NotesStore {
 
   // Actions
   createNewWallet: () => Promise<string>;
-  confirmMnemonic: (mnemonic: string) => Promise<void>;
-  restoreFromMnemonic: (mnemonic: string) => Promise<void>;
+  /** `opts.pin` — same contract as restoreFromMnemonic below: the PIN is part
+   *  of the identity-checked operation, never a separate write around it. */
+  confirmMnemonic: (mnemonic: string, opts?: { pin?: string }) => Promise<void>;
+  /** `opts.pin` sets a quick-unlock PIN as PART of the restore — written only
+   *  after the vault identity check passed, so a foreign (but checksum-valid)
+   *  phrase can never leave a PIN behind, and no tab ever has to delete a PIN
+   *  it did not write. Failure to set it never fails the operation: it
+   *  surfaces through `pinSetupNotice`. */
+  restoreFromMnemonic: (mnemonic: string, opts?: { pin?: string }) => Promise<void>;
+  dismissPinSetupNotice: () => void;
   addNote: (text: string) => Promise<void>;
   /** Create a NEW version of the chain rooted at rootId (fresh UUIDv8 noteId,
    *  rev = current.rev+1). Regular edits pass fmt 'md' (default); «Восстановить
@@ -658,6 +682,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [restoredSafeboxCount, setRestoredSafeboxCount] = useState<number | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [hasPin, setHasPin] = useState(false);
+  const [pinSetupNotice, setPinSetupNotice] = useState<PinSetupNotice | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   // A tab holding the old schema is blocking the v1→v2 upgrade.
   const [storageBlocked, setStorageBlocked] = useState(false);
@@ -1334,8 +1359,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
       // 6. Restore session
       try {
-        const epoch = await openVault(sessionMn);
-        if (epoch === null) return; // a lock won the race — nothing was published
+        // No `initialize`: `init` is already true (checked in step 2), and no
+        // persistence request either — a session resume is not a user gesture.
+        const opened = await openVault(sessionMn);
+        if (!opened) return; // a lock won the race — nothing was published
+        const epoch = opened.epoch;
 
         // 7. Check registration
         await checkAndSetRegistration(epoch);
@@ -1404,13 +1432,28 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   /**
    * Shared open path (bootstrap/confirm/restore/PIN-unlock): prepare → epoch
-   * check → commit → persistent side-effects. Returns the epoch the vault was
-   * published under, or null when a lock superseded the attempt (nothing was
-   * published, the caller must go quiet). Throws VaultMismatchError from
-   * preparation.
+   * check → BIND THE IDENTITY → commit → persistent side-effects. Returns the
+   * epoch (and the vault's public key) the vault was published under, or null
+   * when a lock/reset superseded the attempt — then NOTHING was published and
+   * the caller must go quiet. Throws VaultMismatchError for a foreign vault.
+   *
+   * `initialize` marks the database initialized (`meta.init`) inside the SAME
+   * transaction that binds the key — used by confirm/restore. A separate
+   * setMeta('init') would be writable into a database that was cleared or
+   * re-bound in between, leaving a phantom-initialized empty vault.
+   *
+   * ORDER MATTERS (review round 4): every storage-side refusal happens BEFORE
+   * commitVaultSnapshot() and the session write, so a rejected open cannot
+   * leave a decrypted vault or the seed behind in this tab. What this does NOT
+   * catch is a reset by another tab whose 'reset' broadcast has not arrived —
+   * the project-wide residual window (see storage.ts, dbGeneration).
    */
-  async function openVault(mn: string): Promise<number | null> {
+  async function openVault(
+    mn: string,
+    opts: { initialize?: boolean } = {},
+  ): Promise<{ epoch: number; pkB64: string } | null> {
     const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration();
     const abort = new AbortController();
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = abort;
@@ -1426,12 +1469,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
     if (vaultEpochRef.current !== myEpoch) return null; // locked between prepare and commit
 
+    let bind: VaultBindResult;
+    try {
+      bind = await bindVaultIdentity(snap.pkB64, { initialize: !!opts.initialize }, myDbGen);
+    } catch (err) {
+      // A reset this tab already knows about. Nothing is published yet — stand
+      // down silently, exactly like an abort during preparation.
+      if (err instanceof StorageResetError) return null;
+      throw err;
+    }
+    if (bind === 'foreign') {
+      throw new VaultMismatchError(
+        'На устройстве уже есть данные другого хранилища. ' +
+        'Выполните «Сбросить приложение» перед восстановлением другого seed.'
+      );
+    }
+    if (vaultEpochRef.current !== myEpoch) return null; // locked during the transaction
+
     commitVaultSnapshot(snap);
     sessionStorage.setItem(SESSION_STORAGE_KEY, mn);
-
-    // Persistent (non-React) side-effects may complete even if a lock lands
-    // now — they publish nothing sensitive to the UI (§4).
-    await setMeta('vault-public-key', snap.pkB64);
 
     // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
     // populate them (and flip countsReady) before the UI is interactive, so the
@@ -1460,7 +1516,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // Background: network-dependent parts only (online probe + queue kick).
     void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
 
-    return myEpoch;
+    return { epoch: myEpoch, pkB64: snap.pkB64 };
   }
 
   /** Re-read the two locked-safe safebox facts (config presence + entry count)
@@ -1503,6 +1559,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setVaultError(null);
     // Transient restore banners must not leak into the next unlock.
     setRestoreError(null);
+    setPinSetupNotice(null);
     setRestoredCount(null);
     setRestoredUpdatedCount(null);
     setRestoreProgress(null);
@@ -2088,21 +2145,36 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return mn;
   }, []);
 
-  const confirmMnemonic = useCallback(async (mn: string) => {
-    const epoch = await openVault(mn);
-    if (epoch === null) return;
-    await setMeta('init', true);
+  const confirmMnemonic = useCallback(async (mn: string, opts: { pin?: string } = {}) => {
+    const myDbGen = getDbGeneration();
+    // `init` is written by the SAME transaction that binds the vault key.
+    const opened = await openVault(mn, { initialize: true });
+    if (!opened) return;
+    const epoch = opened.epoch;
+    // The user just created a vault — the one moment a persistence request is
+    // clearly connected to what they did.
+    void ensurePersistentStorage();
+
+    // Same rule as restore: the PIN goes in only AFTER the identity is bound.
+    if (opts.pin) await applyVaultPin(opts.pin, mn, epoch, myDbGen);
+
     await checkAndSetRegistration(epoch);
     if (vaultEpochRef.current === epoch) setScreen('main');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const restoreFromMnemonic = useCallback(async (mn: string) => {
+  const restoreFromMnemonic = useCallback(async (mn: string, opts: { pin?: string } = {}) => {
     if (!isValidMnemonic(mn)) throw new Error('Invalid mnemonic');
 
-    const epoch = await openVault(mn);
-    if (epoch === null) return;
-    await setMeta('init', true);
+    const myDbGen = getDbGeneration();
+    const opened = await openVault(mn, { initialize: true });
+    if (!opened) return;
+    const epoch = opened.epoch;
+    void ensurePersistentStorage();
+
+    // The PIN goes in AFTER the identity check inside openVault: a foreign (but
+    // checksum-valid) phrase must never leave behind a PIN that opens nothing.
+    if (opts.pin) await applyVaultPin(opts.pin, mn, epoch, myDbGen);
 
     await checkAndSetRegistration(epoch);
     if (vaultEpochRef.current !== epoch) return;
@@ -2367,6 +2439,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const dismissError = useCallback(() => {
     setArweave(prev => ({ ...prev, lastError: null }));
   }, []);
+
+  const dismissPinSetupNotice = useCallback(() => setPinSetupNotice(null), []);
 
   const addNote = useCallback(async (text: string) => {
     // Key + epoch captured ONCE, before the first await (§4): a lock during
@@ -2683,8 +2757,59 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   // ─── PIN Actions ────────────────────────────────────────────────────
 
+  /**
+   * Set the quick-unlock PIN as part of an OPEN that already succeeded — the
+   * shared tail of «создать хранилище» and «восстановить по seed».
+   *
+   * The PIN must never be written before openVault has bound the identity:
+   * otherwise a tab that loses the identity race leaves a PIN for a vault this
+   * device does not have — and «rolling it back» would delete the PIN of the
+   * vault that WON. Here there is nothing to roll back: the identity is already
+   * verified, and the write itself is a single conditional transaction.
+   *
+   * NEVER throws: the vault is open — a PIN that could not be stored is worth a
+   * banner, not a failed creation/restore.
+   *
+   * Order is «commit → guard → broadcast → UI»: a lock or reset may land INSIDE
+   * the transaction, and then neither the cross-tab signal nor any React state
+   * may be published — the vault this PIN belongs to no longer exists here.
+   */
+  async function applyVaultPin(
+    pin: string,
+    mn: string,
+    epoch: number,
+    expectedDbGeneration: number,
+  ): Promise<void> {
+    const alive = () =>
+      vaultEpochRef.current === epoch && getDbGeneration() === expectedDbGeneration;
+
+    let written: boolean;
+    try {
+      const blob = await encryptWithPin(mn, pin); // Argon2id — ~1 s
+      if (!alive()) return;
+      written = await commitPinSeedIfAbsent(blob, expectedDbGeneration);
+    } catch (err) {
+      console.error('vault PIN setup failed:', err);
+      if (!alive()) return;
+      setPinSetupNotice('failed');
+      return;
+    }
+
+    if (!alive()) return;
+    if (written) postVaultMessage('config'); // other tabs re-read pin-seed/timeout
+    // BOTH outcomes: a pin-seed now exists, and that fact outranks any reconcile
+    // read that started before this write (round-5 last-caller-wins token).
+    reconcileGenerationRef.current++;
+    applyHasPin(true);
+    // First-writer-wins: another tab configured a PIN first and its blob was
+    // left alone — say so instead of letting the user believe THEIR PIN is set.
+    if (!written) setPinSetupNotice('already-set');
+  }
+
   const setupPinAction = useCallback(async (pin: string) => {
-    if (!mnemonic) return;
+    // Not a silent no-op: a caller with no seed must learn that no PIN was set
+    // (both call sites already surface the failure).
+    if (!mnemonic) throw new Error('No open vault to protect with a PIN');
     const encrypted = await encryptWithPin(mnemonic, pin);
     await setMeta('pin-seed', encrypted);
     // A local authoritative write wins over any in-flight reconcile read
@@ -2775,8 +2900,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     }
 
-    const epoch = await openVault(mn);
-    if (epoch === null) return;
+    const opened = await openVault(mn);
+    if (!opened) return;
+    const epoch = opened.epoch;
+    // An explicit unlock — a user action the persistence request belongs to.
+    void ensurePersistentStorage();
 
     await checkAndSetRegistration(epoch);
     if (vaultEpochRef.current === epoch) setScreen('main');
@@ -3482,6 +3610,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     updateCheck,
     vaultError,
     hasPin,
+    pinSetupNotice,
     autoLockTimeout,
     bootError,
     storageBlocked,
@@ -3490,6 +3619,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     createNewWallet,
     confirmMnemonic,
     restoreFromMnemonic,
+    dismissPinSetupNotice,
     addNote,
     editNote,
     resumeV3Uploads,
@@ -3539,9 +3669,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     safeboxUnlocked, safeboxLockGeneration, safeboxPinConfigured, safeboxEntryCount, safeboxEntries,
     safeboxChains, filteredSafeboxChains, safeboxSearchQuery, restoredSafeboxCount,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
-    restoredCount, restoredUpdatedCount, updateCheck, vaultError, hasPin, autoLockTimeout, bootError,
+    restoredCount, restoredUpdatedCount, updateCheck, vaultError, hasPin, pinSetupNotice,
+    autoLockTimeout, bootError,
     storageBlocked, storageOutdated,
-    createNewWallet, confirmMnemonic, restoreFromMnemonic, addNote,
+    createNewWallet, confirmMnemonic, restoreFromMnemonic, dismissPinSetupNotice, addNote,
     editNote, resumeV3Uploads, resumeV4Uploads,
     activateSafebox, unlockSafebox, lockSafeboxAction, touchSafebox,
     changeSafeboxPin, deactivateSafebox, resetSafeboxPinWithSeed,

@@ -45,6 +45,8 @@ export function Main() {
     restoredUpdatedCount,
     retryRestore,
     clearRestoreStatus,
+    pinSetupNotice,
+    dismissPinSetupNotice,
     updateCheck,
     checkForUpdates,
     syncStatuses,
@@ -351,6 +353,28 @@ export function Main() {
             onClick={clearRestoreStatus}
             title="Скрыть"
             aria-label="Скрыть уведомление о восстановлении"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* A PIN was requested during restore but is NOT the PIN of this device.
+          The restore screen is long gone by now (restore switches to Main
+          before the sweep), so the honest report has to live here — silence
+          would leave the user believing a PIN is set. */}
+      {pinSetupNotice && (
+        <div className="error-banner" role="alert">
+          <span>
+            {pinSetupNotice === 'already-set'
+              ? '⚠️ PIN уже установлен на этом устройстве (в другой вкладке) — ваш новый PIN не применён. Сменить PIN можно в настройках.'
+              : '⚠️ Не удалось сохранить PIN. Вход выполнен; установите PIN в настройках.'}
+          </span>
+          <button
+            className="banner-btn banner-close"
+            onClick={dismissPinSetupNotice}
+            title="Скрыть"
+            aria-label="Скрыть сообщение о PIN"
           >
             ✕
           </button>
