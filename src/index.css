@@ -22,7 +22,7 @@
   --yellow: #fbbf24;
   --radius: 12px;
   --radius-sm: 8px;
-  --font: 'Outfit', -apple-system, system-ui, sans-serif;
+  --font: 'Manrope', -apple-system, system-ui, sans-serif;
   --mono: 'JetBrains Mono', monospace;
 }
 
@@ -168,7 +168,10 @@ body {
 
 .logo-icon {
   font-size: 48px;
-  font-weight: 200;
+  /* U+221E is not in any imported subset and 200 was never imported either —
+     this asked for a weight of a face that does not draw the glyph. 400 is
+     honest; the visual result is settled by a before/after screenshot. */
+  font-weight: 400;
   color: var(--accent);
   line-height: 1;
   margin-bottom: 4px;

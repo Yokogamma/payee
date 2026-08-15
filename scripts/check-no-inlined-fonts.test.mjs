@@ -78,14 +78,25 @@ describe('diffFontSet', () => {
 });
 
 describe('EXPECTED_FONTS', () => {
-  it('matches what the current imports produce: 18 mono + 10 Outfit', () => {
-    expect(EXPECTED_FONTS).toHaveLength(28);
+  it('matches what the current imports produce: 18 mono + 16 Manrope', () => {
+    expect(EXPECTED_FONTS).toHaveLength(34);
     expect(EXPECTED_FONTS.filter(f => f.startsWith('jetbrains-mono-'))).toHaveLength(18);
-    expect(EXPECTED_FONTS.filter(f => f.startsWith('outfit-'))).toHaveLength(10);
+    expect(EXPECTED_FONTS.filter(f => f.startsWith('manrope-'))).toHaveLength(16);
   });
 
-  it('records that Outfit ships no Cyrillic — the reason the UI face is being replaced', () => {
-    expect(EXPECTED_FONTS.some(f => f.startsWith('outfit-') && f.includes('cyrillic'))).toBe(false);
+  it('the UI face now HAS Cyrillic — the whole point of the swap', () => {
+    expect(EXPECTED_FONTS.filter(f => f.startsWith('manrope-') && f.includes('cyrillic')))
+      .toHaveLength(8); // cyrillic + cyrillic-ext × four weights
+  });
+
+  it('greek and vietnamese stay out of the UI face', () => {
+    // Their presence would mean someone went back to the per-weight entrypoint.
+    expect(EXPECTED_FONTS.some(f => f.startsWith('manrope-greek'))).toBe(false);
+    expect(EXPECTED_FONTS.some(f => f.startsWith('manrope-vietnamese'))).toBe(false);
+  });
+
+  it('weight 300 is not shipped — it was imported and used nowhere', () => {
+    expect(EXPECTED_FONTS.some(f => f.startsWith('manrope-') && f.includes('-300-'))).toBe(false);
   });
 
   it('has no duplicates', () => {

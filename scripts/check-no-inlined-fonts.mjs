@@ -46,9 +46,10 @@ export const EXPECTED_FONTS = [
   // Mono: per-weight entrypoints, so all six subsets ship. Deliberately left
   // as-is — narrowing it is a separate decision with its own measurement.
   ...fontSet('jetbrains-mono', ['cyrillic', 'cyrillic-ext', 'greek', 'latin', 'latin-ext', 'vietnamese'], [400, 500, 600]),
-  // UI face: Outfit ships latin only (no Cyrillic at all — every Russian glyph
-  // in this app is a system fallback today). Replaced by Manrope in stage 6.
-  ...fontSet('outfit', ['latin', 'latin-ext'], [300, 400, 500, 600, 700]),
+  // UI face: Manrope, imported per SUBSET so greek and vietnamese stay out.
+  // A slip back to the per-weight entrypoint would add 8 files here and this
+  // exact-set check is what catches it.
+  ...fontSet('manrope', ['latin', 'latin-ext', 'cyrillic', 'cyrillic-ext'], [400, 500, 600, 700]),
 ].sort();
 
 /** Strip Vite's `-[hash]` before the extension. */
