@@ -12,7 +12,7 @@ import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
 import { StatusLine } from '../components/StatusLine';
-import { useTheme } from '../lib/theme';
+import type { ThemePref } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
 import type { NoteData } from '../lib/crypto';
@@ -28,7 +28,12 @@ function isLongNote(text: string): boolean {
   return text.length > 600 || text.split('\n').length > 12;
 }
 
-export function Main() {
+interface MainProps {
+  theme: ThemePref;
+  onThemeChange: (t: ThemePref) => void;
+}
+
+export function Main({ theme, onThemeChange }: MainProps) {
   const {
     filteredChains,
     chains,
@@ -97,7 +102,6 @@ export function Main() {
 
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
   useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
-  const [theme, setTheme] = useTheme();
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
 
@@ -356,7 +360,7 @@ export function Main() {
       )}
 
       {view === 'settings' && (
-        <SettingsSection theme={theme} onThemeChange={setTheme} />
+        <SettingsSection theme={theme} onThemeChange={onThemeChange} />
       )}
 
       {/* The notes section is UNMOUNTED when another section is open, not

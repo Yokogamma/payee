@@ -1,17 +1,39 @@
 import { useEffect, useState } from 'react';
 
-/** Three-way theme preference (7.4): follow the OS by default, or force one. */
-export type ThemePref = 'system' | 'dark' | 'light';
+/**
+ * Theme preference: follow the OS by default, or force one.
+ *
+ * «warm» has no OS equivalent — `prefers-color-scheme` only knows light and
+ * dark — so it can only ever be an explicit choice, never a `system` outcome.
+ */
+export type ThemePref = 'system' | 'dark' | 'light' | 'warm';
 
 const THEME_KEY = 'theme';
-const DARK_BG = '#0a0a0f';
-const LIGHT_BG = '#f5f5f7';
+
+/**
+ * Backgrounds for the `theme-color` meta, which drives the Android status bar
+ * and task-switcher chrome in standalone mode.
+ *
+ * A map rather than two constants: with three explicit themes the old
+ * `dark ? DARK : LIGHT` boolean would have silently painted warm as light.
+ * This is the touchpoint most easily missed, because the symptom only appears
+ * on a real device with the PWA installed.
+ */
+const THEME_BG: Record<Exclude<ThemePref, 'system'>, string> = {
+  dark: '#0a0a0f',
+  light: '#f5f5f7',
+  warm: '#f3ebdf',
+};
+
+const EXPLICIT: readonly ThemePref[] = ['dark', 'light', 'warm'];
 
 export function loadThemePref(): ThemePref {
   const v = localStorage.getItem(THEME_KEY);
-  // Legacy values from the 2-way toggle ('dark'/'light') stay valid choices;
-  // anything else (or nothing) means "follow the system".
-  return v === 'dark' || v === 'light' ? v : 'system';
+  // Anything unrecognised — a legacy value, a corrupted entry, or a theme from
+  // a NEWER build after a rollback — degrades to «follow the system» rather
+  // than to a broken attribute. That degradation is what makes a rollback safe,
+  // so keep it even when adding a theme.
+  return EXPLICIT.includes(v as ThemePref) ? (v as ThemePref) : 'system';
 }
 
 function applyTheme(pref: ThemePref) {
@@ -19,10 +41,10 @@ function applyTheme(pref: ThemePref) {
   if (pref === 'system') root.removeAttribute('data-theme');
   else root.setAttribute('data-theme', pref);
 
-  // Keep the PWA chrome (status bar / task switcher) in sync with the shell.
-  const dark = pref === 'dark'
-    || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? DARK_BG : LIGHT_BG);
+  const effective: Exclude<ThemePref, 'system'> = pref !== 'system'
+    ? pref
+    : window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', THEME_BG[effective]);
 }
 
 export function useTheme(): [ThemePref, (t: ThemePref) => void] {

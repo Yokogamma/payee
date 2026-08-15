@@ -20,6 +20,7 @@ const THEME_LABELS: Record<ThemePref, string> = {
   system: 'Системная',
   dark: 'Тёмная',
   light: 'Светлая',
+  warm: 'Тёплая',
 };
 
 // ─── Inline SVG icons (self-hosted — the CSP forbids external icon fonts) ───
