@@ -365,12 +365,12 @@ describe('Main — R3 (writer OFF) surface', () => {
     expect(screen.getByText(/неизменяема/)).toBeTruthy(); // legacy hint intact
   });
 
-  it('shows the v3-pause standing banner with a resume button', () => {
+  it('пауза v3 — ступень строки состояния, с кнопкой возобновления', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
     s.v3Paused = true;
     render(<Main />);
-    expect(screen.getByText(/временно приостановлена/)).toBeTruthy();
+    expect(screen.getByText(/приостановлена/)).toBeTruthy();
     fireEvent.click(screen.getByText('Возобновить'));
     expect(s.resumeV3Uploads).toHaveBeenCalled();
   });
@@ -602,33 +602,28 @@ describe('Main — «Проверить обновления» в шапке', (
     expect(btn.disabled).toBe(true);
   });
 
-  it('тост показывает, сколько всего пришло — заметки, правки и сейф вместе', async () => {
+  it('результат живёт в строке состояния и виден в ЛЮБОМ разделе', () => {
     const { rerender } = render(<Main />);
     h.store.updateCheck = done({ addedNotes: 2, updatedNotes: 1, changedSafebox: 3 });
     rerender(<Main />);
-    expect(await screen.findByText('✓ Получено с других устройств: 6')).toBeTruthy();
+    expect(screen.getByText(/получено 2/)).toBeTruthy();
+
+    // Including with the settings panel open — the old toast was suppressed
+    // there and had to be re-suppressed on close.
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
+    expect(screen.getByText(/получено 2/)).toBeTruthy();
   });
 
-  it('пустая проверка тоста не даёт', () => {
+  it('пустая проверка тоже отчитывается — «новых записей нет», а не молчанием', () => {
     const { rerender } = render(<Main />);
     h.store.updateCheck = done();
     rerender(<Main />);
-    expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
+    expect(screen.getByText(/новых записей нет/)).toBeTruthy();
   });
 
-  it('проверка, завершившаяся при ОТКРЫТЫХ настройках, не всплывает тостом после их закрытия', () => {
-    const { rerender } = render(<Main />);
-    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
-
-    // Finishes while the panel is open — the panel's own result line reports it.
-    h.store.updateCheck = done({ addedNotes: 2 });
-    rerender(<Main />);
-    expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
-
-    // Closing must NOT resurrect the news out of context.
-    fireEvent.click(screen.getByLabelText('Закрыть настройки'));
-    expect(screen.queryByText(/Получено с других устройств/)).toBeNull();
-  });
+  // The «did this run already pop a toast» bookkeeping is DELETED, not moved:
+  // it existed only because the result had two homes. This is coverage that
+  // goes away with the mechanism it guarded, not coverage that was lost.
 });
 
 // ─── Stage 1: the section lives in the address ──────────────────────

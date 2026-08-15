@@ -43,8 +43,6 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
     downloadSafeboxAttachment,
     syncStatuses,
     arweave,
-    v4Paused,
-    resumeV4Uploads,
     isEncrypting,
   } = useNotes();
 
@@ -165,12 +163,6 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
         </div>
       </div>
 
-      {v4Paused && arweave.enabled && (
-        <div className="offline-banner" role="status">
-          ⏸ Загрузка записей сейфа временно приостановлена — всё сохраняется локально.
-          <button className="banner-btn" onClick={() => void resumeV4Uploads()}>Возобновить</button>
-        </div>
-      )}
 
       {!syncActive && (
         <div className="offline-banner" role="status">

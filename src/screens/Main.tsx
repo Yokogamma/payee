@@ -12,6 +12,7 @@ import { badgeFor } from '../components/syncBadge';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash, leaveSection } from '../lib/route';
 import { AppNav } from '../components/AppNav';
+import { StatusLine } from '../components/StatusLine';
 import { useTheme } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
@@ -40,24 +41,12 @@ export function Main() {
     resetApp,
     arweave,
     retrySync,
-    restoring,
-    restoreProgress,
-    restoreError,
-    restoredCount,
-    restoredUpdatedCount,
-    retryRestore,
-    clearRestoreStatus,
     pinSetupNotice,
     dismissPinSetupNotice,
-    updateCheck,
-    checkForUpdates,
     syncStatuses,
-    dismissError,
     persistDraft,
     readDraft,
     clearDraft,
-    v3Paused,
-    resumeV3Uploads,
     safeboxPinConfigured,
     safeboxDataPresent,
     safeboxLockGeneration,
@@ -76,7 +65,6 @@ export function Main() {
   const safeboxDimmed = !safeboxPinConfigured && !safeboxDataPresent;
   // Settings is a section now, so notes stay mounted behind its overlay.
   const notesVisible = view !== 'safebox';
-  const settingsOpen = view === 'settings';
 
   const [text, setText] = useState('');
   // Blocks the persist mirror from CLEARING the stored draft while the initial
@@ -99,14 +87,6 @@ export function Main() {
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
-  // How many notes/entries the last update check brought in, while that news is
-  // still worth a toast. `null` = nothing to announce.
-  const [receivedCount, setReceivedCount] = useState<number | null>(null);
-  // The `at` of the last check whose result was already dealt with. A finished
-  // run is marked handled EVEN WHEN no toast is shown — the settings panel
-  // reported it there, and without this the toast would pop later, out of
-  // context, the moment the modal closes.
-  const handledCheckAtRef = useRef<number | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
@@ -125,21 +105,11 @@ export function Main() {
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
 
-  // A finished update check: announce it once, and only out here on the feed —
-  // inside the settings panel the result line already says the same thing.
-  useEffect(() => {
-    if (updateCheck.status !== 'done') return;
-    if (handledCheckAtRef.current === updateCheck.at) return;
-    handledCheckAtRef.current = updateCheck.at;
-    const total = updateCheck.addedNotes + updateCheck.updatedNotes + updateCheck.changedSafebox;
-    if (total > 0 && !settingsOpen) setReceivedCount(total);
-  }, [updateCheck, settingsOpen]);
-
-  useEffect(() => {
-    if (receivedCount === null) return;
-    const t = setTimeout(() => setReceivedCount(null), 4000);
-    return () => clearTimeout(t);
-  }, [receivedCount]);
+  // The «Получено с других устройств» toast and its handled-run bookkeeping are
+  // gone. They existed for ONE reason, stated in their own comment: the result
+  // was shown in two places, and the toast had to avoid popping out of context
+  // when the settings panel closed. With one always-visible status line there
+  // is no second place, so there is nothing to reconcile.
 
   // ── Composer open/collapse ──────────────────────────────────────
   //
@@ -360,51 +330,10 @@ export function Main() {
           column instead. Toasts and modal overlays are position:fixed, so they
           never become grid items. */}
       <div className="main-top">
-      {/* Restoring Banner */}
-      {restoring && (
-        <div className="restoring-banner" role="status" aria-live="polite">
-          ⏳ Восстанавливаем заметки из Arweave...
-          {restoreProgress && restoreProgress.total > 0 && ` ${restoreProgress.done}/${restoreProgress.total}`}
-        </div>
-      )}
-
-      {/* Restore failed / partial (M1): distinguish "error" from "nothing to restore" */}
-      {!restoring && restoreError && (
-        <div className="error-banner" role="alert">
-          <span>⚠️ {restoreError}</span>
-          <button className="banner-btn" onClick={retryRestore}>Повторить</button>
-          <button
-            className="banner-btn banner-close"
-            onClick={clearRestoreStatus}
-            title="Скрыть"
-            aria-label="Скрыть сообщение об ошибке восстановления"
-          >
-            ✕
-          </button>
-        </div>
-      )}
-
-      {/* Restore succeeded — show what actually came back (0 included: a
-          completed empty sweep must be distinguishable from «не запускалось»).
-          M = new chains (notes), K = existing chains that gained versions. */}
-      {!restoring && !restoreError && restoredCount !== null && (
-        <div className="success-banner" role="status">
-          <span>
-            {restoredCount > 0 || (restoredUpdatedCount ?? 0) > 0
-              ? `✓ Восстановлено заметок: ${restoredCount}`
-                + ((restoredUpdatedCount ?? 0) > 0 ? `, обновлено: ${restoredUpdatedCount}` : '')
-              : '✓ Восстановление завершено: новых заметок не найдено'}
-          </span>
-          <button
-            className="banner-btn banner-close"
-            onClick={clearRestoreStatus}
-            title="Скрыть"
-            aria-label="Скрыть уведомление о восстановлении"
-          >
-            ✕
-          </button>
-        </div>
-      )}
+        {/* One line replaces the restore banners, both pause banners, the
+            offline banner, the Arweave badge, the note count and the ↻
+            button. Up to three of those used to stack and push the feed. */}
+        <StatusLine />
 
       {/* A PIN was requested during restore but is NOT the PIN of this device.
           The restore screen is long gone by now (restore switches to Main
@@ -427,60 +356,6 @@ export function Main() {
           </button>
         </div>
       )}
-
-      {/* v3 uploads paused by the server kill switch: a STANDING banner (the
-          toast dies with a reload; the persisted pause does not). */}
-      {v3Paused && arweave.enabled && (
-        <div className="offline-banner" role="status">
-          ⏸ Загрузка новых версий заметок временно приостановлена — всё сохраняется локально.
-          <button className="banner-btn" onClick={() => void resumeV3Uploads()}>
-            Возобновить
-          </button>
-        </div>
-      )}
-
-      {/* Offline Banner */}
-      {arweave.enabled && !arweave.online && (
-        <div className="offline-banner">
-          Оффлайн — заметки сохраняются локально
-        </div>
-      )}
-
-      {/* Header */}
-      <header className="main-header">
-        <div className="header-left">
-          <span className="logo-small">∞</span>
-          <span className="app-title">Eternal Notes</span>
-          <span className="note-count">{chains.length}</span>
-          {arweave.enabled && (
-            <span
-              className={`ar-badge ${arweave.online ? 'text-green' : 'text-red'}`}
-              title={arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
-              role="status"
-              aria-label={arweave.syncing ? 'Arweave: синхронизация' : arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
-            >
-              {arweave.syncing ? '⏳' : arweave.online ? '♾️' : '⚠️'}
-            </span>
-          )}
-        </div>
-        <div className="header-right">
-          {/* The 🔐 entry point and the duplicate 🔒 lock are gone: the section
-              lives in the nav, and «Закрыть сейф» stays where it belongs —
-              inside the section it locks. Two near-identical padlocks in one
-              header is what made «locked» and «left» indistinguishable. */}
-          {/* Shown unconditionally: the check works with sync disabled too, so
-              hiding it behind the toggle would contradict the settings button. */}
-          <button
-            className="icon-btn"
-            onClick={() => void checkForUpdates()}
-            disabled={updateCheck.status === 'checking'}
-            title="Проверить обновления"
-            aria-label="Проверить обновления"
-          >
-            {updateCheck.status === 'checking' ? '⏳' : '↻'}
-          </button>
-        </div>
-      </header>
       </div>
 
       <div className="main-content">
@@ -722,11 +597,6 @@ export function Main() {
         </div>
       )}
 
-      {receivedCount !== null && (
-        <div className="toast toast--success" role="status">
-          ✓ Получено с других устройств: {receivedCount}
-        </div>
-      )}
 
       {/* Clipboard feedback — success and failure must look different */}
       {copyFeedback === 'ok' && (
@@ -738,23 +608,6 @@ export function Main() {
         </div>
       )}
 
-      {/* Global sync-error toast (visible outside the settings modal) */}
-      {arweave.enabled && arweave.lastError && !settingsOpen && (
-        <div className="toast toast--error" role="alert">
-          <span>⚠️ {arweave.lastError}</span>
-          <button className="banner-btn" onClick={retrySync} disabled={arweave.syncing}>
-            {arweave.syncing ? '...' : 'Повторить'}
-          </button>
-          <button
-            className="banner-btn banner-close"
-            onClick={dismissError}
-            title="Скрыть"
-            aria-label="Скрыть сообщение об ошибке синхронизации"
-          >
-            ✕
-          </button>
-        </div>
-      )}
 
       {/* Settings Modal (extracted — 7.3) */}
       {/* Derived from the route, not from its own boolean: with two sources of
