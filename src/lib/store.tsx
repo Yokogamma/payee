@@ -551,6 +551,46 @@ export interface SafeboxNewEntry {
 
 const StoreContext = createContext<NotesStore | null>(null);
 
+// ─── Privacy-gate deadlines (§5) ─────────────────────────────────────
+
+/**
+ * How long the return-verdict may hold the opaque gate up before it is
+ * declared undecidable.
+ *
+ * LOAD-BEARING, not a nicety. The verdict waits on ONE IndexedDB meta read;
+ * a read that REJECTS already fails closed (lock → PIN screen), but a read
+ * that never settles used to hold the gate forever — and IndexedDB does stall
+ * exactly in this lifecycle: a connection suspended on BFCache entry, a
+ * transaction started around a freeze/discard, an upgrade blocked by another
+ * tab. The user then meets a blank page with a lone padlock, no PIN prompt,
+ * and no way out but a relaunch (the production report this whole file's
+ * §5 keeps re-learning). A stall is not evidence that the vault is safe to
+ * show, so the timeout joins the unreadable-config branch: fail CLOSED.
+ */
+export const VERDICT_DEADLINE_MS = 5000;
+
+/** Gate is up, the tab is in front and the verdict is taking real time: say so
+ *  instead of showing a mute padlock. */
+export const GATE_NOTE_MS = 1500;
+/** …and past this, something is wedged beyond the verdict's own deadline —
+ *  offer the manual way out (lock now, enter the PIN). */
+export const GATE_EXIT_MS = VERDICT_DEADLINE_MS + 1500;
+
+/** Reject `p` if it has not settled within `ms`. The loser is left running:
+ *  a wedged IndexedDB read can never be cancelled, only outlived. */
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`config read exceeded ${ms}ms`)),
+      Math.max(0, ms),
+    );
+    p.then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 // ─── Stale uploading threshold ───────────────────────────────────────
 
 const STALE_UPLOADING_MS = 10 * 60 * 1000; // 10 minutes (matches server reservation timeout)
@@ -702,7 +742,51 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // — exactly the moment the gate exists for.
   const gateElRef = useRef<HTMLDivElement | null>(null);
   const gateContentRef = useRef<HTMLDivElement | null>(null);
+  const gateNoteRef = useRef<HTMLParagraphElement | null>(null);
+  const gateExitRef = useRef<HTMLButtonElement | null>(null);
   const lockGateRef = useRef(false);
+  const gateRevealTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
+
+  /**
+   * The gate's own dead-man's handle.
+   *
+   * Everything else in §5 is an argument about WHO lowers the gate; twice now a
+   * path was missed and the user was left staring at an opaque padlock with no
+   * PIN prompt. This is the argument-free half: while the gate covers a tab the
+   * user is actually looking at, it explains itself, and if it outlives even
+   * the verdict's own deadline it offers the way out. «Ввести PIN» just calls
+   * lockApp() — locking is never a privacy downgrade, and it always lands on a
+   * screen with an input.
+   *
+   * Reveals ONLY to a foreground tab: a gate over a backgrounded tab has no
+   * audience, and pre-revealing it would flash «Проверяем…» on every ordinary
+   * return. The timer itself keeps running while hidden (it re-arms), because
+   * the one thing a wedged tab cannot be relied on to deliver is an event.
+   */
+  function clearGateReveal(): void {
+    for (const t of gateRevealTimersRef.current) clearTimeout(t);
+    gateRevealTimersRef.current = [];
+    gateNoteRef.current?.setAttribute('hidden', '');
+    gateExitRef.current?.setAttribute('hidden', '');
+  }
+
+  function armGateReveal(): void {
+    clearGateReveal();
+    if (!lockGateRef.current) return;
+    // A timer that RE-ARMS itself while the tab is in the background, rather
+    // than one armed by the return event: the whole point is to survive a tab
+    // whose return event never arrives. Re-armed for real on the visible edge
+    // too, so an ordinary return still counts its wait from zero.
+    const arm = (slot: number, el: () => HTMLElement | null, ms: number) => {
+      gateRevealTimersRef.current[slot] = setTimeout(() => {
+        if (document.visibilityState === 'visible') el()?.removeAttribute('hidden');
+        else arm(slot, el, ms); // no audience yet — look again later
+      }, ms);
+    };
+    arm(0, () => gateNoteRef.current, GATE_NOTE_MS);
+    arm(1, () => gateExitRef.current, GATE_EXIT_MS);
+  }
+
   function setLockGate(up: boolean): void {
     lockGateRef.current = up;
     // ATTRIBUTES, not properties: attribute reflection is universal, whereas
@@ -718,6 +802,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (up) content.setAttribute('inert', '');
       else content.removeAttribute('inert');
     }
+    // A lowered gate owes nobody an explanation; a raised one re-arms its
+    // dead-man's handle (a no-op while the tab is in the background).
+    if (up) armGateReveal();
+    else clearGateReveal();
   }
   // Ownership of the pending return-verdict (review round 3): bumped on every
   // hidden edge, lock and vault commit. A verdict may apply itself — lock or
@@ -953,6 +1041,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     };
 
     const evaluateReturn = () => {
+      // The gate was raised while the tab was in the background, where its
+      // dead-man's handle stays disarmed. The audience is back — arm it now,
+      // for the whole return, not just the verdict below.
+      armGateReveal();
       const now = Date.now();
       const myGen = lockCheckGenerationRef.current;
       const myEpoch = vaultEpochRef.current;
@@ -976,6 +1068,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // An unreadable config fails CLOSED: a vault we cannot vouch for locks.
       lockCheckPendingRef.current = true;
       void (async () => {
+        // ONE deadline for the whole verdict, not per attempt: five stalled
+        // reads in a row must not add up to five times the wait.
+        const decideBy = Date.now() + VERDICT_DEADLINE_MS;
         // The verdict must reflect the LATEST authoritative config. If a newer
         // reconcile — or a local config write — lands while we read, our
         // snapshot cannot be trusted in EITHER direction: completing a stale
@@ -990,13 +1085,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           let freshTimeout: AutoLockTimeout = null;
           let readOk = false;
           try {
-            const { pinSeed, autoLockTimeout: rawTimeout } = await getPinConfigMeta();
+            const { pinSeed, autoLockTimeout: rawTimeout } =
+              await withDeadline(getPinConfigMeta(), decideBy - Date.now());
             freshHasPin = !!pinSeed;
             freshTimeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
             readOk = true;
             lock = decideLockOnReturn(freshTimeout, freshHasPin, marker, now);
           } catch (err) {
-            console.error('auto-lock config re-read failed — locking fail-closed:', err);
+            console.error('auto-lock config re-read failed or timed out — locking fail-closed:', err);
           }
           // A newer hidden/lock/commit owns the gate — this return is over
           // (rounds 3–4). Nothing to complete, nothing to publish.
@@ -1084,6 +1180,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (clipboardClearTimerRef.current !== null) clearTimeout(clipboardClearTimerRef.current);
       // The safebox idle lock must not outlive the provider either.
       if (safeboxIdleTimerRef.current !== null) clearTimeout(safeboxIdleTimerRef.current);
+      // …nor the gate's reveal timers (they would fire into a dead DOM).
+      clearGateReveal();
     };
   }, []);
 
@@ -3710,6 +3808,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         hidden
       >
         <span className="lock-gate-icon" aria-hidden="true">🔒</span>
+        {/* Both revealed IMPERATIVELY (see armGateReveal), on the same grounds
+            as the gate itself. `hidden` also keeps the button out of the tab
+            order until it is genuinely needed. */}
+        <p className="lock-gate-note" ref={gateNoteRef} hidden>
+          Проверяем авто-блокировку…
+        </p>
+        <button
+          type="button"
+          className="btn btn-ghost lock-gate-exit"
+          ref={gateExitRef}
+          onClick={() => lockApp()}
+          hidden
+        >
+          Ввести PIN
+        </button>
       </div>
     </StoreContext.Provider>
   );
