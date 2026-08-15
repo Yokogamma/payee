@@ -1,0 +1,86 @@
+name: CI
+
+# Automatic quality gates. The three deploy workflows are workflow_dispatch-only,
+# so until this file existed the test suite ran ONLY when an operator dispatched a
+# deploy — i.e. a broken suite was discovered at deploy time, on the release path.
+# That is exactly how PR #23 landed a test that could not even be COLLECTED (a
+# shebang in the imported worker/scripts/derive-smoke-key.mjs; fixed in PR #24):
+# four tests vanished from the run and nobody saw it until a local gate run.
+#
+# This workflow runs the SAME gates as the deploys, minus everything that needs a
+# secret or touches infrastructure. It deploys nothing and holds no credentials.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege, matching the deploy workflows: read the code, nothing else.
+# No secrets are referenced anywhere below — see the note on `npm run build`.
+permissions:
+  contents: read
+
+# Superseded PR runs are pointless once a new commit is pushed; main is never
+# cancelled, so every commit on the default branch keeps a real status.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      # ── Client ──
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      # The typecheck half of `npm run build` (`tsc -b`, noEmit in both projects).
+      # The deploys get it for free inside the build; CI cannot run the build
+      # (see below), so the gate is invoked directly — it needs no secrets.
+      - run: npm run typecheck
+      # ── Worker ──
+      - run: npm --prefix worker ci
+      - run: npm --prefix worker run typecheck
+      - run: npm --prefix worker test
+      # Staging config gate: --dry-run validates [env.staging] (bindings,
+      # migrations, vars) without auth — catches wrangler.toml drift before an
+      # operator hits it during the mandatory pre-W3 smoke.
+      - run: npm --prefix worker run deploy:staging:check
+
+      # ── Build + post-build guards, on a DELIBERATELY FAKE owner ──
+      # Two guards can only run against dist/: the bundle budget and the font
+      # check. Leaving them deploy-only means a CSP-breaking inlined font or a
+      # blown budget is found on the release path — the exact failure mode this
+      # workflow exists to end. The font guard in particular is the only thing
+      # standing between `assetsInlineLimit` drift and fonts silently blocked by
+      # `font-src 'self'` in production.
+      #
+      # The build is fail-closed on VITE_TRUSTED_OWNERS, so it needs SOME value,
+      # and secrets are not an option: they do not reach fork PRs or Dependabot
+      # PRs (separate secret store), and .github/dependabot.yml watches three
+      # ecosystems weekly — wiring a secret here would paint every Dependabot PR
+      # red for a missing secret rather than a real defect.
+      #
+      # So the value below is an obvious placeholder, and that is the point. It
+      # is format-valid (43 base64url chars) and provably not a wallet, so it
+      # cannot be mistaken for the production root of trust. This step is an
+      # ASSET gate — does it compile, does it fit the budget, are the fonts
+      # linked rather than inlined — NOT a trust gate. The trust gate stays
+      # fail-closed in the deploy workflows, which hold the real owners and run
+      # the same guards again before anything is published. A CI run cannot make
+      # a bad owner list green in production, because CI publishes nothing.
+      - run: npm run build
+        env:
+          VITE_BASE: /
+          VITE_PROXY_URL: https://ci-placeholder.invalid
+          # NOT A WALLET — see the note above.
+          VITE_TRUSTED_OWNERS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      - run: node scripts/check-bundle-budget.mjs
+      - run: node scripts/check-no-inlined-fonts.mjs
+      # Report only, no threshold — prints what users actually download so the
+      # number is visible in the log when a PR moves it.
+      - run: node scripts/report-precache.mjs
