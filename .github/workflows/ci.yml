@@ -51,17 +51,36 @@ jobs:
       # operator hits it during the mandatory pre-W3 smoke.
       - run: npm --prefix worker run deploy:staging:check
 
-      # ── Deliberately NOT here: `npm run build` + scripts/check-bundle-budget.mjs ──
-      # The build is fail-closed on VITE_TRUSTED_OWNERS (vite.config.ts throws when
-      # it is empty), and the budget check needs the build's output, so both need a
-      # value CI cannot obtain honestly:
-      #   * repo secrets DO reach pull_request runs from branches of this repo, but
-      #     NOT fork PRs and NOT Dependabot PRs (those get the separate Dependabot
-      #     secret store) — and .github/dependabot.yml watches three ecosystems
-      #     weekly, so wiring secrets.VITE_TRUSTED_OWNERS here would paint every
-      #     Dependabot PR red for a missing secret rather than a real defect;
-      #   * a hard-coded placeholder owner would turn the fail-closed root-of-trust
-      #     gate green on a value that is not the production one — the invariant in
-      #     AGENTS.md exists precisely to stop that.
-      # Both gates stay where they can run truthfully: the deploy workflows, which
-      # already hold the secrets and run them before publishing.
+      # ── Build + post-build guards, on a DELIBERATELY FAKE owner ──
+      # Two guards can only run against dist/: the bundle budget and the font
+      # check. Leaving them deploy-only means a CSP-breaking inlined font or a
+      # blown budget is found on the release path — the exact failure mode this
+      # workflow exists to end. The font guard in particular is the only thing
+      # standing between `assetsInlineLimit` drift and fonts silently blocked by
+      # `font-src 'self'` in production.
+      #
+      # The build is fail-closed on VITE_TRUSTED_OWNERS, so it needs SOME value,
+      # and secrets are not an option: they do not reach fork PRs or Dependabot
+      # PRs (separate secret store), and .github/dependabot.yml watches three
+      # ecosystems weekly — wiring a secret here would paint every Dependabot PR
+      # red for a missing secret rather than a real defect.
+      #
+      # So the value below is an obvious placeholder, and that is the point. It
+      # is format-valid (43 base64url chars) and provably not a wallet, so it
+      # cannot be mistaken for the production root of trust. This step is an
+      # ASSET gate — does it compile, does it fit the budget, are the fonts
+      # linked rather than inlined — NOT a trust gate. The trust gate stays
+      # fail-closed in the deploy workflows, which hold the real owners and run
+      # the same guards again before anything is published. A CI run cannot make
+      # a bad owner list green in production, because CI publishes nothing.
+      - run: npm run build
+        env:
+          VITE_BASE: /
+          VITE_PROXY_URL: https://ci-placeholder.invalid
+          # NOT A WALLET — see the note above.
+          VITE_TRUSTED_OWNERS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      - run: node scripts/check-bundle-budget.mjs
+      - run: node scripts/check-no-inlined-fonts.mjs
+      # Report only, no threshold — prints what users actually download so the
+      # number is visible in the log when a PR moves it.
+      - run: node scripts/report-precache.mjs
