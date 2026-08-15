@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useNotes, VaultMismatchError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
 import { copyTextToClipboard } from '../lib/clipboard';
 
 type Step = 'start' | 'seed' | 'verify' | 'pin';
@@ -8,7 +9,7 @@ type Step = 'start' | 'seed' | 'verify' | 'pin';
 const VERIFY_WORDS = 3;
 
 export function Onboarding() {
-  const { createNewWallet, confirmMnemonic, setupPin, removePin, goToRestore, goToLanding, resetApp } = useNotes();
+  const { createNewWallet, confirmMnemonic, goToRestore, goToLanding, resetApp } = useNotes();
   const [step, setStep] = useState<Step>('start');
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [seedRevealed, setSeedRevealed] = useState(false);
@@ -23,6 +24,7 @@ export function Onboarding() {
   const [showReset, setShowReset] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [finishing, setFinishing] = useState(false);
+  const inFlightRef = useRef(false);
 
   async function handleGenerate() {
     const mn = await createNewWallet();
@@ -75,36 +77,25 @@ export function Onboarding() {
   }
 
   async function handleFinish(withPin: boolean) {
-    if (!mnemonic || finishing) return;
+    // Synchronous, unlike `finishing`: two clicks in one React batch would both
+    // pass a state-only guard and start two vault opens.
+    if (!mnemonic || inFlightRef.current) return;
     if (withPin) {
       if (pinInput.length < 6) { setError('PIN — минимум 6 цифр'); return; }
       if (pinInput !== pinConfirm) { setError('PIN-коды не совпадают'); return; }
     }
+    inFlightRef.current = true;
     setFinishing(true);
     setError('');
 
-    // PIN FIRST: after confirmMnemonic the app leaves this screen, so a PIN
-    // failure there would be invisible and the user would believe a PIN is set.
-    // Here a failure keeps the user on the PIN step with an explicit choice:
-    // retry or continue without PIN.
-    if (withPin) {
-      try {
-        await setupPin(pinInput);
-      } catch (err) {
-        console.error('PIN setup failed:', err);
-        setError('Не удалось установить PIN. Попробуйте ещё раз или нажмите «Пропустить», чтобы войти без PIN.');
-        setFinishing(false);
-        return;
-      }
-    }
-
+    // ONE identity-checked operation — never «write the PIN, then check the
+    // vault, then take the PIN back». A tab that loses the identity race would
+    // otherwise leave a PIN for a vault this device does not have, or delete
+    // the PIN of the vault that won. The store writes it only after the
+    // binding, and reports a PIN that did not make it via pinSetupNotice.
     try {
-      await confirmMnemonic(mnemonic);
+      await confirmMnemonic(mnemonic, withPin ? { pin: pinInput } : undefined);
     } catch (err) {
-      // Don't leave a pin-seed for a vault that failed to initialize.
-      if (withPin) {
-        try { await removePin(); } catch { /* best effort */ }
-      }
       if (err instanceof VaultMismatchError) {
         setError(err.message);
         setShowReset(true);
@@ -112,6 +103,7 @@ export function Onboarding() {
         console.error('confirmMnemonic failed:', err);
         setError('Не удалось создать хранилище. Попробуйте ещё раз.');
       }
+      inFlightRef.current = false;
       setFinishing(false);
     }
   }
@@ -253,25 +245,35 @@ export function Onboarding() {
               физическом доступе к устройству он не заменяет надёжное хранение фразы.
             </div>
 
+            {/* Anti-autofill set + neutral name/id, like every other secret
+                field: a manager that saves the master PIN to a third-party
+                cloud breaks the end-to-end model. Locked while the vault is
+                being created — the KDF already took the value on screen. */}
             <input
               type="password"
               inputMode="numeric"
               pattern="[0-9]*"
               className="pin-input"
+              name="setup-code" id="setup-code"
               placeholder="PIN (мин. 6 цифр)"
               value={pinInput}
               maxLength={8}
+              disabled={finishing}
               onChange={e => { setPinInput(e.target.value.replace(/\D/g, '')); setError(''); }}
+              {...SECRET_PASSWORD_FIELD_PROPS}
             />
             <input
               type="password"
               inputMode="numeric"
               pattern="[0-9]*"
               className="pin-input"
+              name="setup-code-2" id="setup-code-2"
               placeholder="Повторите PIN"
               value={pinConfirm}
               maxLength={8}
+              disabled={finishing}
               onChange={e => { setPinConfirm(e.target.value.replace(/\D/g, '')); setError(''); }}
+              {...SECRET_PASSWORD_FIELD_PROPS}
             />
 
             {error && <div className="error-msg">{error}</div>}

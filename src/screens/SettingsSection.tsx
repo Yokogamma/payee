@@ -1,27 +1,31 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useNotes } from '../lib/store';
 import type { AutoLockTimeout } from '../lib/auto-lock';
 import type { ThemePref } from '../lib/theme';
-import { useModalA11y } from '../lib/useModalA11y';
-import { SECRET_PASSWORD_FIELD_PROPS } from './secretFieldProps';
+import { SECRET_PASSWORD_FIELD_PROPS, SAFEBOX_SECRET_FIELD_CLASS } from '../components/secretFieldProps';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { navigate } from '../lib/route';
+import { QUARANTINE_EXPLANATION } from '../lib/syncCounters';
 
-/** Settings modal (7.3/L8) — extracted from the 500-line Main screen.
- *  Reorganised into collapsible blocks (all collapsed by default); each block
- *  header shows a glanceable status chip. Local UI state (seed reveal, PIN form,
- *  invite form) lives here; the reset confirmation dialog stays in Main (it must
- *  outlive the modal). */
-interface SettingsModalProps {
-  open: boolean;
-  onClose: () => void;
+/** Settings SECTION — a routed destination, not a dialog. Grouped into four
+ *  groups («Доступ и замки», «Синхронизация», «Вид», «Опасная зона»), each
+ *  holding collapsible blocks with a glanceable status chip.
+ *
+ *  Local UI state (seed reveal, PIN form, invite form) lives here and dies with
+ *  the unmount when the user navigates away — strictly stronger than the old
+ *  reset-on-close. The reset confirmation dialog lives HERE too now: the section
+ *  is not aria-modal, so it is the only modal layer on screen and does not need
+ *  to outlive anything. */
+interface SettingsSectionProps {
   theme: ThemePref;
   onThemeChange: (t: ThemePref) => void;
-  onRequestReset: () => void;
 }
 
 const THEME_LABELS: Record<ThemePref, string> = {
   system: 'Системная',
   dark: 'Тёмная',
   light: 'Светлая',
+  warm: 'Тёплая',
 };
 
 // ─── Inline SVG icons (self-hosted — the CSP forbids external icon fonts) ───
@@ -40,7 +44,6 @@ const IconLock = () => <Svg><rect x="5" y="11" width="14" height="10" rx="2" /><
 const IconInfinity = () => <Svg><path d="M9.828 9.172a4 4 0 1 0 0 5.656 10 10 0 0 0 2.172 -2.828 10 10 0 0 1 2.172 -2.828 4 4 0 1 1 0 5.656 10 10 0 0 1 -2.172 -2.828 10 10 0 0 0 -2.172 -2.828z" /></Svg>;
 const IconTheme = () => <Svg><circle cx="12" cy="12" r="9" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" /></Svg>;
 const IconTrash = () => <Svg><path d="M4 7h16" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7V4a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></Svg>;
-const IconX = () => <Svg><path d="M18 6 6 18" /><path d="m6 6 12 12" /></Svg>;
 const IconChevron = () => <Svg><path d="m6 9 6 6 6 -6" /></Svg>;
 const IconNote = () => <Svg><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M9 8h6" /><path d="M9 12h6" /><path d="M9 16h4" /></Svg>;
 const IconShield = () => <Svg><path d="M12 3l7 3v5c0 4 -3 7 -7 8 -4 -1 -7 -4 -7 -8V6z" /><circle cx="12" cy="11" r="1.4" /><path d="M12 12.4V15" /></Svg>;
@@ -74,7 +77,7 @@ function SettingsBlock({ icon, title, chip, chipClass, danger, children }: {
   );
 }
 
-export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestReset }: SettingsModalProps) {
+export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) {
   const {
     notes,
     chains,
@@ -96,6 +99,7 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     unlockSafebox,
     changeSafeboxPin,
     deactivateSafebox,
+    resetApp,
   } = useNotes();
 
   const [showSeed, setShowSeed] = useState(false);
@@ -107,25 +111,54 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
   const [seedGateBusy, setSeedGateBusy] = useState(false);
   const [seedGatePassed, setSeedGatePassed] = useState(false);
 
-  function close() {
+  // No `open` prop and no close(): navigating away UNMOUNTS this section, which
+  // is strictly stronger than the old reset-on-close — nothing can survive it.
+  //
+  // Escape is deliberately NOT bound. A section-level «Escape → к заметкам»
+  // would fight the nested dialogs' own stopPropagation and would yank the user
+  // out mid-form. Leaving is the nav, or the Back gesture — which now works.
+  function clearSeedState() {
     setShowSeed(false);
     setSeedGatePin('');
     setSeedGateError('');
     setSeedGatePassed(false);
-    onClose();
   }
 
-  // Phase 7: Escape closes, Tab trapped inside, focus returned to the trigger.
-  const containerRef = useModalA11y<HTMLDivElement>(open, close);
-  useEffect(() => {
-    if (open) containerRef.current?.focus();
-    // The revealed seed must NEVER survive a close, however the modal was
-    // closed — incl. the reset flow, where Main flips `open` directly and the
-    // internal close() is bypassed (round-13 finding: Settings → показать seed
-    // → Reset → отмена → Settings снова показывал фразу без запроса).
-    else { setShowSeed(false); setSeedGatePassed(false); setSeedGatePin(''); setSeedGateError(''); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  // ROUND-13 REGRESSION GUARD, in its new shape. The old modal cleared the
+  // revealed phrase whenever `open` went false, which the reset flow relied on:
+  // «Settings → показать seed → Сброс → отмена → Settings снова показывал фразу
+  // без запроса». In a section the user never leaves during that flow, nothing
+  // unmounts, and the phrase would sit there behind the confirm dialog — so the
+  // clearing has to be explicit here.
+  function requestReset() {
+    clearSeedState();
+    setShowResetConfirm(true);
+  }
+
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+  // Reset-safety is STORAGE-backed (arweave.resetRiskCount): every stored
+  // record that is not confirmed — visible or not (historical versions,
+  // quarantined/undecryptable records) — is unrecoverable after a wipe. The
+  // visible `notes` list undercounts exactly the records most at risk.
+  // The safebox contribution is derived from the ENCRYPTED rows, so the
+  // warning is correct with the section LOCKED — the normal case here.
+  const resetRiskTotal = arweave.resetRisk.notes + arweave.resetRisk.safebox;
+  const resetWarningMessage = !arweave.countsReady
+    // Until the first sync-count read completes we cannot know what is safe.
+    ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
+      + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
+      + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
+    : resetRiskTotal > 0
+      // Only CONFIRMED records are recoverable: an `accepted` transaction can
+      // still be dropped, and after a wipe there is no local ciphertext left.
+      ? `⚠️ ${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+        + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
+        + (arweave.resetRisk.safebox > 0
+          ? `Из них в защищённом сейфе: ${arweave.resetRisk.safebox} — пароли и вложения.\n`
+          : '')
+        + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
+      : 'Все локальные данные будут удалены. Все записи подтверждены в блокчейне — их можно вернуть по seed-фразе.';
 
   // A SECTION LOCK (idle timer, hidden/pagehide, app lock, another tab) must
   // clear this modal's own safebox secrets too — it sits OUTSIDE the subtree
@@ -139,7 +172,6 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     setSeedGateError('');
   }
 
-  if (!open) return null;
 
   // Gate matrix (§2):
   //  - no safebox config, no safebox data → the seed is shown as before;
@@ -183,22 +215,17 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
     : arweave.online ? '● Онлайн' : '○ Оффлайн';
   const arweaveChipClass = arweave.enabled && arweave.online ? 'text-green' : '';
 
+
+
   return (
-    <div className="modal-overlay" onClick={close}>
-      <div
-        ref={containerRef}
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Настройки"
-        tabIndex={-1}
-        onClick={e => e.stopPropagation()}
-      >
+    <section className="settings-section" aria-labelledby="settings-title">
+      <div>
         <div className="settings-topbar">
-          <h2>Настройки</h2>
-          <button type="button" className="settings-close" onClick={close} aria-label="Закрыть настройки">
-            <IconX />
-          </button>
+          {/* tabIndex={-1}: the shell moves focus here on every section change,
+              which is the a11y invariant that replaces the modal focus trap —
+              without it a keyboard user lands at the top of the document with
+              no announcement. */}
+          <h2 id="settings-title" className="section-title" tabIndex={-1}>Настройки</h2>
         </div>
 
         <div className="settings-statusbar">
@@ -211,6 +238,12 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
         </div>
 
         <div className="settings-blocks">
+          {/* Four groups instead of six loose blocks. The point is the first
+              one: three things about locks used to sit interleaved with the
+              theme picker and the reset button, so nothing told the user that
+              the app PIN and the safebox PIN are DIFFERENT contours. */}
+          <div className="settings-group">
+            <h3 className="settings-group-title">Доступ и замки</h3>
           <SettingsBlock icon={<IconKey />} title="Seed-фраза">
             <button
               className="btn btn-outline full-width"
@@ -236,7 +269,7 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
                   type="password"
                   inputMode="numeric"
                   pattern="[0-9]*"
-                  className="pin-input safebox-secret-field"
+                  className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
                   name="sbx-gate-seed"
                   id="sbx-gate-seed"
                   placeholder="PIN сейфа"
@@ -289,23 +322,28 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
             )}
           </SettingsBlock>
 
-          {(safeboxPinConfigured || safeboxDataPresent) && (
-            <SettingsBlock
-              icon={<IconShield />}
-              title="Защищённый сейф"
-              chip={safeboxPinConfigured ? 'PIN установлен' : 'PIN не установлен'}
-            >
-              <SafeboxSettingsSection
-                // Remounted on every section lock: its current/new PIN fields
-                // would otherwise survive a hidden/pagehide round-trip.
-                key={safeboxLockGeneration}
-                configured={safeboxPinConfigured}
-                changeSafeboxPin={changeSafeboxPin}
-                deactivateSafebox={deactivateSafebox}
-              />
-            </SettingsBlock>
-          )}
+          {/* Unconditional, like the nav item: the same appear/disappear
+              formula lived here too. Nothing configured yet is a STATE, shown
+              in the chip, not a reason to hide the only route to it. */}
+          <SettingsBlock
+            icon={<IconShield />}
+            title="Защищённый сейф"
+            chip={safeboxPinConfigured ? 'PIN установлен' : 'не настроен'}
+          >
+            <SafeboxSettingsSection
+              // Remounted on every section lock: its current/new PIN fields
+              // would otherwise survive a hidden/pagehide round-trip.
+              key={safeboxLockGeneration}
+              configured={safeboxPinConfigured}
+              changeSafeboxPin={changeSafeboxPin}
+              deactivateSafebox={deactivateSafebox}
+            />
+          </SettingsBlock>
 
+          </div>
+
+          <div className="settings-group">
+            <h3 className="settings-group-title">Синхронизация</h3>
           <SettingsBlock
             icon={<IconInfinity />}
             title="Вечное хранилище"
@@ -325,16 +363,15 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
               <div>Статус: <strong className={arweave.online ? 'text-green' : 'text-red'}>
                 {arweave.online ? '● Онлайн' : '○ Оффлайн'}
               </strong></div>
-              {/* Per-version accounting: every version is its own transaction. */}
-              <div>Синхронизировано записей: <strong>{arweave.acceptedCount + arweave.confirmedCount}</strong> из <strong>{notes.length}</strong></div>
-              {arweave.confirmedCount > 0 && (
-                <div className="text-green">✓ Подтверждено в блокчейне: <strong>{arweave.confirmedCount}</strong></div>
-              )}
+              {/* The per-note and per-version counters now live in the status
+                  line's expandable panel — one place, one computation. A copy
+                  here meant two answers to «how much is safely on chain», and
+                  the user would have had to reconcile them. */}
               {arweave.acceptedCount > 0 && (
-                <div>⏳ Ожидают подтверждения: <strong>{arweave.acceptedCount}</strong></div>
+                <div>⏳ Ожидают подтверждения версий: <strong>{arweave.acceptedCount}</strong></div>
               )}
               {arweave.unsyncedCount > 0 && (
-                <div>⏳ Ожидают загрузки: <strong>{arweave.unsyncedCount}</strong></div>
+                <div>⏳ Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>
               )}
               {arweave.errorCount > 0 && (
                 <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
@@ -343,8 +380,7 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
                 // Permanent by design — deliberately NOT lumped into «Ошибки»:
                 // no «Повторить» can ever fix a quarantined record.
                 <div>
-                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — созданы
-                  более новой версией приложения; обновите приложение, чтобы загрузить их.
+                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
                 </div>
               )}
               {arweave.lastSync && (
@@ -355,6 +391,7 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
             {arweave.lastError && (
               <div className="error-msg">{arweave.lastError}</div>
             )}
+
 
             {arweave.enabled && (arweave.unsyncedCount > 0 || arweave.lastError) && (
               <button
@@ -377,6 +414,10 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
             )}
           </SettingsBlock>
 
+          </div>
+
+          <div className="settings-group">
+            <h3 className="settings-group-title">Вид</h3>
           <SettingsBlock icon={<IconTheme />} title="Тема" chip={THEME_LABELS[theme]}>
             <div className="theme-picker" role="group" aria-label="Тема оформления">
               {(Object.keys(THEME_LABELS) as ThemePref[]).map(t => (
@@ -392,18 +433,36 @@ export function SettingsModal({ open, onClose, theme, onThemeChange, onRequestRe
             </div>
           </SettingsBlock>
 
+          </div>
+
+          <div className="settings-group">
+            <h3 className="settings-group-title settings-group-title--danger">Опасная зона</h3>
           <SettingsBlock icon={<IconTrash />} title="Сброс приложения" danger>
             <div className="settings-hint">
               Удаляет все локальные данные с этого устройства. Заметки, сохранённые
               в блокчейне, останутся — восстановишь по seed-фразе.
             </div>
-            <button className="btn btn-danger full-width" onClick={onRequestReset}>
+            <button className="btn btn-danger full-width" onClick={requestReset}>
               Сбросить приложение
             </button>
           </SettingsBlock>
+          </div>
         </div>
       </div>
-    </div>
+
+      {/* The reset confirm lives HERE now. Settings is no longer aria-modal, so
+          the old «close settings before opening the confirm» dance is
+          unnecessary: this dialog is the only modal layer on screen. */}
+      <ConfirmDialog
+        open={showResetConfirm}
+        title="Сбросить приложение?"
+        message={resetWarningMessage}
+        confirmLabel="Сбросить"
+        danger
+        onConfirm={() => { setShowResetConfirm(false); navigate('notes', { replace: true }); void resetApp(); }}
+        onCancel={() => setShowResetConfirm(false)}
+      />
+    </section>
   );
 }
 
@@ -487,7 +546,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
         <div className="pin-setup">
           <input
             type="password" inputMode="numeric" pattern="[0-9]*"
-            className="pin-input safebox-secret-field"
+            className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
             name="sbx-cur-code" id="sbx-cur-code"
             placeholder="Текущий PIN сейфа" value={currentPin} maxLength={8}
             onChange={e => { setCurrentPin(e.target.value.replace(/\D/g, '')); setError(''); }}
@@ -497,7 +556,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
             <>
               <input
                 type="password" inputMode="numeric" pattern="[0-9]*"
-                className="pin-input safebox-secret-field"
+                className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
                 name="sbx-next-code" id="sbx-next-code"
                 placeholder="Новый PIN (6–8 цифр)" value={newPin} maxLength={8}
                 onChange={e => { setNewPin(e.target.value.replace(/\D/g, '')); setError(''); }}
@@ -505,7 +564,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
               />
               <input
                 type="password" inputMode="numeric" pattern="[0-9]*"
-                className="pin-input safebox-secret-field"
+                className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
                 name="sbx-next-code-2" id="sbx-next-code-2"
                 placeholder="Повторите новый PIN" value={confirmPin} maxLength={8}
                 onChange={e => { setConfirmPin(e.target.value.replace(/\D/g, '')); setError(''); }}

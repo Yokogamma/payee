@@ -244,6 +244,10 @@ export async function saveNote(note: EncryptedNote): Promise<void> {
  * crash can never leave a note without its sync state (or vice versa). Used on
  * restore to record the already-on-chain TX as `confirmed`, which stops
  * syncPendingNotes from re-uploading it (and, for v2 notes, mis-serializing).
+ *
+ * CONTRACT: the transaction is created SYNCHRONOUSLY on entry. Callers that
+ * guard against a concurrent reset rely on it — an await added before the
+ * `transaction(...)` line would silently reopen the resurrection window.
  */
 export async function saveNoteWithSync(
   note: EncryptedNote,
@@ -283,11 +287,18 @@ export async function mergeRestoredNote(
   note: EncryptedNote,
   txId: string,
   now: number,
+  expectedDbGeneration: number,
 ): Promise<void> {
   const sync = await getSyncRecord(note.noteId);
   const record: SyncRecord = sync?.status === 'confirmed'
     ? sync
     : { noteId: note.noteId, kind: 'note', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+  // The CALLER's pre-merge check is not enough (P1): the getSyncRecord await
+  // above is a real suspension point, and a reset landing inside it would create
+  // its clear transaction BEFORE the write below — resurrecting the note in a
+  // database the user just wiped. Re-assert here, with nothing awaited between
+  // this line and the transaction saveNoteWithSync creates on entry.
+  assertDbGeneration(expectedDbGeneration);
   await saveNoteWithSync(note, record);
 }
 
@@ -321,8 +332,9 @@ export async function countSafeboxEntries(): Promise<number> {
 }
 
 /** Persist an entry and its sync record together in a SINGLE transaction —
- *  same contract as saveNoteWithSync. Used by the restore merge, which records
- *  the already-on-chain TX as `confirmed`. */
+ *  same contract as saveNoteWithSync, including the synchronous creation of the
+ *  transaction on entry. Used by the restore merge, which records the
+ *  already-on-chain TX as `confirmed`. */
 export async function saveSafeboxEntryWithSync(
   entry: EncryptedSafeboxEntry,
   record: SyncRecord,
@@ -347,11 +359,14 @@ export async function mergeRestoredSafeboxEntry(
   entry: EncryptedSafeboxEntry,
   txId: string,
   now: number,
+  expectedDbGeneration: number,
 ): Promise<void> {
   const sync = await getSyncRecord(entry.entryId);
   const record: SyncRecord = sync?.status === 'confirmed'
     ? sync
     : { noteId: entry.entryId, kind: 'safebox', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+  // Same P1 window as mergeRestoredNote — see the comment there.
+  assertDbGeneration(expectedDbGeneration);
   await saveSafeboxEntryWithSync(entry, record);
 }
 
@@ -786,6 +801,62 @@ export async function deleteMeta(key: string): Promise<void> {
   await getDB().delete('meta', key);
 }
 
+// ─── Vault identity ─────────────────────────────────────────────────
+
+/** Outcome of binding a seed's public key to THIS database. */
+export type VaultBindResult = 'bound' | 'same' | 'foreign';
+
+/**
+ * Bind the vault identity — and, optionally, mark the database initialized — in
+ * ONE readwrite `meta` transaction:
+ *   no key yet    → write the key (+ `init` when initialize) → 'bound'
+ *   same key      → (+ `init` when initialize)               → 'same'
+ *   foreign key   → write NOTHING                            → 'foreign'
+ *
+ * First-writer-wins. A plain `setMeta('vault-public-key', pk)` after the
+ * read-only guard in prepareVaultSnapshot leaves a window in which two tabs
+ * opening DIFFERENT seeds against an EMPTY database both pass the guard and
+ * then overwrite each other — one tab's key with the other tab's PIN. Inside
+ * one transaction that cannot happen, and `init` can never be written apart
+ * from the key it belongs to.
+ *
+ * Returns 'foreign' instead of throwing: VaultMismatchError lives in the store
+ * (importing it here would be a cycle), and the caller owns the user-facing
+ * error text.
+ *
+ * BOUNDARY: like every reset-exclusivity check in this file, this sees only
+ * resets THIS tab knows about (dbGeneration). A database cleared by another tab
+ * whose 'reset' broadcast has not arrived yet is indistinguishable from a
+ * never-initialized one — the accepted residual window (see the dbGeneration
+ * comment below).
+ */
+export async function bindVaultIdentity(
+  pkB64: string,
+  opts: { initialize: boolean },
+  expectedDbGeneration: number,
+): Promise<VaultBindResult> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const saved = await meta.get('vault-public-key') as string | undefined;
+    if (saved !== undefined && saved !== pkB64) {
+      await tx.done;
+      return 'foreign';
+    }
+    if (saved === undefined) await meta.put(pkB64, 'vault-public-key');
+    if (opts.initialize) await meta.put(true, 'init');
+    await tx.done;
+    return saved === undefined ? 'bound' : 'same';
+  } catch (e) {
+    // Same rollback discipline as saveNoteWithSync: a failure on the second put
+    // must not let the transaction auto-commit with only the first written.
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
 /**
  * Atomically clear the ENTIRE PIN configuration in ONE transaction over the
  * meta store: delete pin-seed, pin-attempts and pin-locked-until, and reset
@@ -822,6 +893,43 @@ export async function clearPinConfigMeta(): Promise<void> {
     // Same rollback discipline as saveNoteWithSync: an error after the first
     // delete must not let the transaction auto-commit half the cleanup.
     tx.done.catch(() => {}); // swallow the resulting abort rejection (we rethrow e)
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/**
+ * First-writer-wins PIN write for the RESTORE flow. ONE readwrite `meta`
+ * transaction: `pin-seed` is written ONLY when absent, and the metering is
+ * cleared in the same commit so a fresh configuration can never inherit a
+ * stale lockout.
+ *
+ * `false` = another tab configured a PIN first; its blob is left ALONE. The
+ * restore flow must not silently replace a PIN the user set elsewhere —
+ * replacing one is an explicit action, and it lives in the settings screen.
+ *
+ * `auto-lock-timeout` is untouched, exactly like the onboarding `setupPin`.
+ */
+export async function commitPinSeedIfAbsent(
+  blob: PinEncryptedSeed,
+  expectedDbGeneration: number,
+): Promise<boolean> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const existing: unknown = await meta.get('pin-seed');
+    if (existing !== undefined) {
+      await tx.done;
+      return false;
+    }
+    await meta.put(blob, 'pin-seed');
+    await meta.delete('pin-attempts');
+    await meta.delete('pin-locked-until');
+    await tx.done;
+    return true;
+  } catch (e) {
+    tx.done.catch(() => {});
     try { tx.abort(); } catch { /* already aborting/aborted */ }
     throw e;
   }

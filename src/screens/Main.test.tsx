@@ -20,6 +20,7 @@ vi.mock('../lib/store', () => ({
 vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
 
 import { Main } from './Main';
+import { resetRoute } from '../test-stubs/route-reset';
 import { groupChains } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
 
@@ -97,6 +98,8 @@ function baseStore() {
     restoredUpdatedCount: null,
     retryRestore: vi.fn(),
     clearRestoreStatus: vi.fn(),
+    updateCheck: { status: 'idle' as const },
+    checkForUpdates: vi.fn(),
     syncStatuses: { n1: { status: 'confirmed' as const, txId: 'TX123' } },
     dismissError: vi.fn(),
     // encrypted-at-rest draft API (§2)
@@ -116,6 +119,11 @@ function baseStore() {
   };
 }
 
+/** The composer is collapsed by default now — open it before typing. */
+function openComposer() {
+  fireEvent.click(screen.getByRole('button', { name: /\+ Заметка/ }));
+}
+
 function stubClipboard(writeText: (t: string) => Promise<void>) {
   Object.defineProperty(navigator, 'clipboard', {
     value: { writeText },
@@ -126,12 +134,13 @@ function stubClipboard(writeText: (t: string) => Promise<void>) {
 beforeEach(() => {
   h.store = baseStore();
   sessionStorage.clear();
+  resetRoute(); // the section is in location.hash and jsdom keeps one per file
 });
 afterEach(cleanup);
 
 describe('Main — note card menu', () => {
   it('shows the confirmed-TX link even with auto-sync disabled', () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     // A CONFIRMED note keeps its honest badge even with sync switched off —
     // it really is on-chain (unlike a merely local one, which says so).
     expect(document.querySelector('.sync-badge')?.getAttribute('aria-label'))
@@ -143,7 +152,7 @@ describe('Main — note card menu', () => {
 
   it('clipboard success: copied-toast shown, menu closed', async () => {
     stubClipboard(vi.fn(async () => {}));
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('📋 Копировать текст'));
 
@@ -153,7 +162,7 @@ describe('Main — note card menu', () => {
 
   it('clipboard REJECTION: error toast shown, menu stays open (no false success)', async () => {
     stubClipboard(vi.fn(async () => { throw new Error('NotAllowedError'); }));
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('📋 Копировать текст'));
 
@@ -164,47 +173,13 @@ describe('Main — note card menu', () => {
 });
 
 describe('Main — modal exclusivity + live badge (round 12)', () => {
-  it('Settings → Reset closes the settings dialog: only ONE aria-modal at a time', () => {
-    render(<Main />);
-    fireEvent.click(screen.getByLabelText('Настройки'));
-    expect(screen.getAllByRole('dialog')).toHaveLength(1); // settings open
-
-    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
-    fireEvent.click(screen.getByText('Сбросить приложение'));
-    const dialogs = screen.getAllByRole('dialog');
-    expect(dialogs).toHaveLength(1); // confirm replaced settings, not stacked
-    expect(dialogs[0].getAttribute('aria-label')).toBe('Сбросить приложение?');
-  });
-
-  it('revealed seed does NOT survive the Reset→Cancel round-trip (round 13)', () => {
-    (h.store as ReturnType<typeof baseStore>).showMnemonic = vi.fn(() => 'секретное слово фраза');
-    render(<Main />);
-
-    // 1. Open Settings, reveal the seed.
-    fireEvent.click(screen.getByLabelText('Настройки'));
-    fireEvent.click(screen.getByText('Seed-фраза')); // expand the block
-    fireEvent.click(screen.getByText('Показать seed-фразу'));
-    expect(screen.getByText('секретное')).toBeTruthy();
-
-    // 2-3. Reset (closes settings, opens confirm) → cancel the confirm.
-    fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
-    fireEvent.click(screen.getByText('Сбросить приложение'));
-    fireEvent.click(screen.getByText('Отмена'));
-
-    // 4. Reopen Settings — the seed must be hidden again, behind the toggle.
-    fireEvent.click(screen.getByLabelText('Настройки'));
-    fireEvent.click(screen.getByText('Seed-фраза')); // expand the block again
-    expect(screen.queryByText('секретное')).toBeNull();
-    expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
-  });
-
   it('reset warns when ANY stored record is unconfirmed (storage-backed resetRiskCount)', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
     s.arweave.resetRisk = { notes: 1, safebox: 0 }; // e.g. accepted-but-unconfirmed — can still drop
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -223,9 +198,9 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.countsReady = true;
     s.syncStatuses = { n1: { status: 'confirmed' as const, txId: 'TX123' } }; // visible looks safe
     s.arweave.resetRisk = { notes: 1, safebox: 0 }; // …but storage says otherwise
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -239,9 +214,9 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.enabled = true;
     s.arweave.countsReady = true;
     s.arweave.resetRisk = { notes: 0, safebox: 0 };
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -252,9 +227,9 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
   it('reset NEVER claims safety while sync counts are still loading', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.countsReady = false;   // placeholder state right after bootstrap
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
 
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения')); // expand the reset block
     fireEvent.click(screen.getByText('Сбросить приложение'));
 
@@ -267,14 +242,14 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = false;
     s.syncStatuses = { n1: { status: 'queued' as const } };
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     const badge = document.querySelector('.sync-badge');
     expect(badge?.getAttribute('aria-label')).toMatch(/Только на этом устройстве/);
   });
 
   it('per-note sync badge is a live role=status region', () => {
     (h.store as ReturnType<typeof baseStore>).arweave.enabled = true;
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     const badge = document.querySelector('.sync-badge');
     expect(badge?.getAttribute('role')).toBe('status');
     expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне');
@@ -285,7 +260,7 @@ describe('Main — draft hydration dirty guard (§2)', () => {
   it('hydrates the stored draft into a pristine composer', async () => {
     (h.store as ReturnType<typeof baseStore>).readDraft =
       vi.fn(async () => 'сохранённый черновик');
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     await waitFor(() => {
       const input = document.querySelector('.note-input') as HTMLTextAreaElement;
       expect(input.value).toBe('сохранённый черновик');
@@ -296,7 +271,8 @@ describe('Main — draft hydration dirty guard (§2)', () => {
     let resolveDraft!: (v: string | null) => void;
     (h.store as ReturnType<typeof baseStore>).readDraft =
       vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
 
     // The user types and deletes everything while the read is in flight —
@@ -312,7 +288,8 @@ describe('Main — draft hydration dirty guard (§2)', () => {
     let resolveDraft!: (v: string | null) => void;
     (h.store as ReturnType<typeof baseStore>).readDraft =
       vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
 
     fireEvent.change(input, { target: { value: 'свежий ввод' } });
@@ -322,40 +299,44 @@ describe('Main — draft hydration dirty guard (§2)', () => {
 });
 
 describe('Main — search UX', () => {
-  it('Ctrl+K opens the search bar, Escape closes it and clears the query', () => {
-    render(<Main />);
-    expect(screen.queryByPlaceholderText('Найти заметку...')).toBeNull();
-
-    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
-    const input = screen.getByPlaceholderText('Найти заметку...');
-
-    fireEvent.keyDown(input, { key: 'Escape' });
-    expect(screen.queryByPlaceholderText('Найти заметку...')).toBeNull();
-    expect((h.store as ReturnType<typeof baseStore>).setSearchQuery).toHaveBeenCalledWith('');
+  // Ctrl+K is gone with the toggle it drove: the field is part of the section
+  // now, so there is nothing to open.
+  it('поле поиска всегда на экране, без хоткея и без переключателя', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByLabelText('Поиск по заметкам')).toBeTruthy();
+    expect(screen.queryByLabelText('Поиск')).toBeNull(); // старая кнопка в шапке
   });
 
-  it('Cmd+K works too (macOS)', () => {
-    render(<Main />);
-    fireEvent.keyDown(window, { key: 'k', metaKey: true });
-    expect(screen.getByPlaceholderText('Найти заметку...')).toBeTruthy();
+  it('Ctrl+K больше ничего не делает', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    expect(screen.getByLabelText('Поиск по заметкам')).toBeTruthy(); // ничего не изменилось
+  });
+
+  it('Escape в поле очищает запрос, а не прячет поле', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    const input = screen.getByLabelText('Поиск по заметкам');
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect((h.store as ReturnType<typeof baseStore>).setSearchQuery).toHaveBeenCalledWith('');
+    expect(screen.getByLabelText('Поиск по заметкам')).toBeTruthy(); // поле на месте
   });
 });
 
 describe('Main — R3 (writer OFF) surface', () => {
   it('the card menu has NO edit/history items while the writer flag is off', () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     expect(screen.queryByText(/Редактировать/)).toBeNull();
     expect(screen.queryByText(/История версий/)).toBeNull();
     expect(screen.getByText(/неизменяема/)).toBeTruthy(); // legacy hint intact
   });
 
-  it('shows the v3-pause standing banner with a resume button', () => {
+  it('пауза v3 — ступень строки состояния, с кнопкой возобновления', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.arweave.enabled = true;
     s.v3Paused = true;
-    render(<Main />);
-    expect(screen.getByText(/временно приостановлена/)).toBeTruthy();
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByText(/приостановлена/)).toBeTruthy();
     fireEvent.click(screen.getByText('Возобновить'));
     expect(s.resumeV3Uploads).toHaveBeenCalled();
   });
@@ -364,7 +345,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.restoredCount = 2;
     s.restoredUpdatedCount = 3;
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(screen.getByText(/Восстановлено заметок: 2, обновлено: 3/)).toBeTruthy();
   });
 
@@ -372,7 +353,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     const s = h.store as ReturnType<typeof baseStore>;
     s.restoredCount = 0;
     s.restoredUpdatedCount = 1;
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(screen.getByText(/Восстановлено заметок: 0, обновлено: 1/)).toBeTruthy();
   });
 
@@ -380,7 +361,8 @@ describe('Main — R3 (writer OFF) surface', () => {
     const { NoteTooLongError } = await import('../lib/limits');
     const s = h.store as ReturnType<typeof baseStore>;
     s.addNote = vi.fn(async () => { throw new NoteTooLongError(31_000); });
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'длинный текст' } });
     fireEvent.click(screen.getByText('🔐 Сохранить'));
@@ -399,7 +381,8 @@ describe('Main — R3 (writer OFF) surface', () => {
       if (calls === 2) throw new storeModule.OperationInFlightError();
       await new Promise(r => setTimeout(r, 30)); // first call still running
     });
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'двойной клик' } });
 
@@ -410,8 +393,13 @@ describe('Main — R3 (writer OFF) surface', () => {
     // The second call must not leave a false error…
     await act(async () => { await new Promise(r => setTimeout(r, 50)); });
     expect(document.querySelector('.error-msg')).toBeNull();
-    // …and the composer is cleared exactly once — by the FIRST call's success.
-    expect(input.value).toBe('');
+    // …and the FIRST call's success both clears the text and collapses the
+    // composer, so re-opening shows an empty field rather than a resurrected
+    // draft. (`input` is detached by then — assert against the live DOM.)
+    expect(document.querySelector('.note-input')).toBeNull();
+    expect(s.clearDraft).toHaveBeenCalledTimes(1);
+    openComposer();
+    expect((document.querySelector('.note-input') as HTMLTextAreaElement).value).toBe('');
   });
 
   it('search count reflects CHAINS, not raw versions', () => {
@@ -424,50 +412,111 @@ describe('Main — R3 (writer OFF) surface', () => {
     s.chains = groupChains(versions);
     s.filteredChains = s.chains;
     s.searchQuery = 'прав';
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
     expect(screen.getByText('1 из 1')).toBeTruthy(); // one chain either side
   });
 });
 
-describe('Main — safebox entry point (R4 visibility formula)', () => {
-  it('is HIDDEN on R4 when the device has neither data nor a PIN config', () => {
-    render(<Main />);
-    expect(screen.queryByLabelText('Защищённый сейф')).toBeNull();
+describe('Main — пункт сейфа в навигации', () => {
+  // The old visibility formula (SAFEBOX_WRITER_ENABLED || data || pinConfig) is
+  // gone: a section that appears and disappears made the layout jump the moment
+  // a user activated it, and it hid the only route INTO activation.
+  it('присутствует всегда — даже без данных и без PIN', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /Сейф/ })).toBeTruthy();
   });
 
-  it('appears when safebox DATA exists (a restored/rolled-back device)', () => {
+  it('приглушён, когда за ним ничего нет, но НИКОГДА не disabled', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    const item = screen.getByRole('button', { name: /Сейф/ });
+    expect(item.className).toContain('app-nav-item--dim');
+    // `disabled` would strand a new user: this is the only way into activation.
+    expect((item as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('состояние читается вслух, а не только видно', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Сейф, не настроен' })).toBeTruthy();
+  });
+
+  it('не приглушён, когда есть данные', () => {
     h.store.safeboxDataPresent = true;
-    render(<Main />);
-    expect(screen.getByLabelText('Защищённый сейф')).toBeTruthy();
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /Сейф/ }).className).not.toContain('app-nav-item--dim');
   });
 
-  it('appears when a PIN CONFIG exists even with no entries yet', () => {
+  it('не приглушён, когда настроен PIN, даже без записей', () => {
     h.store.safeboxPinConfigured = true;
-    render(<Main />);
-    expect(screen.getByLabelText('Защищённый сейф')).toBeTruthy();
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /Сейф/ }).className).not.toContain('app-nav-item--dim');
   });
 
-  it('switching to the safebox hides the notes composer and feed', () => {
+  it('переключение в сейф РАЗМОНТИРУЕТ ленту заметок, а не прячет её', () => {
     h.store.safeboxDataPresent = true;
-    const { container } = render(<Main />);
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
-    expect(container.querySelector('.note-input-wrap')?.hasAttribute('hidden')).toBe(true);
-    expect(container.querySelector('.notes-feed')?.hasAttribute('hidden')).toBe(true);
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(container.querySelector('.notes-feed')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect(container.querySelector('.notes-feed')).toBeNull();
+    expect(container.querySelector('.note-input-wrap')).toBeNull();
   });
 
-  it('offers a one-tap safebox lock while the section is unlocked', () => {
+  // The half the old `hidden` hack was really protecting, and which was never
+  // actually covered: the draft lives in the shell, so a round-trip through
+  // another section must not touch it.
+  it('черновик переживает круг в сейф и обратно', () => {
     h.store.safeboxDataPresent = true;
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'не потеряй меня' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect(container.querySelector('.note-input')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Заметки' }));
+    // Auto-expanded because a draft exists, and the text is intact.
+    expect((document.querySelector('.note-input') as HTMLTextAreaElement).value)
+      .toBe('не потеряй меня');
+  });
+
+  it('«Закрыть сейф» живёт ВНУТРИ раздела — в шапке дубля больше нет', () => {
+    h.store.safeboxDataPresent = true;
+    h.store.safeboxPinConfigured = true; // otherwise the section shows activation
     h.store.safeboxUnlocked = true;
-    render(<Main />);
-    fireEvent.click(screen.getByLabelText('Закрыть сейф'));
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    fireEvent.click(screen.getByText('🔒 Закрыть сейф'));
     expect(h.store.lockSafebox).toHaveBeenCalled();
+  });
+
+  // ── СООБЩЁННЫЙ С ПРОДА БАГ ──
+  // «Закрыть сейф» запирал раздел и не выпускал: PIN-пад без единого выхода,
+  // потому что замок и навигация были одной осью. Этот тест — граница.
+  it('после «Закрыть сейф» навигация на месте и «Заметки» открываются', () => {
+    h.store.safeboxDataPresent = true;
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxUnlocked = true;
+    const { container, rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    fireEvent.click(screen.getByText('🔒 Закрыть сейф'));
+
+    // The store spy does not flip the flag on its own — model the lock landing.
+    h.store.safeboxUnlocked = false;
+    rerender(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(container.querySelector('.safebox-section')).toBeTruthy(); // PIN-пад
+
+    // The exit survived the lock.
+    const notesItem = screen.getByRole('button', { name: 'Заметки' });
+    expect((notesItem as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(notesItem);
+    expect(container.querySelector('.notes-feed')?.hasAttribute('hidden')).toBe(false);
   });
 
   it('the reset warning counts LOCKED safebox entries as at risk', () => {
     h.store.arweave.resetRisk = { notes: 0, safebox: 2 };
-    render(<Main />);
-    fireEvent.click(screen.getByLabelText('Настройки'));
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
     fireEvent.click(screen.getByText('Сброс приложения'));
     fireEvent.click(screen.getByText('Сбросить приложение'));
     expect(screen.getByText(/2 записей ещё НЕ подтверждены/)).toBeTruthy();
@@ -479,8 +528,8 @@ describe('Main — the safebox subtree is remounted on every lock', () => {
   it('a lock-generation bump clears whatever was typed into the safebox forms', () => {
     h.store.safeboxDataPresent = true;      // activation form (with the seed grid)
     h.store.safeboxLockGeneration = 1;
-    const { rerender } = render(<Main />);
-    fireEvent.click(screen.getByLabelText('Защищённый сейф'));
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
 
     const pin = document.querySelector('#sbx-new-code') as HTMLInputElement;
     fireEvent.change(pin, { target: { value: '135790' } });
@@ -490,10 +539,216 @@ describe('Main — the safebox subtree is remounted on every lock', () => {
 
     // A hidden edge / idle lock / app lock bumps the generation.
     h.store.safeboxLockGeneration = 2;
-    rerender(<Main />);
+    rerender(<Main theme="system" onThemeChange={vi.fn()} />);
 
     // Remounted from scratch: no PIN and no seed word survives.
     expect((document.querySelector('#sbx-new-code') as HTMLInputElement).value).toBe('');
     expect((screen.getAllByLabelText(/Слово \d+ из 12/)[0] as HTMLInputElement).value).toBe('');
+  });
+});
+
+describe('Main — «Проверить обновления» в шапке', () => {
+  const done = (over: Partial<{ addedNotes: number; updatedNotes: number; changedSafebox: number }> = {}) => ({
+    status: 'done' as const,
+    at: 1_700_000_000_000,
+    addedNotes: 0, updatedNotes: 0, changedSafebox: 0, partial: false,
+    ...over,
+  });
+
+  it('иконка вызывает checkForUpdates', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText('Проверить обновления'));
+    expect(h.store.checkForUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it('во время проверки иконка заблокирована', () => {
+    h.store.updateCheck = { status: 'checking', progress: null };
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    const btn = screen.getByLabelText('Проверить обновления') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('результат живёт в строке состояния и виден в ЛЮБОМ разделе', () => {
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    h.store.updateCheck = done({ addedNotes: 2, updatedNotes: 1, changedSafebox: 3 });
+    rerender(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByText(/получено 2/)).toBeTruthy();
+
+    // Including with the settings panel open — the old toast was suppressed
+    // there and had to be re-suppressed on close.
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
+    expect(screen.getByText(/получено 2/)).toBeTruthy();
+  });
+
+  it('пустая проверка тоже отчитывается — «новых записей нет», а не молчанием', () => {
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    h.store.updateCheck = done();
+    rerender(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByText(/новых записей нет/)).toBeTruthy();
+  });
+
+  // The «did this run already pop a toast» bookkeeping is DELETED, not moved:
+  // it existed only because the result had two homes. This is coverage that
+  // goes away with the mechanism it guarded, not coverage that was lost.
+});
+
+// ─── Stage 1: the section lives in the address ──────────────────────
+
+describe('Main — раздел в адресе', () => {
+  const inSafebox = (c: HTMLElement) => c.querySelector('.notes-feed') === null;
+
+  it('открывается на разделе из адреса — перезагрузка не теряет место', () => {
+    h.store.safeboxDataPresent = true;
+    window.history.replaceState(null, '', '#/safebox');
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(inSafebox(container)).toBe(true);
+  });
+
+  it('навигация пишет адрес, а не локальный стейт', () => {
+    h.store.safeboxDataPresent = true;
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect(window.location.hash).toBe('#/safebox');
+    // A nav item navigates; it does not toggle back on a second press.
+    fireEvent.click(screen.getByRole('button', { name: 'Заметки' }));
+    expect(window.location.hash).toBe('#/notes');
+  });
+
+  it('мусорный хеш канонизируется, а не оставляет пустой экран', async () => {
+    window.history.replaceState(null, '', '#/zzz');
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    await waitFor(() => expect(window.location.hash).toBe('#/notes'));
+    expect(inSafebox(container)).toBe(false);
+  });
+
+  it('мусор, введённый поверх АКТИВНОГО раздела, тоже канонизируется', async () => {
+    // Both hashes parse to 'notes'; only the raw hash moves. A parsed-value
+    // snapshot would skip the render and leave the junk in the address bar.
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    await act(async () => {
+      window.history.replaceState(null, '', '#/zzz');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    await waitFor(() => expect(window.location.hash).toBe('#/notes'));
+    expect(inSafebox(container)).toBe(false);
+  });
+
+  it('системная «назад» из сейфа возвращает в заметки', async () => {
+    h.store.safeboxDataPresent = true;
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect(inSafebox(container)).toBe(true);
+
+    // jsdom's history.back() is async and flaky; the mechanism under test is
+    // "does the app follow popstate", which this drives directly.
+    await act(async () => {
+      window.history.replaceState(null, '', '#/notes');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+    expect(inSafebox(container)).toBe(false);
+  });
+
+  it('неизвестный раздел из БУДУЩЕЙ сборки не рисует пустоту (случай отката)', async () => {
+    window.history.replaceState(null, '', '#/feed');
+    const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    await waitFor(() => expect(window.location.hash).toBe('#/notes'));
+    expect(container.querySelector('.notes-feed')).toBeTruthy();
+  });
+});
+
+// ─── Stage 3: the collapsed composer ────────────────────────────────
+
+describe('Main — композер сворачивается за «+»', () => {
+  const field = () => document.querySelector('.note-input') as HTMLTextAreaElement | null;
+
+  it('по умолчанию свёрнут — лента получает всю высоту', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(field()).toBeNull();
+    expect(screen.getByRole('button', { name: /\+ Заметка/ })).toBeTruthy();
+  });
+
+  it('гидратация, завершившаяся ПОСЛЕ первого рендера, раскрывает его', async () => {
+    // The transition that only shows up in practice: readDraft is async, so on
+    // the first render `text` is still empty and the effect has to fire again.
+    let resolveDraft!: (v: string | null) => void;
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(field()).toBeNull();
+
+    await act(async () => { resolveDraft('восстановленный черновик'); });
+    expect(field()?.value).toBe('восстановленный черновик');
+  });
+
+  it('РУЧНОЕ сворачивание не отменяется автораскрытием', async () => {
+    // The sequence has to make `hasDraft` flip AFTER the collapse, or the
+    // effect never re-runs and the test would pass without the flag existing:
+    // open an EMPTY composer, collapse it, and only then let hydration land.
+    // (Typing first would arm the dirty guard, hydration would be refused,
+    // `hasDraft` would never change, and nothing would be exercised.)
+    let resolveDraft!: (v: string | null) => void;
+    (h.store as ReturnType<typeof baseStore>).readDraft =
+      vi.fn(() => new Promise<string | null>(r => { resolveDraft = r; }));
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
+    fireEvent.click(screen.getByText('Свернуть'));
+    expect(field()).toBeNull();
+
+    await act(async () => { resolveDraft('восстановленный черновик'); });
+    expect(field()).toBeNull(); // stayed shut despite a draft arriving
+    // …and the draft is not lost, just not forced onto the user.
+    expect(document.querySelector('.notes-add-dot')).toBeTruthy();
+  });
+
+  it('сворачивание НЕ стирает черновик и не вызывает persistDraft("")', () => {
+    const s = h.store as ReturnType<typeof baseStore>;
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
+    fireEvent.change(field()!, { target: { value: 'текст' } });
+    fireEvent.click(screen.getByText('Свернуть'));
+
+    expect(s.persistDraft).not.toHaveBeenCalledWith('');
+    openComposer();
+    expect(field()?.value).toBe('текст'); // collapsing hides, it does not discard
+  });
+
+  it('черновик из ОДНИХ ПРОБЕЛОВ виден индикатору', () => {
+    // DraftStore clears storage only on an exactly-empty string, so whitespace
+    // really is stored. `text.trim()` would leave the indicator dark over a
+    // draft that exists.
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
+    fireEvent.change(field()!, { target: { value: '   ' } });
+    fireEvent.click(screen.getByText('Свернуть'));
+
+    expect(screen.getByRole('button', { name: '+ Заметка, есть несохранённый черновик' })).toBeTruthy();
+    expect(document.querySelector('.notes-add-dot')).toBeTruthy();
+  });
+
+  it('без черновика индикатора нет', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(document.querySelector('.notes-add-dot')).toBeNull();
+  });
+});
+
+describe('Main — фокус следует за разделом', () => {
+  it('при смене раздела фокус встаёт на его заголовок', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Настройки' }));
+    expect((document.activeElement as HTMLElement)?.textContent).toBe('Настройки');
+  });
+
+  it('и в сейфе тоже, когда у раздела есть заголовок', () => {
+    h.store.safeboxDataPresent = true;
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxUnlocked = true;
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+    expect((document.activeElement as HTMLElement)?.textContent).toBe('Сейф');
+  });
+
+  it('но НЕ крадёт фокус при первом рендере', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(document.activeElement).toBe(document.body);
   });
 });

@@ -17,6 +17,8 @@ import {
   setMeta,
   getPinConfigMeta,
   clearPinConfigMeta,
+  getDbGeneration,
+  StorageResetError,
   type SyncRecord,
 } from './storage';
 
@@ -75,7 +77,7 @@ describe('mergeRestoredNote (restore repair)', () => {
   it('repairs an EXISTING note that has no SyncRecord: writes confirmed', async () => {
     // The old-version-restore scenario: note present, sync state missing.
     await saveNote(NOTE);
-    await mergeRestoredNote(NOTE, 'tx-m1', 100);
+    await mergeRestoredNote(NOTE, 'tx-m1', 100, getDbGeneration());
 
     // Now confirmed → syncPendingNotes' skip-set covers it (no re-upload).
     const confirmed = await getRecordsByStatus('confirmed');
@@ -89,7 +91,7 @@ describe('mergeRestoredNote (restore repair)', () => {
   });
 
   it('writes a brand-new note atomically with its confirmed record', async () => {
-    await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100);
+    await mergeRestoredNote({ ...NOTE, noteId: 'm2' }, 'tx-m2', 100, getDbGeneration());
     expect(await getNoteById('m2')).toBeDefined();
     expect((await getRecordsByStatus('confirmed')).some(r => r.noteId === 'm2')).toBe(true);
   });
@@ -101,7 +103,7 @@ describe('mergeRestoredNote (restore repair)', () => {
     await saveNoteWithSync({ noteId: 'm3', ciphertext: 'CORRUPTED', iv: 'iv', createdAt: 1 },
       { noteId: 'm3', kind: 'note', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
 
-    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100);
+    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100, getDbGeneration());
 
     expect((await getNoteById('m3'))?.ciphertext).toBe('GOOD-ONCHAIN'); // payload repaired
     const rec = (await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm3');
@@ -111,8 +113,28 @@ describe('mergeRestoredNote (restore repair)', () => {
   it('upgrades a non-terminal sync record (e.g. error) to confirmed', async () => {
     await saveNoteWithSync({ ...NOTE, noteId: 'm4' },
       { noteId: 'm4', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 1 });
-    await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100);
+    await mergeRestoredNote({ ...NOTE, noteId: 'm4' }, 'tx-m4', 100, getDbGeneration());
     expect((await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm4')?.txId).toBe('tx-m4');
+  });
+
+  it('a reset landing INSIDE the merge (between the sync read and the write) writes nothing', async () => {
+    // The caller's pre-merge generation check cannot cover this: `await
+    // getSyncRecord()` is a real suspension point. Starting the merge and then
+    // resetting hits exactly that window — resetAll bumps the generation and
+    // creates its clear transaction while the merge is parked on the read.
+    const gen = getDbGeneration();
+    // The handler is attached SYNCHRONOUSLY: the rejection lands during the
+    // resetAll below, and a bare pending promise would surface as an unhandled
+    // rejection before the assertion ever gets to look at it.
+    const merge = mergeRestoredNote({ ...NOTE, noteId: 'm5' }, 'tx-m5', 100, gen)
+      .then(() => null, (e: unknown) => e);
+    await resetAll();
+
+    // Data first: «nothing was resurrected» is the invariant; the typed error
+    // is only the mechanism that enforces it.
+    expect(await getNoteById('m5')).toBeUndefined();
+    expect(await getAllSyncRecords()).toHaveLength(0);
+    expect(await merge).toBeInstanceOf(StorageResetError);
   });
 });
 
@@ -347,7 +369,7 @@ describe('SyncRecord.terminalError round-trip', () => {
 describe('v3 EncryptedNote round-trip', () => {
   it('stores and merges a v3 record like any other version', async () => {
     const note = { noteId: 'v3n', ciphertext: 'c', iv: 'iv', createdAt: 9, v: 3 as const };
-    await mergeRestoredNote(note, 'TX-V3', 10);
+    await mergeRestoredNote(note, 'TX-V3', 10, getDbGeneration());
     expect((await getNoteById('v3n'))?.v).toBe(3);
     expect((await getSyncRecord('v3n'))?.status).toBe('confirmed');
   });
@@ -368,5 +390,94 @@ describe('dbGeneration', () => {
     const before = getDbGeneration();
     noteExternalReset();
     expect(getDbGeneration()).toBe(before + 1);
+  });
+});
+
+// ─── Vault identity + first-writer-wins PIN write ───────────────────
+
+import { bindVaultIdentity, commitPinSeedIfAbsent } from './storage';
+import type { PinEncryptedSeed } from './crypto';
+
+const PK_A = 'pk-aaa';
+const PK_B = 'pk-bbb';
+const BLOB_A = { ciphertext: 'ctA', iv: 'iv', salt: 's' } as PinEncryptedSeed;
+const BLOB_B = { ciphertext: 'ctB', iv: 'iv', salt: 's' } as PinEncryptedSeed;
+
+describe('bindVaultIdentity', () => {
+  it('binds the key on an empty database', async () => {
+    expect(await bindVaultIdentity(PK_A, { initialize: false }, getDbGeneration())).toBe('bound');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+    expect(await getMeta('init')).toBeUndefined(); // initialize:false writes no init
+  });
+
+  it('writes `init` in the SAME commit when asked', async () => {
+    expect(await bindVaultIdentity(PK_A, { initialize: true }, getDbGeneration())).toBe('bound');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+    expect(await getMeta('init')).toBe(true);
+  });
+
+  it('accepts the same key again and can initialize an already-bound vault', async () => {
+    await bindVaultIdentity(PK_A, { initialize: false }, getDbGeneration());
+    expect(await bindVaultIdentity(PK_A, { initialize: true }, getDbGeneration())).toBe('same');
+    expect(await getMeta('init')).toBe(true);
+  });
+
+  it('refuses a FOREIGN key and writes nothing — not the key, not init', async () => {
+    await bindVaultIdentity(PK_A, { initialize: false }, getDbGeneration());
+    expect(await bindVaultIdentity(PK_B, { initialize: true }, getDbGeneration())).toBe('foreign');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+    expect(await getMeta('init')).toBeUndefined();
+  });
+
+  it('two tabs, EMPTY database, different seeds: first-writer-wins', async () => {
+    // The whole point of doing this in one transaction: the loser can never
+    // leave its own key (or init) behind next to the winner's PIN.
+    expect(await bindVaultIdentity(PK_A, { initialize: true }, getDbGeneration())).toBe('bound');
+    expect(await bindVaultIdentity(PK_B, { initialize: true }, getDbGeneration())).toBe('foreign');
+    expect(await getMeta('vault-public-key')).toBe(PK_A);
+  });
+
+  it('throws StorageResetError on a stale generation (wiped meanwhile)', async () => {
+    const stale = getDbGeneration();
+    await resetAll(); // bumps the generation
+    await expect(bindVaultIdentity(PK_A, { initialize: true }, stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('vault-public-key')).toBeUndefined();
+    expect(await getMeta('init')).toBeUndefined();
+  });
+});
+
+describe('commitPinSeedIfAbsent (first-writer-wins)', () => {
+  it('writes the blob when none is configured', async () => {
+    expect(await commitPinSeedIfAbsent(BLOB_A, getDbGeneration())).toBe(true);
+    expect(await getMeta('pin-seed')).toEqual(BLOB_A);
+  });
+
+  it('clears stale metering in the SAME commit', async () => {
+    await setMeta('pin-attempts', 7);
+    await setMeta('pin-locked-until', Date.now() + 60_000);
+    expect(await commitPinSeedIfAbsent(BLOB_A, getDbGeneration())).toBe(true);
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  it('refuses to overwrite a PIN another tab configured first', async () => {
+    await setMeta('pin-seed', BLOB_A);
+    expect(await commitPinSeedIfAbsent(BLOB_B, getDbGeneration())).toBe(false);
+    expect(await getMeta('pin-seed')).toEqual(BLOB_A); // foreign blob untouched
+  });
+
+  it('leaves the metering alone when it refuses', async () => {
+    await setMeta('pin-seed', BLOB_A);
+    await setMeta('pin-attempts', 3);
+    expect(await commitPinSeedIfAbsent(BLOB_B, getDbGeneration())).toBe(false);
+    expect(await getMeta('pin-attempts')).toBe(3);
+  });
+
+  it('throws StorageResetError on a stale generation', async () => {
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitPinSeedIfAbsent(BLOB_A, stale)).rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('pin-seed')).toBeUndefined();
   });
 });

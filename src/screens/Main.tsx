@@ -1,16 +1,18 @@
 import { useState, useRef, useEffect } from 'react';
 import { useNotes } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
-import { ConfirmDialog } from '../components/ConfirmDialog';
-import { SettingsModal } from '../components/SettingsModal';
+import { SettingsSection } from './SettingsSection';
 import { NoteComposer } from '../components/NoteComposer';
 import { NoteMarkdown } from '../components/NoteMarkdown';
 import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
-import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from '../lib/flags';
-import { useTheme } from '../lib/theme';
+import { V3_WRITER_ENABLED } from '../lib/flags';
+import { useRoute, navigate, canonicalHash } from '../lib/route';
+import { AppNav } from '../components/AppNav';
+import { StatusLine } from '../components/StatusLine';
+import type { ThemePref } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
 import type { NoteData } from '../lib/crypto';
@@ -26,7 +28,12 @@ function isLongNote(text: string): boolean {
   return text.length > 600 || text.split('\n').length > 12;
 }
 
-export function Main() {
+interface MainProps {
+  theme: ThemePref;
+  onThemeChange: (t: ThemePref) => void;
+}
+
+export function Main({ theme, onThemeChange }: MainProps) {
   const {
     filteredChains,
     chains,
@@ -35,35 +42,31 @@ export function Main() {
     addNote,
     editNote,
     setSearchQuery,
-    resetApp,
     arweave,
     retrySync,
-    restoring,
-    restoreProgress,
-    restoreError,
-    restoredCount,
-    restoredUpdatedCount,
-    retryRestore,
-    clearRestoreStatus,
+    pinSetupNotice,
+    dismissPinSetupNotice,
     syncStatuses,
-    dismissError,
     persistDraft,
     readDraft,
     clearDraft,
-    v3Paused,
-    resumeV3Uploads,
     safeboxPinConfigured,
     safeboxDataPresent,
-    safeboxUnlocked,
     safeboxLockGeneration,
-    lockSafebox,
   } = useNotes();
 
-  // Local view switch — the safebox lives INSIDE Main, not on its own route.
-  const [view, setView] = useState<'notes' | 'safebox'>('notes');
-  // Entry-point visibility (R4 contract): on W4 everyone can activate; on R4
-  // only devices that already hold safebox data or a PIN configuration.
-  const safeboxVisible = SAFEBOX_WRITER_ENABLED || safeboxDataPresent || safeboxPinConfigured;
+  // The section lives in the address, not in local state: the Android system
+  // Back gesture and a reload both have to land where the user was. `hash` is
+  // kept alongside `view` because the canonicaliser below needs to see a
+  // change that `view` alone would hide (`#/notes` → `#/garbage` parses to the
+  // same section).
+  const { hash, section: view } = useRoute();
+  // The safebox item is ALWAYS in the nav — the visibility formula is gone.
+  // A section that appears and disappears makes the layout jump the moment a
+  // user activates it, and it hid the only route to activation. It is dimmed
+  // (never disabled) while there is nothing behind it yet.
+  const safeboxDimmed = !safeboxPinConfigured && !safeboxDataPresent;
+  const notesVisible = view === 'notes';
 
   const [text, setText] = useState('');
   // Blocks the persist mirror from CLEARING the stored draft while the initial
@@ -73,11 +76,16 @@ export function Main() {
   // True after ANY user edit. `text === ''` alone cannot distinguish a pristine
   // composer from «набрал и стёр» — hydration must lose to both (§2 dirty guard).
   const draftDirtyRef = useRef(false);
-  const [showSearch, setShowSearch] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  // The composer is collapsed by default — it used to occupy the top of the
+  // screen permanently, competing with the feed for the only vertical space a
+  // phone has.
+  const [composerOpen, setComposerOpen] = useState(false);
+  // Set by an explicit «Свернуть». Blocks auto-expansion until the user LEAVES
+  // and re-enters the section; without it a manually collapsed composer would
+  // re-open by itself as soon as hydration resolves.
+  const userCollapsedRef = useRef(false);
   const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
@@ -94,28 +102,78 @@ export function Main() {
 
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
   useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
-  const [theme, setTheme] = useTheme();
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
 
-  // Autofocus on mount
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+  // The «Получено с других устройств» toast and its handled-run bookkeeping are
+  // gone. They existed for ONE reason, stated in their own comment: the result
+  // was shown in two places, and the toast had to avoid popping out of context
+  // when the settings panel closed. With one always-visible status line there
+  // is no second place, so there is nothing to reconcile.
 
-  // Global search hotkey (8.1): Ctrl/Cmd+K toggles the search bar.
+  // ── Composer open/collapse ──────────────────────────────────────
+  //
+  // Presence of a draft is `text.length > 0`, NOT `text.trim()`: DraftStore
+  // clears storage only on an exactly-empty string, so a draft of whitespace
+  // really is stored. With trim() the indicator would go dark and the composer
+  // would stay shut over a draft that exists.
+  const hasDraft = text.length > 0;
+  const wasNotesVisible = useRef(notesVisible);
+
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        if (showSearch) closeSearch();
-        else setShowSearch(true);
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showSearch]);
+    const entered = notesVisible && !wasNotesVisible.current;
+    wasNotesVisible.current = notesVisible;
+    // Re-entering the section is a fresh intent — an earlier «Свернуть» does
+    // not follow the user around forever.
+    if (entered) userCollapsedRef.current = false;
+    // Covers BOTH the return-with-a-draft case and the one that only shows up
+    // in practice: hydration is async, so on the first render `text` is still
+    // empty and this effect has to fire again when the draft lands.
+    if (notesVisible && hasDraft && !userCollapsedRef.current) setComposerOpen(true);
+  }, [notesVisible, hasDraft]);
+
+  function openComposer() {
+    userCollapsedRef.current = false;
+    setComposerOpen(true);
+    // Focus ONLY on an explicit press. Doing it on auto-expansion would pop the
+    // mobile keyboard every time the user merely returns to the section.
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
+  function collapseComposer() {
+    // Never clears `text`: collapsing hides, it does not discard. Clearing here
+    // would let the debounced mirror persist '' and DELETE the stored draft.
+    userCollapsedRef.current = true;
+    setComposerOpen(false);
+  }
+
+  // Focus follows the section. Losing the modal's «focus returns to the
+  // trigger» is fine, but a routed section with no focus management drops a
+  // keyboard or screen-reader user at the top of the document with nothing
+  // announced. This is the invariant that replaces the focus trap.
+  //
+  // A DOM query rather than three threaded refs: the sections are independent
+  // components and the shared class is the contract between them.
+  const firstSectionRender = useRef(true);
+  useEffect(() => {
+    // Not on the very first render — that would steal focus at app start.
+    if (firstSectionRender.current) { firstSectionRender.current = false; return; }
+    (document.querySelector('.main-content .section-title') as HTMLElement | null)?.focus();
+  }, [view]);
+
+  // Canonicalise the address. An empty hash (first load, or an old build that
+  // never wrote one) and an unknown hash (typo, or a section a newer build had
+  // and this one does not) both PARSE to the default — this rewrites the bar to
+  // match what is actually on screen, so the two can never disagree.
+  //
+  // Keyed on the RAW hash: `#/notes → #/garbage` leaves `view` unchanged, and
+  // an effect watching only `view` would never run.
+  //
+  // `replace`, not push: a junk entry the user never chose must not become a
+  // stop on the way back.
+  useEffect(() => {
+    if (hash !== canonicalHash(view)) navigate(view, { replace: true });
+  }, [hash, view]);
 
   // Hydrate the encrypted draft on mount — dirty-guarded (§2): it only fills a
   // composer the user has NOT touched (typing and deleting counts as touched),
@@ -161,7 +219,8 @@ export function Main() {
     clearDraft(); // don't wait out the debounce (also invalidates in-flight persists)
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
-    inputRef.current?.focus();
+    setComposerOpen(false);
+    userCollapsedRef.current = false; // saved, not dismissed
   }
 
   function formatDate(ts: number): string {
@@ -179,11 +238,6 @@ export function Main() {
 
     if (isThisYear) return `${day} ${month}`;
     return `${day} ${month} ${d.getFullYear()}`;
-  }
-
-  function closeSearch() {
-    setShowSearch(false);
-    setSearchQuery('');
   }
 
   /** Clipboard write with visible success/error feedback — a rejected promise
@@ -260,155 +314,43 @@ export function Main() {
     requestAnimationFrame(() => menuBtnRefs.current.get(root)?.focus());
   }
 
-  // Reset-safety is STORAGE-backed (arweave.resetRiskCount): every stored
-  // record that is not confirmed — visible or not (historical versions,
-  // quarantined/undecryptable records) — is unrecoverable after a wipe. The
-  // visible `notes` list undercounts exactly the records most at risk.
-  // The safebox contribution is derived from the ENCRYPTED rows, so the
-  // warning is correct with the section LOCKED — the normal case here.
-  const resetRiskTotal = arweave.resetRisk.notes + arweave.resetRisk.safebox;
-  const resetWarningMessage = !arweave.countsReady
-    // Until the first sync-count read completes we cannot know what is safe.
-    ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
-      + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
-      + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
-    : resetRiskTotal > 0
-      // Only CONFIRMED records are recoverable: an `accepted` transaction can
-      // still be dropped, and after a wipe there is no local ciphertext left.
-      ? `⚠️ ${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
-        + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
-        + (arweave.resetRisk.safebox > 0
-          ? `Из них в защищённом сейфе: ${arweave.resetRisk.safebox} — пароли и вложения.\n`
-          : '')
-        + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
-      : 'Все локальные данные будут удалены. Все записи подтверждены в блокчейне — их можно вернуть по seed-фразе.';
 
   return (
     <div className="main-screen">
-      {/* Restoring Banner */}
-      {restoring && (
-        <div className="restoring-banner" role="status" aria-live="polite">
-          ⏳ Восстанавливаем заметки из Arweave...
-          {restoreProgress && restoreProgress.total > 0 && ` ${restoreProgress.done}/${restoreProgress.total}`}
-        </div>
-      )}
+      {/* Grid areas, not a flat flex column: on a wide screen the nav becomes a
+          full-height left rail, and three loose siblings would each turn into a
+          column instead. Toasts and modal overlays are position:fixed, so they
+          never become grid items. */}
+      <div className="main-top">
+        {/* One line replaces the restore banners, both pause banners, the
+            offline banner, the Arweave badge, the note count and the ↻
+            button. Up to three of those used to stack and push the feed. */}
+        <StatusLine />
 
-      {/* Restore failed / partial (M1): distinguish "error" from "nothing to restore" */}
-      {!restoring && restoreError && (
+      {/* A PIN was requested during restore but is NOT the PIN of this device.
+          The restore screen is long gone by now (restore switches to Main
+          before the sweep), so the honest report has to live here — silence
+          would leave the user believing a PIN is set. */}
+      {pinSetupNotice && (
         <div className="error-banner" role="alert">
-          <span>⚠️ {restoreError}</span>
-          <button className="banner-btn" onClick={retryRestore}>Повторить</button>
-          <button
-            className="banner-btn banner-close"
-            onClick={clearRestoreStatus}
-            title="Скрыть"
-            aria-label="Скрыть сообщение об ошибке восстановления"
-          >
-            ✕
-          </button>
-        </div>
-      )}
-
-      {/* Restore succeeded — show what actually came back (0 included: a
-          completed empty sweep must be distinguishable from «не запускалось»).
-          M = new chains (notes), K = existing chains that gained versions. */}
-      {!restoring && !restoreError && restoredCount !== null && (
-        <div className="success-banner" role="status">
           <span>
-            {restoredCount > 0 || (restoredUpdatedCount ?? 0) > 0
-              ? `✓ Восстановлено заметок: ${restoredCount}`
-                + ((restoredUpdatedCount ?? 0) > 0 ? `, обновлено: ${restoredUpdatedCount}` : '')
-              : '✓ Восстановление завершено: новых заметок не найдено'}
+            {pinSetupNotice === 'already-set'
+              ? '⚠️ PIN уже установлен на этом устройстве (в другой вкладке) — ваш новый PIN не применён. Сменить PIN можно в настройках.'
+              : '⚠️ Не удалось сохранить PIN. Вход выполнен; установите PIN в настройках.'}
           </span>
           <button
             className="banner-btn banner-close"
-            onClick={clearRestoreStatus}
+            onClick={dismissPinSetupNotice}
             title="Скрыть"
-            aria-label="Скрыть уведомление о восстановлении"
+            aria-label="Скрыть сообщение о PIN"
           >
             ✕
           </button>
         </div>
       )}
+      </div>
 
-      {/* v3 uploads paused by the server kill switch: a STANDING banner (the
-          toast dies with a reload; the persisted pause does not). */}
-      {v3Paused && arweave.enabled && (
-        <div className="offline-banner" role="status">
-          ⏸ Загрузка новых версий заметок временно приостановлена — всё сохраняется локально.
-          <button className="banner-btn" onClick={() => void resumeV3Uploads()}>
-            Возобновить
-          </button>
-        </div>
-      )}
-
-      {/* Offline Banner */}
-      {arweave.enabled && !arweave.online && (
-        <div className="offline-banner">
-          Оффлайн — заметки сохраняются локально
-        </div>
-      )}
-
-      {/* Header */}
-      <header className="main-header">
-        <div className="header-left">
-          <span className="logo-small">∞</span>
-          <span className="app-title">Eternal Notes</span>
-          <span className="note-count">{chains.length}</span>
-          {arweave.enabled && (
-            <span
-              className={`ar-badge ${arweave.online ? 'text-green' : 'text-red'}`}
-              title={arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
-              role="status"
-              aria-label={arweave.syncing ? 'Arweave: синхронизация' : arweave.online ? 'Arweave: онлайн' : 'Arweave: оффлайн'}
-            >
-              {arweave.syncing ? '⏳' : arweave.online ? '♾️' : '⚠️'}
-            </span>
-          )}
-        </div>
-        <div className="header-right">
-          {safeboxVisible && (
-            <button
-              className={`icon-btn ${view === 'safebox' ? 'icon-btn--active' : ''}`}
-              onClick={() => setView(v => (v === 'safebox' ? 'notes' : 'safebox'))}
-              title="Защищённый сейф"
-              aria-label="Защищённый сейф"
-              aria-pressed={view === 'safebox'}
-            >
-              🔐
-            </button>
-          )}
-          {safeboxUnlocked && (
-            <button
-              className="icon-btn"
-              onClick={lockSafebox}
-              title="Закрыть сейф"
-              aria-label="Закрыть сейф"
-            >
-              🔒
-            </button>
-          )}
-          <button
-            className={`icon-btn ${showSearch ? 'icon-btn--active' : ''}`}
-            onClick={() => { if (showSearch) closeSearch(); else setShowSearch(true); }}
-            title="Поиск (Ctrl+K)"
-            aria-label="Поиск"
-            aria-pressed={showSearch}
-            aria-keyshortcuts="Control+K"
-          >
-            🔍
-          </button>
-          <button
-            className="icon-btn"
-            onClick={() => setShowSettings(true)}
-            title="Настройки"
-            aria-label="Настройки"
-          >
-            ⚙️
-          </button>
-        </div>
-      </header>
-
+      <div className="main-content">
       {/* KEYED ON THE LOCK GENERATION: every section lock (including a
           hidden/pagehide edge with the section already locked) remounts the
           whole subtree, so no local secret state — a half-typed PIN, or the
@@ -417,33 +359,62 @@ export function Main() {
         <SafeboxSection key={safeboxLockGeneration} formatDate={formatDate} />
       )}
 
-      {/* Search */}
-      {view === 'notes' && showSearch && (
-        <div className="search-bar">
-          <input
-            type="text"
-            placeholder="Найти заметку..."
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Escape') closeSearch(); }}
-            autoFocus
-          />
-          {searchQuery && (
-            <>
-              <span className="search-count">
-                {filteredChains.length} из {chains.length}
-              </span>
-              <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
-                ✕
-              </button>
-            </>
-          )}
-        </div>
+      {view === 'settings' && (
+        <SettingsSection theme={theme} onThemeChange={onThemeChange} />
       )}
 
-      {/* Input — the shared controlled composer; draft
-          hydration/persistence stays HERE (value/onChange above). */}
-      <div className="note-input-wrap" hidden={view !== 'notes'}>
+      {/* The notes section is UNMOUNTED when another section is open, not
+          hidden. It could stay mounted safely — the draft lives in this shell,
+          not in the composer — but a mounted feed keeps re-rendering markdown
+          behind a section the user is not looking at. */}
+      {notesVisible && (
+      <>
+      <div className="notes-topbar">
+        <h2 className="section-title" tabIndex={-1}>Заметки</h2>
+        {composerOpen ? (
+          <button className="btn btn-ghost notes-add" onClick={collapseComposer}>
+            Свернуть
+          </button>
+        ) : (
+          <button
+            className="btn btn-primary notes-add"
+            onClick={openComposer}
+            aria-label={hasDraft ? '+ Заметка, есть несохранённый черновик' : undefined}
+          >
+            + Заметка
+            {/* A collapsed composer must not hide an unsaved draft silently. */}
+            {hasDraft && <span className="notes-add-dot" aria-hidden="true" />}
+          </button>
+        )}
+      </div>
+
+      {/* Always on screen — its own field, scoped to this section. The old
+          Ctrl+K toggle is gone with the toggle it drove. */}
+      <div className="search-bar">
+        <input
+          type="text"
+          placeholder="Поиск по заметкам"
+          aria-label="Поиск по заметкам"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Escape') setSearchQuery(''); }}
+        />
+        {searchQuery && (
+          <>
+            <span className="search-count">
+              {filteredChains.length} из {chains.length}
+            </span>
+            <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
+              ✕
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Draft hydration/persistence stays in the shell (value/onChange above),
+          so collapsing or unmounting the composer never touches the draft. */}
+      {composerOpen && (
+      <div className="note-input-wrap">
         <NoteComposer
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
@@ -460,9 +431,10 @@ export function Main() {
             : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
         />
       </div>
+      )}
 
       {/* Feed — one card per version chain; fields come from chain.current. */}
-      <div className="notes-feed" hidden={view !== 'notes'}>
+      <div className="notes-feed">
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
             <div className="empty-icon">📝</div>
@@ -594,6 +566,9 @@ export function Main() {
           })
         )}
       </div>
+      </>
+      )}
+      </div>
 
       {/* PWA update toast (Phase 8): controlled activation, never silent */}
       {updateReady && !updateDismissed && (
@@ -618,6 +593,7 @@ export function Main() {
         </div>
       )}
 
+
       {/* Clipboard feedback — success and failure must look different */}
       {copyFeedback === 'ok' && (
         <div className="toast toast--success" role="status">✓ Скопировано</div>
@@ -628,47 +604,14 @@ export function Main() {
         </div>
       )}
 
-      {/* Global sync-error toast (visible outside the settings modal) */}
-      {arweave.enabled && arweave.lastError && !showSettings && (
-        <div className="toast toast--error" role="alert">
-          <span>⚠️ {arweave.lastError}</span>
-          <button className="banner-btn" onClick={retrySync} disabled={arweave.syncing}>
-            {arweave.syncing ? '...' : 'Повторить'}
-          </button>
-          <button
-            className="banner-btn banner-close"
-            onClick={dismissError}
-            title="Скрыть"
-            aria-label="Скрыть сообщение об ошибке синхронизации"
-          >
-            ✕
-          </button>
-        </div>
-      )}
 
       {/* Settings Modal (extracted — 7.3) */}
-      <SettingsModal
-        open={showSettings}
-        onClose={() => setShowSettings(false)}
-        theme={theme}
-        onThemeChange={setTheme}
-        onRequestReset={() => {
-          // Never two aria-modal dialogs at once: their Escape handlers and
-          // focus traps would compete. Settings closes before the confirm opens.
-          setShowSettings(false);
-          setShowResetConfirm(true);
-        }}
-      />
+      {/* Derived from the route, not from its own boolean: with two sources of
+          truth the address, the Back gesture and the panel drift apart, which
+          is the very confusion this redesign removes. Becomes a real section in
+          stage 4; the modal is the intermediate. */}
 
-      <ConfirmDialog
-        open={showResetConfirm}
-        title="Сбросить приложение?"
-        message={resetWarningMessage}
-        confirmLabel="Удалить всё"
-        danger
-        onConfirm={() => { setShowResetConfirm(false); resetApp(); }}
-        onCancel={() => setShowResetConfirm(false)}
-      />
+
 
       {/* W3: edit + history + restore-version (one aria-modal layer at a time) */}
       <EditNoteModal
@@ -695,6 +638,8 @@ export function Main() {
         onConfirm={confirmRestore}
         onCancel={cancelRestore}
       />
+
+      <AppNav safeboxDimmed={safeboxDimmed} />
     </div>
   );
 }

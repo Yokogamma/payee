@@ -43,8 +43,6 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
     downloadSafeboxAttachment,
     syncStatuses,
     arweave,
-    v4Paused,
-    resumeV4Uploads,
     isEncrypting,
   } = useNotes();
 
@@ -151,7 +149,7 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
   return (
     <div className="safebox-section" onPointerDown={touchSafebox} onKeyDown={touchSafebox}>
       <div className="safebox-topbar">
-        <h2>🔐 Сейф</h2>
+        <h2 className="section-title" tabIndex={-1}>Сейф</h2>
         <div className="header-right">
           {SAFEBOX_WRITER_ENABLED && (
             <button
@@ -165,12 +163,6 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
         </div>
       </div>
 
-      {v4Paused && arweave.enabled && (
-        <div className="offline-banner" role="status">
-          ⏸ Загрузка записей сейфа временно приостановлена — всё сохраняется локально.
-          <button className="banner-btn" onClick={() => void resumeV4Uploads()}>Возобновить</button>
-        </div>
-      )}
 
       {!syncActive && (
         <div className="offline-banner" role="status">

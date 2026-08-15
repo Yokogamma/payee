@@ -5,7 +5,8 @@ import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({ useNotes: () => h.store }));
 
-import { SettingsModal } from './SettingsModal';
+import { SettingsSection } from './SettingsSection';
+import { SAFEBOX_SCRUB_SELECTOR } from '../components/secretFieldProps';
 
 beforeEach(() => {
   h.store = {
@@ -14,8 +15,14 @@ beforeEach(() => {
     arweave: {
       enabled: true, online: true, syncing: false, registered: true,
       acceptedCount: 0, confirmedCount: 0, unsyncedCount: 0, errorCount: 0,
+      quarantinedCount: 0, countsReady: true,
+      // The reset warning moved into this section with the confirm dialog.
+      resetRisk: { notes: 0, safebox: 0 },
       lastSync: null, lastError: null,
     },
+    syncStatuses: {},
+    updateCheck: { status: 'idle' },
+    checkForUpdates: vi.fn(),
     toggleArweave: vi.fn(),
     retrySync: vi.fn(),
     registerWithInvite: vi.fn(),
@@ -32,53 +39,45 @@ beforeEach(() => {
     unlockSafebox: vi.fn(async () => {}),
     changeSafeboxPin: vi.fn(async () => {}),
     deactivateSafebox: vi.fn(async () => {}),
+    resetApp: vi.fn(),
   };
 });
 afterEach(cleanup);
 
-function renderModal(open = true) {
-  const onClose = vi.fn();
-  return Object.assign(render(
-    <SettingsModal
-      open={open}
-      onClose={onClose}
-      theme="system"
-      onThemeChange={vi.fn()}
-      onRequestReset={vi.fn()}
-    />,
-  ), { onClose });
+/** No `open` and no `onClose`: navigating away unmounts the section. */
+function renderSection() {
+  return render(<SettingsSection theme="system" onThemeChange={vi.fn()} />);
 }
 
-describe('SettingsModal a11y (Phase 7)', () => {
-  it('renders as role=dialog with a label; closed renders nothing', () => {
-    renderModal();
-    expect(screen.getByRole('dialog', { name: 'Настройки' })).toBeTruthy();
-    cleanup();
-    renderModal(false);
+describe('SettingsSection a11y (Phase 7)', () => {
+  it('это РАЗДЕЛ, а не диалог — никакого aria-modal поверх приложения', () => {
+    renderSection();
+    expect(screen.getByRole('region', { name: 'Настройки' })).toBeTruthy();
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
-  it('Escape closes the modal', () => {
-    const { onClose } = renderModal();
+  it('Escape НЕ уводит из раздела', () => {
+    // A section-level Escape handler would fight the nested dialogs' own
+    // stopPropagation and would yank the user out mid-form. Leaving is the nav
+    // or the Back gesture, which now works.
+    renderSection();
     fireEvent.keyDown(window, { key: 'Escape' });
-    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('region', { name: 'Настройки' })).toBeTruthy();
   });
 
-  it('Shift+Tab right after opening stays INSIDE the dialog (container is a boundary)', () => {
-    renderModal();
-    // Initial focus is the dialog container itself (tabIndex=-1).
-    const dialog = screen.getByRole('dialog', { name: 'Настройки' });
-    expect(document.activeElement).toBe(dialog);
-
-    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
-    const active = document.activeElement as HTMLElement;
-    expect(dialog.contains(active)).toBe(true);      // never escapes behind the modal
-    expect(active).not.toBe(dialog);                 // wrapped to a real control
-    expect(active.textContent).toBe('Сброс приложения'); // LAST focusable = last block header
+  it('заголовок раздела фокусируем — это то, что заменяет фокус-ловушку', () => {
+    // Without focus management a keyboard/AT user lands at the top of the
+    // document with no announcement when the section changes. The shell moves
+    // focus here; the heading has to be able to receive it.
+    renderSection();
+    const heading = screen.getByRole('heading', { name: 'Настройки' });
+    expect(heading.getAttribute('tabindex')).toBe('-1');
+    heading.focus();
+    expect(document.activeElement).toBe(heading);
   });
 
   it('theme picker exposes the active option via aria-pressed', () => {
-    renderModal();
+    renderSection();
     // Theme now lives inside a collapsed block — expand it first. "Системная"
     // also appears as the block's status chip, so target the buttons by role.
     fireEvent.click(screen.getByText('Тема'));
@@ -89,23 +88,23 @@ describe('SettingsModal a11y (Phase 7)', () => {
   });
 
   it('PIN block: "Установить" with no PIN; "Сменить" + "Удалить" once set', () => {
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('PIN-код'));
     expect(screen.getByText('Установить PIN-код')).toBeTruthy();
     expect(screen.queryByText('Сменить PIN-код')).toBeNull();
     cleanup();
 
     h.store.hasPin = true;
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('PIN-код'));
     expect(screen.getByText('Сменить PIN-код')).toBeTruthy();
     expect(screen.getByText('Удалить PIN-код')).toBeTruthy();
   });
 });
 
-describe('SettingsModal — safebox seed gate (§2)', () => {
+describe('SettingsSection — safebox seed gate (§2)', () => {
   it('без сейфа: seed-фраза показывается как раньше', () => {
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('Seed-фраза'));
     fireEvent.click(screen.getByText('Показать seed-фразу'));
     expect(screen.getByText('a')).toBeTruthy(); // the words render
@@ -114,7 +113,7 @@ describe('SettingsModal — safebox seed gate (§2)', () => {
   it('с настроенным сейфом seed прячется ЗА PIN сейфа', async () => {
     h.store.safeboxPinConfigured = true;
     h.store.safeboxDataPresent = true;
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('Seed-фраза'));
     fireEvent.click(screen.getByText('Показать seed-фразу'));
 
@@ -134,7 +133,7 @@ describe('SettingsModal — safebox seed gate (§2)', () => {
   it('данные сейфа БЕЗ конфига: показ seed запрещён с подсказкой про сброс по seed', () => {
     h.store.safeboxPinConfigured = false;
     h.store.safeboxDataPresent = true;
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('Seed-фраза'));
     fireEvent.click(screen.getByText('Показать seed-фразу'));
     // A 10-strike wipe must NOT become a shortcut to the seed phrase.
@@ -142,19 +141,22 @@ describe('SettingsModal — safebox seed gate (§2)', () => {
     expect(h.store.showMnemonic).not.toHaveBeenCalled();
   });
 
-  it('блок «Защищённый сейф» виден только при данных или конфиге', () => {
-    renderModal();
-    expect(screen.queryByText('Защищённый сейф')).toBeNull();
-    cleanup();
-
-    h.store.safeboxPinConfigured = true;
-    renderModal();
+  it('блок «Защищённый сейф» присутствует ВСЕГДА, состояние — в чипе', () => {
+    // The same appear/disappear formula the nav item lost. «Nothing configured
+    // yet» is a state to show, not a reason to hide the only route to it.
+    renderSection();
     expect(screen.getByText('Защищённый сейф')).toBeTruthy();
+    expect(screen.getByText('не настроен')).toBeTruthy();
+
+    cleanup();
+    h.store.safeboxPinConfigured = true;
+    renderSection();
+    expect(screen.getByText('PIN установлен')).toBeTruthy();
   });
 
   it('смена PIN сейфа требует ТЕКУЩИЙ PIN', async () => {
     h.store.safeboxPinConfigured = true;
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('Защищённый сейф'));
     fireEvent.click(screen.getByText('Сменить PIN сейфа'));
 
@@ -171,7 +173,7 @@ describe('SettingsModal — safebox seed gate (§2)', () => {
 
   it('деактивация требует текущий PIN и обещает сохранность записей', async () => {
     h.store.safeboxPinConfigured = true;
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('Защищённый сейф'));
     fireEvent.click(screen.getByText('Деактивировать сейф (записи сохранятся)'));
     expect(screen.getByText(/Записи сейфа НЕ удаляются/)).toBeTruthy();
@@ -183,11 +185,11 @@ describe('SettingsModal — safebox seed gate (§2)', () => {
   });
 });
 
-describe('SettingsModal — the seed gate is LIVE, not a one-time flag', () => {
+describe('SettingsSection — the seed gate is LIVE, not a one-time flag', () => {
   it('a safebox lock after the gate was passed hides the phrase again', async () => {
     h.store.safeboxPinConfigured = true;
     h.store.safeboxUnlocked = false;
-    const { rerender } = renderModal();
+    const { rerender } = renderSection();
     fireEvent.click(screen.getByText('Seed-фраза'));
     fireEvent.click(screen.getByText('Показать seed-фразу'));
 
@@ -203,7 +205,7 @@ describe('SettingsModal — the seed gate is LIVE, not a one-time flag', () => {
     (h.store.showMnemonic as ReturnType<typeof vi.fn>).mockClear();
     h.store.safeboxUnlocked = false;
     rerender(
-      <SettingsModal open onClose={vi.fn()} theme="system" onThemeChange={vi.fn()} onRequestReset={vi.fn()} />,
+      <SettingsSection open onClose={vi.fn()} theme="system" onThemeChange={vi.fn()} onRequestReset={vi.fn()} />,
     );
     expect(h.store.showMnemonic).not.toHaveBeenCalled();
     expect(screen.getByText('Показать после ввода PIN')).toBeTruthy(); // asks again
@@ -212,7 +214,7 @@ describe('SettingsModal — the seed gate is LIVE, not a one-time flag', () => {
   it('a REJECTED unlock (lock during the KDF) never opens the gate', async () => {
     h.store.safeboxPinConfigured = true;
     h.store.unlockSafebox = vi.fn(async () => { throw new Error('Сейф заблокирован.'); });
-    renderModal();
+    renderSection();
     fireEvent.click(screen.getByText('Seed-фраза'));
     fireEvent.click(screen.getByText('Показать seed-фразу'));
 
@@ -225,10 +227,10 @@ describe('SettingsModal — the seed gate is LIVE, not a one-time flag', () => {
   });
 });
 
-describe('SettingsModal — a section lock clears ITS safebox secrets too', () => {
+describe('SettingsSection — a section lock clears ITS safebox secrets too', () => {
   it('the PIN-change form is remounted on a lock-generation bump', () => {
     h.store.safeboxPinConfigured = true;
-    const { rerender } = renderModal();
+    const { rerender } = renderSection();
     fireEvent.click(screen.getByText('Защищённый сейф'));
     fireEvent.click(screen.getByText('Сменить PIN сейфа'));
 
@@ -241,7 +243,7 @@ describe('SettingsModal — a section lock clears ITS safebox secrets too', () =
 
     h.store.safeboxLockGeneration = 1;
     rerender(
-      <SettingsModal open onClose={vi.fn()} theme="system" onThemeChange={vi.fn()} onRequestReset={vi.fn()} />,
+      <SettingsSection open onClose={vi.fn()} theme="system" onThemeChange={vi.fn()} onRequestReset={vi.fn()} />,
     );
 
     // Back to the idle state: the typed current PIN is gone with the remount.
@@ -253,7 +255,7 @@ describe('SettingsModal — a section lock clears ITS safebox secrets too', () =
   it('the seed-gate PIN and its passed state are cleared on a lock', async () => {
     h.store.safeboxPinConfigured = true;
     h.store.safeboxUnlocked = true;
-    const { rerender } = renderModal();
+    const { rerender } = renderSection();
     fireEvent.click(screen.getByText('Seed-фраза'));
     fireEvent.click(screen.getByText('Показать seed-фразу'));
 
@@ -267,10 +269,94 @@ describe('SettingsModal — a section lock clears ITS safebox secrets too', () =
     h.store.safeboxLockGeneration = 1;   // a hidden edge locked the section
     h.store.safeboxUnlocked = false;
     rerender(
-      <SettingsModal open onClose={vi.fn()} theme="system" onThemeChange={vi.fn()} onRequestReset={vi.fn()} />,
+      <SettingsSection open onClose={vi.fn()} theme="system" onThemeChange={vi.fn()} onRequestReset={vi.fn()} />,
     );
 
     expect(h.store.showMnemonic).not.toHaveBeenCalled();
     expect((document.querySelector('#sbx-gate-seed') as HTMLInputElement).value).toBe('');
+  });
+});
+
+// The «Проверить обновления» button and its result line MOVED to the status
+// line, where they are visible from every section instead of only inside an
+// open panel. Covered by StatusLine.test.tsx.
+
+// The counters MOVED to the status line's expandable panel, and their logic
+// moved to `computeSyncCounters` — these five cases now live as node unit
+// tests in src/lib/syncCounters.test.ts, where they do not need a rendered
+// panel and a collapsible block to click open.
+
+// ─── Reset: the confirm dialog moved in with the section ────────────
+
+describe('SettingsSection — сброс приложения', () => {
+  it('подтверждение — ЕДИНСТВЕННЫЙ модальный слой: настройки больше не диалог', () => {
+    renderSection();
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    fireEvent.click(screen.getByText('Сброс приложения'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+
+    const dialogs = screen.getAllByRole('dialog');
+    expect(dialogs).toHaveLength(1);
+    expect(dialogs[0].getAttribute('aria-label')).toBe('Сбросить приложение?');
+  });
+
+  // ROUND-13, ported. The old modal cleared the revealed phrase whenever it
+  // closed, and the reset flow relied on that. In a section the user never
+  // leaves, nothing unmounts, and the phrase would sit behind the confirm —
+  // so `requestReset()` has to clear it explicitly. This test is the boundary.
+  it('раскрытая seed-фраза НЕ переживает «Сброс → Отмена»', () => {
+    h.store.showMnemonic = vi.fn(() => 'секретное слово фраза');
+    renderSection();
+
+    fireEvent.click(screen.getByText('Seed-фраза'));
+    fireEvent.click(screen.getByText('Показать seed-фразу'));
+    expect(screen.getByText('секретное')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('Сброс приложения'));
+    fireEvent.click(screen.getByText('Сбросить приложение'));
+    fireEvent.click(screen.getByText('Отмена'));
+
+    // Still on the same screen — nothing unmounted — and the phrase is gone.
+    expect(screen.queryByText('секретное')).toBeNull();
+    expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
+  });
+});
+
+// ─── I4: the BFCache scrub contract ─────────────────────────────────
+
+describe('SettingsSection — поля сейфа попадают под очистку при блокировке', () => {
+  // These fields live OUTSIDE the section the shell remounts on a lock, so the
+  // ONLY thing that wipes them before a `pagehide` snapshot is the store's
+  // synchronous querySelectorAll over SAFEBOX_SCRUB_SELECTOR. A renamed class
+  // or a newly added field would unhook silently — nothing else would fail.
+  const inputsUnderScrub = () =>
+    Array.from(document.querySelectorAll<HTMLInputElement>(SAFEBOX_SCRUB_SELECTOR));
+
+  it('поле seed-гейта ловится селектором', () => {
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxDataPresent = true;
+    renderSection();
+    fireEvent.click(screen.getByText('Seed-фраза'));
+    fireEvent.click(screen.getByText('Показать seed-фразу'));
+
+    const gate = document.querySelector('#sbx-gate-seed') as HTMLInputElement;
+    expect(gate).toBeTruthy();
+    expect(inputsUnderScrub()).toContain(gate);
+  });
+
+  it('ВСЕ поля формы смены PIN сейфа ловятся селектором', () => {
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxDataPresent = true;
+    renderSection();
+    fireEvent.click(screen.getByText('Защищённый сейф'));
+    fireEvent.click(screen.getByText('Сменить PIN сейфа'));
+
+    const all = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="password"], .pin-input'));
+    expect(all.length).toBeGreaterThan(1); // current + new + confirm
+    const scrubbed = inputsUnderScrub();
+    for (const field of all) {
+      expect(scrubbed, `поле ${field.id || field.className} вне очистки`).toContain(field);
+    }
   });
 });

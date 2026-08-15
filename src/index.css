@@ -22,7 +22,7 @@
   --yellow: #fbbf24;
   --radius: 12px;
   --radius-sm: 8px;
-  --font: 'Outfit', -apple-system, system-ui, sans-serif;
+  --font: 'Manrope', -apple-system, system-ui, sans-serif;
   --mono: 'JetBrains Mono', monospace;
 }
 
@@ -43,6 +43,34 @@
   --green-glow: rgba(26, 171, 138, 0.1);
   --red: #dc3545;
   --yellow: #d4a017;
+}
+
+/* Warm: less blue for evening reading. Declares EXACTLY the same key set as
+   the light palette — an omitted variable does not fall back to light, it
+   falls through to the DARK values on :root, and that shows up on one screen
+   a month later. Enforced by scripts/check-theme-parity.test.mjs.
+
+   The violet accent is kept on purpose: with an amber ground it is a
+   complementary pair, and swapping it would break recognition between themes.
+   The only value that needed rethinking rather than recomputing is --red:
+   a cold #dc3545 reads as a foreign object here. */
+[data-theme="warm"] {
+  --bg: #f3ebdf;
+  --bg-card: #fcf7ef;
+  --bg-input: #ebe1d2;
+  --bg-hover: #e6dccb;
+  --border: #dacdb9;
+  --border-focus: #b6a68d;
+  --text: #2b2219;
+  --text-dim: #786a58;
+  --text-muted: #6f6250; /* a11y: contrast against --bg-card, like the others */
+  --accent: #5b4fd1;
+  --accent-hover: #4a3fb8;
+  --accent-glow: rgba(91, 79, 209, 0.12);
+  --green: #1e8a69;
+  --green-glow: rgba(30, 138, 105, 0.1);
+  --red: #b03a2b;
+  --yellow: #a8700c;
 }
 
 /* System theme (7.4): with no explicit data-theme, follow the OS preference.
@@ -91,12 +119,13 @@ body {
   overflow: hidden;
 }
 
+/* Width lives on the SCREENS, not here: the main screen grows to fit a side
+   rail on a wide viewport, and widening .app would drag the landing, the
+   onboarding, the restore flow and the PIN screen along with it. */
 .app {
   height: 100%;
   /* iOS PWA: dynamic viewport height tracks the collapsing browser chrome */
   height: 100dvh;
-  max-width: 640px;
-  margin: 0 auto;
   display: flex;
   flex-direction: column;
   /* Keep content out of the notch / home-indicator (viewport-fit=cover) */
@@ -108,8 +137,12 @@ body {
 
 /* ─── Shared ────────────────────────────────────────────────── */
 
+/* Every non-main screen. Carries the width .app used to own. */
 .screen-center {
   height: 100%;
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -135,7 +168,10 @@ body {
 
 .logo-icon {
   font-size: 48px;
-  font-weight: 200;
+  /* U+221E is not in any imported subset and 200 was never imported either —
+     this asked for a weight of a face that does not draw the glyph. 400 is
+     honest; the visual result is settled by a before/after screenshot. */
+  font-weight: 400;
   color: var(--accent);
   line-height: 1;
   margin-bottom: 4px;
@@ -419,48 +455,45 @@ h1 {
 
 /* ─── Main Screen ───────────────────────────────────────────── */
 
+/* Grid, not a flex column. On a wide viewport the nav becomes a full-height
+   left rail; with three loose flex siblings `flex-direction: row` would turn
+   the header into a column of its own instead. Toasts and modal overlays are
+   position:fixed, so they never become grid items. */
 .main-screen {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-areas: "top" "content" "nav";
+  grid-template-rows: auto 1fr auto;
   height: 100%;
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
   overflow: hidden;
 }
 
-.main-header {
+.main-top { grid-area: top; min-width: 0; }
+
+.main-content {
+  grid-area: content;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
+  flex-direction: column;
+  min-height: 0; /* let .notes-feed scroll instead of stretching the grid row */
+  min-width: 0;
+  overflow: hidden;
 }
 
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+@media (min-width: 768px) {
+  .main-screen {
+    grid-template-areas: "nav top" "nav content";
+    grid-template-columns: 220px 1fr;
+    grid-template-rows: auto 1fr;
+    max-width: 980px;
+  }
 }
 
-.logo-small {
-  font-size: 22px;
-  color: var(--accent);
-  font-weight: 200;
-}
 
-.app-title {
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.3px;
-}
 
-.note-count {
-  font-size: 11px;
-  color: var(--text-muted);
-  background: var(--bg-input);
-  padding: 2px 6px;
-  border-radius: 10px;
-  font-family: var(--mono);
-}
+
+
 
 .header-right {
   display: flex;
@@ -832,10 +865,6 @@ h1 {
 
 /* ─── Arweave ───────────────────────────────────────────────── */
 
-.ar-badge {
-  font-size: 12px;
-  margin-left: 2px;
-}
 
 .settings-heading {
   font-size: 14px;
@@ -905,16 +934,6 @@ h1 {
 
 /* ─── Restoring Banner ─────────────────────────────────────── */
 
-.restoring-banner {
-  background: var(--accent-glow);
-  border-bottom: 1px solid rgba(108, 99, 255, 0.2);
-  color: var(--accent);
-  font-size: 13px;
-  padding: 8px 16px;
-  text-align: center;
-  flex-shrink: 0;
-  animation: pulse-bg 2s ease-in-out infinite;
-}
 
 @keyframes pulse-bg {
   0%, 100% { opacity: 1; }
@@ -1145,14 +1164,16 @@ mark {
 
 /* ─── Theme picker (3-way, settings) ────────────────────────── */
 
+/* 2×2, not a flex row: four options with «Системная» as the longest label
+   overflow a phone in one line. Mirrors the .autolock-grid pattern below. */
 .theme-picker {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 6px;
   width: 100%;
 }
 
 .theme-option {
-  flex: 1;
   font-family: var(--font);
   font-size: 13px;
   padding: 8px 10px;
@@ -1678,7 +1699,10 @@ mark {
   border-radius: var(--radius-sm);
   word-break: break-all;
 }
-.safebox-revealed code { font-family: var(--font-mono, monospace); }
+/* --mono, not --font-mono: the latter never existed, so revealed passwords
+   rendered in the UA default monospace and lost the 0/O and 1/l/I
+   disambiguation that matters most here. Guarded by check-css-vars.test.mjs. */
+.safebox-revealed code { font-family: var(--mono); }
 
 /* Entry form */
 .safebox-form { width: min(560px, 94vw); display: flex; flex-direction: column; gap: 6px; }
@@ -1709,3 +1733,237 @@ mark {
 .pwgen-modes { display: flex; gap: 6px; }
 .pwgen-sets { display: flex; gap: 12px; flex-wrap: wrap; }
 .pwgen-length { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+
+/* ─── Section navigation (bottom bar / side rail) ───────────── */
+
+/* A GRID CHILD, never position:fixed — two reasons.
+   1. A fixed bottom bar on iOS is covered or displaced by the software
+      keyboard the moment the composer takes focus.
+   2. No z-index at all: .lock-gate sits at z-index 100 and beats
+      .modal-overlay ONLY on source order (see the LOAD-BEARING note there).
+      Anything here at >= 100 would paint over the privacy gate — a silent
+      security regression. */
+.app-nav {
+  grid-area: nav;
+  display: flex;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  min-width: 0;
+}
+
+.app-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  /* a11y: ≥44px touch target, same floor as .icon-btn */
+  min-height: 44px;
+  padding: 8px 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--text-dim);
+  transition: color 0.15s;
+}
+
+.app-nav-item svg {
+  width: 20px;
+  height: 20px;
+}
+
+.app-nav-item:hover { color: var(--text); }
+.app-nav-item--active { color: var(--accent); }
+
+/* Nothing behind this section yet. DIMMED, never `disabled`: it is the only
+   route into activation, and the state is in the accessible name too. */
+.app-nav-item--dim { opacity: 0.55; }
+
+.app-nav-label { white-space: nowrap; }
+
+@media (min-width: 768px) {
+  .app-nav {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    padding: 12px 8px;
+    border-top: none;
+    border-right: 1px solid var(--border);
+  }
+  .app-nav-item {
+    flex: 0 0 auto;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+  }
+  .app-nav-item--active { background: var(--bg-hover); }
+}
+
+/* ─── Notes section topbar + collapsed composer ─────────────── */
+
+.notes-topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 16px 9px;
+  flex: 0 0 auto;
+}
+
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  flex: 1;
+  margin: 0;
+}
+
+/* Mirrors «+ Запись» in the safebox topbar — the two sections offer creation
+   in the same place and the same shape. */
+.notes-add {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  font-size: 13px;
+  position: relative;
+}
+
+/* A collapsed composer must not hide an unsaved draft. The state is in the
+   button's accessible name too, not only in this dot. */
+.notes-add-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--yellow);
+}
+
+/* ─── Status line ───────────────────────────────────────────── */
+
+/* One line for ambient state. Never pushes content: the grid gives it a fixed
+   row, so a pause or an error changes what it says, not where the feed is. */
+.status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  flex: 0 0 auto;
+}
+.status-line--busy .status-dot { background: var(--accent); }
+.status-line--warn .status-dot { background: var(--yellow); }
+.status-line--error .status-dot { background: var(--red); }
+
+.status-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-line--error .status-text { color: var(--red); }
+
+.status-btn {
+  flex: 0 0 auto;
+  /* a11y: ≥44px touch target, same floor as every other inline control */
+  min-width: 44px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: 15px;
+  cursor: pointer;
+}
+.status-btn:hover:not(:disabled) { color: var(--text); background: var(--bg-hover); }
+.status-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Breaks to its own row inside the same flex container. */
+.status-details {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 0 2px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.status-details strong { color: var(--text); font-weight: 600; }
+.status-hint { color: var(--text-muted); font-size: 11.5px; }
+
+/* Wordmark: rail-only. On a phone the nav is a row of three and the section
+   title already says where you are. */
+.app-nav-brand { display: none; }
+
+@media (min-width: 768px) {
+  .app-nav-brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px 14px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .app-nav-mark {
+    color: var(--accent);
+    font-size: 17px;
+    line-height: 1;
+  }
+}
+
+/* ─── Settings as a section (was a modal) ───────────────────── */
+
+.settings-section {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 0 20px;
+}
+
+.settings-section .settings-topbar {
+  padding: 13px 16px 9px;
+}
+
+/* The heading takes focus on every section change — the a11y invariant that
+   replaces the modal focus trap. It must not paint a ring for mouse users. */
+.settings-section .section-title:focus { outline: none; }
+.settings-section .section-title:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.settings-group + .settings-group { margin-top: 22px; }
+
+.settings-group-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 4px 7px;
+}
+.settings-group-title--danger { color: var(--red); }

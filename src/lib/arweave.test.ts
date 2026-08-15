@@ -423,6 +423,31 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
     expect(res[0].text).toBe('страница 1');
   });
 
+  it('THROWS when the FIRST page fails — nothing was retrieved, so "partial" would lie', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
+
+    const { fetchAllNotes, ArweaveIndexUnavailableError } = await import('./arweave');
+    await expect(fetchAllNotes('oh', await keyring()))
+      .rejects.toBeInstanceOf(ArweaveIndexUnavailableError);
+  });
+
+  it('an ABORTED first page stays silent (incomplete), never a throw', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    // A lock/reset cancels through the SAME signal a timeout uses, so the two
+    // are indistinguishable by error type — only `signal.aborted` separates them.
+    const ac = new AbortController();
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      ac.abort();
+      throw new DOMException('aborted', 'AbortError');
+    }));
+
+    const { fetchAllNotes } = await import('./arweave');
+    const res = await fetchAllNotes('oh', await keyring(), undefined, { signal: ac.signal });
+    expect(res.incomplete).toBe(true);
+    expect(res.notes).toHaveLength(0);
+  });
+
   it('flags incomplete when a note payload cannot be fetched (network)', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
     const { deriveKey, generateMnemonic } = await import('./crypto');

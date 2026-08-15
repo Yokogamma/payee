@@ -18,6 +18,7 @@ vi.mock('../lib/store', () => ({
 vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
 
 import { Main } from './Main';
+import { resetRoute } from '../test-stubs/route-reset';
 import { groupChains } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
 
@@ -85,6 +86,8 @@ function makeStore(notes: NoteData[]) {
     restoredUpdatedCount: null,
     retryRestore: vi.fn(),
     clearRestoreStatus: vi.fn(),
+    updateCheck: { status: 'idle' as const },
+    checkForUpdates: vi.fn(),
     syncStatuses: {} as Record<string, { status: string; txId?: string }>,
     dismissError: vi.fn(),
     persistDraft: vi.fn(async () => {}),
@@ -110,15 +113,21 @@ function chainNotes(): NoteData[] {
   ];
 }
 
+/** The composer is collapsed by default now — open it before typing. */
+function openComposer() {
+  fireEvent.click(screen.getByRole('button', { name: /\+ Заметка/ }));
+}
+
 beforeEach(() => {
   h.store = makeStore(chainNotes());
   sessionStorage.clear();
+  resetRoute(); // the section is in location.hash and jsdom keeps one per file
 });
 afterEach(cleanup);
 
 describe('Main W3 — markdown rendering', () => {
   it('renders the CURRENT md version as a markdown element tree (no raw #)', () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     const heading = document.querySelector('.note-md h1');
     expect(heading?.textContent).toBe('Заголовок');
     expect(document.querySelector('.note-md strong')?.textContent).toBe('жирный');
@@ -130,7 +139,7 @@ describe('Main W3 — markdown rendering', () => {
 
   it('falls back to PLAIN text with <mark> while a search query is active', () => {
     (h.store as ReturnType<typeof makeStore>).searchQuery = 'жирный';
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(document.querySelector('.note-md')).toBeNull(); // markdown off
     expect(document.querySelector('mark')?.textContent).toBe('жирный');
     expect(document.querySelector('.note-text')?.textContent).toContain('**жирный**'); // raw markdown text
@@ -138,7 +147,7 @@ describe('Main W3 — markdown rendering', () => {
 
   it('a plain-fmt current version renders as text even without a query', () => {
     h.store = makeStore([note({ id: 'p1', text: '*звёзды* литеральны', fmt: 'plain' })]);
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(document.querySelector('.note-md')).toBeNull();
     expect(document.querySelector('.note-text')?.textContent).toContain('*звёзды*');
   });
@@ -146,7 +155,8 @@ describe('Main W3 — markdown rendering', () => {
 
 describe('Main W3 — composer toolbar/preview', () => {
   it('shows the toolbar; a bold click wraps the selection', async () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'слово' } });
     input.setSelectionRange(0, 5);
@@ -155,7 +165,8 @@ describe('Main W3 — composer toolbar/preview', () => {
   });
 
   it('preview toggle renders the draft as markdown and back', () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: '# Черновик' } });
     fireEvent.click(screen.getByText('Превью'));
@@ -168,7 +179,7 @@ describe('Main W3 — composer toolbar/preview', () => {
 describe('Main W3 — edit flow', () => {
   it('menu → Редактировать opens the modal prefilled; save calls editNote and closes', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('✏️ Редактировать'));
 
@@ -185,7 +196,7 @@ describe('Main W3 — edit flow', () => {
   it('a failed save keeps the modal open with the text and an inline error', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
     s.editNote = vi.fn(async () => { throw new Error('quota'); });
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('✏️ Редактировать'));
 
@@ -203,7 +214,7 @@ describe('Main W3 — edit flow', () => {
 describe('Main W3 — history + restore-version flow', () => {
   it('history lists versions ordinally with dates; restore goes through the async confirm', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('🕓 История версий (2)'));
 
@@ -229,7 +240,7 @@ describe('Main W3 — history + restore-version flow', () => {
   });
 
   it('cancelling the confirm reopens history focused on the same version row', async () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('🕓 История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
@@ -248,7 +259,7 @@ describe('Main W3 — history + restore-version flow', () => {
   it('a failing restore shows the error INSIDE the confirm without closing it', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
     s.editNote = vi.fn(async () => { throw new Error('offline db'); });
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('🕓 История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
@@ -260,7 +271,7 @@ describe('Main W3 — history + restore-version flow', () => {
   });
 
   it('the updated immutability hint mentions versions', () => {
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     expect(screen.getByText(/редактирование добавляет новую версию/)).toBeTruthy();
   });
@@ -269,7 +280,7 @@ describe('Main W3 — history + restore-version flow', () => {
 describe('Main W3 — edit buffer survives background chain rebuilds (review regression)', () => {
   it('typing in the edit modal is NOT overwritten when the store rebuilds chain objects', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
-    const { rerender } = render(<Main />);
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('✏️ Редактировать'));
 
@@ -280,7 +291,7 @@ describe('Main W3 — edit buffer survives background chain rebuilds (review reg
     // Background publishNotes (e.g. a restore sweep) rebuilds EVERY chain
     // object with fresh identities — same data, new references.
     h.store = { ...s, ...makeStore(chainNotes()) };
-    rerender(<Main />);
+    rerender(<Main theme="system" onThemeChange={vi.fn()} />);
 
     const after = screen.getByRole('dialog', { name: 'Редактирование заметки' })
       .querySelector('.note-input') as HTMLTextAreaElement;
@@ -291,7 +302,8 @@ describe('Main W3 — edit buffer survives background chain rebuilds (review reg
 describe('Main W3 — Ctrl+Enter works in preview mode (review fix)', () => {
   it('submits from the preview surface where the textarea is unmounted', async () => {
     const s = h.store as ReturnType<typeof makeStore>;
-    render(<Main />);
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'из превью' } });
     fireEvent.click(screen.getByText('Превью'));

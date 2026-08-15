@@ -177,6 +177,35 @@ Deploy order is **strictly worker-first**: **Worker v4-acceptor → R4 → W4.**
    other code. **Mandatory preconditions:** production `/health` shows
    `versions` containing `'4'` and `v4Uploads:true`; the signed v4 staging smoke
    passed; the v4-acceptor worker tag is recorded below as the floor.
+   **DEPLOYED 2026-08-12** (tag `client-w4` = c1346e4) on notes.matamata.dev,
+   run 31594140875 — all gates green, smoke-headers passed. All three
+   preconditions were met first: prod `/health` `v4Uploads:true`, the signed v4
+   smoke passed 8/8 against PRODUCTION (see `worker-r3` below), `worker-r3` was
+   already the recorded floor. The diff is literally one line in
+   `src/lib/flags.ts`.
+
+   Verified against the live site, as a brand-new user on a clean profile:
+   - the deployed bundle (`index-CMXYxCUh.js`) CONTAINS «+ Запись», «Вернуть
+     эту версию» and the password-generator strings — at R4 tree-shaking
+     removed them, so their presence is direct evidence the flag is `true` in
+     the artifact, not merely in the source;
+   - the header shows the **«Защищённый сейф» 🔐** button for a user with no
+     safebox data and no PIN — the `SAFEBOX_WRITER_ENABLED || … ` visibility
+     formula end to end (at R4 the same check found it absent);
+   - IndexedDB is at **version 2** with stores `meta/notes/safebox/sync`;
+   - CSP / `X-Frame-Options: DENY` / `nosniff` / `Referrer-Policy` intact.
+
+   ⚠️ **The update is prompt-gated, so W4 does NOT reach open clients on its
+   own.** Observed live: an already-loaded tab kept running R4 (no safebox
+   button) and only switched after «Обновить» in the update toast —
+   `registerType:'prompt'`, no unconditional `skipWaiting`. Expect a long tail
+   of R4 clients; that is by design, not a failed deploy.
+
+   NOT verified (deliberately, cost/side-effects): creating a real safebox
+   entry end-to-end from the UI. That path needs a registered account (an
+   invite) and posts a real paid v4 transaction. The v4 wire format itself is
+   covered by the signed smoke; what remains unexercised in production is the
+   client-side publish path (`publishUnlockedSafebox` → upload).
 
 ### v4 upload kill switch (`V4_UPLOADS_ENABLED`)
 
@@ -309,9 +338,312 @@ KV placeholder is still in `wrangler.toml`.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
+  **Client floor since 2026-08-12: `client-r4`** (f43e503) — never below it.
+  R4 raises IndexedDB to version 2 on first launch regardless of the writer
+  flag, and any device that has run R4 gets a `VersionError` on a client with
+  `DB_VERSION=1`. Rolling W4 → R4 is allowed and is the writer kill switch for
+  the safebox; rolling below R4 is not.
+  **A W4 → R4 rollback is gradual, exactly like W3 → R3**: already-loaded tabs
+  and installed PWAs keep running W4 until the user accepts the update prompt,
+  so they keep writing v4 locally and uploading. Observed live on the W4
+  deploy: an open tab stayed on R4 until «Обновить» was clicked. The immediate
+  server-side stop is `V4_UPLOADS_ENABLED=false`, not a Pages rollback.
 - **CORS:** if the Pages origin changes, update `ALLOWED_ORIGINS` in
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
   the new origin is allowed while a stranger origin is rejected.
+
+## Multi-device sync — Phase 0 (manual «Проверить обновления»)
+
+Client-only release: the Worker is untouched, so the roll-forward «worker first»
+step does not apply. No new on-chain format, no new endpoint, no feature flag —
+the client simply calls the EXISTING restore sweep on demand instead of only on
+seed entry. Rollback is a plain redeploy of the previous client tag; nothing
+about it is a floor.
+
+**DEPLOYED 2026-08-13** (tag `client-sync0` = 2edec7e) on notes.matamata.dev,
+run 31687866818 — all gates green (lint, 640 client tests, worker
+typecheck + tests, staging config check, bundle budget 181.7 KB gz of 186 KB),
+smoke-headers passed against the deployment URL.
+
+Verified against the live site: `https://notes.matamata.dev/` returns 200 with
+the CSP intact, and the deployed bundle (`index-IAnsTq5S.js`) CONTAINS
+«Проверить обновления», «Получено с других устройств», «Заметки в блокчейне» and
+«Передано, ждёт подтверждения» — direct evidence the new code is in the artifact,
+not merely in the source.
+
+What shipped:
+
+- `checkForUpdates()` runs the SAME sweep restore runs (`runArweaveSweep(mode)`),
+  reporting into its own `updateCheck` state so the restore banners stay
+  untouched. Both modes share one `restoringRef` — two concurrent sweeps would
+  double-fetch and race their merges.
+- Reading Arweave needs neither the sync toggle nor a registered key (those gate
+  UPLOADS), so the button works on a read-only device.
+- `fetchAllNotes` throws `ArweaveIndexUnavailableError` when the FIRST GraphQL
+  page fails **and the caller did not abort**. An offline device used to be told
+  «часть данных недоступна» instead of «не удалось». The abort carve-out is
+  load-bearing: `requestSignal` composes the caller's signal with the timeout via
+  `AbortSignal.any`, so a lock and a timeout are indistinguishable by error type.
+- Settings counters moved from versions to notes. «В блокчейне» counts only
+  `confirmed` — the reset warning treats exactly that status as recoverable, and
+  the counter must not promise more than the dialog that is about to wipe it.
+  `accepted` gets its own line; the version denominator comes from the
+  storage-backed aggregates, which include versions this build cannot decrypt.
+- **P1 fixed in `storage.ts`**: `mergeRestoredNote` / `mergeRestoredSafeboxEntry`
+  awaited `getSyncRecord()` between the caller's generation check and the write
+  transaction. A reset landing in that window created its clear transaction
+  FIRST, so the record reappeared in a just-wiped database. Both now re-assert
+  the generation immediately before the write, exactly like `commitSafeboxEntry`.
+  Reproduced before the fix and covered by a test in each store.
+
+⚠️ **The update is prompt-gated** (same as W4): already-loaded tabs keep running
+the previous build until «Обновить» in the update toast. Expect a tail of old
+clients — by design, not a failed deploy.
+
+**Two-device acceptance PASSED** (operator, 2026-08-13): notes created on one
+device are pulled onto another with the `↻` button. That is the whole point of
+the release and it works in production.
+
+Still unexercised, deliberately: the repeat-check idempotency counters
+(«новых заметок нет» / «в сейфе: 0» on a second press) and the safebox half of
+the pull. Both are covered by tests — including a mutation check proving the
+safebox counter would otherwise re-announce the entire history on every run —
+but no production run has confirmed them.
+
+### Hotfix on top of Phase 0 — the stuck privacy gate
+
+**DEPLOYED 2026-08-13** (tag `client-sync0-hotfix1` = 66b35c0) on
+notes.matamata.dev, run 31690638225 — all gates green (lint, `tsc -b`,
+**643 client tests / 34 files**, worker typecheck + tests, staging config check,
+bundle budget), smoke-headers passed. Client-only; the Worker is untouched.
+
+**Reported from production on `client-sync0`:** after a long idle the app opens
+as a blank page with a lone padlock, no PIN prompt, and ONLY a full close +
+relaunch clears it. The padlock is `.lock-gate` — the opaque full-screen privacy
+overlay at `z-index: 100`. The PIN screen is rendered underneath it, unreachable.
+
+Two defects, both of the invariant *a locked app holds no plaintext, so no gate
+may cover it*:
+
+1. **The bootstrap lock branch never lowered the gate.** A page that wakes up
+   HIDDEN (Android reloads a backgrounded PWA) raises the gate on mount, because
+   the session seed still makes `vaultPresentInTab()` true. The bootstrap lock
+   decision then drops that seed, sets screen `'pin'` and returns — leaving the
+   gate up with nothing left that could lower it.
+2. **`lockApp()` silently broke its own contract.** It returns on its first line
+   when `vaultPresentInTab()` is false, while THREE call sites in
+   `evaluateReturn` delegate the gate to it on the strength of its comment
+   («the locked UI is non-sensitive, so no gate may be left covering it»). Once
+   defect 1 removed the seed, that promise no longer held.
+
+Both now lower the gate explicitly; `lockApp` also force-closes the safebox
+first, defensively.
+
+Tests (`privacy gate never outlives the screen it covers` in `store.test.tsx`):
+the production scenario (hidden bootstrap + lock), the foreground return, and a
+contract test pinning `lockApp`. The first and third FAILED before their
+respective fix — each was verified in reverse.
+
+Verified on the live site: new bundle `index-CqiIswKu.js`, CSP and
+`X-Frame-Options: DENY` intact.
+**NOT verified in production:** the lifecycle itself. Reproducing it needs a real
+device that backgrounds the PWA long enough for the OS to reload it — that is the
+operator's manual check. Everything asserted above is proven by tests, not by a
+production run.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the buggy build until
+«Обновить». A user currently stuck behind the gate must relaunch the app — which
+is exactly the workaround they already found.
+
+### PIN on restore + persistent storage (client-only)
+
+**DEPLOYED 2026-08-14** (main `7fcc595`, PR #31) on notes.matamata.dev,
+run 31790744299 — all gates green (lint, **704 client tests / 36 files**, baseline
+was 643/34; worker typecheck + tests, staging config check, bundle budget
+182.7/186 KB gz), smoke-headers passed. Live bundle `index-B5AX2wGH.js`; CSP and
+`X-Frame-Options: DENY` verified on the origin. Client-only; **the Worker is
+untouched**.
+
+**Reported from production (desktop Chrome):** the app asks for the seed phrase
+every day instead of a PIN. Two independent causes, both fixed here:
+
+1. **The restore screen never offered a PIN.** A PIN could only be set during
+   onboarding or in settings, so everyone who entered a device «by seed phrase»
+   (second device, reinstall, local data loss) stayed with no `pin-seed` at all
+   — and the session lives in `sessionStorage`, which dies when the last Chrome
+   window closes. `Restore.tsx` is now two steps (phrase → PIN offer, skippable,
+   hidden when a PIN already exists).
+2. **The app never requested persistent storage.** `navigator.storage.persist()`
+   was called nowhere, so IndexedDB stayed best-effort and could be evicted —
+   taking `meta.init` with it, which is what makes the app look like it never
+   had a vault (`src/lib/persistence.ts`).
+
+Storage-side invariants added on the way (both в одной readwrite-транзакции
+`meta`, both first-writer-wins):
+
+- `bindVaultIdentity(pk, { initialize }, gen)` replaces the unconditional
+  `setMeta('vault-public-key', …)` and writes `meta.init` in the SAME commit.
+  Two tabs opening DIFFERENT seeds against an EMPTY database can no longer end
+  up with one tab's key next to the other tab's PIN, and `init` can never be
+  written into a database that was cleared in between.
+- `commitPinSeedIfAbsent(blob, gen)` writes the restore-flow PIN only when none
+  exists (and clears stale `pin-attempts`/`pin-locked-until` in the same
+  commit). A PIN configured elsewhere is never replaced behind the user's back;
+  the main screen says so instead (`pinSetupNotice`).
+
+`openVault` now runs the identity transaction BEFORE `commitVaultSnapshot()` and
+the session write, so a rejected open cannot leave a decrypted vault or the seed
+in the tab.
+
+**Both PIN-setting flows follow the same rule**: the PIN is an argument of the
+identity-checked operation (`confirmMnemonic(mn, { pin })` /
+`restoreFromMnemonic(mn, { pin })`), never a `setupPin()` before it with a
+`removePin()` to undo. The old onboarding shape left a mixed race with restore:
+a tab that lost the identity race could leave `vault-public-key(B)` next to
+`pin-seed(A)`, or delete the PIN — and the auto-lock setting — of the vault that
+won. Unconditional `setupPin`/`removePin` now live only where replacing a PIN is
+the user's explicit intent: the settings screen.
+
+Three facts were verified in reverse (each test fails against the old code):
+publishing the snapshot before the identity verdict, broadcasting `config`
+without the post-commit guard, and the PIN-first/undo onboarding shape.
+
+**Accepted, unchanged residual risk:** cross-tab reset exclusivity still rests on
+the `'reset'` broadcast plus each tab's own `dbGeneration` — a database cleared
+by a tab whose broadcast has not arrived is indistinguishable from a
+never-initialized one. This release neither widens nor narrows that window; a
+persistent reset token would be a separate, project-wide change.
+
+**Firefox compromise:** `persist()` is called (skipped only on an already-denied
+permission) because gating it on a `'granted'` permission state risked never
+requesting persistence in Chromium at all — the browser this fix exists for.
+Firefox may therefore show its permission doorhanger once, always after a button
+the user pressed; a refusal is remembered per tab (`sessionStorage`) so reloads
+do not re-ask.
+
+**Operator checks — STILL PENDING after the rollout (NOT covered by tests):**
+- on a clean Chrome profile, BEFORE the first `persist()`, record
+  `await navigator.permissions.query({name:'persistent-storage'})` → `state`,
+  then after an unlock record `await navigator.storage.persisted()`. Write both
+  values here — they are the only real evidence that cause №2 is fixed on a
+  fresh origin;
+- remove the PIN, close all Chrome windows, reopen: the restore screen must
+  offer the PIN step, and the next launch must show the PIN screen;
+- Firefox: at most one permission prompt per tab, never after a refusal.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the previous build until
+«Обновить». No IndexedDB schema change (existing `meta` keys only) → no client
+floor; rollback = redeploy the previous client build.
+
+## Navigation redesign — stages 0–6 (client-only)
+
+Six client-only releases; the Worker is untouched, so the «worker first» step
+does not apply. Nothing here changes the on-chain format, adds an endpoint, or
+introduces a feature flag.
+
+**DEPLOYED 2026-08-15 as `client-nav1`** (`main` = `85c543d`, run
+[31887203740](https://github.com/Yokogamma/payee/actions/runs/31887203740)).
+All six stages went out in ONE Pages deploy, not one at a time — see «How the
+stack actually merged» below for why that was not the original intent.
+
+| Stage | What ships |
+|---|---|
+| 0 | Guards only: CSS-variable check, theme-palette parity, font-inlining check. Plus one fix — `var(--font-mono)` never existed, so revealed safebox passwords rendered in the UA default monospace |
+| 1 | The section moves into `location.hash`. No visible change |
+| 2 | Three-item nav; the safebox lock stops taking the exit with it (the reported production bug) |
+| 3 | Composer collapses behind «+»; per-section search; `Ctrl+K` removed |
+| 4 | One status line replaces five header icons and the banner stack; settings becomes a section |
+| 5 | Warm theme; `useTheme` moves under `ErrorBoundary` |
+| 6 | Outfit → Manrope (the UI face finally covers Cyrillic) |
+
+### How the stack actually merged — a warning worth keeping
+
+The six stages were a PR stack, each based on the one before it. Merging them
+in a loop with `gh pr merge --merge --delete-branch` **closed half of them
+without merging**: deleting a branch destroys the base of the next PR in the
+stack, and GitHub closes a PR whose base is gone rather than retargeting it.
+The result was #37 and #39 merged, #38 and #40 closed `DIRTY`, and #39's merge
+landing in its own base branch instead of `main`.
+
+Nothing was lost — the tip branch already contained every commit — and the
+recovery was one PR ([#41](https://github.com/Yokogamma/payee/pull/41)) from the
+tip onto `main`. But the failure mode is silent enough to be worth naming:
+**merge a stack one PR at a time, letting GitHub retarget the next one, or
+retarget with `--base main` before each merge. Never `--delete-branch` in a
+loop over a stack.**
+
+### Post-deploy verification (what was actually checked)
+
+Against the live origin, not the local build:
+
+- CSS: 16 unique `manrope-*` `@font-face` entries, zero `outfit`, zero
+  `url(data:` (CSP `font-src 'self'` would have silently killed inlined fonts),
+  `data-theme=warm` present, `font-mono` gone;
+- JS: «Тёплая», «Сейф», «Настройки», «не настроен» all present;
+- one woff2 fetched end-to-end: `200`, `font/woff2`, 7840 bytes.
+
+Guards on the merged `main` before the deploy: lint 0 errors, `tsc -b` clean,
+44 test files green, worker typecheck + tests green, bundle 183.4 KB gz against
+the 186 KB ceiling, font guard 34/34.
+
+**Device-only checks are still OUTSTANDING** and none of them can be done from
+CI: standalone-PWA back gesture, BFCache, iOS keyboard versus the bottom nav,
+Android `theme_color` on the warm theme, DevTools «Rendered Fonts» on a Cyrillic
+paragraph, and the auto-lock lifecycle. If a report arrives that looks like any
+of these, check them before suspecting the redesign.
+
+### Hash routing is a ROLLBACK ADVANTAGE — record this before it is forgotten
+
+The section lives in `location.hash`, and both directions across the
+prompt-gated update tail are safe **by construction**:
+
+- an OLD build loaded at `#/settings` ignores a hash it does not know and its
+  whitelist parse degrades to `#/notes` — no blank screen, no 404;
+- a NEW build must survive the EMPTY hash an old build left behind, which the
+  canonicaliser rewrites on mount.
+
+A pathname router would have turned any rollback into a 404 on a path the old
+build never had. This is the single reason a hash was chosen over a path, and
+it is worth keeping in mind before anyone «modernises» it.
+
+### Theme rollback is safe for the same reason
+
+`loadThemePref` parses against a whitelist, so a user who picked «Тёплая» and
+then loads a build without it gets `system` — not a `data-theme` attribute
+nobody styles. Keep that degradation in place when adding a theme.
+
+### What the client floor becomes
+
+Unchanged: **`client-r4`** stays the floor (IndexedDB v2 on first launch). None
+of these stages touches storage, the sync protocol, or the crypto, so a rollback
+to any tag at or above `client-r4` remains data-safe. Rolling back is a plain
+Pages redeploy.
+
+⚠️ As always, prompt-gated: an already-loaded tab keeps the previous build until
+«Обновить». Expect a tail of clients on the old navigation — by design.
+
+### Precache grew, and the bundle budget cannot see it
+
+`scripts/check-bundle-budget.mjs` measures gzipped JS only. Stage 6 moved the
+font set from 28 files to 34 while the JS number barely moved, so
+`scripts/report-precache.mjs` was added to print what users actually download:
+
+```
+js                     4 files    183.4 KB gz
+fonts/jetbrains-mono  18 files    128.9 KB gz
+fonts/manrope         16 files    124.8 KB gz
+assets                 6 files     25.5 KB gz
+css                    1 file       7.1 KB gz
+html                   1 file       0.6 KB gz
+TOTAL                 46 files    470.3 KB gz
+```
+
+Report only, no threshold — a baseline has to exist before a gate can be honest.
+Worth noting from the first run: **JetBrains Mono costs MORE than the entire UI
+face**, because it ships six subsets (greek and vietnamese included) for what
+draws code spans and PIN fields. Narrowing it is a separate decision with its
+own measurement; it was deliberately left out of the font swap so that any
+visual regression there could only have one cause.
 
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
