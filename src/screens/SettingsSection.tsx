@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { useNotes } from '../lib/store';
 import type { AutoLockTimeout } from '../lib/auto-lock';
 import type { ThemePref } from '../lib/theme';
-import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
+import { SECRET_PASSWORD_FIELD_PROPS, SAFEBOX_SECRET_FIELD_CLASS } from '../components/secretFieldProps';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { navigate } from '../lib/route';
 
@@ -264,7 +264,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
                   type="password"
                   inputMode="numeric"
                   pattern="[0-9]*"
-                  className="pin-input safebox-secret-field"
+                  className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
                   name="sbx-gate-seed"
                   id="sbx-gate-seed"
                   placeholder="PIN сейфа"
@@ -542,7 +542,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
         <div className="pin-setup">
           <input
             type="password" inputMode="numeric" pattern="[0-9]*"
-            className="pin-input safebox-secret-field"
+            className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
             name="sbx-cur-code" id="sbx-cur-code"
             placeholder="Текущий PIN сейфа" value={currentPin} maxLength={8}
             onChange={e => { setCurrentPin(e.target.value.replace(/\D/g, '')); setError(''); }}
@@ -552,7 +552,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
             <>
               <input
                 type="password" inputMode="numeric" pattern="[0-9]*"
-                className="pin-input safebox-secret-field"
+                className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
                 name="sbx-next-code" id="sbx-next-code"
                 placeholder="Новый PIN (6–8 цифр)" value={newPin} maxLength={8}
                 onChange={e => { setNewPin(e.target.value.replace(/\D/g, '')); setError(''); }}
@@ -560,7 +560,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
               />
               <input
                 type="password" inputMode="numeric" pattern="[0-9]*"
-                className="pin-input safebox-secret-field"
+                className={`pin-input ${SAFEBOX_SECRET_FIELD_CLASS}`}
                 name="sbx-next-code-2" id="sbx-next-code-2"
                 placeholder="Повторите новый PIN" value={confirmPin} maxLength={8}
                 onChange={e => { setConfirmPin(e.target.value.replace(/\D/g, '')); setError(''); }}

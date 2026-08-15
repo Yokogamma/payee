@@ -210,7 +210,14 @@ export function StatusLine() {
           {arweave.unsyncedCount > 0 && <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>}
           {arweave.errorCount > 0 && <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>}
           {arweave.quarantinedCount > 0 && (
-            <div className="status-hint">Отложено: {arweave.quarantinedCount} — созданы до регистрации, повтор не поможет</div>
+            // `terminalError` is 'unsupported_version' | 'malformed_record':
+            // a record this build cannot process, not a queue problem. The
+            // previous wording blamed «created before registration», which is
+            // a different situation and would send the user down the wrong
+            // recovery path.
+            <div className="status-hint">
+              Отложено: {arweave.quarantinedCount} — эта версия приложения не может обработать такие записи; повтор не поможет
+            </div>
           )}
         </div>
       )}

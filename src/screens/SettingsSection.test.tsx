@@ -6,6 +6,7 @@ const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({ useNotes: () => h.store }));
 
 import { SettingsSection } from './SettingsSection';
+import { SAFEBOX_SCRUB_SELECTOR } from '../components/secretFieldProps';
 
 beforeEach(() => {
   h.store = {
@@ -319,5 +320,43 @@ describe('SettingsSection — сброс приложения', () => {
     // Still on the same screen — nothing unmounted — and the phrase is gone.
     expect(screen.queryByText('секретное')).toBeNull();
     expect(screen.getByText('Показать seed-фразу')).toBeTruthy();
+  });
+});
+
+// ─── I4: the BFCache scrub contract ─────────────────────────────────
+
+describe('SettingsSection — поля сейфа попадают под очистку при блокировке', () => {
+  // These fields live OUTSIDE the section the shell remounts on a lock, so the
+  // ONLY thing that wipes them before a `pagehide` snapshot is the store's
+  // synchronous querySelectorAll over SAFEBOX_SCRUB_SELECTOR. A renamed class
+  // or a newly added field would unhook silently — nothing else would fail.
+  const inputsUnderScrub = () =>
+    Array.from(document.querySelectorAll<HTMLInputElement>(SAFEBOX_SCRUB_SELECTOR));
+
+  it('поле seed-гейта ловится селектором', () => {
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxDataPresent = true;
+    renderSection();
+    fireEvent.click(screen.getByText('Seed-фраза'));
+    fireEvent.click(screen.getByText('Показать seed-фразу'));
+
+    const gate = document.querySelector('#sbx-gate-seed') as HTMLInputElement;
+    expect(gate).toBeTruthy();
+    expect(inputsUnderScrub()).toContain(gate);
+  });
+
+  it('ВСЕ поля формы смены PIN сейфа ловятся селектором', () => {
+    h.store.safeboxPinConfigured = true;
+    h.store.safeboxDataPresent = true;
+    renderSection();
+    fireEvent.click(screen.getByText('Защищённый сейф'));
+    fireEvent.click(screen.getByText('Сменить PIN сейфа'));
+
+    const all = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="password"], .pin-input'));
+    expect(all.length).toBeGreaterThan(1); // current + new + confirm
+    const scrubbed = inputsUnderScrub();
+    for (const field of all) {
+      expect(scrubbed, `поле ${field.id || field.className} вне очистки`).toContain(field);
+    }
   });
 });

@@ -178,3 +178,23 @@ describe('StatusLine — подробности', () => {
     expect(screen.queryByText(/Заметки в блокчейне/)).toBeNull();
   });
 });
+
+describe('StatusLine — карантин объясняется верно', () => {
+  it('называет настоящую причину, а не «созданы до регистрации»', () => {
+    // terminalError is 'unsupported_version' | 'malformed_record' — a record
+    // this build cannot process. The old wording described a different
+    // situation and pointed at the wrong recovery.
+    s().arweave.quarantinedCount = 2;
+    render(<StatusLine />);
+    fireEvent.click(screen.getByLabelText('Показать подробности'));
+    const hint = screen.getByText(/Отложено: 2/);
+    expect(hint.textContent).toMatch(/не может обработать/);
+    expect(hint.textContent).not.toMatch(/до регистрации/);
+  });
+
+  it('без карантина строки нет', () => {
+    render(<StatusLine />);
+    fireEvent.click(screen.getByLabelText('Показать подробности'));
+    expect(screen.queryByText(/Отложено/)).toBeNull();
+  });
+});
