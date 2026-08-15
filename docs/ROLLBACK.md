@@ -645,6 +645,71 @@ draws code spans and PIN fields. Narrowing it is a separate decision with its
 own measurement; it was deliberately left out of the font swap so that any
 visual regression there could only have one cause.
 
+## Section density — `client-nav2` (client-only)
+
+**DEPLOYED 2026-08-15** (`main` = `d3469b4`, run
+[31890192625](https://github.com/Yokogamma/payee/actions/runs/31890192625)).
+Follows `client-nav1` the same day, after phone screenshots showed the shipped
+UI did not match the approved mockup.
+
+### What the screenshots actually showed
+
+Measured, not eyeballed: **the shell matched** the mockup to within a couple of
+pixels (status line 12.5 vs 11.5px, top bar `13px 16px 9px` vs `13px 14px 9px`,
+nav 11px/20px vs 10.5px/19px, section title 16px in both). Everything INSIDE
+the sections did not. Stages 3 and 4b said «move», and the content moved without
+being redrawn — so a phone showed chrome where it should have shown content.
+
+| | Before | After | Mockup at 360px |
+|---|---|---|---|
+| Status-line buttons | `min-width/min-height: 44px` — 88px of width, row 62px tall, text truncated at «блокч…» | 28px box, 44px target in `::after` | 43px row |
+| Details panel | opened with `Заметки в блокчейне: N из M`, directly under a row already saying it | starts at the breakdown | — |
+| Settings row | `.settings-block`, own card, 54px + 10px gap = **64px pitch** | one card per group, hairlines, **44px** | 44px |
+| Row icons | 20px accent glyph = 31px of width | none | none |
+| Create | «+ Заметка», a 44px `.btn` in the header | round «+» at the bottom | same |
+
+### The 44px touch floor is not a 44px BOX
+
+The single largest defect was `min-width: 44px; min-height: 44px` on
+`.status-btn`. The a11y floor is real and stays, but putting it on the element
+itself spent 88px of a 360px row on two icons and pushed the row 16px taller
+than the design — which is why the one place the sync number appeared read
+«2 из 2 заметок в блокч…». The floor now lives in an `::after` overlay that
+takes no space in the flex row. **The same pattern is used by `.btn-tiny`.
+Do not "simplify" either back into a plain min-height.**
+
+### The FAB is sticky ON PURPOSE
+
+`position: fixed` would need a `z-index`, and any `z-index ≥ 100` paints over
+the privacy lock gate — invariant **I2**, which holds on source order alone.
+A sticky, in-flow element with no `z-index` cannot reach that layer. It also
+keeps `env(safe-area-inset-bottom)` working and stays out of the iOS keyboard's
+way. See the header comment in `src/components/Fab.tsx`.
+
+### Verified on the live origin
+
+CSS carries `settings-rows`, `btn-tiny`, `section-chip`, `fab-slot`, `fab-mark`,
+`green-line`; `notes-add` and `url(data:` are gone. JS carries «Новая заметка»,
+«Запереть», «Копировать пароль», «Открыт»; «заметок в блокчейне», «Заметки в
+блокчейне», «🔐 Сохранить», «📋 Пароль» are gone.
+
+⚠️ **A plain `curl` of the origin right after the deploy returned the PREVIOUS
+asset hashes** — an edge-cached HTML response, `cf-cache-status: DYNAMIC`, even
+though the document is `max-age=0, must-revalidate`. A cache-busting query
+string returned the new build immediately. When verifying a Pages deploy, always
+bust the query string before concluding the deploy did not land.
+
+### Still emoji, deliberately out of scope
+
+`SafeboxHistoryModal` («👁 Показать пароль этой версии») and the note card menu
+(«📋 Копировать текст»). Both live inside modals the mockup does not cover.
+
+### Floor
+
+Unchanged: **`client-r4`**. This release touches presentation only — no storage,
+no sync protocol, no crypto. Rolling back to `client-nav1` or any tag at or
+above `client-r4` is a plain Pages redeploy.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
