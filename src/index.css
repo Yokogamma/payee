@@ -1284,6 +1284,7 @@ mark {
   align-items: center;
   justify-content: center;
   gap: 14px;
+  padding: 20px;
   background: var(--bg); /* fully opaque: no plaintext may shine through */
 }
 
@@ -1301,13 +1302,18 @@ mark {
   opacity: 0.6;
 }
 
-/* Both start `hidden` and are revealed imperatively (armGateReveal): a gate
-   that outstays a second is a gate that owes the user an explanation, and one
-   that outstays the verdict's own deadline owes them a way out. */
+/* The gate's dead-man's handle. Both start `hidden` and are revealed
+   imperatively (armGateReveal in store.tsx): a gate that outstays a second
+   owes the user an explanation, and one that outstays the auto-lock verdict's
+   own deadline owes them a way out. Their `[hidden]` rules are LOAD-BEARING
+   for the same reason .lock-gate[hidden] is — `.btn` sets `display:inline-flex`
+   at equal specificity, which would leave the button on screen from the start
+   and turn the padlock into a permanent «lock the app» prompt. */
 .lock-gate-note {
   margin: 0;
   max-width: 280px;
   font-size: 13px;
+  line-height: 1.5;
   text-align: center;
   color: var(--text-muted);
 }

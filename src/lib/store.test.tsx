@@ -89,7 +89,10 @@ Object.defineProperty(globalThis, 'crypto', {
   },
 });
 
-import { NotesProvider, useNotes, PinWipedError, WriterDisabledError, OperationInFlightError } from './store';
+import {
+  NotesProvider, useNotes, PinWipedError, WriterDisabledError, OperationInFlightError,
+  VERDICT_DEADLINE_MS, GATE_NOTE_MS, GATE_EXIT_MS,
+} from './store';
 import {
   initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords,
   clearPinConfigMeta, saveNote, getAllNotes as getStoredNotes,
@@ -385,6 +388,114 @@ describe('privacy gate never outlives the screen it covers', () => {
     act(() => { store.lockApp(); });
 
     expect(gateUp()).toBe(false);
+  });
+
+  // Round 2 of the SAME production report — the padlock came back.
+  //
+  // Both fixes above answer «who lowers the gate», and both assume the verdict
+  // ARRIVES. It does not have to. The verdict waits on one IndexedDB read, and
+  // IndexedDB stalls precisely in this lifecycle (a connection suspended on
+  // BFCache entry, a transaction opened around a freeze/discard, an upgrade
+  // blocked by another tab). A read that REJECTS already fails closed; a read
+  // that never settles used to hold the gate open forever — and every later
+  // hide/return raised it again, so only a relaunch cleared it.
+  describe('an authoritative read that never settles', () => {
+    // Only the two timer functions the gate itself uses are faked, and only
+    // AFTER the vault is open: fake-indexeddb drives its transactions on
+    // setImmediate, and waitFor() needs a real clock to poll on.
+    function freezeTheClock() {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    }
+    afterEach(() => { vi.useRealTimers(); });
+
+    /** Vault open on screen, real clock. The clock is frozen only afterwards —
+     *  every timer the gate arms must be created under the FAKE clock, or
+     *  advancing it would move nothing. */
+    async function openTheVault() {
+      await setMeta('init', true);
+      await setMeta('pin-seed', FAKE_PIN_BLOB);
+      renderStore();
+      await untilReady();
+      await openMain();
+    }
+
+    async function openAndHide() {
+      await openTheVault();
+      freezeTheClock();
+      act(() => { setVisibility('hidden'); });
+      expect(gateUp()).toBe(true);
+    }
+
+    async function stallTheVerdict() {
+      await openAndHide();
+      // The read is issued and simply never answers — not an error, not a
+      // rejection, nothing to catch.
+      vi.mocked(getPinConfigMeta).mockImplementationOnce(() => new Promise(() => {}));
+      act(() => { setVisibility('visible'); });
+      expect(gateUp()).toBe(true); // still legitimately checking
+    }
+
+    it('fails CLOSED on its deadline: PIN screen, gate down, no relaunch needed', async () => {
+      await stallTheVerdict();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(VERDICT_DEADLINE_MS + 1000); });
+
+      expect(store.screen).toBe('pin');
+      expect(store.mnemonic).toBeNull();
+      expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+      expect(gateUp()).toBe(false);
+      expect(document.querySelector('div[inert]')).toBeNull();
+    });
+
+    it('explains itself, then offers the manual way out while it waits', async () => {
+      await stallTheVerdict();
+
+      const note = () => document.querySelector('.lock-gate-note');
+      const exit = () => document.querySelector<HTMLButtonElement>('.lock-gate-exit');
+      expect(note()!.hasAttribute('hidden')).toBe(true);
+
+      // A second in: the padlock is no longer mute.
+      await act(async () => { await vi.advanceTimersByTimeAsync(GATE_NOTE_MS + 100); });
+      expect(note()!.hasAttribute('hidden')).toBe(false);
+      expect(exit()!.hasAttribute('hidden')).toBe(true); // the verdict may still land
+    });
+
+    // The deadline above answers every path that RUNS. This answers the one
+    // that does not: a tab that comes back without ever delivering a return
+    // event (no visibilitychange, no pageshow) leaves the gate up with no
+    // verdict in flight to time out — nothing is stuck, because nothing is
+    // running. That is the shape of both production reports, and the shape of
+    // whatever path is missed next. The handle must not depend on the event.
+    it('the escape hatch appears — and locks — with no return event at all', async () => {
+      await openAndHide();
+      freezeTheClock();
+
+      // Visible again, but the browser never told us (property flipped WITHOUT
+      // dispatching, the same way the file-level afterEach does it).
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(GATE_EXIT_MS + 500); });
+      const exit = document.querySelector<HTMLButtonElement>('.lock-gate-exit')!;
+      expect(document.querySelector('.lock-gate-note')!.hasAttribute('hidden')).toBe(false);
+      expect(exit.hasAttribute('hidden')).toBe(false);
+
+      await act(async () => { exit.click(); });
+
+      expect(store.screen).toBe('pin');
+      expect(gateUp()).toBe(false);
+      expect(store.mnemonic).toBeNull();
+      expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    });
+
+    it('stays mute over a BACKGROUND tab — nobody is looking at it', async () => {
+      await openAndHide();
+      freezeTheClock();
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+
+      expect(gateUp()).toBe(true); // correct: a hidden tab holds an open vault
+      expect(document.querySelector('.lock-gate-note')!.hasAttribute('hidden')).toBe(true);
+      expect(document.querySelector('.lock-gate-exit')!.hasAttribute('hidden')).toBe(true);
+    });
   });
 });
 
