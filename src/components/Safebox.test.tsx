@@ -76,7 +76,7 @@ describe('SafeboxSection — unlocked list', () => {
   it('copying a password NEVER puts the plaintext in the DOM', async () => {
     const { container } = render(<SafeboxSection formatDate={formatDate} />);
     await act(async () => {
-      fireEvent.click(screen.getByText('📋 Пароль'));
+      fireEvent.click(screen.getByText('Копировать пароль'));
     });
     expect(h.store.copySafeboxPassword).toHaveBeenCalledWith('e1');
     // The store writes to the clipboard straight from the decrypted string.
@@ -86,7 +86,7 @@ describe('SafeboxSection — unlocked list', () => {
 
   it('the copy toast tells the honest clipboard story (best-effort, on return)', async () => {
     render(<SafeboxSection formatDate={formatDate} />);
-    await act(async () => { fireEvent.click(screen.getByText('📋 Пароль')); });
+    await act(async () => { fireEvent.click(screen.getByText('Копировать пароль')); });
     expect(screen.getByText(/Пароль скопирован/)).toBeDefined();
     expect(screen.getByText(/~60 с/)).toBeDefined();
   });
@@ -95,7 +95,7 @@ describe('SafeboxSection — unlocked list', () => {
     vi.useFakeTimers();
     try {
       const { container } = render(<SafeboxSection formatDate={formatDate} />);
-      await act(async () => { fireEvent.click(screen.getByText('👁 Показать')); });
+      await act(async () => { fireEvent.click(screen.getByText('Показать')); });
       expect(container.textContent).toContain('PLAINTEXT-PASSWORD');
 
       await act(async () => { vi.advanceTimersByTime(21_000); });
@@ -107,7 +107,7 @@ describe('SafeboxSection — unlocked list', () => {
 
   it('a lock clears an already-revealed password immediately', async () => {
     const { container, rerender } = render(<SafeboxSection formatDate={formatDate} />);
-    await act(async () => { fireEvent.click(screen.getByText('👁 Показать')); });
+    await act(async () => { fireEvent.click(screen.getByText('Показать')); });
     expect(container.textContent).toContain('PLAINTEXT-PASSWORD');
 
     h.store = { ...baseStore(), safeboxUnlocked: false };

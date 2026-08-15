@@ -28,6 +28,20 @@ import { computeSyncCounters, QUARANTINE_EXPLANATION } from '../lib/syncCounters
 
 type Tone = 'ok' | 'busy' | 'warn' | 'error';
 
+/* Line icons, 24-box, matching AppNav and SettingsSection. The glyphs ↻ ⌄ ⏳
+   that used to sit here render in whatever the platform ships — a colour
+   emoji hourglass next to monochrome SVG everywhere else. */
+const IconRefresh = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+    <path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" />
+  </svg>
+);
+const IconChevron = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+    <path d="m6 9 6 6 6-6" />
+  </svg>
+);
+
 interface Rung {
   tone: Tone;
   text: string;
@@ -143,8 +157,11 @@ export function StatusLine() {
     if (!arweave.enabled) return { tone: 'ok', text: 'Синхронизация выключена — всё на устройстве' };
     return {
       tone: 'ok',
+      // «в блокчейне» is what the details panel is FOR. Spelling it out here
+      // overflowed the row and truncated the sentence mid-word, so the one
+      // place the number was visible showed «2 из 2 заметок в блокч…».
       text: arweave.countsReady
-        ? `Синхронизировано · ${counters.confirmedChains} из ${chains.length} заметок в блокчейне`
+        ? `Синхронизировано · ${counters.confirmedChains} из ${chains.length} заметок`
         : 'Синхронизировано',
     };
   }
@@ -180,16 +197,16 @@ export function StatusLine() {
         title="Проверить обновления"
         aria-label="Проверить обновления"
       >
-        {checkBusy ? '⏳' : '↻'}
+        <IconRefresh />
       </button>
       <button
-        className="status-btn"
+        className="status-btn status-btn--plain"
         onClick={() => setExpanded(v => !v)}
         aria-expanded={expanded}
         aria-label={expanded ? 'Скрыть подробности' : 'Показать подробности'}
         title="Подробности"
       >
-        {expanded ? '⌃' : '⌄'}
+        <IconChevron />
       </button>
 
       {expanded && (
@@ -200,11 +217,14 @@ export function StatusLine() {
             <div>Синхронизировано: <strong>загружается…</strong></div>
           ) : (
             <>
-              <div>Заметки в блокчейне: <strong>{counters.confirmedChains}</strong> из <strong>{chains.length}</strong></div>
+              {/* NOT «Заметки в блокчейне: N из M» — the collapsed row already
+                  carries that number, and printing it again directly under
+                  itself was the panel's first line. What the row cannot fit is
+                  the breakdown, so the panel starts there. */}
               {counters.pendingChains > 0 && (
                 <div>Передано, ждёт подтверждения: <strong>{counters.pendingChains}</strong></div>
               )}
-              <div className="status-hint">версий (транзакций): {arweave.confirmedCount} из {counters.totalVersions}</div>
+              <div className="status-hint">в блокчейне · версий (транзакций): {arweave.confirmedCount} из {counters.totalVersions}</div>
             </>
           )}
           {arweave.unsyncedCount > 0 && <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>}

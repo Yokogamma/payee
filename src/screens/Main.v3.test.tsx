@@ -115,7 +115,7 @@ function chainNotes(): NoteData[] {
 
 /** The composer is collapsed by default now — open it before typing. */
 function openComposer() {
-  fireEvent.click(screen.getByRole('button', { name: /\+ Заметка/ }));
+  fireEvent.click(screen.getByRole('button', { name: /Новая заметка/ }));
 }
 
 beforeEach(() => {
@@ -188,7 +188,7 @@ describe('Main W3 — edit flow', () => {
     expect(textarea.value).toBe('# Заголовок\n\n**жирный** текст'); // current version prefilled
 
     fireEvent.change(textarea, { target: { value: 'новая версия' } });
-    fireEvent.click(screen.getByText('🔐 Сохранить новую версию'));
+    fireEvent.click(screen.getByText('Сохранить новую версию'));
     await waitFor(() => expect(s.editNote).toHaveBeenCalledWith('root1', 'новая версия'));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull()); // closed on success
   });
@@ -203,7 +203,7 @@ describe('Main W3 — edit flow', () => {
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'не сохранится' } });
-    fireEvent.click(screen.getByText('🔐 Сохранить новую версию'));
+    fireEvent.click(screen.getByText('Сохранить новую версию'));
 
     expect(await screen.findByText(/Не удалось сохранить версию/)).toBeTruthy();
     expect(screen.getByRole('dialog', { name: 'Редактирование заметки' })).toBeTruthy(); // still open

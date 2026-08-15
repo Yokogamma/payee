@@ -78,7 +78,7 @@ export function EditNoteModal({ open, chain, onClose, onSave }: EditNoteModalPro
           value={text}
           onChange={setText}
           onSubmit={() => void handleSave()}
-          submitLabel="🔐 Сохранить новую версию"
+          submitLabel="Сохранить новую версию"
           submitBusyLabel="🔐..."
           busy={busy}
           markdown

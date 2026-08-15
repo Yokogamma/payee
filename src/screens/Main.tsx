@@ -3,6 +3,7 @@ import { useNotes } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import { SettingsSection } from './SettingsSection';
 import { NoteComposer } from '../components/NoteComposer';
+import { Fab } from '../components/Fab';
 import { NoteMarkdown } from '../components/NoteMarkdown';
 import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
@@ -369,21 +370,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
           behind a section the user is not looking at. */}
       {notesVisible && (
       <>
+      {/* «+ Заметка» used to be a full `.btn` in the header — 44px tall, with
+          `min-height` and 20px of side padding, sitting where the section name
+          goes. The mockup puts creation on a round button at the bottom of the
+          list, within thumb reach, and gives the header back to the title. */}
       <div className="notes-topbar">
-        <h2 className="section-title" tabIndex={-1}>Заметки</h2>
-        {composerOpen ? (
-          <button className="btn btn-ghost notes-add" onClick={collapseComposer}>
+        <h2 className="section-title" tabIndex={-1}>
+          {composerOpen ? 'Новая заметка' : 'Заметки'}
+        </h2>
+        {composerOpen && (
+          <button className="btn-tiny" onClick={collapseComposer}>
             Свернуть
-          </button>
-        ) : (
-          <button
-            className="btn btn-primary notes-add"
-            onClick={openComposer}
-            aria-label={hasDraft ? '+ Заметка, есть несохранённый черновик' : undefined}
-          >
-            + Заметка
-            {/* A collapsed composer must not hide an unsaved draft silently. */}
-            {hasDraft && <span className="notes-add-dot" aria-hidden="true" />}
           </button>
         )}
       </div>
@@ -419,8 +416,8 @@ export function Main({ theme, onThemeChange }: MainProps) {
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
           onSubmit={() => void handleSave()}
-          submitLabel="🔐 Сохранить"
-          submitBusyLabel="🔐..."
+          submitLabel="Сохранить"
+          submitBusyLabel="Сохраняем…"
           busy={isEncrypting}
           placeholder="Быстрая заметка..."
           markdown={V3_WRITER_ENABLED}
@@ -566,6 +563,16 @@ export function Main({ theme, onThemeChange }: MainProps) {
           })
         )}
       </div>
+
+      {!composerOpen && (
+        // The dot is the only thing standing between a collapsed composer and
+        // silently hiding an unsaved draft.
+        <Fab
+          label={hasDraft ? 'Новая заметка, есть несохранённый черновик' : 'Новая заметка'}
+          onClick={openComposer}
+          marked={hasDraft}
+        />
+      )}
       </>
       )}
       </div>
