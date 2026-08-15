@@ -541,8 +541,10 @@ Six client-only releases; the Worker is untouched, so the «worker first» step
 does not apply. Nothing here changes the on-chain format, adds an endpoint, or
 introduces a feature flag.
 
-**Not yet deployed at the time of writing** — the stages are merged in order
-and released together or one at a time, operator's call.
+**DEPLOYED 2026-08-15 as `client-nav1`** (`main` = `85c543d`, run
+[31887203740](https://github.com/Yokogamma/payee/actions/runs/31887203740)).
+All six stages went out in ONE Pages deploy, not one at a time — see «How the
+stack actually merged» below for why that was not the original intent.
 
 | Stage | What ships |
 |---|---|
@@ -553,6 +555,42 @@ and released together or one at a time, operator's call.
 | 4 | One status line replaces five header icons and the banner stack; settings becomes a section |
 | 5 | Warm theme; `useTheme` moves under `ErrorBoundary` |
 | 6 | Outfit → Manrope (the UI face finally covers Cyrillic) |
+
+### How the stack actually merged — a warning worth keeping
+
+The six stages were a PR stack, each based on the one before it. Merging them
+in a loop with `gh pr merge --merge --delete-branch` **closed half of them
+without merging**: deleting a branch destroys the base of the next PR in the
+stack, and GitHub closes a PR whose base is gone rather than retargeting it.
+The result was #37 and #39 merged, #38 and #40 closed `DIRTY`, and #39's merge
+landing in its own base branch instead of `main`.
+
+Nothing was lost — the tip branch already contained every commit — and the
+recovery was one PR ([#41](https://github.com/Yokogamma/payee/pull/41)) from the
+tip onto `main`. But the failure mode is silent enough to be worth naming:
+**merge a stack one PR at a time, letting GitHub retarget the next one, or
+retarget with `--base main` before each merge. Never `--delete-branch` in a
+loop over a stack.**
+
+### Post-deploy verification (what was actually checked)
+
+Against the live origin, not the local build:
+
+- CSS: 16 unique `manrope-*` `@font-face` entries, zero `outfit`, zero
+  `url(data:` (CSP `font-src 'self'` would have silently killed inlined fonts),
+  `data-theme=warm` present, `font-mono` gone;
+- JS: «Тёплая», «Сейф», «Настройки», «не настроен» all present;
+- one woff2 fetched end-to-end: `200`, `font/woff2`, 7840 bytes.
+
+Guards on the merged `main` before the deploy: lint 0 errors, `tsc -b` clean,
+44 test files green, worker typecheck + tests green, bundle 183.4 KB gz against
+the 186 KB ceiling, font guard 34/34.
+
+**Device-only checks are still OUTSTANDING** and none of them can be done from
+CI: standalone-PWA back gesture, BFCache, iOS keyboard versus the bottom nav,
+Android `theme_color` on the warm theme, DevTools «Rendered Fonts» on a Cyrillic
+paragraph, and the auto-lock lifecycle. If a report arrives that looks like any
+of these, check them before suspecting the redesign.
 
 ### Hash routing is a ROLLBACK ADVANTAGE — record this before it is forgotten
 
