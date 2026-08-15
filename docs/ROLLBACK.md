@@ -710,6 +710,81 @@ Unchanged: **`client-r4`**. This release touches presentation only — no storag
 no sync protocol, no crypto. Rolling back to `client-nav1` or any tag at or
 above `client-r4` is a plain Pages redeploy.
 
+## Hotfix on top of `client-nav2` — the stuck privacy gate, round 2
+
+**DEPLOYED 2026-08-15** (tag `client-nav2-hotfix1` = c7c9c65) on
+notes.matamata.dev, run 31891951041 — all gates green (lint, **795 client
+tests / 45 files**, baseline was 791/45; worker typecheck + tests, staging
+config check, build, bundle budget 183.4/186 KB gz, font guard),
+`smoke-headers` passed on the deployment URL. Client-only; the Worker is
+untouched.
+
+**Reported from production again:** the same padlock as `client-sync0-hotfix1`
+— app locked, no way to enter the PIN, cleared only by a relaunch.
+
+That hotfix closed two paths, and both answered the question *who lowers the
+gate*. Both assumed the return-verdict ARRIVES. It does not have to.
+
+The verdict waits on ONE IndexedDB config read. A read that **rejects** already
+fails closed (lock → PIN screen). A read that **never settles** held the gate
+open forever: nothing to catch, and no deadline. IndexedDB stalls precisely in
+this lifecycle — a connection suspended on BFCache entry, a transaction opened
+around freeze/discard, an upgrade blocked by another tab. Every later
+hide/return raised the gate again, so only a relaunch cleared it.
+
+Two changes, both in `store.tsx`:
+
+1. **`VERDICT_DEADLINE_MS` = 5 s for the WHOLE verdict** (one deadline across
+   all five attempts, not per attempt). Expiry joins the unreadable-config
+   branch — fail **CLOSED**: a stall is not evidence that the vault is safe to
+   show. The console line to look for is
+   `auto-lock config re-read failed or timed out`.
+2. **A dead-man's handle on the gate itself.** While it covers a tab the user
+   is actually looking at: at 1.5 s it explains itself («Проверяем
+   авто-блокировку…»), at 6.5 s — past the verdict's own deadline — it offers
+   «Ввести PIN», which is just `lockApp()` (locking is never a privacy
+   downgrade and always lands on a screen with an input). The timer re-arms
+   while the tab is hidden rather than being armed by the return event: the one
+   thing a wedged tab cannot be relied on to deliver is an event.
+
+The `.lock-gate-note` / `.lock-gate-exit` CSS shipped ahead of its markup in
+`client-nav2` (dead rules); this release activates it. Their `[hidden]` rules
+are load-bearing exactly like `.lock-gate[hidden]` — `.btn` sets
+`display:inline-flex` at equal specificity, which would leave the button on
+screen from the start and turn the padlock into a permanent «lock the app»
+prompt. Verified in a real browser, not jsdom: gate raised alone keeps both at
+`display:none`.
+
+Tests (four, in `privacy gate never outlives the screen it covers`), each
+verified IN REVERSE — every one fails without its own half of the fix: the
+deadline (fails without `withDeadline`), the notice, the escape hatch with **no
+return event at all**, and the guard that both stay mute over a background tab
+(fails if the reveal ignores visibility).
+
+### Verified on the live origin
+
+`index-ezJWfOkk.js` — identical hash to the run's build; the fetched bundle
+carries «Проверяем авто-блокировку», «Ввести PIN» and `config read exceeded`.
+CSP, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy` present on the
+custom domain.
+
+**NOT verified in production:** the lifecycle itself, again. Reproducing a
+wedged IndexedDB needs a real device that backgrounds the PWA long enough — the
+operator's manual check. Everything above is proven by tests and by the shipped
+asset, not by a production run. If the padlock returns, the shape of the report
+now discriminates: a visible «Ввести PIN» button means the gate stuck on a path
+still unknown (and the user is no longer locked out), while an app that drops to
+the PIN screen by itself after ~5 s means the deadline did its job.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the old build until
+«Обновить». A user currently stuck behind the gate must relaunch the app.
+
+### Floor
+
+Unchanged: **`client-r4`**. Lifecycle and presentation only — no storage, no
+sync protocol, no crypto. Rolling back to `client-nav2` or any tag at or above
+`client-r4` is a plain Pages redeploy (and reinstates the stuck gate).
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
