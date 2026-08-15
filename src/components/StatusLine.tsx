@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useNotes } from '../lib/store';
-import { computeSyncCounters } from '../lib/syncCounters';
+import { computeSyncCounters, QUARANTINE_EXPLANATION } from '../lib/syncCounters';
 
 /**
  * One line instead of five header icons and a stack of banners.
@@ -210,13 +210,8 @@ export function StatusLine() {
           {arweave.unsyncedCount > 0 && <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>}
           {arweave.errorCount > 0 && <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>}
           {arweave.quarantinedCount > 0 && (
-            // `terminalError` is 'unsupported_version' | 'malformed_record':
-            // a record this build cannot process, not a queue problem. The
-            // previous wording blamed «created before registration», which is
-            // a different situation and would send the user down the wrong
-            // recovery path.
             <div className="status-hint">
-              Отложено: {arweave.quarantinedCount} — эта версия приложения не может обработать такие записи; повтор не поможет
+              Отложено: {arweave.quarantinedCount} — {QUARANTINE_EXPLANATION}
             </div>
           )}
         </div>

@@ -596,6 +596,7 @@ fonts/jetbrains-mono  18 files    128.9 KB gz
 fonts/manrope         16 files    124.8 KB gz
 assets                 6 files     25.5 KB gz
 css                    1 file       7.1 KB gz
+html                   1 file       0.6 KB gz
 TOTAL                 46 files    470.3 KB gz
 ```
 

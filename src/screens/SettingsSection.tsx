@@ -5,12 +5,17 @@ import type { ThemePref } from '../lib/theme';
 import { SECRET_PASSWORD_FIELD_PROPS, SAFEBOX_SECRET_FIELD_CLASS } from '../components/secretFieldProps';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { navigate } from '../lib/route';
+import { QUARANTINE_EXPLANATION } from '../lib/syncCounters';
 
-/** Settings modal (7.3/L8) — extracted from the 500-line Main screen.
- *  Reorganised into collapsible blocks (all collapsed by default); each block
- *  header shows a glanceable status chip. Local UI state (seed reveal, PIN form,
- *  invite form) lives here; the reset confirmation dialog stays in Main (it must
- *  outlive the modal). */
+/** Settings SECTION — a routed destination, not a dialog. Grouped into four
+ *  groups («Доступ и замки», «Синхронизация», «Вид», «Опасная зона»), each
+ *  holding collapsible blocks with a glanceable status chip.
+ *
+ *  Local UI state (seed reveal, PIN form, invite form) lives here and dies with
+ *  the unmount when the user navigates away — strictly stronger than the old
+ *  reset-on-close. The reset confirmation dialog lives HERE too now: the section
+ *  is not aria-modal, so it is the only modal layer on screen and does not need
+ *  to outlive anything. */
 interface SettingsSectionProps {
   theme: ThemePref;
   onThemeChange: (t: ThemePref) => void;
@@ -375,8 +380,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
                 // Permanent by design — deliberately NOT lumped into «Ошибки»:
                 // no «Повторить» can ever fix a quarantined record.
                 <div>
-                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — созданы
-                  более новой версией приложения; обновите приложение, чтобы загрузить их.
+                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
                 </div>
               )}
               {arweave.lastSync && (

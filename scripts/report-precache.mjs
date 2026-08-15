@@ -33,7 +33,10 @@ function classify(url) {
   }
   if (url.endsWith('.js')) return { group: 'js', detail: 'js' };
   if (url.endsWith('.css')) return { group: 'css', detail: 'css' };
+  if (url.endsWith('.html')) return { group: 'html', detail: 'html' };
   if (/\.(png|svg|ico|webmanifest)$/.test(url)) return { group: 'assets', detail: 'assets' };
+  // Anything landing here is unclassified ON PURPOSE — a visible «other» row is
+  // the signal to extend this function, not something to fold into a neighbour.
   return { group: 'other', detail: 'other' };
 }
 
