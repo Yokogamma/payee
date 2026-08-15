@@ -535,6 +535,78 @@ do not re-ask.
 «Обновить». No IndexedDB schema change (existing `meta` keys only) → no client
 floor; rollback = redeploy the previous client build.
 
+## Navigation redesign — stages 0–6 (client-only)
+
+Six client-only releases; the Worker is untouched, so the «worker first» step
+does not apply. Nothing here changes the on-chain format, adds an endpoint, or
+introduces a feature flag.
+
+**Not yet deployed at the time of writing** — the stages are merged in order
+and released together or one at a time, operator's call.
+
+| Stage | What ships |
+|---|---|
+| 0 | Guards only: CSS-variable check, theme-palette parity, font-inlining check. Plus one fix — `var(--font-mono)` never existed, so revealed safebox passwords rendered in the UA default monospace |
+| 1 | The section moves into `location.hash`. No visible change |
+| 2 | Three-item nav; the safebox lock stops taking the exit with it (the reported production bug) |
+| 3 | Composer collapses behind «+»; per-section search; `Ctrl+K` removed |
+| 4 | One status line replaces five header icons and the banner stack; settings becomes a section |
+| 5 | Warm theme; `useTheme` moves under `ErrorBoundary` |
+| 6 | Outfit → Manrope (the UI face finally covers Cyrillic) |
+
+### Hash routing is a ROLLBACK ADVANTAGE — record this before it is forgotten
+
+The section lives in `location.hash`, and both directions across the
+prompt-gated update tail are safe **by construction**:
+
+- an OLD build loaded at `#/settings` ignores a hash it does not know and its
+  whitelist parse degrades to `#/notes` — no blank screen, no 404;
+- a NEW build must survive the EMPTY hash an old build left behind, which the
+  canonicaliser rewrites on mount.
+
+A pathname router would have turned any rollback into a 404 on a path the old
+build never had. This is the single reason a hash was chosen over a path, and
+it is worth keeping in mind before anyone «modernises» it.
+
+### Theme rollback is safe for the same reason
+
+`loadThemePref` parses against a whitelist, so a user who picked «Тёплая» and
+then loads a build without it gets `system` — not a `data-theme` attribute
+nobody styles. Keep that degradation in place when adding a theme.
+
+### What the client floor becomes
+
+Unchanged: **`client-r4`** stays the floor (IndexedDB v2 on first launch). None
+of these stages touches storage, the sync protocol, or the crypto, so a rollback
+to any tag at or above `client-r4` remains data-safe. Rolling back is a plain
+Pages redeploy.
+
+⚠️ As always, prompt-gated: an already-loaded tab keeps the previous build until
+«Обновить». Expect a tail of clients on the old navigation — by design.
+
+### Precache grew, and the bundle budget cannot see it
+
+`scripts/check-bundle-budget.mjs` measures gzipped JS only. Stage 6 moved the
+font set from 28 files to 34 while the JS number barely moved, so
+`scripts/report-precache.mjs` was added to print what users actually download:
+
+```
+js                     4 files    183.4 KB gz
+fonts/jetbrains-mono  18 files    128.9 KB gz
+fonts/manrope         16 files    124.8 KB gz
+assets                 6 files     25.5 KB gz
+css                    1 file       7.1 KB gz
+html                   1 file       0.6 KB gz
+TOTAL                 46 files    470.3 KB gz
+```
+
+Report only, no threshold — a baseline has to exist before a gate can be honest.
+Worth noting from the first run: **JetBrains Mono costs MORE than the entire UI
+face**, because it ships six subsets (greek and vietnamese included) for what
+draws code spans and PIN fields. Narrowing it is a separate decision with its
+own measurement; it was deliberately left out of the font swap so that any
+visual regression there could only have one cause.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's

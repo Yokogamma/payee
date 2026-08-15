@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useNotes } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
-import { ConfirmDialog } from '../components/ConfirmDialog';
-import { SettingsModal } from '../components/SettingsModal';
+import { SettingsSection } from './SettingsSection';
 import { NoteComposer } from '../components/NoteComposer';
 import { NoteMarkdown } from '../components/NoteMarkdown';
 import { EditNoteModal } from '../components/EditNoteModal';
@@ -10,10 +9,10 @@ import { VersionHistoryModal, RestoreVersionDialog } from '../components/Version
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { V3_WRITER_ENABLED } from '../lib/flags';
-import { useRoute, navigate, canonicalHash, leaveSection } from '../lib/route';
+import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
 import { StatusLine } from '../components/StatusLine';
-import { useTheme } from '../lib/theme';
+import type { ThemePref } from '../lib/theme';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { subscribeToPwaUpdate, applyPwaUpdate } from '../lib/pwa';
 import type { NoteData } from '../lib/crypto';
@@ -29,7 +28,12 @@ function isLongNote(text: string): boolean {
   return text.length > 600 || text.split('\n').length > 12;
 }
 
-export function Main() {
+interface MainProps {
+  theme: ThemePref;
+  onThemeChange: (t: ThemePref) => void;
+}
+
+export function Main({ theme, onThemeChange }: MainProps) {
   const {
     filteredChains,
     chains,
@@ -38,7 +42,6 @@ export function Main() {
     addNote,
     editNote,
     setSearchQuery,
-    resetApp,
     arweave,
     retrySync,
     pinSetupNotice,
@@ -63,8 +66,7 @@ export function Main() {
   // user activates it, and it hid the only route to activation. It is dimmed
   // (never disabled) while there is nothing behind it yet.
   const safeboxDimmed = !safeboxPinConfigured && !safeboxDataPresent;
-  // Settings is a section now, so notes stay mounted behind its overlay.
-  const notesVisible = view !== 'safebox';
+  const notesVisible = view === 'notes';
 
   const [text, setText] = useState('');
   // Blocks the persist mirror from CLEARING the stored draft while the initial
@@ -84,7 +86,6 @@ export function Main() {
   const userCollapsedRef = useRef(false);
   const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
@@ -101,7 +102,6 @@ export function Main() {
 
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
   useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
-  const [theme, setTheme] = useTheme();
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
 
@@ -146,6 +146,20 @@ export function Main() {
     userCollapsedRef.current = true;
     setComposerOpen(false);
   }
+
+  // Focus follows the section. Losing the modal's «focus returns to the
+  // trigger» is fine, but a routed section with no focus management drops a
+  // keyboard or screen-reader user at the top of the document with nothing
+  // announced. This is the invariant that replaces the focus trap.
+  //
+  // A DOM query rather than three threaded refs: the sections are independent
+  // components and the shared class is the contract between them.
+  const firstSectionRender = useRef(true);
+  useEffect(() => {
+    // Not on the very first render — that would steal focus at app start.
+    if (firstSectionRender.current) { firstSectionRender.current = false; return; }
+    (document.querySelector('.main-content .section-title') as HTMLElement | null)?.focus();
+  }, [view]);
 
   // Canonicalise the address. An empty hash (first load, or an old build that
   // never wrote one) and an unknown hash (typo, or a section a newer build had
@@ -300,28 +314,6 @@ export function Main() {
     requestAnimationFrame(() => menuBtnRefs.current.get(root)?.focus());
   }
 
-  // Reset-safety is STORAGE-backed (arweave.resetRiskCount): every stored
-  // record that is not confirmed — visible or not (historical versions,
-  // quarantined/undecryptable records) — is unrecoverable after a wipe. The
-  // visible `notes` list undercounts exactly the records most at risk.
-  // The safebox contribution is derived from the ENCRYPTED rows, so the
-  // warning is correct with the section LOCKED — the normal case here.
-  const resetRiskTotal = arweave.resetRisk.notes + arweave.resetRisk.safebox;
-  const resetWarningMessage = !arweave.countsReady
-    // Until the first sync-count read completes we cannot know what is safe.
-    ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
-      + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
-      + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
-    : resetRiskTotal > 0
-      // Only CONFIRMED records are recoverable: an `accepted` transaction can
-      // still be dropped, and after a wipe there is no local ciphertext left.
-      ? `⚠️ ${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
-        + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
-        + (arweave.resetRisk.safebox > 0
-          ? `Из них в защищённом сейфе: ${arweave.resetRisk.safebox} — пароли и вложения.\n`
-          : '')
-        + 'Дождитесь статуса «Сохранена в блокчейне», если они вам нужны.'
-      : 'Все локальные данные будут удалены. Все записи подтверждены в блокчейне — их можно вернуть по seed-фразе.';
 
   return (
     <div className="main-screen">
@@ -367,6 +359,10 @@ export function Main() {
         <SafeboxSection key={safeboxLockGeneration} formatDate={formatDate} />
       )}
 
+      {view === 'settings' && (
+        <SettingsSection theme={theme} onThemeChange={onThemeChange} />
+      )}
+
       {/* The notes section is UNMOUNTED when another section is open, not
           hidden. It could stay mounted safely — the draft lives in this shell,
           not in the composer — but a mounted feed keeps re-rendering markdown
@@ -374,7 +370,7 @@ export function Main() {
       {notesVisible && (
       <>
       <div className="notes-topbar">
-        <h2 className="section-title">Заметки</h2>
+        <h2 className="section-title" tabIndex={-1}>Заметки</h2>
         {composerOpen ? (
           <button className="btn btn-ghost notes-add" onClick={collapseComposer}>
             Свернуть
@@ -614,33 +610,8 @@ export function Main() {
           truth the address, the Back gesture and the panel drift apart, which
           is the very confusion this redesign removes. Becomes a real section in
           stage 4; the modal is the intermediate. */}
-      <SettingsModal
-        open={view === 'settings'}
-        onClose={() => leaveSection()}
-        theme={theme}
-        onThemeChange={setTheme}
-        onRequestReset={() => {
-          // Never two aria-modal dialogs at once: their Escape handlers and
-          // focus traps would compete. Settings closes before the confirm opens.
-          //
-          // `replace`, not leaveSection(): history.back() resolves on a later
-          // task, so the confirm would open while settings is still up. This
-          // path is not «go back» anyway — it hands the user to a destructive
-          // flow that ends on the landing screen.
-          navigate('notes', { replace: true });
-          setShowResetConfirm(true);
-        }}
-      />
 
-      <ConfirmDialog
-        open={showResetConfirm}
-        title="Сбросить приложение?"
-        message={resetWarningMessage}
-        confirmLabel="Удалить всё"
-        danger
-        onConfirm={() => { setShowResetConfirm(false); resetApp(); }}
-        onCancel={() => setShowResetConfirm(false)}
-      />
+
 
       {/* W3: edit + history + restore-version (one aria-modal layer at a time) */}
       <EditNoteModal

@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { render, act, cleanup } from '@testing-library/react';
-import { parseHash, canonicalHash, navigate, leaveSection, useRoute, SECTIONS, DEFAULT_SECTION } from './route';
+import { parseHash, canonicalHash, navigate, useRoute, SECTIONS, DEFAULT_SECTION } from './route';
 
 // jsdom, not node: `location` and `history` do not exist in the node
 // environment, and stubbing them would test the stub.
@@ -79,43 +79,6 @@ describe('navigate', () => {
     navigate('safebox');
     navigate('safebox');
     expect(window.history.length).toBe(after);
-  });
-});
-
-describe('leaveSection', () => {
-  // Closing an overlay section has two honest answers, and picking one for
-  // both cases breaks something. An unconditional replace leaves the stack as
-  // `notes → notes`, so the next system Back looks broken; an unconditional
-  // back() exits the app when the user arrived by deep link.
-
-  it('шагает НАЗАД, если запись добавили мы — и возвращает в предыдущий раздел', () => {
-    navigate('safebox');           // the user was here…
-    navigate('settings');          // …and opened settings from it
-    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {});
-    leaveSection();
-    expect(back).toHaveBeenCalledTimes(1);
-    back.mockRestore();
-  });
-
-  it('ЗАМЕНЯЕТ на заметки при прямой ссылке — back() вышел бы из приложения', () => {
-    // A fresh load straight onto #/settings: no entry of ours behind it.
-    window.history.replaceState(null, '', '#/settings');
-    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {});
-    leaveSection();
-    expect(back).not.toHaveBeenCalled();
-    expect(window.location.hash).toBe('#/notes');
-    back.mockRestore();
-  });
-
-  it('после перезагрузки на нашей записи маркер уже не наш — тоже замена', () => {
-    // replaceState marks enSection:false, which is what a canonicalise or a
-    // reload-restored entry looks like.
-    navigate('settings', { replace: true });
-    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {});
-    leaveSection();
-    expect(back).not.toHaveBeenCalled();
-    expect(window.location.hash).toBe('#/notes');
-    back.mockRestore();
   });
 });
 

@@ -22,7 +22,7 @@
   --yellow: #fbbf24;
   --radius: 12px;
   --radius-sm: 8px;
-  --font: 'Outfit', -apple-system, system-ui, sans-serif;
+  --font: 'Manrope', -apple-system, system-ui, sans-serif;
   --mono: 'JetBrains Mono', monospace;
 }
 
@@ -43,6 +43,34 @@
   --green-glow: rgba(26, 171, 138, 0.1);
   --red: #dc3545;
   --yellow: #d4a017;
+}
+
+/* Warm: less blue for evening reading. Declares EXACTLY the same key set as
+   the light palette — an omitted variable does not fall back to light, it
+   falls through to the DARK values on :root, and that shows up on one screen
+   a month later. Enforced by scripts/check-theme-parity.test.mjs.
+
+   The violet accent is kept on purpose: with an amber ground it is a
+   complementary pair, and swapping it would break recognition between themes.
+   The only value that needed rethinking rather than recomputing is --red:
+   a cold #dc3545 reads as a foreign object here. */
+[data-theme="warm"] {
+  --bg: #f3ebdf;
+  --bg-card: #fcf7ef;
+  --bg-input: #ebe1d2;
+  --bg-hover: #e6dccb;
+  --border: #dacdb9;
+  --border-focus: #b6a68d;
+  --text: #2b2219;
+  --text-dim: #786a58;
+  --text-muted: #6f6250; /* a11y: contrast against --bg-card, like the others */
+  --accent: #5b4fd1;
+  --accent-hover: #4a3fb8;
+  --accent-glow: rgba(91, 79, 209, 0.12);
+  --green: #1e8a69;
+  --green-glow: rgba(30, 138, 105, 0.1);
+  --red: #b03a2b;
+  --yellow: #a8700c;
 }
 
 /* System theme (7.4): with no explicit data-theme, follow the OS preference.
@@ -140,7 +168,10 @@ body {
 
 .logo-icon {
   font-size: 48px;
-  font-weight: 200;
+  /* U+221E is not in any imported subset and 200 was never imported either —
+     this asked for a weight of a face that does not draw the glyph. 400 is
+     honest; the visual result is settled by a before/after screenshot. */
+  font-weight: 400;
   color: var(--accent);
   line-height: 1;
   margin-bottom: 4px;
@@ -1133,14 +1164,16 @@ mark {
 
 /* ─── Theme picker (3-way, settings) ────────────────────────── */
 
+/* 2×2, not a flex row: four options with «Системная» as the longest label
+   overflow a phone in one line. Mirrors the .autolock-grid pattern below. */
 .theme-picker {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 6px;
   width: 100%;
 }
 
 .theme-option {
-  flex: 1;
   font-family: var(--font);
   font-size: 13px;
   padding: 8px 10px;
@@ -1899,3 +1932,38 @@ mark {
     line-height: 1;
   }
 }
+
+/* ─── Settings as a section (was a modal) ───────────────────── */
+
+.settings-section {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 0 20px;
+}
+
+.settings-section .settings-topbar {
+  padding: 13px 16px 9px;
+}
+
+/* The heading takes focus on every section change — the a11y invariant that
+   replaces the modal focus trap. It must not paint a ring for mouse users. */
+.settings-section .section-title:focus { outline: none; }
+.settings-section .section-title:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.settings-group + .settings-group { margin-top: 22px; }
+
+.settings-group-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 4px 7px;
+}
+.settings-group-title--danger { color: var(--red); }

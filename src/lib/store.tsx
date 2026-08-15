@@ -139,6 +139,7 @@ import {
 } from './auto-lock';
 import { userFacingUploadError, userFacingRegistrationError } from './errors';
 import { copyTextToClipboard } from './clipboard';
+import { SAFEBOX_SCRUB_SELECTOR } from '../components/secretFieldProps';
 
 // Re-exported for callers that only need the storage key (reset paths, tests).
 export { DRAFT_STORAGE_KEY };
@@ -1225,7 +1226,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // seed-gate PIN — which no remount of the section would ever reach.
     try {
       const fields = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-        '.safebox-section input, .safebox-section textarea, .safebox-secret-field',
+        SAFEBOX_SCRUB_SELECTOR,
       );
       for (const field of fields) field.value = '';
     } catch { /* no DOM (SSR/test) — the remount below is the real guarantee */ }

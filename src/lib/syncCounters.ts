@@ -58,3 +58,19 @@ export function computeSyncCounters(
     totalVersions: arweave.confirmedCount + arweave.acceptedCount + arweave.unsyncedCount,
   };
 }
+
+/**
+ * What a quarantined record actually is, in one sentence, in ONE place.
+ *
+ * `SyncRecord.terminalError` is `'unsupported_version' | 'malformed_record'`:
+ * either a record a newer build wrote, or a row that is simply broken. Naming
+ * only the first — as both the status line and the settings panel did, in two
+ * separately-worded copies — tells the owner of a corrupted row to «update the
+ * app», which will not help and hides the real problem.
+ *
+ * Exported rather than duplicated for the same reason the scrub selector is:
+ * two copies of one explanation drift, and the drift is invisible until someone
+ * reads both.
+ */
+export const QUARANTINE_EXPLANATION =
+  'эта версия приложения не может обработать такие записи; повтор не поможет';

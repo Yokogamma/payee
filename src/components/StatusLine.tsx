@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useNotes } from '../lib/store';
-import { computeSyncCounters } from '../lib/syncCounters';
+import { computeSyncCounters, QUARANTINE_EXPLANATION } from '../lib/syncCounters';
 
 /**
  * One line instead of five header icons and a stack of banners.
@@ -210,7 +210,9 @@ export function StatusLine() {
           {arweave.unsyncedCount > 0 && <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>}
           {arweave.errorCount > 0 && <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>}
           {arweave.quarantinedCount > 0 && (
-            <div className="status-hint">Отложено: {arweave.quarantinedCount} — созданы до регистрации, повтор не поможет</div>
+            <div className="status-hint">
+              Отложено: {arweave.quarantinedCount} — {QUARANTINE_EXPLANATION}
+            </div>
           )}
         </div>
       )}
