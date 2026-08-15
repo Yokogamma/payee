@@ -39,19 +39,17 @@ function Svg({ children }: { children: ReactNode }) {
     </svg>
   );
 }
-const IconKey = () => <Svg><circle cx="8" cy="15" r="4" /><path d="M10.85 12.15 19 5" /><path d="m18 6 2 2" /><path d="m15 9 2 2" /></Svg>;
-const IconLock = () => <Svg><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></Svg>;
-const IconInfinity = () => <Svg><path d="M9.828 9.172a4 4 0 1 0 0 5.656 10 10 0 0 0 2.172 -2.828 10 10 0 0 1 2.172 -2.828 4 4 0 1 1 0 5.656 10 10 0 0 1 -2.172 -2.828 10 10 0 0 0 -2.172 -2.828z" /></Svg>;
-const IconTheme = () => <Svg><circle cx="12" cy="12" r="9" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" /></Svg>;
-const IconTrash = () => <Svg><path d="M4 7h16" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7V4a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></Svg>;
 const IconChevron = () => <Svg><path d="m6 9 6 6 6 -6" /></Svg>;
-const IconNote = () => <Svg><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M9 8h6" /><path d="M9 12h6" /><path d="M9 16h4" /></Svg>;
-const IconShield = () => <Svg><path d="M12 3l7 3v5c0 4 -3 7 -7 8 -4 -1 -7 -4 -7 -8V6z" /><circle cx="12" cy="11" r="1.4" /><path d="M12 12.4V15" /></Svg>;
 
-/** One collapsible settings block. Collapsed by default; the header stays a
- *  button so keyboard + the modal focus-trap treat it as one stop. */
-function SettingsBlock({ icon, title, chip, chipClass, danger, children }: {
-  icon: ReactNode;
+/** One settings row. Collapsed by default; the header stays a button so the
+ *  keyboard treats it as one stop.
+ *
+ *  NO LEADING ICON, deliberately. Each row used to carry a 20px accent glyph,
+ *  which is 31px of the row's width spent on decoration that repeats the label
+ *  it sits next to. The approved mockup has none, and on a 360px phone that
+ *  width is the difference between «Авто-блокировка · Через 5 мин» fitting and
+ *  wrapping. Icons stay where they disambiguate — the three nav items. */
+function SettingsBlock({ title, chip, chipClass, danger, children }: {
   title: string;
   chip?: string;
   chipClass?: string;
@@ -67,7 +65,6 @@ function SettingsBlock({ icon, title, chip, chipClass, danger, children }: {
         aria-expanded={open}
         onClick={() => setOpen(o => !o)}
       >
-        <span className="settings-block-icon">{icon}</span>
         <span className="settings-block-title">{title}</span>
         {chip && <span className={`settings-block-chip${chipClass ? ' ' + chipClass : ''}`}>{chip}</span>}
         <span className="settings-block-chev"><IconChevron /></span>
@@ -228,15 +225,6 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           <h2 id="settings-title" className="section-title" tabIndex={-1}>Настройки</h2>
         </div>
 
-        <div className="settings-statusbar">
-          {/* Notes = chains (what the user perceives); записи = raw versions. */}
-          <span>
-            <IconNote /> Заметок: <strong>{chains.length}</strong>
-            {notes.length !== chains.length && <> · записей: <strong>{notes.length}</strong></>}
-          </span>
-          <span><IconShield /> AES-256-GCM</span>
-        </div>
-
         <div className="settings-blocks">
           {/* Four groups instead of six loose blocks. The point is the first
               one: three things about locks used to sit interleaved with the
@@ -244,7 +232,8 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               the app PIN and the safebox PIN are DIFFERENT contours. */}
           <div className="settings-group">
             <h3 className="settings-group-title">Доступ и замки</h3>
-          <SettingsBlock icon={<IconKey />} title="Seed-фраза">
+            <div className="settings-rows">
+          <SettingsBlock title="Seed-фраза">
             <button
               className="btn btn-outline full-width"
               onClick={() => setShowSeed(!showSeed)}
@@ -309,7 +298,6 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </SettingsBlock>
 
           <SettingsBlock
-            icon={<IconLock />}
             title="PIN-код"
             chip={hasPin ? 'установлен' : 'не установлен'}
           >
@@ -326,7 +314,6 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               formula lived here too. Nothing configured yet is a STATE, shown
               in the chip, not a reason to hide the only route to it. */}
           <SettingsBlock
-            icon={<IconShield />}
             title="Защищённый сейф"
             chip={safeboxPinConfigured ? 'PIN установлен' : 'не настроен'}
           >
@@ -341,11 +328,12 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </SettingsBlock>
 
           </div>
+          </div>
 
           <div className="settings-group">
             <h3 className="settings-group-title">Синхронизация</h3>
+            <div className="settings-rows">
           <SettingsBlock
-            icon={<IconInfinity />}
             title="Вечное хранилище"
             chip={arweaveChip}
             chipClass={arweaveChipClass}
@@ -415,10 +403,12 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </SettingsBlock>
 
           </div>
+          </div>
 
           <div className="settings-group">
             <h3 className="settings-group-title">Вид</h3>
-          <SettingsBlock icon={<IconTheme />} title="Тема" chip={THEME_LABELS[theme]}>
+            <div className="settings-rows">
+          <SettingsBlock title="Тема" chip={THEME_LABELS[theme]}>
             <div className="theme-picker" role="group" aria-label="Тема оформления">
               {(Object.keys(THEME_LABELS) as ThemePref[]).map(t => (
                 <button
@@ -434,10 +424,12 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </SettingsBlock>
 
           </div>
+          </div>
 
           <div className="settings-group">
             <h3 className="settings-group-title settings-group-title--danger">Опасная зона</h3>
-          <SettingsBlock icon={<IconTrash />} title="Сброс приложения" danger>
+            <div className="settings-rows">
+          <SettingsBlock title="Сброс приложения" danger>
             <div className="settings-hint">
               Удаляет все локальные данные с этого устройства. Заметки, сохранённые
               в блокчейне, останутся — восстановишь по seed-фразе.
@@ -447,7 +439,18 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
             </button>
           </SettingsBlock>
           </div>
+          </div>
         </div>
+
+        {/* Was a meta line directly under the title, where it took the most
+            valuable strip on the screen to say something nobody opens settings
+            to read. The note count is in the status line; the cipher name is
+            reassurance. Both belong at the end. */}
+        <p className="settings-footnote">
+          Заметок: {chains.length}
+          {notes.length !== chains.length && <> · записей: {notes.length}</>}
+          {' · '}AES-256-GCM
+        </p>
       </div>
 
       {/* The reset confirm lives HERE now. Settings is no longer aria-modal, so

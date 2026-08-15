@@ -6,6 +6,7 @@ import { SafeboxPinPad } from './SafeboxPinPad';
 import { SafeboxActivation, SafeboxSeedReset } from './SafeboxActivation';
 import { SafeboxEntryForm } from './SafeboxEntryForm';
 import { SafeboxHistoryModal, SafeboxRestoreDialog } from './SafeboxHistoryModal';
+import { Fab } from './Fab';
 import type { SafeboxEntryData } from '../lib/crypto';
 import type { SafeboxEntryPatch } from '../lib/safebox';
 import type { SafeboxNewEntry } from '../lib/store';
@@ -148,19 +149,14 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
 
   return (
     <div className="safebox-section" onPointerDown={touchSafebox} onKeyDown={touchSafebox}>
+      {/* Три конкурирующих веса стояли в один ряд: заголовок, заливная «+ Запись»
+          и «🔒 Закрыть сейф», который на 360px переносился в две строки. По
+          мокапу состояние — это чип, выход — мелкая контурная кнопка, а
+          создание записи уехало на круглую «+» внизу, как в заметках. */}
       <div className="safebox-topbar">
         <h2 className="section-title" tabIndex={-1}>Сейф</h2>
-        <div className="header-right">
-          {SAFEBOX_WRITER_ENABLED && (
-            <button
-              className="btn btn-primary"
-              onClick={() => { setFormRoot(null); setFormOpen(true); }}
-            >
-              + Запись
-            </button>
-          )}
-          <button className="btn btn-ghost" onClick={lockSafebox}>🔒 Закрыть сейф</button>
-        </div>
+        <span className="section-chip section-chip--open">Открыт</span>
+        <button className="btn-tiny" onClick={lockSafebox}>Запереть</button>
       </div>
 
 
@@ -210,29 +206,33 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
               {entry.login && <div className="safebox-card-login">{entry.login}</div>}
               {entry.url && <div className="safebox-card-url">{entry.url}</div>}
 
+              {/* Мелкие контурные токены вместо кнопок с эмодзи. Эмодзи здесь
+                  были единственным цветным элементом на монохромном экране и
+                  рисовались платформенным шрифтом — рядом с SVG-штрихом всего
+                  остального интерфейса это читалось как два разных языка. */}
               <div className="safebox-card-actions">
-                <button className="btn btn-ghost" onClick={() => void handleCopy(entry.id)}>
-                  📋 Пароль
+                <button className="btn-tiny" onClick={() => void handleCopy(entry.id)}>
+                  Копировать пароль
                 </button>
                 {entry.login && (
-                  <button className="btn btn-ghost" onClick={() => void handleCopyLogin(entry.login)}>
-                    📋 Логин
+                  <button className="btn-tiny" onClick={() => void handleCopyLogin(entry.login)}>
+                    Логин
                   </button>
                 )}
-                <button className="btn btn-ghost" onClick={() => void handleReveal(entry.id)}>
-                  👁 Показать
+                <button className="btn-tiny" onClick={() => void handleReveal(entry.id)}>
+                  Показать
                 </button>
                 {SAFEBOX_WRITER_ENABLED && (
-                  <button className="btn btn-ghost" onClick={() => { setFormRoot(chain.root); setFormOpen(true); }}>
-                    ✏️ Изменить
+                  <button className="btn-tiny" onClick={() => { setFormRoot(chain.root); setFormOpen(true); }}>
+                    Изменить
                   </button>
                 )}
                 {chain.versions.length > 1 && (
                   <button
-                    className="btn btn-ghost"
+                    className="btn-tiny"
                     onClick={() => { setHistoryFocusId(null); setHistoryRoot(chain.root); }}
                   >
-                    🕓 История ({chain.versions.length})
+                    История ({chain.versions.length})
                   </button>
                 )}
               </div>
@@ -261,6 +261,10 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
           );
         })}
       </div>
+
+      {SAFEBOX_WRITER_ENABLED && (
+        <Fab label="Новая запись" onClick={() => { setFormRoot(null); setFormOpen(true); }} />
+      )}
 
       {toast && (
         <div className={`toast ${toast.kind === 'ok' ? 'toast--success' : 'toast--error'}`} role="status">

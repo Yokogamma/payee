@@ -165,9 +165,24 @@ describe('StatusLine — проверка обновлений', () => {
 describe('StatusLine — подробности', () => {
   it('счётчики свёрнуты по умолчанию и раскрываются', () => {
     render(<StatusLine />);
-    expect(screen.queryByText(/Заметки в блокчейне/)).toBeNull();
+    expect(screen.queryByText(/версий \(транзакций\)/)).toBeNull();
     fireEvent.click(screen.getByLabelText('Показать подробности'));
-    expect(screen.getByText(/Заметки в блокчейне/)).toBeTruthy();
+    expect(screen.getByText(/версий \(транзакций\)/)).toBeTruthy();
+  });
+
+  it('панель НЕ повторяет число, которое уже стоит в свёрнутой строке', () => {
+    // The panel used to open with «Заметки в блокчейне: N из M» directly under
+    // a row already reading «Синхронизировано · N из M заметок». Two copies of
+    // one number, 12px apart, and the row truncated to make space for it.
+    render(<StatusLine />);
+    fireEvent.click(screen.getByLabelText('Показать подробности'));
+    expect(screen.queryByText(/Заметки в блокчейне/)).toBeNull();
+    expect(screen.getByText(/Синхронизировано · \d+ из \d+ заметок$/)).toBeTruthy();
+  });
+
+  it('свёрнутая строка не тянет «в блокчейне» — она там не помещалась', () => {
+    render(<StatusLine />);
+    expect(screen.queryByText(/заметок в блокчейне/)).toBeNull();
   });
 
   it('пока счётчики не загружены, не рисуется честно выглядящая ложь «0 из N»', () => {
@@ -175,7 +190,7 @@ describe('StatusLine — подробности', () => {
     render(<StatusLine />);
     fireEvent.click(screen.getByLabelText('Показать подробности'));
     expect(screen.getByText(/загружается/)).toBeTruthy();
-    expect(screen.queryByText(/Заметки в блокчейне/)).toBeNull();
+    expect(screen.queryByText(/версий \(транзакций\)/)).toBeNull();
   });
 });
 

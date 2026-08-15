@@ -17,9 +17,11 @@
   --accent-hover: #5b52ee;
   --accent-glow: rgba(108, 99, 255, 0.15);
   --green: #2dd4a8;
+  --green-line: #1d5a4a;
   --green-glow: rgba(45, 212, 168, 0.1);
   --red: #f05365;
   --yellow: #fbbf24;
+  --yellow-line: #5a4a1d;
   --radius: 12px;
   --radius-sm: 8px;
   --font: 'Manrope', -apple-system, system-ui, sans-serif;
@@ -40,9 +42,11 @@
   --accent-hover: #4a41d6;
   --accent-glow: rgba(91, 82, 238, 0.12);
   --green: #1aab8a;
+  --green-line: #7fc9b2;
   --green-glow: rgba(26, 171, 138, 0.1);
   --red: #dc3545;
   --yellow: #d4a017;
+  --yellow-line: #d9bd77;
 }
 
 /* Warm: less blue for evening reading. Declares EXACTLY the same key set as
@@ -68,9 +72,11 @@
   --accent-hover: #4a3fb8;
   --accent-glow: rgba(91, 79, 209, 0.12);
   --green: #1e8a69;
+  --green-line: #8cc5ae;
   --green-glow: rgba(30, 138, 105, 0.1);
   --red: #b03a2b;
   --yellow: #a8700c;
+  --yellow-line: #d6b575;
 }
 
 /* System theme (7.4): with no explicit data-theme, follow the OS preference.
@@ -90,9 +96,11 @@
     --accent-hover: #4a41d6;
     --accent-glow: rgba(91, 82, 238, 0.12);
     --green: #1aab8a;
+    --green-line: #7fc9b2;
     --green-glow: rgba(26, 171, 138, 0.1);
     --red: #dc3545;
     --yellow: #d4a017;
+    --yellow-line: #d9bd77;
   }
 }
 
@@ -748,16 +756,84 @@ h1 {
 }
 .settings-close:hover { background: var(--bg-hover); color: var(--text); }
 
-.settings-statusbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 16px;
-  margin-top: -8px;
-  font-size: 12px;
+.settings-footnote {
+  margin: 18px 0 0;
+  font-size: 11.5px;
   color: var(--text-muted);
 }
-.settings-statusbar span { display: inline-flex; align-items: center; gap: 5px; }
-.settings-statusbar svg { width: 15px; height: 15px; }
+
+/* ─── Section chip, tiny token, FAB ─────────────────────────── */
+
+/* State as a label, not as a button. «Открыт»/«Заперт» used to be readable
+   only from the presence of a big «🔒 Закрыть сейф», which is a control. */
+.section-chip {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+}
+.section-chip--open { color: var(--green); border-color: var(--green-line); }
+.section-chip--shut { color: var(--yellow); border-color: var(--yellow-line); }
+
+/* The row-action token: a real 44px touch target without a 44px BOX, same
+   trick as .status-btn. Buttons sized to their own text let four actions sit
+   on one line of a 360px card instead of wrapping onto three. */
+.btn-tiny {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.btn-tiny::after { content: ''; position: absolute; inset: -9px -4px; }
+.btn-tiny:hover { color: var(--text); background: var(--bg-hover); }
+
+/* Sticky, never fixed — see the comment in Fab.tsx: a fixed FAB needs a
+   z-index, and any z-index ≥ 100 would paint over the privacy lock gate. */
+.fab-slot {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 8px;
+  pointer-events: none;
+}
+.fab {
+  position: relative;
+  pointer-events: auto;
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+.fab svg { width: 24px; height: 24px; }
+.fab-mark {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--yellow);
+  border: 2px solid var(--bg);
+}
 
 .settings-blocks {
   display: flex;
@@ -765,35 +841,37 @@ h1 {
   gap: 10px;
 }
 
-.settings-block {
+/* THE GROUP is the card, not the row. Each row used to be its own bordered
+   card with a 54px header and a 10px gap — 64px of pitch for a label, a value
+   and a chevron. Four of those filled a phone screen before the second group
+   started. One card per group with hairline separators is the approved mockup
+   and costs 44px a row with no gaps at all. */
+.settings-rows {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-card);
   overflow: hidden;
 }
 
+.settings-block { border: none; border-radius: 0; background: transparent; }
+.settings-block + .settings-block { border-top: 1px solid var(--border); }
+
 .settings-block-header {
   display: flex;
   align-items: center;
   gap: 11px;
   width: 100%;
-  min-height: 54px;
+  min-height: 44px;
   padding: 0 14px;
   border: none;
   background: transparent;
   color: var(--text);
   font-family: var(--font);
-  font-size: 15px;
+  font-size: 14px;
   text-align: left;
   cursor: pointer;
 }
 .settings-block-header:hover { background: var(--bg-hover); }
-
-.settings-block-icon {
-  display: flex;
-  flex-shrink: 0;
-  color: var(--accent);
-}
 
 .settings-block-title {
   flex: 1;
@@ -813,7 +891,7 @@ h1 {
   color: var(--text-muted);
   transition: transform 0.18s ease;
 }
-.settings-block-chev svg { width: 18px; height: 18px; }
+.settings-block-chev svg { width: 16px; height: 16px; }
 .settings-block.is-open .settings-block-chev { transform: rotate(180deg); }
 
 .settings-block-body {
@@ -1202,8 +1280,10 @@ mark {
   inset: 0;
   z-index: 100; /* above every modal/overlay — nothing may paint over the gate */
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 14px;
   background: var(--bg); /* fully opaque: no plaintext may shine through */
 }
 
@@ -1219,6 +1299,26 @@ mark {
 .lock-gate-icon {
   font-size: 28px;
   opacity: 0.6;
+}
+
+/* Both start `hidden` and are revealed imperatively (armGateReveal): a gate
+   that outstays a second is a gate that owes the user an explanation, and one
+   that outstays the verdict's own deadline owes them a way out. */
+.lock-gate-note {
+  margin: 0;
+  max-width: 280px;
+  font-size: 13px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.lock-gate-exit {
+  width: auto;
+}
+
+.lock-gate-note[hidden],
+.lock-gate-exit[hidden] {
+  display: none;
 }
 
 /* ─── Auto-lock picker (PIN block) — 2×2 grid, ≥44px targets ── */
@@ -1629,13 +1729,15 @@ mark {
   gap: 14px;
   padding: 16px;
 }
+/* Title takes the slack; the state chip and «Запереть» sit tight against the
+   right edge. `justify-content: space-between` was right for two children and
+   would have scattered three. */
 .safebox-topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 9px;
 }
-.safebox-topbar h2 { margin: 0; font-size: 1.05rem; }
+.safebox-topbar h2 { margin: 0; font-size: 1.05rem; flex: 1; min-width: 0; }
 
 /* Locked gate / activation share the centered card look */
 .safebox-gate,
@@ -1825,25 +1927,6 @@ mark {
 
 /* Mirrors «+ Запись» in the safebox topbar — the two sections offer creation
    in the same place and the same shape. */
-.notes-add {
-  width: auto;
-  flex: 0 0 auto;
-  padding: 8px 16px;
-  font-size: 13px;
-  position: relative;
-}
-
-/* A collapsed composer must not hide an unsaved draft. The state is in the
-   button's accessible name too, not only in this dot. */
-.notes-add-dot {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--yellow);
-}
 
 /* ─── Status line ───────────────────────────────────────────── */
 
@@ -1880,23 +1963,35 @@ mark {
 }
 .status-line--error .status-text { color: var(--red); }
 
+/* 28px BOX, 44px TARGET. A literal min-width/min-height:44px cost 88px of the
+   row's width and forced it 16px taller than the mockup — which is why the
+   status text truncated mid-word at «блокч…». The touch floor is still 44px,
+   it just lives in an overlay that takes no space in the flex row. */
 .status-btn {
+  position: relative;
   flex: 0 0 auto;
-  /* a11y: ≥44px touch target, same floor as every other inline control */
-  min-width: 44px;
-  min-height: 44px;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
   background: transparent;
-  border: none;
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text-dim);
-  font-size: 15px;
   cursor: pointer;
 }
+.status-btn::after {
+  content: '';
+  position: absolute;
+  /* (44 - 28) / 2 — the hit area a finger needs, out of the layout. */
+  inset: -8px;
+}
+.status-btn svg { width: 14px; height: 14px; }
 .status-btn:hover:not(:disabled) { color: var(--text); background: var(--bg-hover); }
 .status-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.status-btn--plain { border-color: transparent; }
+.status-btn[aria-expanded='true'] svg { transform: rotate(180deg); }
 
 /* Breaks to its own row inside the same flex container. */
 .status-details {

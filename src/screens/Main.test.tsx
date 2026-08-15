@@ -121,7 +121,7 @@ function baseStore() {
 
 /** The composer is collapsed by default now — open it before typing. */
 function openComposer() {
-  fireEvent.click(screen.getByRole('button', { name: /\+ Заметка/ }));
+  fireEvent.click(screen.getByRole('button', { name: /Новая заметка/ }));
 }
 
 function stubClipboard(writeText: (t: string) => Promise<void>) {
@@ -365,7 +365,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'длинный текст' } });
-    fireEvent.click(screen.getByText('🔐 Сохранить'));
+    fireEvent.click(screen.getByText('Сохранить'));
 
     expect(await screen.findByText(/слишком длинная/)).toBeTruthy();
     expect(input.value).toBe('длинный текст'); // draft NOT cleared
@@ -386,7 +386,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'двойной клик' } });
 
-    const saveBtn = screen.getByText('🔐 Сохранить');
+    const saveBtn = screen.getByText('Сохранить');
     fireEvent.click(saveBtn);
     fireEvent.click(saveBtn); // second submit before the first resolves
 
@@ -486,7 +486,7 @@ describe('Main — пункт сейфа в навигации', () => {
     h.store.safeboxUnlocked = true;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
-    fireEvent.click(screen.getByText('🔒 Закрыть сейф'));
+    fireEvent.click(screen.getByText('Запереть'));
     expect(h.store.lockSafebox).toHaveBeenCalled();
   });
 
@@ -499,7 +499,7 @@ describe('Main — пункт сейфа в навигации', () => {
     h.store.safeboxUnlocked = true;
     const { container, rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
-    fireEvent.click(screen.getByText('🔒 Закрыть сейф'));
+    fireEvent.click(screen.getByText('Запереть'));
 
     // The store spy does not flip the flag on its own — model the lock landing.
     h.store.safeboxUnlocked = false;
@@ -664,7 +664,7 @@ describe('Main — композер сворачивается за «+»', () =
   it('по умолчанию свёрнут — лента получает всю высоту', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(field()).toBeNull();
-    expect(screen.getByRole('button', { name: /\+ Заметка/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Новая заметка/ })).toBeTruthy();
   });
 
   it('гидратация, завершившаяся ПОСЛЕ первого рендера, раскрывает его', async () => {
@@ -697,7 +697,7 @@ describe('Main — композер сворачивается за «+»', () =
     await act(async () => { resolveDraft('восстановленный черновик'); });
     expect(field()).toBeNull(); // stayed shut despite a draft arriving
     // …and the draft is not lost, just not forced onto the user.
-    expect(document.querySelector('.notes-add-dot')).toBeTruthy();
+    expect(document.querySelector('.fab-mark')).toBeTruthy();
   });
 
   it('сворачивание НЕ стирает черновик и не вызывает persistDraft("")', () => {
@@ -721,13 +721,13 @@ describe('Main — композер сворачивается за «+»', () =
     fireEvent.change(field()!, { target: { value: '   ' } });
     fireEvent.click(screen.getByText('Свернуть'));
 
-    expect(screen.getByRole('button', { name: '+ Заметка, есть несохранённый черновик' })).toBeTruthy();
-    expect(document.querySelector('.notes-add-dot')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Новая заметка, есть несохранённый черновик' })).toBeTruthy();
+    expect(document.querySelector('.fab-mark')).toBeTruthy();
   });
 
   it('без черновика индикатора нет', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
-    expect(document.querySelector('.notes-add-dot')).toBeNull();
+    expect(document.querySelector('.fab-mark')).toBeNull();
   });
 });
 
