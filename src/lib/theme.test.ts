@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { loadThemePref } from './theme';
 
 // jsdom: `localStorage`, `matchMedia` and the document are the whole subsystem.
