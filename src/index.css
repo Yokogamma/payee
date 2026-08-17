@@ -441,7 +441,8 @@ textarea:focus-visible {
 }
 /* Was a green glow. Ink does not glow — a press darkens it, the way more
    pressure darkens a stroke. */
-.btn-save:hover:not(:disabled) {
+.btn-save:hover:not(:disabled),
+.btn-save:active:not(:disabled) {
   background: var(--accent-hover);
 }
 

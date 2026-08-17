@@ -94,10 +94,20 @@ describe('base layer, as the browser resolves it', () => {
   });
 
   it('nothing in the base layer drops below the 13px floor', () => {
-    for (const cls of ['section-label', 'state', 'search-count', 'btn-tiny', 'subtitle']) {
+    // The floor was 12 here, which made the name of this test a lie: a
+    // regression of .state or .btn-tiny to 12px would have passed.
+    for (const cls of ['state', 'search-count', 'btn-tiny', 'subtitle']) {
       const size = parseFloat(resolved(cls, 'font-size'));
-      expect(size, `.${cls} is ${size}px, under the 13px floor`).toBeGreaterThanOrEqual(12);
+      expect(size, `.${cls} is ${size}px, under the 13px floor`).toBeGreaterThanOrEqual(13);
     }
+  });
+
+  it('the section label is the ONE thing allowed under the floor', () => {
+    // The handoff sets the floor at 13px and then specifies these labels at
+    // PT Mono 12px itself. It is not prose: uppercase, spaced 0.12em, mono,
+    // and never longer than two words. Naming it as an exception is what
+    // keeps «13px floor» honest for everything else.
+    expect(parseFloat(resolved('section-label', 'font-size'))).toBe(12);
   });
 
   it('every button variant keeps the 44px target', () => {
