@@ -55,6 +55,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
     clearDraft,
     safeboxPinConfigured,
     safeboxDataPresent,
+    v3Paused,
     safeboxLockGeneration,
   } = useNotes();
 
@@ -134,6 +135,26 @@ export function Main({ theme, onThemeChange }: MainProps) {
   const hasDraft = text.length > 0;
   const wasNotesVisible = useRef(notesVisible);
 
+  /**
+   * Where this note is about to live, said plainly.
+   *
+   * Going fullscreen unmounts the status line, so this sentence is the ONLY
+   * thing left that can answer it — which means it has to answer for every
+   * state the status line would have covered, not just the easy two.
+   *
+   * `v3Paused` is the one that hides: sync is on, the key is registered, and
+   * the upload queue is still stopped until the user resumes it by hand. A
+   * text that only checked enabled/registered promised the blockchain in
+   * exactly the state where nothing is being sent — see the matching rung in
+   * StatusLine, which is the warning this paragraph replaces on this screen.
+   */
+  const composerDestination =
+    !arweave.enabled || !arweave.registered
+      ? 'Синхронизация выключена — запись останется только на этом устройстве.'
+      : v3Paused
+        ? 'Загрузка приостановлена — запись останется на устройстве до возобновления.'
+        : 'Она отправится в блокчейн и станет вечной после подтверждения сети.';
+
   useEffect(() => {
     const entered = notesVisible && !wasNotesVisible.current;
     wasNotesVisible.current = notesVisible;
@@ -161,15 +182,16 @@ export function Main({ theme, onThemeChange }: MainProps) {
    * itself entirely. The FAB is the right landing: it is what reopens the
    * composer, so the user is left holding the door they came through.
    *
-   * A DOM query rather than a threaded ref, matching the section-title focus
-   * handling below: the FAB is remounted by this very state change, so any ref
-   * captured earlier points at a detached node.
+   * Through a REF, not `document.querySelector('.fab')`. The safebox renders a
+   * FAB too, and a save is async: if the route changes while one is in flight
+   * — a Back gesture, a hash edit — the global lookup would find the safebox's
+   * button and yank focus off the safebox heading that had just claimed it.
+   * With a ref, an unmounted notes FAB is simply `null` and nothing moves.
    */
+  const notesFabRef = useRef<HTMLButtonElement | null>(null);
+
   function focusFabAfterCollapse() {
-    requestAnimationFrame(() => {
-      const fab = document.querySelector('.fab') as HTMLElement | null;
-      fab?.focus();
-    });
+    requestAnimationFrame(() => notesFabRef.current?.focus());
   }
 
   function collapseComposer() {
@@ -415,9 +437,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
         // could have told the user where their note is about to live.
         <p className="composer-intro">
           Запись нельзя удалить — только дополнить новой версией.{' '}
-          {arweave.enabled && arweave.registered
-            ? 'Она отправится в блокчейн и станет вечной после подтверждения сети.'
-            : 'Синхронизация выключена — запись останется только на этом устройстве.'}
+          {composerDestination}
         </p>
       )}
 
@@ -614,6 +634,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
         // The dot is the only thing standing between a collapsed composer and
         // silently hiding an unsaved draft.
         <Fab
+          ref={notesFabRef}
           label={hasDraft ? 'Новая заметка, есть несохранённый черновик' : 'Новая заметка'}
           onClick={openComposer}
           marked={hasDraft}

@@ -546,6 +546,47 @@ describe('Main — пункт сейфа в навигации', () => {
       expect(screen.getByRole('button', { name: 'Сохранить' }).querySelector('svg')).toBeNull();
     });
 
+    it('пауза загрузки — обещания блокчейна нет', () => {
+      // Состояние, которое прячется: синхронизация включена, ключ
+      // зарегистрирован, а очередь остановлена до ручного возобновления.
+      // Проверка только enabled/registered обещала блокчейн ровно там, где
+      // ничего не отправляется.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = true;
+      s.arweave.registered = true;
+      s.v3Paused = true;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/приостановлена/);
+      expect(intro).not.toMatch(/отправится в блокчейн/);
+    });
+
+    it('фокус не уходит на FAB сейфа, если раздел сменился во время сохранения', async () => {
+      // .fab есть и в сейфе. Глобальный querySelector после асинхронного
+      // сохранения украл бы фокус у заголовка сейфа, который его только что
+      // получил. Ref размонтированной кнопки — null, и ничего не двигается.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.safeboxDataPresent = true;
+      let resolveSave: () => void = () => {};
+      s.addNote = vi.fn(() => new Promise<void>(r => { resolveSave = r; }));
+
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      fireEvent.change(document.querySelector('.note-input')!, { target: { value: 'текст' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+
+      // Сохранение ещё в полёте — уходим в сейф.
+      fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
+      fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+      const safeboxFab = document.querySelector('.fab');
+
+      await act(async () => { resolveSave(); });
+      await new Promise(r => requestAnimationFrame(r));
+
+      expect(document.activeElement).not.toBe(safeboxFab);
+    });
+
     it('ключ не зарегистрирован — обещания тоже нет', () => {
       const s = h.store as ReturnType<typeof baseStore>;
       s.arweave.enabled = true;

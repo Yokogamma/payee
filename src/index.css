@@ -2215,8 +2215,18 @@ mark {
   border: none;
   cursor: pointer;
   font-family: var(--font);
-  /* 11px was under the floor. The tab label is the only text on screen a user
-     navigates by, and it was the smallest thing in the interface. */
+  /* 12.5px, and it is UNDER THE 13px FLOOR ON PURPOSE — one of exactly two
+     places that are.
+     The handoff contradicts itself: «Минимум текста: 13px. Ничего мельче» in
+     the type section, and then «подпись 12.5px» in the navigation section and
+     «Метки секций: PT Mono 12px» for group labels. Both of the smaller numbers
+     are stated for a specific element, so both are honoured and both are named
+     — here, in scripts-adjacent tests (src/index.cascade.test.ts), and in the
+     plan. Nothing else in the interface may go under 13px; a third exception
+     would mean the floor is not a floor.
+     It was 11px before, which was under the floor by accident rather than by
+     specification — the tab label is the only text a user navigates BY, and it
+     was the smallest thing on screen. */
   font-size: 12.5px;
   letter-spacing: 0.03em;
   color: var(--text-dim);
