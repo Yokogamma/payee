@@ -1140,7 +1140,13 @@ h1 {
   bottom: 0;
   display: flex;
   justify-content: flex-end;
-  padding-top: 8px;
+  /* Insets on THREE sides, not just the top. The slot is a direct child of
+     `.main-content`, which has no padding of its own — the feed's 20px belongs
+     to the feed — so with only `padding-top` the button sat flush against the
+     bottom and right edges of the screen. The mockup gives it `0 20px 14px`
+     and it needs every bit of that: a 56px circle touching two edges reads as
+     clipped rather than as placed. */
+  padding: 8px var(--pad-screen) 14px;
   pointer-events: none;
 }
 .fab {
@@ -2468,6 +2474,24 @@ mark {
 .status-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .status-btn--plain { border-color: transparent; }
 .status-btn[aria-expanded='true'] svg { transform: rotate(180deg); }
+
+/* THE TWO-LINE RESERVATION IS A MOBILE MEASURE, and it has to be released
+   here — AFTER `.status-line`, not in the ≥768px block a thousand lines above.
+   That block sits before this rule, so at equal specificity the base wins and
+   the override does nothing; I wrote it there first and measured 62px in a
+   browser afterwards, which is the only reason it did not ship silently.
+   Third time this file has taught the same lesson (see .section-title and
+   .main-screen--composing): in one long stylesheet, ORDER is the rule.
+
+   On a wide screen the longest rung — «Загрузка новых версий приостановлена —
+   всё сохраняется локально» — still fits on one line, so there is nothing to
+   reserve against, and reserving anyway left 41px of permanent emptiness
+   above the feed. */
+@media (min-width: 768px) {
+  .status-line {
+    min-height: 0;
+  }
+}
 
 /* Breaks to its own row inside the same flex container. */
 .status-details {
