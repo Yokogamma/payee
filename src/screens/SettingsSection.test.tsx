@@ -82,7 +82,8 @@ describe('SettingsSection a11y (Phase 7)', () => {
     // also appears as the block's status chip, so target the buttons by role.
     fireEvent.click(screen.getByText('Тема'));
     const system = screen.getByRole('button', { name: 'Системная' });
-    const dark = screen.getByRole('button', { name: 'Тёмная' });
+    // «Тёмная» → «Чернильная»: id темы прежний, изменилось только слово.
+    const dark = screen.getByRole('button', { name: 'Чернильная' });
     expect(system.getAttribute('aria-pressed')).toBe('true');
     expect(dark.getAttribute('aria-pressed')).toBe('false');
   });
@@ -358,5 +359,27 @@ describe('SettingsSection — поля сейфа попадают под очи
     for (const field of all) {
       expect(scrubbed, `поле ${field.id || field.className} вне очистки`).toContain(field);
     }
+  });
+});
+
+describe('SettingsSection — футер вне скролла', () => {
+  it('футер НЕ лежит внутри .settings-scroll', () => {
+    // Каскадный тест проверяет правила CSS; это проверяет разметку. Одно без
+    // другого проходит при верной сетке и футере, оставленном в колонке.
+    const { container } = renderSection();
+    const scroll = container.querySelector('.settings-scroll');
+    const foot = container.querySelector('.settings-footnote');
+    expect(scroll, 'скроллер не найден').not.toBeNull();
+    expect(foot, 'футер не найден').not.toBeNull();
+    expect(scroll.contains(foot), 'футер уехал обратно в прокручиваемую колонку').toBe(false);
+    expect(foot.parentElement).toBe(container.querySelector('.settings-section'));
+  });
+
+  it('футер идёт ПОСЛЕ скроллера — вторая строка сетки, а не первая', () => {
+    const { container } = renderSection();
+    const section = container.querySelector('.settings-section');
+    const kids = [...section.children];
+    expect(kids.indexOf(container.querySelector('.settings-footnote')))
+      .toBeGreaterThan(kids.indexOf(container.querySelector('.settings-scroll')));
   });
 });

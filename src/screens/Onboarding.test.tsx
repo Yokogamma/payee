@@ -63,7 +63,7 @@ describe('Onboarding — seed copy honesty', () => {
     fireEvent.click(screen.getByText('Копировать'));
 
     expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
-    expect(screen.queryByText('✓ Скопировано')).toBeNull();
+    expect(screen.queryByText('Скопировано')).toBeNull();
   });
 
   it('resolved clipboard write → «Скопировано» (warning already shown pre-copy)', async () => {
@@ -73,7 +73,7 @@ describe('Onboarding — seed copy honesty', () => {
 
     fireEvent.click(screen.getByText('Копировать'));
 
-    expect(await screen.findByText('✓ Скопировано')).toBeTruthy();
+    expect(await screen.findByText('Скопировано')).toBeTruthy();
     expect(writeText).toHaveBeenCalledWith(MNEMONIC);
     expect(screen.getByText(/мастер-ключ/)).toBeTruthy();
   });
@@ -90,7 +90,7 @@ async function reachPinStep() {
   stubClipboard(vi.fn(async () => {}));
   await revealSeed();
   fireEvent.click(screen.getByLabelText('Я записал(а) seed-фразу в надёжное место'));
-  fireEvent.click(screen.getByText('Продолжить →'));
+  fireEvent.click(screen.getByText('Продолжить'));
 
   const words = MNEMONIC.split(' ');
   await screen.findByText('Проверка записи');
@@ -99,7 +99,7 @@ async function reachPinStep() {
     const input = label.parentElement!.querySelector('input')!;
     fireEvent.change(input, { target: { value: words[index] } });
   }
-  fireEvent.click(screen.getByText('Проверить →'));
+  fireEvent.click(screen.getByText('Проверить'));
   await screen.findByText('Быстрый вход по PIN');
 }
 
@@ -112,7 +112,7 @@ describe('Onboarding — the PIN travels with the vault creation', () => {
   it('passes the PIN to confirmMnemonic and never writes it separately', async () => {
     await reachPinStep();
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и начать →'));
+    fireEvent.click(screen.getByText('Установить PIN и начать'));
 
     await waitFor(() => expect(confirmFn()).toHaveBeenCalledWith(MNEMONIC, { pin: '123456' }));
     expect(h.store.setupPin).not.toHaveBeenCalled();
@@ -133,7 +133,7 @@ describe('Onboarding — the PIN travels with the vault creation', () => {
     });
     await reachPinStep();
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и начать →'));
+    fireEvent.click(screen.getByText('Установить PIN и начать'));
 
     expect(await screen.findByText(/данные другого хранилища/)).toBeTruthy();
     expect(h.store.removePin).not.toHaveBeenCalled();
@@ -163,7 +163,7 @@ describe('Onboarding — the PIN travels with the vault creation', () => {
     h.store.confirmMnemonic = vi.fn(() => new Promise<void>(res => { release = res; }));
     await reachPinStep();
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и начать →'));
+    fireEvent.click(screen.getByText('Установить PIN и начать'));
 
     // The KDF already has the value on screen — an editable field would suggest
     // a PIN the vault was never given.
@@ -180,7 +180,7 @@ describe('Onboarding — the PIN travels with the vault creation', () => {
     await reachPinStep();
     setPin('123456');
 
-    const btn = screen.getByText('Установить PIN и начать →');
+    const btn = screen.getByText('Установить PIN и начать');
     fireEvent.click(btn);
     fireEvent.click(btn); // same React batch — `finishing` has not flushed yet
 

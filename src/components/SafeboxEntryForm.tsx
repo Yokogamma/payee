@@ -17,6 +17,7 @@ import {
 } from '../lib/crypto';
 import type { SafeboxEntryPatch, SafeboxFileAction } from '../lib/safebox';
 import type { SafeboxNewEntry } from '../lib/store';
+import { IconClose, IconEye, IconEyeOff, IconShuffle } from './icons';
 
 /**
  * Create / edit form for one safebox entry.
@@ -277,7 +278,7 @@ export function SafeboxEntryForm({ open, current, busy, onClose, onCreate, onSav
       >
         <div className="modal-header">
           <h2>{editing ? 'Изменить запись' : 'Новая запись'}</h2>
-          <button className="icon-btn" onClick={requestClose} title="Закрыть" aria-label="Закрыть">✕</button>
+          <button className="icon-btn" onClick={requestClose} title="Закрыть" aria-label="Закрыть"><IconClose /></button>
         </div>
 
         <label className="settings-hint" htmlFor="sbx-f-title">Название</label>
@@ -312,7 +313,7 @@ export function SafeboxEntryForm({ open, current, busy, onClose, onCreate, onSav
             aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
             title={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
           >
-            {showPassword ? '🙈' : '👁'}
+            {showPassword ? <IconEyeOff /> : <IconEye />}
           </button>
           <button
             type="button" className="icon-btn"
@@ -321,7 +322,7 @@ export function SafeboxEntryForm({ open, current, busy, onClose, onCreate, onSav
             aria-label="Генератор паролей"
             title="Генератор паролей"
           >
-            🎲
+            <IconShuffle />
           </button>
         </div>
         {editing && !passwordTouched && (
@@ -368,7 +369,7 @@ export function SafeboxEntryForm({ open, current, busy, onClose, onCreate, onSav
                 aria-label={`Удалить вложение ${f.name}`}
                 title="Удалить"
               >
-                ✕
+                <IconClose />
               </button>
             </div>
           ))}

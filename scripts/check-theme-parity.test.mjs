@@ -20,6 +20,10 @@ import { readFileSync } from 'node:fs';
 
 const CSS_PATH = 'src/index.css';
 
+/** Layout and typography: declared once on :root, inherited by every theme.
+ *  Not part of any palette, so they are excluded from every comparison here. */
+const SHARED = ['--radius', '--radius-sm', '--pad-screen', '--font', '--mono'];
+
 function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, c => '\n'.repeat((c.match(/\n/g) ?? []).length));
 }
@@ -90,10 +94,38 @@ describe('theme palette parity', () => {
   });
 
   it('does not require the layout/typography tokens to be repeated', () => {
-    // --radius / --font / --mono live only on :root by design and cascade to
-    // every theme. Pinning that keeps a future palette from copying them.
-    for (const shared of ['--radius', '--font', '--mono']) {
+    // These live only on :root by design and cascade to every theme. Pinning
+    // that keeps a future palette from copying them.
+    for (const shared of SHARED) {
       expect(light.has(shared), `${shared} should NOT be redeclared in the light palette`).toBe(false);
+    }
+  });
+
+  // The dark palette shares its block with `:root`, so `themeBlocks()` cannot
+  // see it and it sat outside this guard entirely — the one palette that is
+  // ALSO the fallback for every key another theme forgets. A key present in
+  // light and missing here does not degrade: it renders whatever :root last
+  // said, which after the «Архив» rewrite is an ink-on-paper value on a
+  // near-black ground.
+  const dark = tokens(blockBody(css, /:root,\s*\[data-theme="dark"\]\s*\{/) ?? '');
+
+  it('found the dark palette (it shares its block with :root)', () => {
+    expect(dark.size).toBeGreaterThan(10);
+  });
+
+  it('the dark palette declares the same key set as light, plus the shared tokens', () => {
+    const palette = new Set([...dark.keys()].filter(k => !SHARED.includes(k)));
+    const missing = [...light.keys()].filter(k => !palette.has(k));
+    const extra = [...palette].filter(k => !light.has(k));
+    expect(missing, `dark is missing: ${missing.join(', ')}`).toEqual([]);
+    // An extra key here is worse than a missing one: it works in dark and
+    // silently resolves to the dark VALUE in light, warm and system.
+    expect(extra, `dark declares keys no other palette has: ${extra.join(', ')}`).toEqual([]);
+  });
+
+  it('the shared layout/typography tokens are declared exactly once, on :root', () => {
+    for (const shared of SHARED) {
+      expect(dark.has(shared), `${shared} must be declared on :root`).toBe(true);
     }
   });
 });

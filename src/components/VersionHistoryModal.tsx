@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { formatNoteDate } from '../lib/format-date';
 import { useModalA11y } from '../lib/useModalA11y';
 import { NoteMarkdown } from './NoteMarkdown';
 import { badgeFor } from './syncBadge';
@@ -6,6 +7,7 @@ import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
+import { IconClose, IconRestore } from './icons';
 
 /**
  * Version history of one chain (current-first). Versions are numbered by
@@ -26,7 +28,6 @@ interface VersionHistoryModalProps {
   onRequestRestore: (version: NoteData) => void;
   /** Version row to focus on (re)open — the cancel path of the confirm. */
   focusVersionId?: string | null;
-  formatDate: (ts: number) => string;
 }
 
 export function VersionHistoryModal({
@@ -37,7 +38,6 @@ export function VersionHistoryModal({
   onClose,
   onRequestRestore,
   focusVersionId,
-  formatDate,
 }: VersionHistoryModalProps) {
   const containerRef = useModalA11y<HTMLDivElement>(open, onClose);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -77,7 +77,7 @@ export function VersionHistoryModal({
       >
         <div className="modal-header">
           <h2>История версий</h2>
-          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть">✕</button>
+          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть"><IconClose /></button>
         </div>
 
         <div className="history-list">
@@ -102,13 +102,13 @@ export function VersionHistoryModal({
                     {isCurrent && <span className="history-current-mark"> · текущая</span>}
                   </span>
                   <span className="history-row-meta">
-                    <span className="note-time">{formatDate(version.createdAt)}</span>
+                    <span className="note-time">{formatNoteDate(version.createdAt)}</span>
                     <span
-                      className={`sync-badge ${badge.className}`}
+                      className={`state sync-state ${badge.className}`}
                       title={badge.label}
                       aria-label={badge.label}
                     >
-                      {badge.icon}
+                      {badge.word}
                     </span>
                   </span>
                 </button>
@@ -126,7 +126,7 @@ export function VersionHistoryModal({
                       >
                         {/* «Вернуть», не «Восстановить» — восстановление в
                             продукте уже значит restore-по-seed из блокчейна. */}
-                        ↩️ Вернуть эту версию
+                        <IconRestore /> Вернуть эту версию
                       </button>
                     )}
                   </div>

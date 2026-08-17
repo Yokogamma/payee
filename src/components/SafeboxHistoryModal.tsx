@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
+import { formatNoteDate } from '../lib/format-date';
 import { useModalA11y } from '../lib/useModalA11y';
 import { badgeFor } from './syncBadge';
 import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { SafeboxChain } from '../lib/chains';
 import type { SafeboxEntryData } from '../lib/crypto';
+import { IconClose, IconEye, IconRestore } from './icons';
 
 /**
  * Version history of one safebox entry (current-first), mirroring
@@ -28,12 +30,11 @@ interface SafeboxHistoryModalProps {
   onRequestRestore: (version: SafeboxEntryData) => void;
   onRevealVersion: (versionId: string) => Promise<string>;
   focusVersionId?: string | null;
-  formatDate: (ts: number) => string;
 }
 
 export function SafeboxHistoryModal({
   open, chain, syncStatuses, syncActive, canRestore,
-  onClose, onRequestRestore, onRevealVersion, focusVersionId, formatDate,
+  onClose, onRequestRestore, onRevealVersion, focusVersionId,
 }: SafeboxHistoryModalProps) {
   const containerRef = useModalA11y<HTMLDivElement>(open, onClose);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -96,7 +97,7 @@ export function SafeboxHistoryModal({
       >
         <div className="modal-header">
           <h2>История версий</h2>
-          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть">✕</button>
+          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть"><IconClose /></button>
         </div>
 
         <div className="history-list">
@@ -121,9 +122,9 @@ export function SafeboxHistoryModal({
                     {isCurrent && <span className="history-current-mark"> · текущая</span>}
                   </span>
                   <span className="history-row-meta">
-                    <span className="note-time">{formatDate(version.createdAt)}</span>
-                    <span className={`sync-badge ${badge.className}`} title={badge.label} aria-label={badge.label}>
-                      {badge.icon}
+                    <span className="note-time">{formatNoteDate(version.createdAt)}</span>
+                    <span className={`state sync-state ${badge.className}`} title={badge.label} aria-label={badge.label}>
+                      {badge.word}
                     </span>
                   </span>
                 </button>
@@ -142,7 +143,7 @@ export function SafeboxHistoryModal({
                       className="btn btn-ghost"
                       onClick={() => void reveal(version.id)}
                     >
-                      👁 Показать пароль этой версии
+                      <IconEye /> Показать пароль этой версии
                     </button>
                     {revealed?.id === version.id && (
                       <div className="safebox-revealed" role="status">
@@ -155,7 +156,7 @@ export function SafeboxHistoryModal({
                         className="btn btn-ghost history-restore-btn"
                         onClick={() => onRequestRestore(version)}
                       >
-                        ↩️ Вернуть эту версию
+                        <IconRestore /> Вернуть эту версию
                       </button>
                     )}
                   </div>

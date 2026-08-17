@@ -1,0 +1,281 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { useState } from 'react';
+import { CardMenu, type CardMenuCloseReason } from './CardMenu';
+
+/**
+ * The contract, not the appearance.
+ *
+ * Focus policy is the half most likely to be «simplified» later into «always
+ * return focus to the trigger», which looks tidy and is wrong in two of the
+ * four cases — each of those two has a test here saying why.
+ */
+
+afterEach(cleanup);
+
+/** Controlled wrapper, the way both real callers use it. */
+function Harness({ onClose }: { onClose?: (reason?: CardMenuCloseReason) => void } = {}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <button type="button">снаружи</button>
+      <CardMenu
+        open={open}
+        onOpenChange={(next, reason) => {
+          setOpen(next);
+          if (!next) onClose?.(reason);
+        }}
+        label="Меню записи"
+        id="menu-1"
+        items={[
+          { key: 'a', label: 'Действие', onSelect: vi.fn() },
+          { key: 'b', label: 'Ссылка', href: 'https://example.invalid/tx' },
+        ]}
+        hint="пояснение"
+      />
+    </div>
+  );
+}
+
+const trigger = () => screen.getByRole('button', { name: 'Меню записи' });
+const open = () => fireEvent.click(trigger());
+
+describe('CardMenu — раскрытие', () => {
+  it('закрыт по умолчанию и объявляет это', () => {
+    render(<Harness />);
+    expect(trigger().getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('открытие связывает триггер с попапом через aria-controls', () => {
+    render(<Harness />);
+    open();
+    expect(trigger().getAttribute('aria-expanded')).toBe('true');
+    expect(trigger().getAttribute('aria-controls')).toBe('menu-1');
+    expect(document.getElementById('menu-1')).not.toBeNull();
+  });
+
+  it('повторное нажатие на триггер закрывает', () => {
+    render(<Harness />);
+    open();
+    fireEvent.click(trigger());
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('ссылка остаётся ссылкой — среднее нажатие и «открыть в новой вкладке» живы', () => {
+    render(<Harness />);
+    open();
+    const link = screen.getByRole('menuitem', { name: 'Ссылка' }) as HTMLAnchorElement;
+    expect(link.tagName).toBe('A');
+    expect(link.href).toContain('example.invalid');
+    expect(link.rel).toContain('noopener');
+  });
+});
+
+describe('CardMenu — фокус возвращается ПО ПРИЧИНЕ', () => {
+  it('Escape: закрывает и возвращает фокус на триггер', () => {
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    open();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(onClose).toHaveBeenCalledWith('escape');
+    expect(document.activeElement).toBe(trigger());
+  });
+
+  it('клик снаружи: закрывает и НЕ трогает фокус', () => {
+    // У клика есть своя цель. Перетащить фокус обратно на триггер — значит
+    // отменить осознанное перемещение пользователя.
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    open();
+    const outside = screen.getByRole('button', { name: 'снаружи' });
+    outside.focus();
+    fireEvent.pointerDown(outside);
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(onClose).toHaveBeenCalledWith('outside');
+    expect(document.activeElement).toBe(outside);
+  });
+
+  it('выбор пункта: закрывает и НЕ забирает фокус себе', async () => {
+    // Действие обычно открывает диалог, которому фокус и нужен. Забрать его
+    // первым — значит столкнуть две системы управления фокусом лбами.
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    open();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Действие' }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith('select'));
+    expect(document.activeElement).not.toBe(trigger());
+  });
+
+  it('размонтирование: ничего не фокусирует и не бросает', () => {
+    // Блокировка раздела уносит и триггер. Дотянуться до отсоединённого узла —
+    // ровно то, чем такой замок и падает.
+    const { unmount } = render(<Harness />);
+    open();
+    expect(() => unmount()).not.toThrow();
+    expect(document.activeElement).toBe(document.body);
+  });
+});
+
+describe('CardMenu — Tab и повторный клик по триггеру', () => {
+  it('Tab закрывает, но НЕ возвращает фокус — это отменило бы переход', () => {
+    render(<Harness />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowDown' });
+    const first = screen.getAllByRole('menuitem')[0];
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(document.activeElement, 'фокус остаётся там, откуда Tab его понесёт дальше').not.toBe(trigger());
+  });
+
+  it('повторный клик по триггеру закрывает, фокус и так на нём', () => {
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    open();
+    fireEvent.click(trigger());
+    expect(onClose).toHaveBeenCalledWith('programmatic');
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+});
+
+describe('CardMenu — пункт может отменить закрытие', () => {
+  function VetoHarness({ result }: { result: void | false }) {
+    const [open, setOpen] = useState(true);
+    return (
+      <CardMenu
+        open={open}
+        onOpenChange={next => setOpen(next)}
+        label="Меню"
+        id="menu-veto"
+        items={[{ key: 'copy', label: 'Копировать', onSelect: () => result }]}
+      />
+    );
+  }
+
+  it('обычный пункт закрывает меню', async () => {
+    render(<VetoHarness result={undefined} />);
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Копировать' }));
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('вернувший false — оставляет открытым', async () => {
+    // Запасной путь при отказе буфера обмена — выделить текст руками, а для
+    // этого он должен остаться на экране.
+    render(<VetoHarness result={false} />);
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Копировать' }));
+    // Пауза достаточная, чтобы закрытие успело бы произойти, если бы вето не работало.
+    await new Promise(r => setTimeout(r, 20));
+    expect(screen.queryByRole('menu')).not.toBeNull();
+  });
+});
+
+describe('CardMenu — Escape не всплывает наружу', () => {
+  it('внешний обработчик Escape не срабатывает, пока меню открыто', () => {
+    // Иначе один Escape закроет и меню, и модалку под ним, и поиск.
+    const outer = vi.fn();
+    document.addEventListener('keydown', outer);
+    try {
+      render(<Harness />);
+      open();
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(outer).not.toHaveBeenCalled();
+    } finally {
+      document.removeEventListener('keydown', outer);
+    }
+  });
+});
+
+describe('CardMenu — фокус входит в меню при любом открытии', () => {
+  it('открытие мышью ставит фокус на первый пункт', () => {
+    // Раньше фокус входил только при открытии с клавиатуры, и после клика он
+    // оставался на триггере — а каждая стрелка после этого толковалась
+    // относительно «не пункта». Отсюда и брался промах ArrowUp на единицу.
+    render(<Harness />);
+    open();
+    expect(document.activeElement).toBe(screen.getAllByRole('menuitem')[0]);
+  });
+
+  it('ArrowUp с триггера открывает меню на ПОСЛЕДНЕМ пункте', () => {
+    render(<Harness />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowUp' });
+    const items = screen.getAllByRole('menuitem');
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it('ArrowUp с первого пункта заворачивает на последний', () => {
+    render(<Harness />);
+    open();
+    fireEvent.keyDown(document, { key: 'ArrowUp' });
+    const items = screen.getAllByRole('menuitem');
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+});
+
+describe('CardMenu — меню это ОДНА остановка в порядке обхода', () => {
+  it('пункты не участвуют в обходе по Tab', () => {
+    // APG: до пунктов добираются стрелками, не Tab. Без tabindex=-1 они были
+    // обычными кнопками и ссылками, то есть Tab шёл БЫ по ним — закрытие по
+    // Tab маскировало это, но не отменяло.
+    render(<Harness />);
+    open();
+    for (const item of screen.getAllByRole('menuitem')) {
+      expect(item.getAttribute('tabindex'), item.textContent ?? '').toBe('-1');
+    }
+  });
+
+  it('триггер остаётся обычной остановкой', () => {
+    render(<Harness />);
+    expect(trigger().getAttribute('tabindex')).toBeNull();
+  });
+});
+
+describe('CardMenu — у меню есть имя, у пустого меню нет триггера', () => {
+  it('попап именуется кнопкой, которая им управляет', () => {
+    // role="menu" без имени объявляется как голое «меню» — единственное
+    // слово, которое ничего не говорит о том, в какой карточке слушатель
+    // находится, на экране с десятком одинаковых триггеров.
+    render(<Harness />);
+    open();
+    const popup = screen.getByRole('menu');
+    const labelledBy = popup.getAttribute('aria-labelledby');
+    expect(labelledBy).toBeTruthy();
+    const namer = document.getElementById(labelledBy!);
+    expect(namer).toBe(trigger());
+    expect(namer!.getAttribute('aria-label')).toBe('Меню записи');
+  });
+
+  it('без пунктов триггер не рисуется вовсе', () => {
+    // Откат по SAFEBOX_WRITER_ENABLED=false: запись без логина, без вложений
+    // и в одной версии не даёт НИ ОДНОГО пункта. Кнопка, открывающая пустую
+    // коробку, хуже отсутствующей кнопки.
+    render(
+      <CardMenu
+        open={false}
+        onOpenChange={() => {}}
+        label="Меню записи"
+        id="menu-empty"
+        items={[]}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Меню записи' })).toBeNull();
+  });
+
+  it('появление первого пункта возвращает триггер', () => {
+    const { rerender } = render(
+      <CardMenu open={false} onOpenChange={() => {}} label="Меню записи" id="menu-empty" items={[]} />,
+    );
+    expect(screen.queryByRole('button', { name: 'Меню записи' })).toBeNull();
+    rerender(
+      <CardMenu
+        open={false}
+        onOpenChange={() => {}}
+        label="Меню записи"
+        id="menu-empty"
+        items={[{ key: 'a', label: 'Действие', onSelect: vi.fn() }]}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Меню записи' })).toBeTruthy();
+  });
+});

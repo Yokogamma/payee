@@ -2,6 +2,7 @@ import { useRef, useState, type RefObject } from 'react';
 import { applyFormat, type MarkdownFormat } from '../lib/markdown-insert';
 import { noteJsonByteLength, MAX_NOTE_JSON_BYTES } from '../lib/limits';
 import { NoteMarkdown } from './NoteMarkdown';
+import { IconLink } from './icons';
 
 /**
  * Controlled, presentational composer shared by the Main screen and the edit
@@ -15,14 +16,16 @@ import { NoteMarkdown } from './NoteMarkdown';
  * able to explain it.
  */
 
-const TOOLBAR: Array<{ format: MarkdownFormat; label: string; title: string }> = [
+const TOOLBAR: Array<{ format: MarkdownFormat; label: React.ReactNode; title: string }> = [
   { format: 'bold',    label: 'Ж',  title: 'Жирный' },
   { format: 'italic',  label: 'К',  title: 'Курсив' },
   { format: 'heading', label: 'H',  title: 'Заголовок' },
   { format: 'ul',      label: '•',  title: 'Список' },
   { format: 'ol',      label: '1.', title: 'Нумерованный список' },
   { format: 'code',    label: '<>', title: 'Код' },
-  { format: 'link',    label: '🔗', title: 'Ссылка' },
+  // The only emoji left in the toolbar; it drew in colour at a size the
+  // platform font chose, beside six monochrome labels.
+  { format: 'link',    label: <IconLink />, title: 'Ссылка' },
 ];
 
 /** Counter appears when the note is within this many bytes of the cap. */
@@ -97,20 +100,26 @@ export function NoteComposer({
     <div className="note-composer" onKeyDown={handleKeyDown}>
       {markdown && (
         <div className="composer-toolbar" role="toolbar" aria-label="Форматирование">
-          {TOOLBAR.map(({ format, label, title }) => (
-            <button
-              key={format}
-              type="button"
-              className="composer-tool"
-              onClick={() => handleFormat(format)}
-              disabled={preview || busy}
-              title={title}
-              aria-label={title}
-            >
-              {label}
-            </button>
-          ))}
-          <div className="composer-toolbar-spacer" />
+          {/* The format buttons scroll horizontally; «Превью» stays pinned
+              outside the scroller. Seven 38px targets plus the toggle want
+              ~398px and a 360px phone has 320 — wrapping to a second row would
+              cost the sheet a line of writing space on the narrowest screen
+              that has the least of it. */}
+          <div className="composer-toolbar-scroll">
+            {TOOLBAR.map(({ format, label, title }) => (
+              <button
+                key={format}
+                type="button"
+                className="composer-tool"
+                onClick={() => handleFormat(format)}
+                disabled={preview || busy}
+                title={title}
+                aria-label={title}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <button
             type="button"
             className={`composer-tool composer-tool--toggle ${preview ? 'composer-tool--active' : ''}`}
@@ -149,6 +158,15 @@ export function NoteComposer({
             </span>
           ) : hint}
         </span>
+        {/* NO ∞ HERE, and the reasoning is worth keeping.
+            It sat on this button for one commit, on the grounds that «every
+            save through this composer is permanent». It is not. `addNote`
+            queues an upload only when sync is enabled, and even then the note
+            becomes permanent at `confirmed`, not at save. So the mark promised
+            an outcome the press cannot deliver — and it promised it hardest in
+            the state where the user has no other signal, because the composer
+            unmounts the status line that would have said «всё на устройстве».
+            The mark belongs to `confirmed` and nowhere else; see syncBadge. */}
         <button
           className="btn btn-save"
           onClick={onSubmit}

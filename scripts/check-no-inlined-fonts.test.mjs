@@ -57,6 +57,11 @@ describe('logicalFontName', () => {
   it('tolerates an unhashed name', () => {
     expect(logicalFontName('outfit-latin-400-normal.woff2')).toBe('outfit-latin-400-normal');
   });
+
+  it('handles the variable-font stem, which names an axis where a static one names a weight', () => {
+    expect(logicalFontName('literata-cyrillic-ext-wght-italic-DrMGjC4f.woff2'))
+      .toBe('literata-cyrillic-ext-wght-italic');
+  });
 });
 
 describe('diffFontSet', () => {
@@ -68,35 +73,44 @@ describe('diffFontSet', () => {
     expect(diffFontSet(['a'], ['a', 'b']).missing).toEqual(['b']);
   });
 
-  it('reports a stray font — this is the "someone imported 400.css again" case', () => {
-    // A per-weight entrypoint would drag greek and vietnamese back in.
-    const expected = ['manrope-latin-400-normal', 'manrope-cyrillic-400-normal'];
-    const actual = [...expected, 'manrope-greek-400-normal', 'manrope-vietnamese-400-normal'];
+  it('reports a stray font — this is the "someone imported wght.css again" case', () => {
+    // The variable package publishes no per-subset CSS, so its entrypoint drags
+    // greek and vietnamese back in. That is why src/fonts.css hand-writes them.
+    const expected = ['literata-latin-wght-normal', 'literata-cyrillic-wght-normal'];
+    const actual = [...expected, 'literata-greek-wght-normal', 'literata-vietnamese-wght-normal'];
     expect(diffFontSet(actual, expected).unexpected)
-      .toEqual(['manrope-greek-400-normal', 'manrope-vietnamese-400-normal']);
+      .toEqual(['literata-greek-wght-normal', 'literata-vietnamese-wght-normal']);
   });
 });
 
 describe('EXPECTED_FONTS', () => {
-  it('matches what the current imports produce: 18 mono + 16 Manrope', () => {
-    expect(EXPECTED_FONTS).toHaveLength(34);
-    expect(EXPECTED_FONTS.filter(f => f.startsWith('jetbrains-mono-'))).toHaveLength(18);
-    expect(EXPECTED_FONTS.filter(f => f.startsWith('manrope-'))).toHaveLength(16);
+  it('matches what src/fonts.css declares: 8 Literata + 4 PT Mono', () => {
+    expect(EXPECTED_FONTS).toHaveLength(12);
+    expect(EXPECTED_FONTS.filter(f => f.startsWith('literata-'))).toHaveLength(8);
+    expect(EXPECTED_FONTS.filter(f => f.startsWith('pt-mono-'))).toHaveLength(4);
   });
 
-  it('the UI face now HAS Cyrillic — the whole point of the swap', () => {
-    expect(EXPECTED_FONTS.filter(f => f.startsWith('manrope-') && f.includes('cyrillic')))
-      .toHaveLength(8); // cyrillic + cyrillic-ext × four weights
+  it('both faces carry Cyrillic — this is a Russian app', () => {
+    expect(EXPECTED_FONTS.filter(f => f.startsWith('literata-') && f.includes('cyrillic')))
+      .toHaveLength(4); // cyrillic + cyrillic-ext × normal/italic
+    expect(EXPECTED_FONTS.filter(f => f.startsWith('pt-mono-') && f.includes('cyrillic')))
+      .toHaveLength(2);
   });
 
-  it('greek and vietnamese stay out of the UI face', () => {
-    // Their presence would mean someone went back to the per-weight entrypoint.
-    expect(EXPECTED_FONTS.some(f => f.startsWith('manrope-greek'))).toBe(false);
-    expect(EXPECTED_FONTS.some(f => f.startsWith('manrope-vietnamese'))).toBe(false);
+  it('greek and vietnamese stay out of both families', () => {
+    // Their presence would mean someone replaced fonts.css with a package import.
+    expect(EXPECTED_FONTS.some(f => f.includes('-greek'))).toBe(false);
+    expect(EXPECTED_FONTS.some(f => f.includes('-vietnamese'))).toBe(false);
   });
 
-  it('weight 300 is not shipped — it was imported and used nowhere', () => {
-    expect(EXPECTED_FONTS.some(f => f.startsWith('manrope-') && f.includes('-300-'))).toBe(false);
+  it('italics are real files, not a synthetic slant', () => {
+    // The redesign uses italic for meaning — placeholders, settings values —
+    // and an obliqued serif reads as a rendering fault at 13px.
+    expect(EXPECTED_FONTS.filter(f => f.endsWith('-italic'))).toHaveLength(4);
+  });
+
+  it('the opsz axis is not shipped — 557 KB against 263 KB, deliberate', () => {
+    expect(EXPECTED_FONTS.some(f => f.includes('-opsz-') || f.includes('-standard-'))).toBe(false);
   });
 
   it('has no duplicates', () => {

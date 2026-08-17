@@ -143,10 +143,10 @@ describe('Main — note card menu', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     // A CONFIRMED note keeps its honest badge even with sync switched off —
     // it really is on-chain (unlike a merely local one, which says so).
-    expect(document.querySelector('.sync-badge')?.getAttribute('aria-label'))
-      .toBe('Сохранена в блокчейне');
+    expect(document.querySelector('.sync-state')?.getAttribute('aria-label'))
+      .toBe('Сохранена в блокчейне навсегда');
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    const link = screen.getByText('🔗 Транзакция в блокчейне') as HTMLAnchorElement;
+    const link = screen.getByText('Транзакция в блокчейне') as HTMLAnchorElement;
     expect(link.getAttribute('href')).toContain('TX123'); // link is NOT gated
   });
 
@@ -154,21 +154,21 @@ describe('Main — note card menu', () => {
     stubClipboard(vi.fn(async () => {}));
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('📋 Копировать текст'));
+    fireEvent.click(screen.getByText('Копировать текст'));
 
-    expect(await screen.findByText('✓ Скопировано')).toBeTruthy();
-    expect(screen.queryByText('📋 Копировать текст')).toBeNull(); // menu closed
+    expect(await screen.findByText('Скопировано')).toBeTruthy();
+    expect(screen.queryByText('Копировать текст')).toBeNull(); // menu closed
   });
 
   it('clipboard REJECTION: error toast shown, menu stays open (no false success)', async () => {
     stubClipboard(vi.fn(async () => { throw new Error('NotAllowedError'); }));
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('📋 Копировать текст'));
+    fireEvent.click(screen.getByText('Копировать текст'));
 
     expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
-    expect(screen.queryByText('✓ Скопировано')).toBeNull();
-    expect(screen.getByText('📋 Копировать текст')).toBeTruthy(); // still open
+    expect(screen.queryByText('Скопировано')).toBeNull();
+    expect(screen.getByText('Копировать текст')).toBeTruthy(); // still open
   });
 });
 
@@ -243,16 +243,16 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.enabled = false;
     s.syncStatuses = { n1: { status: 'queued' as const } };
     render(<Main theme="system" onThemeChange={vi.fn()} />);
-    const badge = document.querySelector('.sync-badge');
+    const badge = document.querySelector('.sync-state');
     expect(badge?.getAttribute('aria-label')).toMatch(/Только на этом устройстве/);
   });
 
   it('per-note sync badge is a live role=status region', () => {
     (h.store as ReturnType<typeof baseStore>).arweave.enabled = true;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
-    const badge = document.querySelector('.sync-badge');
+    const badge = document.querySelector('.sync-state');
     expect(badge?.getAttribute('role')).toBe('status');
-    expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне');
+    expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне навсегда');
   });
 });
 
@@ -471,6 +471,10 @@ describe('Main — пункт сейфа в навигации', () => {
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'не потеряй меня' } });
 
+    // Композер занимает экран целиком, поэтому выход из него — «Свернуть», а
+    // не таб-бар: таб-бара в этот момент нет. Инвариант теста остался прежним
+    // (черновик не теряется при уходе из раздела), маршрут стал на шаг длиннее.
+    fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
     fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
     expect(container.querySelector('.note-input')).toBeNull();
 
@@ -478,6 +482,165 @@ describe('Main — пункт сейфа в навигации', () => {
     // Auto-expanded because a draft exists, and the text is intact.
     expect((document.querySelector('.note-input') as HTMLTextAreaElement).value)
       .toBe('не потеряй меня');
+  });
+
+  describe('композер занимает экран целиком', () => {
+    // Скрыть визуально было бы недостаточно: скрытые узлы остаются в порядке
+    // обхода и в дереве доступности, и клавиатурный пользователь ушёл бы из
+    // композера в ленту, которой не видно.
+    it('статусная строка, поиск, лента, FAB и навигация РАЗМОНТИРОВАНЫ', () => {
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      expect(container.querySelector('.status-line')).not.toBeNull();
+      expect(container.querySelector('.app-nav')).not.toBeNull();
+
+      openComposer();
+
+      expect(container.querySelector('.status-line'), 'статусная строка').toBeNull();
+      expect(container.querySelector('.search-bar'), 'поиск').toBeNull();
+      expect(container.querySelector('.notes-feed'), 'лента').toBeNull();
+      expect(container.querySelector('.fab'), 'FAB').toBeNull();
+      expect(container.querySelector('.app-nav'), 'навигация').toBeNull();
+      // Ни одного скрытого узла вместо размонтированных.
+      expect(container.querySelectorAll('[hidden]')).toHaveLength(0);
+    });
+
+    it('это состояние сетки, а не слой поверх privacy-гейта', () => {
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const screenEl = container.querySelector('.main-screen');
+      expect(screenEl?.className).toContain('main-screen--composing');
+      // Никакого position/z-index: гейт держит z-index 100 и обязан остаться
+      // выше всего, что рисует приложение.
+      expect(container.querySelector('.note-composer')).not.toBeNull();
+    });
+
+    it('композер не обещает вечность при выключенной синхронизации', () => {
+      // Полноэкранный режим размонтирует статусную строку, поэтому этот абзац —
+      // ЕДИНСТВЕННОЕ, что может сказать, где окажется запись. Кнопка «Сохранить
+      // навечно» и безусловный ∞ обещали здесь то, чего нажатие не делает:
+      // addNote ставит загрузку в очередь только при включённой синхронизации,
+      // а вечной запись становится на confirmed, не при сохранении.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = false;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/Синхронизация выключена/);
+      expect(intro).toMatch(/только на этом устройстве/);
+      expect(intro).not.toMatch(/навечно|вечной/);
+      // На кнопке нет ни знака, ни слова «навечно».
+      const save = screen.getByRole('button', { name: 'Сохранить' });
+      expect(save.querySelector('svg')).toBeNull();
+    });
+
+    it('при включённой синхронизации вечность привязана к подтверждению сети', () => {
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = true;
+      s.arweave.registered = true;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/после подтверждения сети/);
+      // Даже здесь знака нет: он принадлежит confirmed, а не нажатию.
+      expect(screen.getByRole('button', { name: 'Сохранить' }).querySelector('svg')).toBeNull();
+    });
+
+    it('пауза загрузки — обещания блокчейна нет', () => {
+      // Состояние, которое прячется: синхронизация включена, ключ
+      // зарегистрирован, а очередь остановлена до ручного возобновления.
+      // Проверка только enabled/registered обещала блокчейн ровно там, где
+      // ничего не отправляется.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = true;
+      s.arweave.registered = true;
+      s.v3Paused = true;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/приостановлена/);
+      expect(intro).not.toMatch(/отправится в блокчейн/);
+    });
+
+    it('фокус не уходит на FAB сейфа, если раздел сменился во время сохранения', async () => {
+      // .fab есть и в сейфе. Глобальный querySelector после асинхронного
+      // сохранения украл бы фокус у заголовка сейфа, который его только что
+      // получил. Ref размонтированной кнопки — null, и ничего не двигается.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.safeboxDataPresent = true;
+      let resolveSave: () => void = () => {};
+      s.addNote = vi.fn(() => new Promise<void>(r => { resolveSave = r; }));
+
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      fireEvent.change(document.querySelector('.note-input')!, { target: { value: 'текст' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+
+      // Сохранение ещё в полёте — уходим в сейф.
+      fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
+      fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
+      const safeboxFab = document.querySelector('.fab');
+
+      await act(async () => { resolveSave(); });
+      await new Promise(r => requestAnimationFrame(r));
+
+      expect(document.activeElement).not.toBe(safeboxFab);
+    });
+
+    it('устройство не подключено — причина названа своя, не «выключена»', () => {
+      // Три способа остаться локальным, и они не взаимозаменяемы. Свести этот
+      // случай к «синхронизация выключена» — верно про исход и неверно про
+      // причину: синхронизация как раз включена, не хватает invite-кода. Это
+      // то, что пользователь может пойти и исправить, в отличие от
+      // выключателя, который он сам выключил.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = true;
+      s.arweave.registered = false;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/не подключено к хранилищу/);
+      expect(intro).toMatch(/invite-кода/);
+      expect(intro, 'синхронизация включена — так говорить нельзя')
+        .not.toMatch(/Синхронизация выключена/);
+      expect(intro).not.toMatch(/навечно|вечной/);
+    });
+
+    it('«Свернуть» возвращает фокус на FAB, а не на body', async () => {
+      // Нажатая кнопка размонтируется вместе с полноэкранным режимом. Без
+      // явного переноса фокус падает на body, и клавиатурный пользователь
+      // теряет позицию в интерфейсе, который целиком сменился.
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
+      await waitFor(() => {
+        expect(document.activeElement).toBe(document.querySelector('.fab'));
+      });
+    });
+
+    it('после сохранения фокус тоже уходит на FAB', async () => {
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+      fireEvent.change(input, { target: { value: 'текст' } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+      });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(document.querySelector('.fab'));
+      });
+    });
+
+    it('«Свернуть» возвращает оболочку целиком', () => {
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
+      expect(container.querySelector('.status-line')).not.toBeNull();
+      expect(container.querySelector('.app-nav')).not.toBeNull();
+      expect(container.querySelector('.notes-feed')).not.toBeNull();
+      expect(container.querySelector('.note-input')).toBeNull();
+    });
   });
 
   it('«Закрыть сейф» живёт ВНУТРИ раздела — в шапке дубля больше нет', () => {

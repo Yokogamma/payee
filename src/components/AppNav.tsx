@@ -1,5 +1,6 @@
 import type { ReactElement } from 'react';
 import { useRoute, navigate, type Section } from '../lib/route';
+import { InfinityMark } from './icons';
 
 /**
  * The three top-level destinations.
@@ -32,17 +33,17 @@ interface Props {
 
 const ICONS: Record<Section, ReactElement> = {
   notes: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
       <path d="M5 4h14v16H5z" /><path d="M9 9h6M9 13h6M9 17h3" />
     </svg>
   ),
   safebox: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
       <rect x="4" y="4" width="16" height="16" rx="2" /><circle cx="12" cy="12" r="3" /><path d="M12 15v3" />
     </svg>
   ),
   settings: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
       <circle cx="12" cy="12" r="3" />
       <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4" />
     </svg>
@@ -64,7 +65,7 @@ export function AppNav({ safeboxDimmed }: Props) {
           rail has room for it; on a phone the section title carries the
           context and a second title would just eat a row. */}
       <div className="app-nav-brand" aria-hidden="true">
-        <span className="app-nav-mark">∞</span>
+        <InfinityMark className="app-nav-mark" />
         <span>Eternal Notes</span>
       </div>
       {(Object.keys(LABELS) as Section[]).map(id => {

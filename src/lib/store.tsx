@@ -140,6 +140,7 @@ import {
 import { userFacingUploadError, userFacingRegistrationError } from './errors';
 import { copyTextToClipboard } from './clipboard';
 import { SAFEBOX_SCRUB_SELECTOR } from '../components/secretFieldProps';
+import { IconLock } from '../components/icons';
 
 // Re-exported for callers that only need the storage key (reset paths, tests).
 export { DRAFT_STORAGE_KEY };
@@ -3807,7 +3808,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         aria-label="Проверка авто-блокировки"
         hidden
       >
-        <span className="lock-gate-icon" aria-hidden="true">🔒</span>
+        <span className="lock-gate-icon" aria-hidden="true"><IconLock /></span>
         {/* Both revealed IMPERATIVELY (see armGateReveal), on the same grounds
             as the gate itself. `hidden` also keeps the button out of the tab
             order until it is genuinely needed. */}

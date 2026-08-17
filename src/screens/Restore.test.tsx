@@ -49,7 +49,7 @@ describe('Restore — the PIN offer', () => {
   it('the phrase leads to the PIN step when no PIN is configured', async () => {
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
 
     expect(await screen.findByText('Быстрый вход по PIN')).toBeTruthy();
     expect(restoreFn()).not.toHaveBeenCalled(); // nothing started yet
@@ -58,10 +58,10 @@ describe('Restore — the PIN offer', () => {
   it('passes the PIN to the store in ONE call', async () => {
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и восстановить →'));
+    fireEvent.click(screen.getByText('Установить PIN и восстановить'));
 
     await waitFor(() => expect(restoreFn()).toHaveBeenCalledTimes(1));
     expect(restoreFn()).toHaveBeenCalledWith(MNEMONIC, { pin: '123456' });
@@ -70,7 +70,7 @@ describe('Restore — the PIN offer', () => {
   it('«Пропустить» restores without a PIN', async () => {
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     fireEvent.click(screen.getByText('Пропустить — войти без PIN'));
 
@@ -81,7 +81,7 @@ describe('Restore — the PIN offer', () => {
   it('the PIN fields carry the anti-autofill set and neutral name/id', async () => {
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
 
     for (const field of [
@@ -101,19 +101,19 @@ describe('Restore — the PIN offer', () => {
   it('mismatched PIN confirmation cannot be submitted', async () => {
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     fireEvent.change(screen.getByPlaceholderText('PIN (мин. 6 цифр)'), { target: { value: '123456' } });
     fireEvent.change(screen.getByPlaceholderText('Повторите PIN'), { target: { value: '654321' } });
 
-    expect(screen.getByText('Установить PIN и восстановить →')).toHaveProperty('disabled', true);
+    expect(screen.getByText('Установить PIN и восстановить')).toHaveProperty('disabled', true);
   });
 
   it('with a PIN already set there is no PIN step at all', async () => {
     h.store.hasPin = true;
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Восстановить заметки →'));
+    fireEvent.click(screen.getByText('Восстановить заметки'));
 
     await waitFor(() => expect(restoreFn()).toHaveBeenCalledWith(MNEMONIC, undefined));
     expect(screen.queryByText('Быстрый вход по PIN')).toBeNull();
@@ -122,7 +122,7 @@ describe('Restore — the PIN offer', () => {
   it('an invalid phrase never reaches the PIN step', async () => {
     render(<Restore />);
     typePhrase(BAD_MNEMONIC);
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
 
     expect(await screen.findByText('Неверная seed-фраза. Проверьте слова.')).toBeTruthy();
     expect(screen.queryByText('Быстрый вход по PIN')).toBeNull();
@@ -131,7 +131,7 @@ describe('Restore — the PIN offer', () => {
   it('an incomplete phrase is caught before the PIN step', async () => {
     render(<Restore />);
     fireEvent.change(screen.getByLabelText('Слово 1 из 12'), { target: { value: 'alpha' } });
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
 
     expect(await screen.findByText('Заполните все 12 слов')).toBeTruthy();
     expect(screen.queryByText('Быстрый вход по PIN')).toBeNull();
@@ -145,11 +145,11 @@ describe('Restore — nothing races the restore', () => {
 
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     setPin('123456');
 
-    const btn = screen.getByText('Установить PIN и восстановить →');
+    const btn = screen.getByText('Установить PIN и восстановить');
     fireEvent.click(btn);
     fireEvent.click(btn); // same React batch — the disabled prop alone is too late
 
@@ -163,14 +163,14 @@ describe('Restore — nothing races the restore', () => {
 
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и восстановить →'));
+    fireEvent.click(screen.getByText('Установить PIN и восстановить'));
 
     await waitFor(() => {
       expect(screen.getByText('Пропустить — войти без PIN')).toHaveProperty('disabled', true);
-      expect(screen.getByText('← Назад к seed-фразе')).toHaveProperty('disabled', true);
+      expect(screen.getByText('Назад к seed-фразе')).toHaveProperty('disabled', true);
       expect(screen.getByPlaceholderText('PIN (мин. 6 цифр)')).toHaveProperty('disabled', true);
     });
     release();
@@ -183,11 +183,11 @@ describe('Restore — nothing races the restore', () => {
 
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Восстановить заметки →'));
+    fireEvent.click(screen.getByText('Восстановить заметки'));
 
     await waitFor(() => {
       expect(screen.getByLabelText('Слово 1 из 12')).toHaveProperty('disabled', true);
-      expect(screen.getByText('← Создать новое хранилище')).toHaveProperty('disabled', true);
+      expect(screen.getByText('Создать новое хранилище')).toHaveProperty('disabled', true);
     });
     release();
   });
@@ -201,14 +201,14 @@ describe('Restore — failures come back to the phrase', () => {
 
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и восстановить →'));
+    fireEvent.click(screen.getByText('Установить PIN и восстановить'));
 
     expect(await screen.findByText(/данные другого хранилища/)).toBeTruthy();
     expect(screen.getByText('Сбросить приложение')).toBeTruthy();
-    expect(screen.getByText('Далее →')).toBeTruthy(); // back on the seed step
+    expect(screen.getByText('Далее')).toBeTruthy(); // back on the seed step
   });
 
   it('any other failure returns to the phrase with the generic message', async () => {
@@ -216,12 +216,12 @@ describe('Restore — failures come back to the phrase', () => {
 
     render(<Restore />);
     typePhrase();
-    fireEvent.click(screen.getByText('Далее →'));
+    fireEvent.click(screen.getByText('Далее'));
     await screen.findByText('Быстрый вход по PIN');
     setPin('123456');
-    fireEvent.click(screen.getByText('Установить PIN и восстановить →'));
+    fireEvent.click(screen.getByText('Установить PIN и восстановить'));
 
     expect(await screen.findByText('Неверная seed-фраза. Проверьте слова.')).toBeTruthy();
-    expect(screen.getByText('Далее →')).toBeTruthy();
+    expect(screen.getByText('Далее')).toBeTruthy();
   });
 });

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useNotes, PinLockedError, PinWipedError, VaultMismatchError } from '../lib/store';
 import { PinUnlockUnavailableError } from '../lib/crypto';
 import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
+import { InfinityMark } from '../components/icons';
 
 export function PinUnlock() {
   const { unlockWithPin, getPinLockState, goToRestore } = useNotes();
@@ -99,7 +100,7 @@ export function PinUnlock() {
     return (
       <div className="screen-center">
         <div className="card onboarding">
-          <div className="logo-icon">∞</div>
+          <div className="logo-icon"><InfinityMark /></div>
           <h1>PIN удалён</h1>
           <p className="subtitle">
             После 10 неудачных попыток PIN-код был удалён. Заметки не пострадали —
@@ -116,7 +117,7 @@ export function PinUnlock() {
   return (
     <div className="screen-center">
       <div className="card onboarding">
-        <div className="logo-icon">∞</div>
+        <div className="logo-icon"><InfinityMark /></div>
         <h1>Eternal Notes</h1>
         <p className="subtitle">Введите PIN для разблокировки</p>
 

@@ -1,4 +1,5 @@
 import { Component, type ReactNode, type ErrorInfo } from 'react';
+import { InfinityMark } from './icons';
 
 interface Props {
   children: ReactNode;
@@ -29,7 +30,7 @@ export class ErrorBoundary extends Component<Props, State> {
       return (
         <div className="screen-center">
           <div className="card onboarding">
-            <div className="logo-icon">∞</div>
+            <div className="logo-icon"><InfinityMark /></div>
             <h1>Что-то пошло не так</h1>
             <p className="subtitle">
               Интерфейс завершился с ошибкой. Заметки не пострадали — они в

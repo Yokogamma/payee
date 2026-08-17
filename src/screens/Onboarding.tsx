@@ -3,6 +3,7 @@ import { useNotes, VaultMismatchError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
 import { copyTextToClipboard } from '../lib/clipboard';
+import { InfinityMark, IconEye } from '../components/icons';
 
 type Step = 'start' | 'seed' | 'verify' | 'pin';
 
@@ -111,7 +112,7 @@ export function Onboarding() {
   return (
     <div className="screen-center">
       <div className="card onboarding">
-        <div className="logo-icon">∞</div>
+        <div className="logo-icon"><InfinityMark /></div>
 
         {step === 'start' && (
           <>
@@ -127,7 +128,7 @@ export function Onboarding() {
               У меня есть seed-фраза
             </button>
             <button className="btn btn-ghost" onClick={goToLanding}>
-              ← Назад
+              Назад
             </button>
           </>
         )}
@@ -136,13 +137,13 @@ export function Onboarding() {
           <>
             <h1>Ваша seed-фраза</h1>
             <div className="seed-warning">
-              ⚠️ Запишите эти 12 слов. Это единственный способ восстановить ваши заметки.
+              Запишите эти 12 слов. Это единственный способ восстановить ваши заметки.
               Никому не показывайте.
             </div>
 
             {!seedRevealed ? (
               <button className="seed-cover" onClick={() => setSeedRevealed(true)}>
-                <span className="seed-cover-icon">👁</span>
+                <span className="seed-cover-icon"><IconEye /></span>
                 <span>Нажмите, чтобы показать фразу</span>
                 <span className="seed-cover-hint">Убедитесь, что никто не смотрит на экран</span>
               </button>
@@ -166,7 +167,7 @@ export function Onboarding() {
                   вставки очистите историю буфера средствами ОС.
                 </div>
                 <button className="btn btn-outline" onClick={handleCopy}>
-                  {copied ? '✓ Скопировано' : 'Копировать'}
+                  {copied ? 'Скопировано' : 'Копировать'}
                 </button>
                 {copyError && <div className="error-msg" role="alert">{copyError}</div>}
 
@@ -184,7 +185,7 @@ export function Onboarding() {
                   disabled={!confirmed}
                   onClick={startVerify}
                 >
-                  Продолжить →
+                  Продолжить
                 </button>
               </>
             )}
@@ -226,10 +227,10 @@ export function Onboarding() {
               disabled={verifyInputs.some(w => !w.trim())}
               onClick={handleVerify}
             >
-              Проверить →
+              Проверить
             </button>
             <button className="btn btn-ghost" onClick={() => { setError(''); setStep('seed'); }}>
-              ← Посмотреть фразу ещё раз
+              Посмотреть фразу ещё раз
             </button>
           </>
         )}
@@ -303,7 +304,7 @@ export function Onboarding() {
               disabled={finishing || pinInput.length < 6 || pinInput !== pinConfirm}
               onClick={() => handleFinish(true)}
             >
-              {finishing ? 'Создание...' : 'Установить PIN и начать →'}
+              {finishing ? 'Создание...' : 'Установить PIN и начать'}
             </button>
             <button
               className="btn btn-ghost"

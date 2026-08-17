@@ -133,8 +133,8 @@ describe('Main W3 — markdown rendering', () => {
     expect(document.querySelector('.note-md strong')?.textContent).toBe('жирный');
     // one card per chain
     expect(document.querySelectorAll('.note-card')).toHaveLength(1);
-    // version badge visible
-    expect(screen.getByText('v2')).toBeTruthy();
+    // «v2» был жаргоном системы контроля версий на экране для людей
+    expect(screen.getByText('2-я версия')).toBeTruthy();
   });
 
   it('falls back to PLAIN text with <mark> while a search query is active', () => {
@@ -181,7 +181,7 @@ describe('Main W3 — edit flow', () => {
     const s = h.store as ReturnType<typeof makeStore>;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('✏️ Редактировать'));
+    fireEvent.click(screen.getByText('Редактировать'));
 
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;
@@ -198,7 +198,7 @@ describe('Main W3 — edit flow', () => {
     s.editNote = vi.fn(async () => { throw new Error('quota'); });
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('✏️ Редактировать'));
+    fireEvent.click(screen.getByText('Редактировать'));
 
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;
@@ -216,7 +216,7 @@ describe('Main W3 — history + restore-version flow', () => {
     const s = h.store as ReturnType<typeof makeStore>;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('🕓 История версий (2)'));
+    fireEvent.click(screen.getByText('История версий (2)'));
 
     // History modal open — exactly one dialog.
     expect(screen.getAllByRole('dialog')).toHaveLength(1);
@@ -225,7 +225,7 @@ describe('Main W3 — history + restore-version flow', () => {
 
     // Expand the OLD version → restore button appears.
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть эту версию'));
 
     // Modal-stack: history replaced by the confirm — still exactly ONE dialog.
     const dialogs = screen.getAllByRole('dialog');
@@ -242,9 +242,9 @@ describe('Main W3 — history + restore-version flow', () => {
   it('cancelling the confirm reopens history focused on the same version row', async () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('🕓 История версий (2)'));
+    fireEvent.click(screen.getByText('История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть эту версию'));
     fireEvent.click(screen.getByText('Отмена'));
 
     // History back, one dialog, the old-version row focused + expanded.
@@ -261,19 +261,27 @@ describe('Main W3 — history + restore-version flow', () => {
     s.editNote = vi.fn(async () => { throw new Error('offline db'); });
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('🕓 История версий (2)'));
+    fireEvent.click(screen.getByText('История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть эту версию'));
     fireEvent.click(screen.getByText('Вернуть'));
 
     expect(await screen.findByText(/Не удалось вернуть версию/)).toBeTruthy();
     expect(screen.getByRole('dialog', { name: 'Вернуть эту версию?' })).toBeTruthy();
   });
 
-  it('the updated immutability hint mentions versions', () => {
+  it('подсказка говорит о неизменяемости ОПУБЛИКОВАННОГО, а не о факте публикации', () => {
+    // Прежний текст обещал «каждая версия навсегда сохраняется в блокчейне»
+    // под КАЖДОЙ заметкой — включая лежащую только на устройстве. Здесь
+    // синхронизация выключена (baseStore), и подсказка не должна ничего
+    // обещать про блокчейн для этой записи.
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    expect(screen.getByText(/редактирование добавляет новую версию/)).toBeTruthy();
+    const hint = document.querySelector('.card-menu-hint')!.textContent!;
+    expect(hint).toMatch(/добавляет новую версию/);
+    expect(hint).toMatch(/уже опубликованную/);
+    expect(hint, 'безусловного обещания «каждая версия сохраняется» быть не должно')
+      .not.toMatch(/Каждая версия навсегда сохраняется/);
   });
 });
 
@@ -282,7 +290,7 @@ describe('Main W3 — edit buffer survives background chain rebuilds (review reg
     const s = h.store as ReturnType<typeof makeStore>;
     const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('✏️ Редактировать'));
+    fireEvent.click(screen.getByText('Редактировать'));
 
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;

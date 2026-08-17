@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useNotes } from '../lib/store';
+import { InfinityMark } from '../components/icons';
 
 export function ErrorScreen() {
   const { bootError, storageOutdated, resetBrokenStorage } = useNotes();
@@ -30,7 +31,7 @@ export function ErrorScreen() {
     return (
       <div className="screen-center">
         <div className="card onboarding">
-          <div className="logo-icon">∞</div>
+          <div className="logo-icon"><InfinityMark /></div>
           <h1>Приложение обновилось</h1>
           <p className="subtitle">
             Данные на устройстве уже обновлены более новой версией приложения —
@@ -50,7 +51,7 @@ export function ErrorScreen() {
   return (
     <div className="screen-center">
       <div className="card onboarding">
-        <div className="logo-icon">∞</div>
+        <div className="logo-icon"><InfinityMark /></div>
         <h1>Не удалось запустить</h1>
         <p className="subtitle">
           Хранилище на устройстве не открывается. Обычно помогает перезагрузка;
@@ -65,7 +66,7 @@ export function ErrorScreen() {
 
         {confirmReset && (
           <div className="seed-warning">
-            ⚠️ Все локальные данные будут удалены. Заметки, сохранённые в
+            Все локальные данные будут удалены. Заметки, сохранённые в
             блокчейне, можно вернуть по seed-фразе. Нажмите ещё раз для
             подтверждения.
           </div>

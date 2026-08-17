@@ -3,6 +3,7 @@ import { useNotes, SafeboxSamePinError, SafeboxSeedRequiredError, SafeboxSeedMis
 import { SECRET_PASSWORD_FIELD_PROPS } from './secretFieldProps';
 import { SeedEntryGrid } from './SeedEntryGrid';
 import { emptySeedWords, emptySeedFlags } from '../lib/seed-words';
+import { IconVault } from './icons';
 
 /**
  * First activation of the safebox — and the ONLY honest place to say what the
@@ -64,7 +65,7 @@ export function SafeboxActivation({ dataPresent, entryCount, syncInactive }: Saf
 
   return (
     <div className="safebox-activation">
-      <div className="logo-icon">🔐</div>
+      <div className="logo-icon"><IconVault /></div>
       <h2>Защищённый сейф</h2>
 
       {dataPresent && (
@@ -92,7 +93,7 @@ export function SafeboxActivation({ dataPresent, entryCount, syncInactive }: Saf
       </ul>
 
       <div className="seed-warning">
-        ⚠️ <strong>Запишите seed-фразу сейчас.</strong> После активации сейфа
+        <strong>Запишите seed-фразу сейчас.</strong> После активации сейфа
         просмотр seed-фразы в настройках будет закрыт PIN-кодом сейфа. Если
         забыть PIN и не иметь записанной фразы, доступ к сейфу не восстановить.
       </div>

@@ -1,0 +1,149 @@
+/* Self-hosted faces for the «Архив» redesign. No Google CDN — `font-src 'self'`
+   (scripts/postbuild.mjs) would refuse it, and a CDN would leak every page view.
+
+   WHY HAND-WRITTEN @font-face INSTEAD OF THE PACKAGE ENTRYPOINTS
+   ─────────────────────────────────────────────────────────────
+   Two independent reasons, one per family:
+
+   1. Literata is a VARIABLE font, and @fontsource-variable ships no per-subset
+      CSS: `wght.css` declares all SEVEN subsets, greek and vietnamese included.
+      That is the exact «simplification» main.tsx has warned against since the
+      Manrope switch. Hand-writing four faces is the only way to choose, and
+      `./files/*.woff2` is a PUBLIC export of the package (see its `exports`
+      map), not an internal path.
+
+   2. PT Mono DOES have a correct entrypoint (`400.css` — the four subsets it
+      ships, with proper ranges), but every @fontsource `src` lists a legacy
+      `.woff` beside the `.woff2`. Vite emits both. The old build carried 34
+      such files — 333.7 KB that no browser this PWA supports would ever
+      request, because woff2 comes first in `src` and has been universal since
+      2016. Declaring woff2 alone is what keeps them out of the deploy.
+
+   The unicode-ranges below are COPIED VERBATIM from the packages
+   (`wght.css`, `wght-italic.css`, `400.css`). They are not guesses and must
+   not be edited by hand: scripts/check-font-face-drift.test.mjs re-reads the
+   packages on every run and fails if these declarations and the upstream ones
+   diverge. That guard is why the dependency stays on `^5.3.0` like every other
+   one here instead of being pinned — an upstream range change turns the suite
+   red instead of silently dropping a glyph range to a system fallback.
+
+   The four subsets cover Russian, Ukrainian, Serbian and European diacritics.
+   Note text is written by the USER, so narrowing further would drop a
+   Ukrainian ї into the system font in the middle of a word. */
+
+/* ─── Literata Variable — wght axis, 200..900 ────────────────── */
+/* The opsz axis is deliberately absent: `standard.css` carries both axes and
+   costs 557 KB against 263 KB for four subsets, for optical-size compensation
+   that is barely legible between 13px and 30px. Recorded in the handoff
+   deviation list — the design asked for ital,opsz,wght. */
+
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-cyrillic-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0460-052F,U+1C80-1C8A,U+20B4,U+2DE0-2DFF,U+A640-A69F,U+FE2E-FE2F;
+}
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-cyrillic-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+
+/* Real italics, not a synthetic slant. The «Архив» direction leans on them for
+   meaning, not decoration: search placeholders, settings values («установлен»,
+   «онлайн»), the note counter and the settings footnote are all italic in the
+   mockup. An oblique synthesised from the upright face shears the serifs and
+   reads as a rendering fault at 13–14px. */
+
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: italic;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-cyrillic-ext-wght-italic.woff2') format('woff2-variations');
+  unicode-range: U+0460-052F,U+1C80-1C8A,U+20B4,U+2DE0-2DFF,U+A640-A69F,U+FE2E-FE2F;
+}
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: italic;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-cyrillic-wght-italic.woff2') format('woff2-variations');
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: italic;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-latin-ext-wght-italic.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Literata Variable';
+  font-style: italic;
+  font-display: swap;
+  font-weight: 200 900;
+  src: url('@fontsource-variable/literata/files/literata-latin-wght-italic.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+
+/* ─── PT Mono 400 ─────────────────────────────────────────────── */
+/* Time, sync status, section labels and the byte counter. One weight is all the
+   family ships and all the design uses. Note the ranges here are NOT the same
+   objects as Literata's despite looking alike — latin covers U+0000-00FF, and
+   copying the wrong one silently kills the Cyrillic. */
+
+@font-face {
+  font-family: 'PT Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('@fontsource/pt-mono/files/pt-mono-cyrillic-ext-400-normal.woff2') format('woff2');
+  unicode-range: U+0460-052F,U+1C80-1C8A,U+20B4,U+2DE0-2DFF,U+A640-A69F,U+FE2E-FE2F;
+}
+@font-face {
+  font-family: 'PT Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('@fontsource/pt-mono/files/pt-mono-cyrillic-400-normal.woff2') format('woff2');
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+@font-face {
+  font-family: 'PT Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('@fontsource/pt-mono/files/pt-mono-latin-ext-400-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+@font-face {
+  font-family: 'PT Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('@fontsource/pt-mono/files/pt-mono-latin-400-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}

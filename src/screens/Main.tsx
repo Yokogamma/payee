@@ -9,6 +9,9 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
+import { CardMenu } from '../components/CardMenu';
+import { formatNoteDate } from '../lib/format-date';
+import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -53,6 +56,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
     clearDraft,
     safeboxPinConfigured,
     safeboxDataPresent,
+    v3Paused,
     safeboxLockGeneration,
   } = useNotes();
 
@@ -81,6 +85,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // screen permanently, competing with the feed for the only vertical space a
   // phone has.
   const [composerOpen, setComposerOpen] = useState(false);
+  // FULL SCREEN, and by UNMOUNTING the rest — not by hiding it.
+  //
+  // The mockup gives writing the whole screen: no status line, no search, no
+  // feed, no FAB, no tab bar. Hiding those visually would leave every one of
+  // them in the tab order and in the accessibility tree, so a keyboard user
+  // would tab from the composer into a feed they cannot see.
+  //
+  // It is a GRID STATE, not an overlay. `.lock-gate` sits at z-index 100 and
+  // beats every modal on source order; a composer layered above it would put
+  // plaintext over the privacy gate — see the note in AppNav.
+  const composing = view === 'notes' && composerOpen;
   // Set by an explicit «Свернуть». Blocks auto-expansion until the user LEAVES
   // and re-enters the section; without it a manually collapsed composer would
   // re-open by itself as soon as hydration resolves.
@@ -104,7 +119,23 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
   useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
+  /**
+   * One ref object per card's ⋯ trigger, handed to CardMenu and reused by
+   * `confirmRestore` to land focus after the modal stack closes.
+   *
+   * Created lazily and CACHED: a fresh `{ current: null }` on every render
+   * would hand CardMenu a new object each time, and the ref the restore flow
+   * reads would never be the one React filled in.
+   */
+  const menuBtnRefs = useRef(new Map<string, React.RefObject<HTMLButtonElement | null>>());
+  function menuTriggerRef(root: string) {
+    let ref = menuBtnRefs.current.get(root);
+    if (!ref) {
+      ref = { current: null };
+      menuBtnRefs.current.set(root, ref);
+    }
+    return ref;
+  }
 
   // The «Получено с других устройств» toast and its handled-run bookkeeping are
   // gone. They existed for ONE reason, stated in their own comment: the result
@@ -120,6 +151,34 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // would stay shut over a draft that exists.
   const hasDraft = text.length > 0;
   const wasNotesVisible = useRef(notesVisible);
+
+  /**
+   * Where this note is about to live, said plainly.
+   *
+   * Going fullscreen unmounts the status line, so this sentence is the ONLY
+   * thing left that can answer it — which means it has to answer for every
+   * state the status line would have covered, not just the easy two.
+   *
+   * `v3Paused` is the one that hides: sync is on, the key is registered, and
+   * the upload queue is still stopped until the user resumes it by hand. A
+   * text that only checked enabled/registered promised the blockchain in
+   * exactly the state where nothing is being sent — see the matching rung in
+   * StatusLine, which is the warning this paragraph replaces on this screen.
+   *
+   * Three ways to stay local, and they are NOT interchangeable. Collapsing the
+   * unregistered case into «синхронизация выключена» was accurate about the
+   * outcome and wrong about the cause: sync is on, and what is missing is an
+   * invite code — which is a thing the user can go and fix, unlike a switch
+   * they deliberately turned off. A destination line that misnames the reason
+   * sends them to the wrong screen.
+   */
+  const composerDestination = !arweave.enabled
+    ? 'Синхронизация выключена — запись останется только на этом устройстве.'
+    : !arweave.registered
+      ? 'Устройство не подключено к хранилищу — до ввода invite-кода запись останется только на нём.'
+      : v3Paused
+        ? 'Загрузка приостановлена — запись останется на устройстве до возобновления.'
+        : 'Она отправится в блокчейн и станет вечной после подтверждения сети.';
 
   useEffect(() => {
     const entered = notesVisible && !wasNotesVisible.current;
@@ -141,11 +200,31 @@ export function Main({ theme, onThemeChange }: MainProps) {
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
+  /**
+   * Leaving the fullscreen composer takes the pressed button with it, so focus
+   * has to be placed deliberately — otherwise it lands on `<body>` and a
+   * keyboard user loses their position in an interface that just replaced
+   * itself entirely. The FAB is the right landing: it is what reopens the
+   * composer, so the user is left holding the door they came through.
+   *
+   * Through a REF, not `document.querySelector('.fab')`. The safebox renders a
+   * FAB too, and a save is async: if the route changes while one is in flight
+   * — a Back gesture, a hash edit — the global lookup would find the safebox's
+   * button and yank focus off the safebox heading that had just claimed it.
+   * With a ref, an unmounted notes FAB is simply `null` and nothing moves.
+   */
+  const notesFabRef = useRef<HTMLButtonElement | null>(null);
+
+  function focusFabAfterCollapse() {
+    requestAnimationFrame(() => notesFabRef.current?.focus());
+  }
+
   function collapseComposer() {
     // Never clears `text`: collapsing hides, it does not discard. Clearing here
     // would let the debounced mirror persist '' and DELETE the stored draft.
     userCollapsedRef.current = true;
     setComposerOpen(false);
+    focusFabAfterCollapse();
   }
 
   // Focus follows the section. Losing the modal's «focus returns to the
@@ -222,36 +301,21 @@ export function Main({ theme, onThemeChange }: MainProps) {
     setTimeout(() => setJustSaved(false), 2000);
     setComposerOpen(false);
     userCollapsedRef.current = false; // saved, not dismissed
-  }
-
-  function formatDate(ts: number): string {
-    const d = new Date(ts);
-    const now = new Date();
-    const diff = now.getTime() - d.getTime();
-
-    if (diff < 60000) return 'только что';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)} мин назад`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)} ч назад`;
-
-    const isThisYear = d.getFullYear() === now.getFullYear();
-    const day = d.getDate().toString().padStart(2, '0');
-    const month = d.toLocaleString('ru', { month: 'short' });
-
-    if (isThisYear) return `${day} ${month}`;
-    return `${day} ${month} ${d.getFullYear()}`;
+    // Same reason as «Свернуть»: the save button unmounts under the press.
+    focusFabAfterCollapse();
   }
 
   /** Clipboard write with visible success/error feedback — a rejected promise
    *  must not look identical to a successful copy. On failure the menu stays
    *  open so the text can still be selected manually. */
-  async function handleCopyNote(noteText: string) {
-    if (await copyTextToClipboard(noteText)) {
-      setOpenMenuId(null);
-      setCopyFeedback('ok');
-    } else {
-      setCopyFeedback('fail');
-    }
+  /** Returns `false` on failure, which CardMenu reads as «keep the menu open»
+   *  — the fallback for a rejected clipboard write is selecting the text by
+   *  hand, and that needs the note still on screen. */
+  async function handleCopyNote(noteText: string): Promise<void | false> {
+    const ok = await copyTextToClipboard(noteText);
+    setCopyFeedback(ok ? 'ok' : 'fail');
     setTimeout(() => setCopyFeedback(null), 2000);
+    return ok ? undefined : false;
   }
 
   /** Wrap query matches in <mark> (8.1) — case-insensitive, plain text only.
@@ -312,16 +376,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
     const root = restoreTarget.root;
     setRestoreTarget(null);
     setHistoryFocusVersionId(null);
-    requestAnimationFrame(() => menuBtnRefs.current.get(root)?.focus());
+    requestAnimationFrame(() => menuBtnRefs.current.get(root)?.current?.focus());
   }
 
 
   return (
-    <div className="main-screen">
+    <div className={`main-screen${composing ? ' main-screen--composing' : ''}`}>
       {/* Grid areas, not a flat flex column: on a wide screen the nav becomes a
           full-height left rail, and three loose siblings would each turn into a
           column instead. Toasts and modal overlays are position:fixed, so they
           never become grid items. */}
+      {!composing && (
       <div className="main-top">
         {/* One line replaces the restore banners, both pause banners, the
             offline banner, the Arweave badge, the note count and the ↻
@@ -336,8 +401,8 @@ export function Main({ theme, onThemeChange }: MainProps) {
         <div className="error-banner" role="alert">
           <span>
             {pinSetupNotice === 'already-set'
-              ? '⚠️ PIN уже установлен на этом устройстве (в другой вкладке) — ваш новый PIN не применён. Сменить PIN можно в настройках.'
-              : '⚠️ Не удалось сохранить PIN. Вход выполнен; установите PIN в настройках.'}
+              ? 'PIN уже установлен на этом устройстве (в другой вкладке) — ваш новый PIN не применён. Сменить PIN можно в настройках.'
+              : 'Не удалось сохранить PIN. Вход выполнен; установите PIN в настройках.'}
           </span>
           <button
             className="banner-btn banner-close"
@@ -345,11 +410,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
             title="Скрыть"
             aria-label="Скрыть сообщение о PIN"
           >
-            ✕
+            <IconClose />
           </button>
         </div>
       )}
       </div>
+      )}
 
       <div className="main-content">
       {/* KEYED ON THE LOCK GENERATION: every section lock (including a
@@ -357,7 +423,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
           whole subtree, so no local secret state — a half-typed PIN, or the
           seed-reset grid holding all 12 words — can survive it. */}
       {view === 'safebox' && (
-        <SafeboxSection key={safeboxLockGeneration} formatDate={formatDate} />
+        <SafeboxSection key={safeboxLockGeneration} />
       )}
 
       {view === 'settings' && (
@@ -376,17 +442,33 @@ export function Main({ theme, onThemeChange }: MainProps) {
           list, within thumb reach, and gives the header back to the title. */}
       <div className="notes-topbar">
         <h2 className="section-title" tabIndex={-1}>
-          {composerOpen ? 'Новая заметка' : 'Заметки'}
+          {composing ? 'Новая заметка' : 'Заметки'}
         </h2>
-        {composerOpen && (
-          <button className="btn-tiny" onClick={collapseComposer}>
+        {composing && (
+          <button className="btn btn-ghost" onClick={collapseComposer}>
             Свернуть
           </button>
         )}
       </div>
 
-      {/* Always on screen — its own field, scoped to this section. The old
-          Ctrl+K toggle is gone with the toggle it drove. */}
+      {composing && (
+        // TWO SENTENCES, and only the first is unconditional.
+        //
+        // The mockup prints «Запись сохранится навечно» flat, and for one
+        // commit so did this. That is false with sync off — the note stays on
+        // this device — and false-until-`confirmed` with sync on. It was also
+        // the worst possible place to overpromise: going fullscreen unmounts
+        // the status line, so this paragraph is the ONLY thing on screen that
+        // could have told the user where their note is about to live.
+        <p className="composer-intro">
+          Запись нельзя удалить — только дополнить новой версией.{' '}
+          {composerDestination}
+        </p>
+      )}
+
+      {/* The composer takes the whole screen, so the search field goes with the
+          feed it filters. */}
+      {!composing && (
       <div className="search-bar">
         <input
           type="text"
@@ -402,15 +484,16 @@ export function Main({ theme, onThemeChange }: MainProps) {
               {filteredChains.length} из {chains.length}
             </span>
             <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
-              ✕
+              <IconClose />
             </button>
           </>
         )}
       </div>
+      )}
 
       {/* Draft hydration/persistence stays in the shell (value/onChange above),
           so collapsing or unmounting the composer never touches the draft. */}
-      {composerOpen && (
+      {composing && (
       <div className="note-input-wrap">
         <NoteComposer
           value={text}
@@ -424,17 +507,18 @@ export function Main({ theme, onThemeChange }: MainProps) {
           textareaRef={inputRef}
           error={saveError}
           hint={justSaved
-            ? '✓ Сохранено и зашифровано'
-            : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
+            ? 'Сохранено и зашифровано'
+            : <span className="mono">зашифровано · AES-256</span>}
         />
       </div>
       )}
 
       {/* Feed — one card per version chain; fields come from chain.current. */}
+      {!composing && (
       <div className="notes-feed">
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
-            <div className="empty-icon">📝</div>
+            <div className="empty-icon"><IconNote /></div>
             <p>Первая заметка — самая важная.</p>
             <p className="empty-sub">Просто начните печатать.</p>
           </div>
@@ -455,6 +539,11 @@ export function Main({ theme, onThemeChange }: MainProps) {
             const clamped = long && !expanded;
             return (
               <div className="note-card" key={chain.root}>
+                {/* The date leads the entry instead of trailing it. A line in
+                    a ledger is found by when it was written; putting the date
+                    under the text made every entry start with an unanchored
+                    sentence. */}
+                <div className="note-date section-label">{formatNoteDate(note.createdAt)}</div>
                 <div className={`note-text ${clamped ? 'note-text--clamped' : ''}`}>
                   {note.fmt === 'md' && !searchQuery.trim()
                     ? <NoteMarkdown text={note.text} />
@@ -466,108 +555,105 @@ export function Main({ theme, onThemeChange }: MainProps) {
                   </button>
                 )}
                 <div className="note-meta">
-                  <span className="note-time">{formatDate(note.createdAt)}</span>
-                  {chain.versions.length > 1 && (
-                    <span
-                      className="note-rev-badge"
-                      title={`Версий: ${chain.versions.length}`}
-                      aria-label={`Версий: ${chain.versions.length}`}
-                    >
-                      v{chain.versions.length}
-                    </span>
-                  )}
-                  {badge && info && (
-                    info.status === 'error' && arweave.enabled && arweave.registered ? (
+                  {/* Status in words. The 🔒 that used to sit here is gone with
+                      the rest of the emoji: every note is encrypted, so a
+                      padlock on each one carried no information — it was a
+                      property of the app repeated per row. */}
+                  {/* No `info &&` guard: `info` falls back to
+                      `{ status: 'queued' }` above, so the condition was always
+                      true and read as if a card could have no sync state. */}
+                  {info.status === 'error' && arweave.enabled && arweave.registered ? (
                       <button
-                        className={`sync-badge ${badge.className}`}
+                        className={`state sync-state ${badge.className}`}
                         onClick={retrySync}
                         title={badge.label}
                         aria-label={badge.label}
                       >
-                        {badge.icon} повторить
+                        {badge.word} · повторить
                       </button>
                     ) : (
                       <span
-                        className={`sync-badge ${badge.className}`}
+                        className={`state sync-state ${badge.className}`}
                         title={badge.label}
                         role="status"
                         aria-label={badge.label}
                       >
-                        {badge.icon}
+                        {badge.permanent && <InfinityMark />}
+                        {badge.word}
                       </span>
-                    )
+                    )}
+                  {chain.versions.length > 1 && (
+                    <span className="state state--quiet">
+                      {chain.versions.length}-я версия
+                    </span>
                   )}
-                  <span className="note-lock" aria-hidden="true">🔒</span>
-                  <button
-                    ref={el => {
-                      if (el) menuBtnRefs.current.set(chain.root, el);
-                      else menuBtnRefs.current.delete(chain.root);
-                    }}
-                    className="icon-btn note-menu-btn"
-                    onClick={() => setOpenMenuId(openMenuId === chain.root ? null : chain.root)}
-                    title="Меню заметки"
-                    aria-label="Меню заметки"
-                    aria-expanded={openMenuId === chain.root}
-                  >
-                    ⋯
-                  </button>
+                  <span className="note-meta-gap" />
+                  <CardMenu
+                    open={openMenuId === chain.root}
+                    onOpenChange={next => setOpenMenuId(next ? chain.root : null)}
+                    label="Меню заметки"
+                    id={`note-menu-${chain.root}`}
+                    triggerRef={menuTriggerRef(chain.root)}
+                    items={[
+                      {
+                        key: 'copy',
+                        icon: <IconCopy />,
+                        label: 'Копировать текст',
+                        onSelect: () => handleCopyNote(note.text),
+                      },
+                      ...(V3_WRITER_ENABLED
+                        ? [{
+                            key: 'edit',
+                            icon: <IconEdit />,
+                            label: 'Редактировать',
+                            onSelect: () => setEditChainRoot(chain.root),
+                          }]
+                        : []),
+                      ...(V3_WRITER_ENABLED && chain.versions.length > 1
+                        ? [{
+                            key: 'history',
+                            icon: <IconHistory />,
+                            label: `История версий (${chain.versions.length})`,
+                            onSelect: () => {
+                              setHistoryFocusVersionId(null);
+                              setHistoryChainRoot(chain.root);
+                            },
+                          }]
+                        : []),
+                      ...(info.status === 'confirmed' && info.txId
+                        ? [{
+                            key: 'tx',
+                            icon: <IconLink />,
+                            label: 'Транзакция в блокчейне',
+                            href: `https://viewblock.io/arweave/tx/${info.txId}`,
+                          }]
+                        : []),
+                    ]}
+                    /* О НЕИЗМЕНЯЕМОСТИ ОПУБЛИКОВАННОГО, а не о том, что
+                       публикация состоялась. Прежний текст обещал «каждая
+                       версия навсегда сохраняется в блокчейне» под КАЖДОЙ
+                       заметкой — включая ту, что лежит только на устройстве
+                       при выключенной синхронизации, и ту, что ещё в очереди
+                       или упала с ошибкой. Та же ошибка, что была в композере;
+                       здесь я не заметил её по аналогии. Где запись находится
+                       сейчас, говорит её статус — он в той же строке. */
+                    hint={V3_WRITER_ENABLED
+                      ? 'Редактирование добавляет новую версию — старые остаются в истории. Версию, уже опубликованную в блокчейне, изменить или удалить невозможно.'
+                      : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
+                  />
                 </div>
-                {openMenuId === chain.root && (
-                  <div className="note-menu">
-                    <button
-                      className="note-menu-item"
-                      onClick={() => void handleCopyNote(note.text)}
-                    >
-                      📋 Копировать текст
-                    </button>
-                    {V3_WRITER_ENABLED && (
-                      <button
-                        className="note-menu-item"
-                        onClick={() => { setOpenMenuId(null); setEditChainRoot(chain.root); }}
-                      >
-                        ✏️ Редактировать
-                      </button>
-                    )}
-                    {V3_WRITER_ENABLED && chain.versions.length > 1 && (
-                      <button
-                        className="note-menu-item"
-                        onClick={() => {
-                          setOpenMenuId(null);
-                          setHistoryFocusVersionId(null);
-                          setHistoryChainRoot(chain.root);
-                        }}
-                      >
-                        🕓 История версий ({chain.versions.length})
-                      </button>
-                    )}
-                    {info?.status === 'confirmed' && info.txId && (
-                      <a
-                        className="note-menu-item"
-                        href={`https://viewblock.io/arweave/tx/${info.txId}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={() => setOpenMenuId(null)}
-                      >
-                        🔗 Транзакция в блокчейне
-                      </a>
-                    )}
-                    <div className="note-menu-hint">
-                      {V3_WRITER_ENABLED
-                        ? 'Каждая версия навсегда сохраняется в блокчейне: редактирование добавляет новую версию, старые остаются в истории. Удалить опубликованные данные невозможно.'
-                        : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
-                    </div>
-                  </div>
-                )}
               </div>
             );
           })
         )}
       </div>
+      )}
 
-      {!composerOpen && (
+      {!composing && (
         // The dot is the only thing standing between a collapsed composer and
         // silently hiding an unsaved draft.
         <Fab
+          ref={notesFabRef}
           label={hasDraft ? 'Новая заметка, есть несохранённый черновик' : 'Новая заметка'}
           onClick={openComposer}
           marked={hasDraft}
@@ -588,7 +674,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
             title="Позже"
             aria-label="Отложить обновление"
           >
-            ✕
+            <IconClose />
           </button>
         </div>
       )}
@@ -596,14 +682,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
       {/* Prominent save confirmation (2.5) */}
       {justSaved && (
         <div className="toast toast--success" role="status">
-          ✓ Сохранено и зашифровано
+          Сохранено и зашифровано
         </div>
       )}
 
 
       {/* Clipboard feedback — success and failure must look different */}
       {copyFeedback === 'ok' && (
-        <div className="toast toast--success" role="status">✓ Скопировано</div>
+        <div className="toast toast--success" role="status">Скопировано</div>
       )}
       {copyFeedback === 'fail' && (
         <div className="toast toast--error" role="alert">
@@ -636,7 +722,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
         onClose={() => { setHistoryChainRoot(null); setHistoryFocusVersionId(null); }}
         onRequestRestore={requestRestore}
         focusVersionId={historyFocusVersionId}
-        formatDate={formatDate}
+
       />
 
       <RestoreVersionDialog
@@ -646,7 +732,10 @@ export function Main({ theme, onThemeChange }: MainProps) {
         onCancel={cancelRestore}
       />
 
-      <AppNav safeboxDimmed={safeboxDimmed} />
+      {/* Unmounted while composing. The composer is a place you finish or
+          leave by «Свернуть», and a tab bar under it is both a distraction and
+          a tab stop past the save button. */}
+      {!composing && <AppNav safeboxDimmed={safeboxDimmed} />}
     </div>
   );
 }

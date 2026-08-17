@@ -8,6 +8,7 @@ import {
 } from '../lib/store';
 import { SafeboxPinUnavailableError } from '../lib/crypto';
 import { SECRET_PASSWORD_FIELD_PROPS } from './secretFieldProps';
+import { IconVault } from './icons';
 
 /**
  * Safebox unlock pad — the PinUnlock screen's shape, but for the SECOND PIN
@@ -90,7 +91,7 @@ export function SafeboxPinPad({ onRequestSeedReset }: SafeboxPinPadProps) {
   if (wiped) {
     return (
       <div className="safebox-gate">
-        <div className="logo-icon">🔐</div>
+        <div className="logo-icon"><IconVault /></div>
         <h2>PIN сейфа удалён</h2>
         <p className="subtitle">
           После 10 неудачных попыток PIN-код сейфа удалён. <strong>Записи не
@@ -107,7 +108,7 @@ export function SafeboxPinPad({ onRequestSeedReset }: SafeboxPinPadProps) {
 
   return (
     <div className="safebox-gate">
-      <div className="logo-icon">🔐</div>
+      <div className="logo-icon"><IconVault /></div>
       <h2>Сейф заблокирован</h2>
       <p className="subtitle">Введите PIN сейфа</p>
 

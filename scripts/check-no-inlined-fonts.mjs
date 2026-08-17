@@ -31,9 +31,19 @@ import { join } from 'node:path';
 
 const ASSETS_DIR = 'dist/assets';
 
+/** The four subsets every family here ships: Russian, Ukrainian, Serbian and
+ *  European diacritics. Greek and vietnamese are deliberately absent. */
+const SUBSETS = ['cyrillic', 'cyrillic-ext', 'latin', 'latin-ext'];
+
 /** `family` × `subsets` × `weights` → the @fontsource logical stems. */
 function fontSet(family, subsets, weights) {
   return subsets.flatMap(s => weights.map(w => `${family}-${s}-${w}-normal`));
+}
+
+/** Variable families name the AXIS where a static one names the weight, and
+ *  they ship a separate file per style rather than synthesising the italic. */
+function variableFontSet(family, subsets, axis, styles) {
+  return subsets.flatMap(s => styles.map(st => `${family}-${s}-${axis}-${st}`));
 }
 
 /**
@@ -43,14 +53,27 @@ function fontSet(family, subsets, weights) {
  * a diff here is the visible half of a decision about what users download.
  */
 export const EXPECTED_FONTS = [
-  // Mono: per-weight entrypoints, so all six subsets ship. Deliberately left
-  // as-is — narrowing it is a separate decision with its own measurement.
-  ...fontSet('jetbrains-mono', ['cyrillic', 'cyrillic-ext', 'greek', 'latin', 'latin-ext', 'vietnamese'], [400, 500, 600]),
-  // UI face: Manrope, imported per SUBSET so greek and vietnamese stay out.
-  // A slip back to the per-weight entrypoint would add 8 files here and this
-  // exact-set check is what catches it.
-  ...fontSet('manrope', ['latin', 'latin-ext', 'cyrillic', 'cyrillic-ext'], [400, 500, 600, 700]),
+  // Reading face: Literata, variable on the WEIGHT axis only. The `opsz` axis
+  // would double the payload (557 KB against 263 KB for these four subsets)
+  // for optical-size compensation that is barely legible between 13px and
+  // 30px — recorded as a deliberate deviation from the design handoff.
+  //
+  // Both styles are real files. The redesign uses italics for meaning rather
+  // than emphasis — search placeholders, settings values, the note counter —
+  // and a synthetic slant shears the serifs visibly at 13px.
+  ...variableFontSet('literata', SUBSETS, 'wght', ['normal', 'italic']),
+  // Mono: time, sync status, section labels. One weight is all PT Mono ships.
+  ...fontSet('pt-mono', SUBSETS, [400]),
 ].sort();
+
+/** Legacy `.woff` beside every `.woff2`. @fontsource lists both in `src`, so
+ *  taking a package CSS entrypoint made Vite emit BOTH — the previous build
+ *  carried 34 of them, 333.7 KB that no browser this PWA supports would ever
+ *  request (woff2 comes first in `src` and has been universal since 2016).
+ *  They never reached users — the workbox glob precaches woff2 only — but they
+ *  shipped to the origin on every deploy. The hand-written @font-face in
+ *  src/fonts.css declare woff2 alone, and this asserts it stays that way. */
+export const EXPECTED_LEGACY_WOFF_COUNT = 0;
 
 /** Strip Vite's `-[hash]` before the extension. */
 export function logicalFontName(filename) {
@@ -96,10 +119,16 @@ function main() {
 
   const actual = entries.filter(f => f.endsWith('.woff2')).map(logicalFontName).sort();
   const { missing, unexpected } = diffFontSet(actual, EXPECTED_FONTS);
+  const legacy = entries.filter(f => f.endsWith('.woff'));
 
   console.log(`Fonts: ${actual.length} woff2 in ${ASSETS_DIR} (expected ${EXPECTED_FONTS.length})`);
 
-  if (inlined.length === 0 && missing.length === 0 && unexpected.length === 0) {
+  if (
+    inlined.length === 0 &&
+    missing.length === 0 &&
+    unexpected.length === 0 &&
+    legacy.length === EXPECTED_LEGACY_WOFF_COUNT
+  ) {
     console.log('Font guard OK');
     return;
   }
@@ -121,6 +150,14 @@ function main() {
         unexpected.map(f => `  - ${f}`).join('\n') +
         `\nIf this is intentional, update EXPECTED_FONTS in this file IN THE SAME COMMIT ` +
         `as the import change in src/main.tsx.`,
+    );
+  }
+  if (legacy.length !== EXPECTED_LEGACY_WOFF_COUNT) {
+    console.error(
+      `\nLEGACY .woff EMITTED: ${legacy.length} file(s), expected ${EXPECTED_LEGACY_WOFF_COUNT}. ` +
+        `Nothing requests these — woff2 comes first in every \`src\` — so they are pure deploy weight.\n` +
+        `Almost always the cause is a @fontsource CSS entrypoint imported somewhere instead of a ` +
+        `hand-written @font-face in src/fonts.css: the package \`src\` lists a .woff fallback and Vite emits it.`,
     );
   }
   process.exit(1);

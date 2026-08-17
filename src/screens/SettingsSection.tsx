@@ -21,10 +21,19 @@ interface SettingsSectionProps {
   onThemeChange: (t: ThemePref) => void;
 }
 
+/**
+ * «Чернильная», not «Тёмная».
+ *
+ * The theme IDs stay `dark`/`light`/`warm` — they are what `localStorage`
+ * holds and what an older build degrades from, so renaming them would break a
+ * rollback. Only the words change, and they change because the palettes did:
+ * this is no longer «light and its dimmed twin» but three papers, one of
+ * which is inked. The mockup names them exactly this way.
+ */
 const THEME_LABELS: Record<ThemePref, string> = {
   system: 'Системная',
-  dark: 'Тёмная',
   light: 'Светлая',
+  dark: 'Чернильная',
   warm: 'Тёплая',
 };
 
@@ -143,13 +152,13 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
   const resetRiskTotal = arweave.resetRisk.notes + arweave.resetRisk.safebox;
   const resetWarningMessage = !arweave.countsReady
     // Until the first sync-count read completes we cannot know what is safe.
-    ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
+    ? 'Состояние синхронизации ещё загружается — сейчас нельзя определить, '
       + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
       + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
     : resetRiskTotal > 0
       // Only CONFIRMED records are recoverable: an `accepted` transaction can
       // still be dropped, and after a wipe there is no local ciphertext left.
-      ? `⚠️ ${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+      ? `${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
         + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
         + (arweave.resetRisk.safebox > 0
           ? `Из них в защищённом сейфе: ${arweave.resetRisk.safebox} — пароли и вложения.\n`
@@ -209,14 +218,17 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
   const arweaveChip = !arweave.enabled
     ? 'выключено'
-    : arweave.online ? '● Онлайн' : '○ Оффлайн';
+    : arweave.online ? 'Онлайн' : 'Оффлайн';
   const arweaveChipClass = arweave.enabled && arweave.online ? 'text-green' : '';
 
 
 
   return (
     <section className="settings-section" aria-labelledby="settings-title">
-      <div>
+      {/* The scroller. The section itself is a two-row grid now, so the
+          footnote below can sit on its own row instead of trailing the
+          content — see `.settings-section` in index.css. */}
+      <div className="settings-scroll">
         <div className="settings-topbar">
           {/* tabIndex={-1}: the shell moves focus here on every section change,
               which is the a11y invariant that replaces the modal focus trap —
@@ -231,7 +243,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               theme picker and the reset button, so nothing told the user that
               the app PIN and the safebox PIN are DIFFERENT contours. */}
           <div className="settings-group">
-            <h3 className="settings-group-title">Доступ и замки</h3>
+            <h3 className="section-label settings-group-title">Доступ и замки</h3>
             <div className="settings-rows">
           <SettingsBlock title="Seed-фраза">
             <button
@@ -281,7 +293,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
             {mnemonic && (
               <div className="seed-reveal">
                 <div className="seed-warning">
-                  ⚠️ Никому не показывайте! Кто знает фразу — имеет доступ ко всем заметкам.
+                  Никому не показывайте! Кто знает фразу — имеет доступ ко всем заметкам.
                   На время сессии фраза хранится в памяти вкладки (sessionStorage) и
                   очищается при закрытии браузера.
                 </div>
@@ -331,7 +343,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
 
           <div className="settings-group">
-            <h3 className="settings-group-title">Синхронизация</h3>
+            <h3 className="section-label settings-group-title">Синхронизация</h3>
             <div className="settings-rows">
           <SettingsBlock
             title="Вечное хранилище"
@@ -349,26 +361,26 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
             <div className="settings-info">
               <div>Статус: <strong className={arweave.online ? 'text-green' : 'text-red'}>
-                {arweave.online ? '● Онлайн' : '○ Оффлайн'}
+                {arweave.online ? 'Онлайн' : 'Оффлайн'}
               </strong></div>
               {/* The per-note and per-version counters now live in the status
                   line's expandable panel — one place, one computation. A copy
                   here meant two answers to «how much is safely on chain», and
                   the user would have had to reconcile them. */}
               {arweave.acceptedCount > 0 && (
-                <div>⏳ Ожидают подтверждения версий: <strong>{arweave.acceptedCount}</strong></div>
+                <div>Ожидают подтверждения версий: <strong>{arweave.acceptedCount}</strong></div>
               )}
               {arweave.unsyncedCount > 0 && (
-                <div>⏳ Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>
+                <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>
               )}
               {arweave.errorCount > 0 && (
-                <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
+                <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>
               )}
               {arweave.quarantinedCount > 0 && (
                 // Permanent by design — deliberately NOT lumped into «Ошибки»:
                 // no «Повторить» can ever fix a quarantined record.
                 <div>
-                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
+                  Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
                 </div>
               )}
               {arweave.lastSync && (
@@ -387,7 +399,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
                 onClick={retrySync}
                 disabled={arweave.syncing}
               >
-                {arweave.syncing ? '⏳ Загрузка...' : '↻ Повторить загрузку'}
+                {arweave.syncing ? 'Загрузка…' : 'Повторить загрузку'}
               </button>
             )}
 
@@ -397,7 +409,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
             {arweave.registered && (
               <div className="settings-info">
-                <div className="text-green">✓ Синхронизация доступна</div>
+                <div className="text-green">Синхронизация доступна</div>
               </div>
             )}
           </SettingsBlock>
@@ -406,7 +418,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
 
           <div className="settings-group">
-            <h3 className="settings-group-title">Вид</h3>
+            <h3 className="section-label settings-group-title">Вид</h3>
             <div className="settings-rows">
           <SettingsBlock title="Тема" chip={THEME_LABELS[theme]}>
             <div className="theme-picker" role="group" aria-label="Тема оформления">
@@ -427,7 +439,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
 
           <div className="settings-group">
-            <h3 className="settings-group-title settings-group-title--danger">Опасная зона</h3>
+            <h3 className="section-label settings-group-title settings-group-title--danger">Опасная зона</h3>
             <div className="settings-rows">
           <SettingsBlock title="Сброс приложения" danger>
             <div className="settings-hint">
@@ -442,16 +454,20 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
         </div>
 
-        {/* Was a meta line directly under the title, where it took the most
-            valuable strip on the screen to say something nobody opens settings
-            to read. The note count is in the status line; the cipher name is
-            reassurance. Both belong at the end. */}
-        <p className="settings-footnote">
-          Заметок: {chains.length}
-          {notes.length !== chains.length && <> · записей: {notes.length}</>}
-          {' · '}AES-256-GCM
-        </p>
       </div>
+
+      {/* OUT OF THE SCROLL, sitting on the section's own last row, right above
+          the tab bar — where the mockup puts it.
+          It used to be the last child of the scrolling column, which meant the
+          one line that describes the whole vault was visible only to someone
+          who had already scrolled past everything else. It is not a control
+          and not urgent; it is a footer, and a footer that scrolls away is
+          just a paragraph. */}
+      <p className="settings-footnote">
+        Заметок: {chains.length}
+        {notes.length !== chains.length && <> · записей: {notes.length}</>}
+        {' · '}AES-256-GCM
+      </p>
 
       {/* The reset confirm lives HERE now. Settings is no longer aria-modal, so
           the old «close settings before opening the confirm» dance is
@@ -520,7 +536,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
     return (
       <div className="settings-hint">
         На устройстве есть записи сейфа, но PIN не установлен. Откройте раздел
-        «🔐 Сейф» и восстановите доступ, введя полную seed-фразу — записи не
+        «Сейф» и восстановите доступ, введя полную seed-фразу — записи не
         пострадали.
       </div>
     );
