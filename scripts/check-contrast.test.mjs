@@ -194,6 +194,54 @@ describe('WCAG contrast of the theme palettes', () => {
   });
 });
 
+/**
+ * The accent pair, enforced structurally rather than by measurement.
+ *
+ * Two rules shipped a hard-coded label colour on top of `var(--accent)`:
+ * `.btn-primary { color: white }` and `.fab { color: #fff }`. Both were
+ * correct for as long as the accent was violet — dark in every theme. The
+ * moment the accent became ink, which is dark on paper and PALE on the ink
+ * theme, they turned into buttons with no visible label. A third,
+ * `.btn-save { color: #0a0a0f }` over `var(--green)`, failed the same way.
+ *
+ * No contrast computation can catch this: the values are literals, not tokens,
+ * so there is no palette entry to measure. What is checkable is the PAIRING —
+ * a themed fill takes a themed label.
+ */
+describe('themed fills carry a themed label', () => {
+  /** `selector { … }` bodies, comments already stripped. */
+  function rules(source) {
+    return [...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .map(m => ({ selector: m[1].trim().replace(/\s+/g, ' '), body: m[2] }))
+      .filter(r => !r.selector.startsWith('@'));
+  }
+
+  /** Fills whose lightness flips between themes, and the label each demands. */
+  const PAIRS = [
+    { fill: '--accent', label: '--accent-text' },
+    { fill: '--text', label: '--bg' },
+    { fill: '--green', label: '--accent-text' },
+  ];
+
+  it('no rule paints a literal colour on top of a themed fill', () => {
+    const offenders = [];
+    for (const { selector, body } of rules(css)) {
+      const fill = PAIRS.find(p => new RegExp(`background(-color)?:\\s*var\\(${p.fill}\\)`).test(body));
+      if (!fill) continue;
+      const colour = body.match(/(?:^|;)\s*color:\s*([^;]+)/)?.[1]?.trim();
+      if (!colour) continue; // inherits — fine, and often deliberate
+      if (!colour.startsWith('var(')) {
+        offenders.push(`  ${selector} — background var(${fill.fill}), color ${colour}`);
+      }
+    }
+    expect(
+      offenders,
+      'A literal colour on a themed fill assumes which half of the pair is dark, ' +
+        `and that assumption breaks on the theme where it is not:\n${offenders.join('\n')}`,
+    ).toEqual([]);
+  });
+});
+
 /* --border-strong is deliberately NOT asserted at 3:1. It keeps the handoff's
  * #c9bda1 and is only ever a decorative rule — the search underline, the line
  * between feed entries, group boundaries. SC 1.4.11 governs what identifies a

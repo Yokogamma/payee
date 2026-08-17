@@ -280,13 +280,17 @@ h1 {
   cursor: not-allowed;
 }
 
+/* `color: white` was right for exactly as long as the accent was violet — a
+   fill that is dark in every theme. Ink is dark on paper and PALE on the ink
+   theme, where white text on a #ece4d3 fill is a button with no visible label.
+   That is what --accent-text is for: it names the other half of the pair
+   instead of assuming which half is dark. */
 .btn-primary {
   background: var(--accent);
-  color: white;
+  color: var(--accent-text);
 }
 .btn-primary:hover:not(:disabled) {
   background: var(--accent-hover);
-  box-shadow: 0 0 20px var(--accent-glow);
 }
 
 .btn-outline {
@@ -884,9 +888,9 @@ h1 {
   border: none;
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-text); /* not #fff — see .btn-primary */
   cursor: pointer;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 3px 12px var(--accent-glow);
 }
 .fab svg { width: 24px; height: 24px; }
 .fab-mark {
