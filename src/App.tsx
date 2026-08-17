@@ -8,6 +8,7 @@ import { ErrorScreen } from './screens/ErrorScreen';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useTheme, type ThemePref } from './lib/theme';
 import './index.css';
+import { InfinityMark } from './components/icons';
 
 interface RouterProps {
   theme: ThemePref;
@@ -25,7 +26,7 @@ function AppRouter({ theme, onThemeChange }: RouterProps) {
               upgrade resumes automatically once that tab closes. */}
           {storageBlocked ? (
             <div className="card onboarding">
-              <div className="logo-icon">∞</div>
+              <div className="logo-icon"><InfinityMark /></div>
               <h1>Закройте другие вкладки</h1>
               <p className="subtitle">
                 Приложение обновляет локальное хранилище, но оно открыто в

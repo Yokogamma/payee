@@ -6,6 +6,7 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SeedEntryGrid } from '../components/SeedEntryGrid';
 import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
 import { emptySeedWords, emptySeedFlags } from '../lib/seed-words';
+import { InfinityMark } from '../components/icons';
 
 /**
  * Two steps, mirroring onboarding: the phrase, then an OFFER to set a PIN.
@@ -93,7 +94,7 @@ export function Restore() {
   return (
     <div className="screen-center">
       <div className="card onboarding">
-        <div className="logo-icon">∞</div>
+        <div className="logo-icon"><InfinityMark /></div>
 
         {step === 'seed' && (
           <>

@@ -3,6 +3,7 @@ import { useNotes, VaultMismatchError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
 import { copyTextToClipboard } from '../lib/clipboard';
+import { InfinityMark } from '../components/icons';
 
 type Step = 'start' | 'seed' | 'verify' | 'pin';
 
@@ -111,7 +112,7 @@ export function Onboarding() {
   return (
     <div className="screen-center">
       <div className="card onboarding">
-        <div className="logo-icon">∞</div>
+        <div className="logo-icon"><InfinityMark /></div>
 
         {step === 'start' && (
           <>

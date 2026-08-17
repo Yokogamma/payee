@@ -1,4 +1,5 @@
 import { useNotes } from '../lib/store';
+import { InfinityMark } from '../components/icons';
 
 export function Landing() {
   const { goToOnboarding, goToRestore } = useNotes();
@@ -7,7 +8,7 @@ export function Landing() {
     <div className="screen-center">
       <div className="card landing-card">
         <div className="landing-hero">
-          <div className="logo-icon landing-logo">∞</div>
+          <div className="logo-icon landing-logo"><InfinityMark /></div>
           <h1>Eternal Notes</h1>
           <p className="subtitle">
             Зашифрованы на устройстве. По желанию — навсегда в блокчейне.

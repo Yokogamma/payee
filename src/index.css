@@ -32,13 +32,20 @@
    needs a visibly darker colour — not a rounding the way --text-dim was.
    So the two jobs split:
 
-     --border-strong   #c9bda1   decoration: the search underline, group rules,
-                                 anything a pointer cannot act on
+     --border-strong   #c9bda1   a heavy rule that promises nothing
      --border-control  #93856a   identity: button and field boundaries, 3.07:1
 
    A line that promises nothing keeps the paper look; a line that promises a
    press is legible to someone who cannot see the difference between paper and
-   parchment. Pinned in scripts/check-contrast.test.mjs. */
+   parchment. Pinned in scripts/check-contrast.test.mjs.
+
+   WORTH KNOWING while reading the mockups: they draw EVERY 1.5px rule in
+   #c9bda1, and every one of them turns out to sit on a control — the search
+   underline, the refresh ring, the ⋯ ring, the outline buttons, the composer
+   toolbar. So --border-strong may well end up with no users at all. It is
+   kept rather than removed because «no users yet» and «no users ever» look
+   identical halfway through a redesign; if it is still unused when the last
+   screen lands, delete it then. */
 
 :root,
 [data-theme="dark"] {
@@ -176,10 +183,59 @@ html, body, #root {
 
 body {
   font-family: var(--font);
+  /* 16.5px, not 14. The old scale was a dense dashboard; this one is meant to
+     be read, and every size below derives from here. */
+  font-size: 16.5px;
+  line-height: 1.55;
   background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
+}
+
+/* ─── Type scale ────────────────────────────────────────────────
+   The floor is 13px and there is nothing beneath it. Anything that wants to
+   be smaller wants to be shorter instead. */
+
+/* Screen title: «Заметки», «Сейф», «Настройки». */
+.section-title {
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+/* Group label above a settings block or a date above a feed entry. Mono and
+   spaced, so it reads as an index entry rather than as a quiet heading —
+   which is what a smaller serif would have looked like. */
+.section-label {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* Status, never action: a fact stated in text, with no border and no capsule.
+   The rule the whole redesign turns on — see .btn below for the other half. */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.state--quiet { color: var(--text-dim); }
+
+/* The drawn marks (∞, ⋯ — see components/icons.tsx). Sized in em so they
+   track the text they sit in, and nudged off the baseline because an
+   optically centred glyph sits lower than a geometrically centred box. */
+.mark {
+  width: 1.15em;
+  height: 1.15em;
+  vertical-align: -0.22em;
+  flex: none;
 }
 
 /* Width lives on the SCREENS, not here: the main screen grows to fit a side
@@ -209,7 +265,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding: var(--pad-screen);
 }
 
 .card {
@@ -229,46 +285,58 @@ body {
   text-align: center;
 }
 
+/* The comment that used to live here said U+221E «is not in any imported
+   subset» and settled for weight 400. That was half the story and the better
+   half is worse: it is in no subset Google publishes for Literata AT ALL, so
+   no import could have fixed it. The mark is drawn now (components/icons.tsx)
+   and this box just sizes it. The glow went with the rest of them. */
 .logo-icon {
   font-size: 48px;
-  /* U+221E is not in any imported subset and 200 was never imported either —
-     this asked for a weight of a face that does not draw the glyph. 400 is
-     honest; the visual result is settled by a before/after screenshot. */
   font-weight: 400;
   color: var(--accent);
   line-height: 1;
   margin-bottom: 4px;
-  text-shadow: 0 0 40px var(--accent-glow);
+}
+.logo-icon .mark {
+  width: 52px;
+  height: 52px;
+  vertical-align: 0;
 }
 
 h1 {
-  font-size: 24px;
+  font-size: 27px;
   font-weight: 600;
-  letter-spacing: -0.5px;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
 }
 
 .subtitle {
   color: var(--text-dim);
-  font-size: 14px;
-  line-height: 1.5;
-  max-width: 320px;
+  font-size: 15px;
+  line-height: 1.6;
+  max-width: 340px;
 }
 
 /* ─── Buttons ───────────────────────────────────────────────── */
+
+/* THE RULE THIS SECTION EXISTS FOR: a control is a FILL or a 1.5px rule, and
+   nothing else on screen may borrow either. State is text (see .state above).
+   The old UI blurred this — statuses wore capsules, actions wore none — and a
+   user could not tell by looking which things did something. */
 
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 8px;
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 500;
   padding: 10px 20px;
   border-radius: var(--radius-sm);
   border: none;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
   width: 100%;
   /* a11y (Phase 7): every button is a ≥44px touch target — variants with
      smaller padding (btn-save, invite-btn) inherit this floor. */
@@ -278,6 +346,17 @@ h1 {
 .btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* Focus is not decoration here: with borders this quiet, an outline is how a
+   keyboard user finds themselves at all. Ink on paper, outside the box so a
+   filled button does not swallow it. */
+.btn:focus-visible,
+.icon-btn:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
 }
 
 /* `color: white` was right for exactly as long as the accent was violet — a
@@ -293,14 +372,17 @@ h1 {
   background: var(--accent-hover);
 }
 
+/* 1.5px --border-control, not 1px --border: this rule is what says «button»,
+   so it is the one that has to clear 3:1 (SC 1.4.11). --border is a hair
+   lighter and belongs to dividers, which promise nothing. */
 .btn-outline {
   background: transparent;
   color: var(--text);
-  border: 1px solid var(--border);
+  border: 1.5px solid var(--border-control);
 }
 .btn-outline:hover {
   border-color: var(--border-focus);
-  background: var(--bg-hover);
+  background: var(--accent-glow);
 }
 
 .btn-ghost {
@@ -309,15 +391,19 @@ h1 {
 }
 .btn-ghost:hover {
   color: var(--text);
+  background: var(--accent-glow);
 }
 
+/* Was a hard-coded rgba of the old cold red, which on paper read as a sticker
+   someone left on the page. Danger is stated in the same ink weight as
+   everything else and differs only in hue. */
 .btn-danger {
   background: transparent;
   color: var(--red);
-  border: 1px solid rgba(240, 83, 101, 0.3);
+  border: 1.5px solid currentColor;
 }
 .btn-danger:hover {
-  background: rgba(240, 83, 101, 0.1);
+  background: var(--accent-glow);
 }
 
 /* Was `background: var(--green); color: #0a0a0f` — a green fill with the old
@@ -574,50 +660,51 @@ h1 {
   gap: 4px;
 }
 
-.icon-btn {
-  background: none;
-  border: none;
-  font-size: 16px;
-  padding: 6px 8px;
-  cursor: pointer;
-  border-radius: 6px;
-  transition: background 0.15s;
-  /* a11y: touch target ≥44px */
-  min-width: 44px;
-  min-height: 44px;
-}
-.icon-btn:hover {
-  background: var(--bg-hover);
-}
+/* .icon-btn was defined here as a borderless 44px square and AGAIN in the
+   FAB section; two definitions of one control is one too many. The single
+   definition now lives with the other round controls — see «Section chip,
+   tiny token, FAB». */
 
-/* Search */
+/* Search — a RULED LINE, not a box. A bordered, filled, rounded field is a
+   form control borrowed from a settings dialog; on a page that is trying to
+   look like a book, the search sits on the page the way a line of writing
+   does. The 1.5px rule is the field's boundary, so it takes --border-control:
+   an input still has to be identifiable (SC 1.4.11). */
 .search-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border);
+  gap: 10px;
+  margin: 6px var(--pad-screen) 0;
+  padding: 10px 2px;
+  border-bottom: 1.5px solid var(--border-control);
   flex-shrink: 0;
 }
 
 .search-bar input {
   flex: 1;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  min-width: 0;
+  background: transparent;
+  border: none;
   color: var(--text);
   font-family: var(--font);
-  font-size: 14px;
-  padding: 8px 12px;
+  font-size: 16.5px;
+  padding: 0;
   outline: none;
 }
-.search-bar input:focus {
-  border-color: var(--accent);
+/* Italic, and only the placeholder: a prompt is not content, and the slant is
+   what says so without a second colour or a smaller size. */
+.search-bar input::placeholder {
+  color: var(--text-dim);
+  font-style: italic;
+  opacity: 1; /* Firefox dims placeholders by default — that would undo the contrast work */
+}
+.search-bar:focus-within {
+  border-bottom-color: var(--border-focus);
 }
 
 .search-count {
-  font-size: 12px;
-  color: var(--text-muted);
+  font-size: 13.5px;
+  color: var(--text-dim);
   white-space: nowrap;
 }
 
@@ -855,18 +942,42 @@ h1 {
 .btn-tiny {
   position: relative;
   flex: 0 0 auto;
-  padding: 4px 9px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  padding: 7px 14px;
+  border: 1.5px solid var(--border-control);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--text-dim);
+  /* Was --text-dim at 12px. A control that whispers is a control nobody
+     presses, and 12px is under the floor besides: this is ink at 14px. */
+  color: var(--text);
   font-family: var(--font);
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.5;
   cursor: pointer;
 }
-.btn-tiny::after { content: ''; position: absolute; inset: -9px -4px; }
-.btn-tiny:hover { color: var(--text); background: var(--bg-hover); }
+.btn-tiny::after { content: ''; position: absolute; inset: -6px -4px; }
+.btn-tiny:hover { border-color: var(--border-focus); background: var(--accent-glow); }
+
+/* Round icon control: the ⋯ menu trigger, the status line's refresh. Visual
+   size is 36–44px per the mockup; the ::after keeps the TOUCH target at 44
+   regardless, which is why the two numbers are allowed to differ. */
+.icon-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border: 1.5px solid var(--border-control);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+.icon-btn::after { content: ''; position: absolute; inset: -2px; }
+.icon-btn:hover { border-color: var(--border-focus); background: var(--accent-glow); }
+.icon-btn svg { width: 18px; height: 18px; }
+.icon-btn .mark { width: 20px; height: 20px; vertical-align: 0; }
 
 /* Sticky, never fixed — see the comment in Fab.tsx: a fixed FAB needs a
    z-index, and any z-index ≥ 100 would paint over the privacy lock gate. */
@@ -2098,8 +2209,9 @@ mark {
   }
   .app-nav-mark {
     color: var(--accent);
-    font-size: 17px;
-    line-height: 1;
+    width: 20px;
+    height: 20px;
+    vertical-align: 0;
   }
 }
 
