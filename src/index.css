@@ -326,6 +326,9 @@ body {
   line-height: 1;
   margin-bottom: 4px;
 }
+/* Both the drawn marks and the line icons — a bare <svg> here would take the
+   replaced-element default of ~300×150px and swallow the screen. */
+.logo-icon svg,
 .logo-icon .mark {
   width: 52px;
   height: 52px;
@@ -375,6 +378,14 @@ h1 {
 .btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* Icons inside buttons track the label they sit beside. Declared here so a
+   variant that forgets to size its icon still gets a sane one. */
+.btn svg {
+  width: 1.1em;
+  height: 1.1em;
+  flex: none;
 }
 
 /* No focus rule here. A global `:focus-visible` already covers every element

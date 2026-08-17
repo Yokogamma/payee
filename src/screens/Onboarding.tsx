@@ -128,7 +128,7 @@ export function Onboarding() {
               У меня есть seed-фраза
             </button>
             <button className="btn btn-ghost" onClick={goToLanding}>
-              ← Назад
+              Назад
             </button>
           </>
         )}
@@ -185,7 +185,7 @@ export function Onboarding() {
                   disabled={!confirmed}
                   onClick={startVerify}
                 >
-                  Продолжить →
+                  Продолжить
                 </button>
               </>
             )}
@@ -227,10 +227,10 @@ export function Onboarding() {
               disabled={verifyInputs.some(w => !w.trim())}
               onClick={handleVerify}
             >
-              Проверить →
+              Проверить
             </button>
             <button className="btn btn-ghost" onClick={() => { setError(''); setStep('seed'); }}>
-              ← Посмотреть фразу ещё раз
+              Посмотреть фразу ещё раз
             </button>
           </>
         )}
@@ -304,7 +304,7 @@ export function Onboarding() {
               disabled={finishing || pinInput.length < 6 || pinInput !== pinConfirm}
               onClick={() => handleFinish(true)}
             >
-              {finishing ? 'Создание...' : 'Установить PIN и начать →'}
+              {finishing ? 'Создание...' : 'Установить PIN и начать'}
             </button>
             <button
               className="btn btn-ghost"

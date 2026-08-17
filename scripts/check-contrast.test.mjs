@@ -254,14 +254,29 @@ describe('themed fills carry a themed label', () => {
  * check that keeps the three palettes meaningful: every colour in the
  * stylesheet either IS a palette entry or refers to one.
  */
+const RESET_MARKER = '*, *::before';
+
 describe('colour lives in the palettes and nowhere else', () => {
+  it('found the boundary between palettes and rules (guards the guard)', () => {
+    // Without this the `indexOf` below can return -1, `slice(-1)` yields one
+    // character, and the whole check passes on an empty haystack — green, and
+    // measuring nothing.
+    expect(css.indexOf(RESET_MARKER)).toBeGreaterThan(0);
+  });
+
   it('no rule outside the palette blocks carries a literal colour', () => {
     // Everything before the reset is palette; everything after is rules.
-    const rules = css.slice(css.indexOf('*, *::before'));
+    const rules = css.slice(css.indexOf(RESET_MARKER));
+    // Split on `;` rather than on line starts. `.foo { color: #fff; }` written
+    // on ONE line has no declaration at the beginning of a line, and the first
+    // version of this scan walked straight past it.
     const literals = [
       ...new Set(
-        [...rules.matchAll(/^\s*[a-z-]+:\s*[^;]*(?:rgba?\([0-9]|#[0-9a-fA-F]{3,6})[^;]*;/gm)]
-          .map(m => m[0].trim()),
+        rules
+          .split(/[;{}]/)
+          .map(d => d.trim())
+          .filter(d => /^[a-z-]+\s*:/.test(d))
+          .filter(d => /rgba?\([0-9]|#[0-9a-fA-F]{3,6}\b/.test(d)),
       ),
     ];
     expect(

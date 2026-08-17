@@ -361,3 +361,25 @@ describe('SettingsSection — поля сейфа попадают под очи
     }
   });
 });
+
+describe('SettingsSection — футер вне скролла', () => {
+  it('футер НЕ лежит внутри .settings-scroll', () => {
+    // Каскадный тест проверяет правила CSS; это проверяет разметку. Одно без
+    // другого проходит при верной сетке и футере, оставленном в колонке.
+    const { container } = renderSection();
+    const scroll = container.querySelector('.settings-scroll');
+    const foot = container.querySelector('.settings-footnote');
+    expect(scroll, 'скроллер не найден').not.toBeNull();
+    expect(foot, 'футер не найден').not.toBeNull();
+    expect(scroll.contains(foot), 'футер уехал обратно в прокручиваемую колонку').toBe(false);
+    expect(foot.parentElement).toBe(container.querySelector('.settings-section'));
+  });
+
+  it('футер идёт ПОСЛЕ скроллера — вторая строка сетки, а не первая', () => {
+    const { container } = renderSection();
+    const section = container.querySelector('.settings-section');
+    const kids = [...section.children];
+    expect(kids.indexOf(container.querySelector('.settings-footnote')))
+      .toBeGreaterThan(kids.indexOf(container.querySelector('.settings-scroll')));
+  });
+});

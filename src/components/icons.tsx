@@ -40,6 +40,8 @@ export function InfinityMark({ className }: MarkProps) {
     <svg
       className={`mark${className ? ` ${className}` : ''}`}
       viewBox="0 0 24 24"
+      width="1em"
+      height="1em"
       fill="none"
       stroke="currentColor"
       strokeWidth="1.8"
@@ -58,9 +60,28 @@ export function InfinityMark({ className }: MarkProps) {
    already use. Sizing is the caller's business (.icon-btn svg, .status-btn
    svg), so these carry no dimensions of their own. */
 
+/**
+ * `width`/`height` DEFAULT TO 1em, and that is a safety net rather than a
+ * style choice.
+ *
+ * An `<svg>` with no dimensions and no CSS sizing it falls back to the
+ * replaced-element default — about 300×150px. Not «a bit large»: a single
+ * unsized icon takes over the screen it is on. Every container here does set a
+ * size, but «every container» is a claim that has to stay true across every
+ * future caller, and the failure is silent in tests and spectacular in the
+ * browser. Sizing to the surrounding text means a missed rule costs a slightly
+ * wrong icon instead of a broken layout, and any container that wants a
+ * specific size still overrides this from CSS.
+ *
+ * `flex: none` for the same reason: in a flex row an icon must not be the
+ * thing that shrinks.
+ */
 const Line = ({ children }: { children: React.ReactNode }) => (
   <svg
     viewBox="0 0 24 24"
+    width="1em"
+    height="1em"
+    style={{ flex: 'none' }}
     fill="none"
     stroke="currentColor"
     strokeWidth="1.8"
@@ -209,6 +230,8 @@ export function EllipsisMark({ className }: MarkProps) {
     <svg
       className={`mark${className ? ` ${className}` : ''}`}
       viewBox="0 0 24 24"
+      width="1em"
+      height="1em"
       fill="currentColor"
       aria-hidden="true"
     >

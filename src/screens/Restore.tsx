@@ -142,7 +142,7 @@ export function Restore() {
                 onClick={() => handleFinish(false)}
                 disabled={loading}
               >
-                {loading ? 'Восстановление...' : 'Восстановить заметки →'}
+                {loading ? 'Восстановление...' : 'Восстановить заметки'}
               </button>
             ) : (
               <button
@@ -150,12 +150,12 @@ export function Restore() {
                 onClick={handleContinue}
                 disabled={loading}
               >
-                Далее →
+                Далее
               </button>
             )}
 
             <button className="btn btn-ghost" onClick={goToOnboarding} disabled={loading}>
-              ← Создать новое хранилище
+              Создать новое хранилище
             </button>
           </>
         )}
@@ -205,7 +205,7 @@ export function Restore() {
               disabled={loading || pinInput.length < 6 || pinInput !== pinConfirm}
               onClick={() => handleFinish(true)}
             >
-              {loading ? 'Восстановление...' : 'Установить PIN и восстановить →'}
+              {loading ? 'Восстановление...' : 'Установить PIN и восстановить'}
             </button>
             <button
               className="btn btn-ghost"
@@ -219,7 +219,7 @@ export function Restore() {
               disabled={loading}
               onClick={() => { setError(''); setStep('seed'); }}
             >
-              ← Назад к seed-фразе
+              Назад к seed-фразе
             </button>
           </>
         )}

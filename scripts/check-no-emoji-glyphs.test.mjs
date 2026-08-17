@@ -25,17 +25,26 @@ import { execSync } from 'node:child_process';
  */
 
 /**
- * Allowed.
- *
- * ∞ and ⋯ are approved by the design as text glyphs.
- *
- * The arrows are PUNCTUATION, not pictures. Russian UI prose uses → to mean
- * «then»: «Настройки → Вечное хранилище», «Сброс → Отмена», and the sync
- * state machine writes `queued → uploading` in its logs. Flagging those made
- * the first run report a dozen files that had nothing wrong with them, which
- * is how a check earns the reputation that gets it disabled.
+ * Allowed EVERYWHERE: exactly the two the design approves.
  */
-const ALLOWED = new Set(['∞', '⋯', '→', '←', '⇒', '↔']);
+const ALLOWED = new Set(['∞', '⋯']);
+
+/**
+ * Allowed in `src/lib` ONLY, and the distinction is the point.
+ *
+ * In logic, → is punctuation: the sync machine writes `queued → uploading` in
+ * a log line and an error message says «Настройки → Вечное хранилище», both
+ * meaning «then». In the UI layer the same character was DECORATION on button
+ * labels — «Далее →», «← Назад» — where the direction is already carried by
+ * the button and its place in the flow.
+ *
+ * The first version of this file allowed arrows globally, and that turned the
+ * audit green while eleven of them were still sitting in button captions. An
+ * allowlist wide enough to cover the legitimate case was wide enough to hide
+ * the illegitimate one; scoping it by directory keeps both answers right.
+ */
+const ALLOWED_IN_LIB = new Set(['→', '←', '⇒', '↔']);
+const LIB = /^src\/lib\//;
 
 /**
  * What counts as «an icon pretending to be a character».
@@ -46,14 +55,19 @@ const ALLOWED = new Set(['∞', '⋯', '→', '←', '⇒', '↔']);
  */
 const PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
 const SYMBOL_RANGES = [
-  [0x21a9, 0x21bb], // Arrows used AS ICONS — ↩ return, ↻ refresh
+  // The WHOLE arrows block. Narrowing it to ↩ and ↻ was the first attempt and
+  // it made → and ← unflaggable anywhere, including the eleven button captions
+  // they were decorating. The block is caught wholesale and `ALLOWED_IN_LIB`
+  // carves out the one place arrows are punctuation.
+  [0x2190, 0x21ff], // Arrows — → ← ↩ ↻
   [0x25a0, 0x25ff], // Geometric Shapes — ● ○ ▲
   [0x2713, 0x2718], // Dingbats: check marks and crosses — ✓ ✕
   [0x2731, 0x2731], // Heavy asterisk — ✱
 ];
 
-function isFlagged(ch) {
+function isFlagged(ch, file = '') {
   if (ALLOWED.has(ch)) return false;
+  if (LIB.test(file) && ALLOWED_IN_LIB.has(ch)) return false;
   if (PICTOGRAPHIC.test(ch)) return true;
   const cp = ch.codePointAt(0);
   return SYMBOL_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
@@ -80,7 +94,7 @@ function offendersIn(file) {
   const src = stripComments(readFileSync(file, 'utf8'));
   const found = new Map();
   for (const ch of src) {
-    if (!isFlagged(ch)) continue;
+    if (!isFlagged(ch, file)) continue;
     const cp = ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
     found.set(ch, `${ch} (U+${cp})`);
   }
@@ -114,9 +128,10 @@ describe('никаких эмодзи и символов вместо икон�
     expect(isFlagged('🔒')).toBe(true);
     expect(isFlagged('↻')).toBe(true);
     expect(isFlagged('↩')).toBe(true);
-    // Стрелка-пунктуация в «Настройки → Вечное хранилище» — не иконка.
-    expect(isFlagged('→')).toBe(false);
-    expect(isFlagged('←')).toBe(false);
+    // Стрелка — пунктуация В ЛОГИКЕ и украшение В ИНТЕРФЕЙСЕ.
+    expect(isFlagged('→', 'src/lib/errors.ts')).toBe(false);
+    expect(isFlagged('→', 'src/screens/Restore.tsx')).toBe(true);
+    expect(isFlagged('←', 'src/components/Foo.tsx')).toBe(true);
     expect(isFlagged('●')).toBe(true);
     expect(isFlagged('⚠️')).toBe(true);
     // Обычный текст не трогаем.
