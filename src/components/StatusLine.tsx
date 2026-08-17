@@ -40,6 +40,23 @@ interface Rung {
   dismiss?: () => void;
 }
 
+/**
+ * The leading indicator, decided SEPARATELY from severity.
+ *
+ * Tying ∞ to `tone === 'ok'` looked right and was wrong: `ok` means «nothing
+ * is broken», and four different rungs claim it. Two of them contradict the
+ * mark outright — «Синхронизация выключена — всё на устройстве» is the state
+ * of NOT being permanent, and «Синхронизировано · 1 из 2 заметок» is half of
+ * one. The interface would have promised eternity next to a sentence saying
+ * the notes live on this device only.
+ *
+ * So severity picks the WORDS and storage state picks the MARK. ∞ appears
+ * only when every chain is confirmed on-chain, and never while something is
+ * wrong or in flight — a transient «Проверяем обновления…» has no business
+ * carrying a permanence claim either.
+ */
+type Indicator = 'permanent' | 'dot';
+
 export function StatusLine() {
   const {
     arweave, chains, syncStatuses,
@@ -63,6 +80,17 @@ export function StatusLine() {
   const checkBusy = checking || restoring;
 
   const rung = pickRung();
+
+  // Every chain confirmed on-chain, and the counts are real rather than the
+  // empty pre-hydration state that would read as «0 of 0 — all done».
+  const allPermanent =
+    arweave.enabled &&
+    arweave.registered &&
+    arweave.countsReady &&
+    chains.length > 0 &&
+    counters.confirmedChains === chains.length;
+
+  const indicator: Indicator = rung.tone === 'ok' && allPermanent ? 'permanent' : 'dot';
 
   function pickRung(): Rung {
     if (restoring) {
@@ -159,11 +187,9 @@ export function StatusLine() {
 
   return (
     <div className={`status-line status-line--${rung.tone}`}>
-      {/* ∞ only on the good rung. It is a claim — «everything is saved,
-          forever» — and printing it beside «Оффлайн» or «Не удалось проверить
-          обновления» would be the interface contradicting itself in its own
-          vocabulary. Every other state gets a toned dot. */}
-      {rung.tone === 'ok'
+      {/* See the Indicator type: the mark answers «is everything permanent»,
+          not «is anything broken». */}
+      {indicator === 'permanent'
         ? <InfinityMark className="status-mark" />
         : <span className="status-dot" aria-hidden="true" />}
       {/* An explicit aria-live OVERRIDES the implicit `assertive` that comes

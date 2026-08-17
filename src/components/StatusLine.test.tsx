@@ -213,3 +213,76 @@ describe('StatusLine — карантин объясняется верно', ()
     expect(screen.queryByText(/Отложено/)).toBeNull();
   });
 });
+
+describe('StatusLine — знак ∞ утверждает вечность, а не отсутствие проблем', () => {
+  // Первая версия привязывала ∞ к tone === 'ok'. Тон означает «ничего не
+  // сломано», и его выдают четыре разные ветки — включая ровно те две, где
+  // вечности нет: синхронизация выключена и подтверждена лишь часть заметок.
+  const chain = (root: string, ...versionIds: string[]) => ({
+    root,
+    versions: versionIds.map(id => ({ id })),
+    current: { id: versionIds[versionIds.length - 1] },
+  });
+  const mark = () => document.querySelector('.status-mark');
+  const dot = () => document.querySelector('.status-dot');
+
+  function withChains(chains: ReturnType<typeof chain>[], statuses: Record<string, string>) {
+    s().chains = chains as never;
+    s().syncStatuses = Object.fromEntries(
+      Object.entries(statuses).map(([id, status]) => [id, { status }]),
+    ) as never;
+  }
+
+  it('всё подтверждено — знак стоит', () => {
+    withChains([chain('a', 'a1'), chain('b', 'b1')], { a1: 'confirmed', b1: 'confirmed' });
+    render(<StatusLine />);
+    expect(mark()).not.toBeNull();
+    expect(dot()).toBeNull();
+  });
+
+  it('подтверждена половина — знака нет', () => {
+    withChains([chain('a', 'a1'), chain('b', 'b1')], { a1: 'confirmed', b1: 'queued' });
+    render(<StatusLine />);
+    expect(mark(), '«1 из 2» не является вечностью').toBeNull();
+    expect(dot()).not.toBeNull();
+  });
+
+  it('синхронизация выключена — знака нет даже при спокойном тоне', () => {
+    // Текст здесь прямо говорит «всё на устройстве»: ∞ рядом с ним был бы
+    // не неточностью, а противоречием в одном предложении.
+    withChains([chain('a', 'a1')], { a1: 'confirmed' });
+    s().arweave.enabled = false;
+    render(<StatusLine />);
+    expect(text().textContent).toMatch(/выключена/);
+    expect(mark()).toBeNull();
+  });
+
+  it('ключ не зарегистрирован — знака нет', () => {
+    withChains([chain('a', 'a1')], { a1: 'confirmed' });
+    s().arweave.registered = false;
+    render(<StatusLine />);
+    expect(mark()).toBeNull();
+  });
+
+  it('счётчики ещё не загрузились — знака нет', () => {
+    // countsReady=false означает пустой syncStatuses, из которого «0 из 0»
+    // читалось бы как «всё готово».
+    withChains([chain('a', 'a1')], { a1: 'confirmed' });
+    s().arweave.countsReady = false;
+    render(<StatusLine />);
+    expect(mark()).toBeNull();
+  });
+
+  it('заметок нет вовсе — знака нет', () => {
+    render(<StatusLine />);
+    expect(mark(), 'пустое хранилище не «сохранено навечно»').toBeNull();
+  });
+
+  it('ошибка перебивает знак, даже если всё подтверждено', () => {
+    withChains([chain('a', 'a1')], { a1: 'confirmed' });
+    s().arweave.lastError = 'сеть недоступна';
+    render(<StatusLine />);
+    expect(mark()).toBeNull();
+    expect(dot()).not.toBeNull();
+  });
+});
