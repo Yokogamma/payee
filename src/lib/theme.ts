@@ -20,9 +20,9 @@ const THEME_KEY = 'theme';
  * on a real device with the PWA installed.
  */
 const THEME_BG: Record<Exclude<ThemePref, 'system'>, string> = {
-  dark: '#0a0a0f',
-  light: '#f5f5f7',
-  warm: '#f3ebdf',
+  dark: '#191612',
+  light: '#f2ecdf',
+  warm: '#f4e7d0',
 };
 
 const EXPLICIT: readonly ThemePref[] = ['dark', 'light', 'warm'];

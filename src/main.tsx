@@ -1,40 +1,17 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 // Self-hosted fonts (no Google CDN → privacy + offline + CSP font-src 'self').
-// Family names match those referenced in index.css ('Manrope', 'JetBrains Mono').
 //
-// PER-SUBSET IMPORTS, NOT PER-WEIGHT. `@fontsource/manrope/400.css` declares
-// SIX @font-face — latin, latin-ext, cyrillic, cyrillic-ext, greek, vietnamese
-// — so four weights would ship 24 woff2 for two alphabets nobody types here.
-// Naming the subsets is the only way to choose; do not «simplify» this back.
+// The sixteen per-subset @fontsource imports that used to sit here are now
+// twelve hand-written @font-face in fonts.css. That file explains why at
+// length; the short version is that the choice they encoded — name the
+// subsets, never take the per-weight entrypoint, never ship greek and
+// vietnamese to a Russian notes app — cannot be expressed as an import for a
+// VARIABLE family, because @fontsource-variable publishes no per-subset CSS.
 //
-// The four chosen subsets cover Russian, Ukrainian, Serbian and European
-// diacritics. Note text is written by the USER, so narrowing further would drop
-// a Ukrainian ї into the system font in the middle of a word.
-//
-// Weight 300 is gone: it was imported and used nowhere.
-//
-// Why Manrope at all: Outfit ships latin only, so every Cyrillic glyph in this
-// Russian app was already a system fallback — the brand face drew two words.
-import '@fontsource/manrope/latin-400.css'
-import '@fontsource/manrope/latin-ext-400.css'
-import '@fontsource/manrope/cyrillic-400.css'
-import '@fontsource/manrope/cyrillic-ext-400.css'
-import '@fontsource/manrope/latin-500.css'
-import '@fontsource/manrope/latin-ext-500.css'
-import '@fontsource/manrope/cyrillic-500.css'
-import '@fontsource/manrope/cyrillic-ext-500.css'
-import '@fontsource/manrope/latin-600.css'
-import '@fontsource/manrope/latin-ext-600.css'
-import '@fontsource/manrope/cyrillic-600.css'
-import '@fontsource/manrope/cyrillic-ext-600.css'
-import '@fontsource/manrope/latin-700.css'
-import '@fontsource/manrope/latin-ext-700.css'
-import '@fontsource/manrope/cyrillic-700.css'
-import '@fontsource/manrope/cyrillic-ext-700.css'
-import '@fontsource/jetbrains-mono/400.css'
-import '@fontsource/jetbrains-mono/500.css'
-import '@fontsource/jetbrains-mono/600.css'
+// Family names match those referenced in index.css ('Literata Variable',
+// 'PT Mono').
+import './fonts.css'
 import './index.css'
 import App from './App.tsx'
 import { initPwaUpdater } from './lib/pwa'

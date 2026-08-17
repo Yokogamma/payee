@@ -2,105 +2,141 @@
 
 /* ─── Reset & Variables ─────────────────────────────────────── */
 
+/* «Архив»: paper and ink, not a tinted grey UI. Three palettes speak one
+   language — a warm ground, an ink foreground, and rules drawn rather than
+   filled. The accent is no longer a colour: it is the CONTRAST of ink against
+   paper, which is why --accent equals --text in every theme and needs
+   --accent-text to say what sits on top of it.
+
+   WHAT LEFT AND WHY IT IS NOT COMING BACK:
+   - the violet #6c63ff / #5b52ee / #5b4fd1. It was the one colour with no job
+     in a paper metaphor.
+   - --green-line, --green-glow, --yellow-line. Glows and tinted rules belong
+     to the previous language; there is no paper equivalent to invent, and
+     keeping three keys alive only so the parity test stays quiet would be
+     vocabulary without meaning. Their four call sites were rewritten in the
+     same commit.
+
+   --green survives as a KEY but not as a colour: confirmation is stated in
+   ink and in words («∞ навечно»), never in green. It stays because ~16 rules
+   still name it and collapsing them is a rename, not a redesign.
+
+   --text-muted is now var(--text-dim) everywhere. Two secondary inks were a
+   distinction the old palette needed for contrast on cards; this one does not.
+   Aliasing rather than deleting keeps 25 call sites out of this commit. */
+
 :root,
 [data-theme="dark"] {
-  --bg: #0a0a0f;
-  --bg-card: #12121a;
-  --bg-input: #1a1a26;
-  --bg-hover: #1e1e2e;
-  --border: #2a2a3a;
-  --border-focus: #4a4a6a;
-  --text: #e4e4ef;
-  --text-dim: #7a7a8f;
-  --text-muted: #8a8aa0; /* a11y: was #4a4a5f — failed contrast on dark cards */
-  --accent: #6c63ff;
-  --accent-hover: #5b52ee;
-  --accent-glow: rgba(108, 99, 255, 0.15);
-  --green: #2dd4a8;
-  --green-line: #1d5a4a;
-  --green-glow: rgba(45, 212, 168, 0.1);
-  --red: #f05365;
-  --yellow: #fbbf24;
-  --yellow-line: #5a4a1d;
-  --radius: 12px;
+  --bg: #191612;
+  --bg-card: #201c17;
+  --bg-input: #201c17;
+  --bg-hover: #2a251d;
+  --border: #3a3428;
+  --border-strong: #4a4335;
+  --border-inner: #2b261f;
+  --border-focus: #ece4d3;
+  --text: #ece4d3;
+  --text-dim: #968c78; /* 5.42:1 on --bg */
+  --text-muted: var(--text-dim);
+  --accent: #ece4d3;
+  --accent-text: #191612;
+  --accent-hover: #f6efdd;
+  --accent-glow: rgba(236, 228, 211, 0.08);
+  --green: #ece4d3;
+  --red: #c9705c;
+  --yellow: #b99a4a;
+
+  /* Layout and typography live ONLY here and cascade to every theme —
+     check-theme-parity.test.mjs pins that, so a future palette cannot start
+     copying them. */
+  --radius: 10px;
   --radius-sm: 8px;
-  --font: 'Manrope', -apple-system, system-ui, sans-serif;
-  --mono: 'JetBrains Mono', monospace;
+  --pad-screen: 20px;
+  --font: 'Literata Variable', Literata, Georgia, serif;
+  --mono: 'PT Mono', ui-monospace, monospace;
 }
 
+/* The light palette carries the handoff's exact values with ONE deliberate
+   exception, --text-dim. The design specifies #77705e, which measures 4.56:1
+   on the card ground (#faf6ea) and 4.18:1 on the screen ground (#f2ecdf).
+   The screen ground is where the mockup puts the search placeholder, the
+   dates, the note counter and every sync status — all of it 13–16.5px normal
+   text, so WCAG 2.2 SC 1.4.3 asks for 4.5:1 and does not get it. #6f6857
+   measures 4.70:1 and is otherwise indistinguishable. The pairs are pinned in
+   scripts/check-contrast.test.mjs so this cannot drift back. */
 [data-theme="light"] {
-  --bg: #f5f5f7;
-  --bg-card: #ffffff;
-  --bg-input: #eeeef2;
-  --bg-hover: #e5e5eb;
-  --border: #d1d1d9;
-  --border-focus: #a0a0b4;
-  --text: #1a1a2e;
-  --text-dim: #6b6b80;
-  --text-muted: #70708a; /* a11y contrast on light cards */
-  --accent: #5b52ee;
-  --accent-hover: #4a41d6;
-  --accent-glow: rgba(91, 82, 238, 0.12);
-  --green: #1aab8a;
-  --green-line: #7fc9b2;
-  --green-glow: rgba(26, 171, 138, 0.1);
-  --red: #dc3545;
-  --yellow: #d4a017;
-  --yellow-line: #d9bd77;
+  --bg: #f2ecdf;
+  --bg-card: #faf6ea;
+  --bg-input: #faf6ea;
+  --bg-hover: #e9e1cd;
+  --border: #d9cfb8;
+  --border-strong: #c9bda1;
+  --border-inner: #e7ddc8;
+  --border-focus: #292317;
+  --text: #292317;
+  --text-dim: #6f6857; /* handoff #77705e is 4.18:1 on --bg — see above */
+  --text-muted: var(--text-dim);
+  --accent: #292317;
+  --accent-text: #f2ecdf;
+  --accent-hover: #14110b;
+  --accent-glow: rgba(41, 35, 23, 0.05);
+  --green: #292317;
+  --red: #9a3a28;
+  --yellow: #806119;
 }
 
-/* Warm: less blue for evening reading. Declares EXACTLY the same key set as
-   the light palette — an omitted variable does not fall back to light, it
-   falls through to the DARK values on :root, and that shows up on one screen
-   a month later. Enforced by scripts/check-theme-parity.test.mjs.
+/* Warm: the same paper, aged further — an amber ground for evening reading.
+   Declares EXACTLY the same key set as the light palette; an omitted variable
+   does not fall back to light, it falls through to the DARK values on :root,
+   and that shows up on one screen a month later. Enforced by
+   scripts/check-theme-parity.test.mjs.
 
-   The violet accent is kept on purpose: with an amber ground it is a
-   complementary pair, and swapping it would break recognition between themes.
-   The only value that needed rethinking rather than recomputing is --red:
-   a cold #dc3545 reads as a foreign object here. */
+   It is no longer the odd one out. Under the previous language it kept a
+   violet accent against amber as a complementary pair; with ink as the accent
+   the three themes are now one family at three temperatures. */
 [data-theme="warm"] {
-  --bg: #f3ebdf;
-  --bg-card: #fcf7ef;
-  --bg-input: #ebe1d2;
-  --bg-hover: #e6dccb;
-  --border: #dacdb9;
-  --border-focus: #b6a68d;
-  --text: #2b2219;
-  --text-dim: #786a58;
-  --text-muted: #6f6250; /* a11y: contrast against --bg-card, like the others */
-  --accent: #5b4fd1;
-  --accent-hover: #4a3fb8;
-  --accent-glow: rgba(91, 79, 209, 0.12);
-  --green: #1e8a69;
-  --green-line: #8cc5ae;
-  --green-glow: rgba(30, 138, 105, 0.1);
-  --red: #b03a2b;
-  --yellow: #a8700c;
-  --yellow-line: #d6b575;
+  --bg: #f4e7d0;
+  --bg-card: #fdf3e2;
+  --bg-input: #fdf3e2;
+  --bg-hover: #ecdcc0;
+  --border: #e0cfae;
+  --border-strong: #cbb389;
+  --border-inner: #eee0c6;
+  --border-focus: #2e2415;
+  --text: #2e2415;
+  --text-dim: #6e5f45; /* 5.08:1 on --bg */
+  --text-muted: var(--text-dim);
+  --accent: #2e2415;
+  --accent-text: #f4e7d0;
+  --accent-hover: #191204;
+  --accent-glow: rgba(46, 36, 21, 0.05);
+  --green: #2e2415;
+  --red: #99381f;
+  --yellow: #7a5b12;
 }
 
 /* System theme (7.4): with no explicit data-theme, follow the OS preference.
    Values must mirror [data-theme="light"] above. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
-    --bg: #f5f5f7;
-    --bg-card: #ffffff;
-    --bg-input: #eeeef2;
-    --bg-hover: #e5e5eb;
-    --border: #d1d1d9;
-    --border-focus: #a0a0b4;
-    --text: #1a1a2e;
-    --text-dim: #6b6b80;
-    --text-muted: #70708a; /* a11y contrast on light cards */
-    --accent: #5b52ee;
-    --accent-hover: #4a41d6;
-    --accent-glow: rgba(91, 82, 238, 0.12);
-    --green: #1aab8a;
-    --green-line: #7fc9b2;
-    --green-glow: rgba(26, 171, 138, 0.1);
-    --red: #dc3545;
-    --yellow: #d4a017;
-    --yellow-line: #d9bd77;
+    --bg: #f2ecdf;
+    --bg-card: #faf6ea;
+    --bg-input: #faf6ea;
+    --bg-hover: #e9e1cd;
+    --border: #d9cfb8;
+    --border-strong: #c9bda1;
+    --border-inner: #e7ddc8;
+    --border-focus: #292317;
+    --text: #292317;
+    --text-dim: #6f6857; /* handoff #77705e is 4.18:1 on --bg — see above */
+    --text-muted: var(--text-dim);
+    --accent: #292317;
+    --accent-text: #f2ecdf;
+    --accent-hover: #14110b;
+    --accent-glow: rgba(41, 35, 23, 0.05);
+    --green: #292317;
+    --red: #9a3a28;
+    --yellow: #806119;
   }
 }
 
@@ -261,16 +297,23 @@ h1 {
   background: rgba(240, 83, 101, 0.1);
 }
 
+/* Was `background: var(--green); color: #0a0a0f` — a green fill with the old
+   dark ground hard-coded as its label. With --green rewritten to ink that
+   would have been near-black text on a near-black fill: an invisible primary
+   action, and nothing in the type system to catch it.
+   It is the primary action, so it takes the accent pair. */
 .btn-save {
-  background: var(--green);
-  color: #0a0a0f;
+  background: var(--accent);
+  color: var(--accent-text);
   font-weight: 600;
   width: auto;
   padding: 8px 16px;
   font-size: 13px;
 }
+/* Was a green glow. Ink does not glow — a press darkens it, the way more
+   pressure darkens a stroke. */
 .btn-save:hover:not(:disabled) {
-  box-shadow: 0 0 20px var(--green-glow);
+  background: var(--accent-hover);
 }
 
 .full-width { width: 100%; }
@@ -777,8 +820,11 @@ h1 {
   border-radius: 5px;
   color: var(--text-dim);
 }
-.section-chip--open { color: var(--green); border-color: var(--green-line); }
-.section-chip--shut { color: var(--yellow); border-color: var(--yellow-line); }
+/* The capsule itself goes away in the safebox pass — the handoff states the
+   open/locked state as text with a lock glyph, because a bordered pill reads
+   as a button and this is not one. Until then it borrows the ordinary rule. */
+.section-chip--open { color: var(--green); border-color: var(--border-strong); }
+.section-chip--shut { color: var(--yellow); border-color: var(--border-strong); }
 
 /* The row-action token: a real 44px touch target without a 44px BOX, same
    trick as .status-btn. Buttons sized to their own text let four actions sit
@@ -1050,8 +1096,8 @@ h1 {
 }
 
 .success-banner {
-  background: var(--green-glow);
-  border-bottom: 1px solid rgba(45, 212, 168, 0.25);
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
   color: var(--green);
 }
 

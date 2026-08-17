@@ -42,8 +42,11 @@ export default defineConfig(({ command, mode }) => {
           description: "Вечные зашифрованные заметки в блокчейне",
           // start_url/scope default to the Vite base — correct for both targets.
           display: "standalone",
-          background_color: "#0a0a0f",
-          theme_color: "#0a0a0f",
+          // Both track the DARK palette's --bg: the OS paints the splash from
+          // the manifest before any JS runs, so it cannot know the user's
+          // preference and must match what :root renders unstyled.
+          background_color: "#191612",
+          theme_color: "#191612",
           orientation: "portrait-primary",
           categories: ["productivity", "utilities"],
           lang: "ru",
