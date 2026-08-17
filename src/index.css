@@ -240,6 +240,16 @@ body {
 }
 .state--quiet { color: var(--text-dim); }
 
+/* The dot a status wears when it has no glyph of its own — «открыт» in the
+   safebox. Ink, not colour: state is stated in the word beside it. */
+.state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text);
+  flex: none;
+}
+
 /* A reading off an instrument, not prose: clock times and byte counts.
    NO size adjustment. The 0.95em here was meant to optically match PT Mono to
    Literata, and inside the 13.5px status line it resolved to 12.825px — a
@@ -1444,10 +1454,9 @@ h1 {
   min-width: 44px;
 }
 
-.note-menu-btn {
-  min-height: 44px;
-  min-width: 44px;
-}
+/* `.note-menu-btn` used to be declared twice here, both times restating a
+   44px floor — which then beat `.icon-btn--ring`'s 40px box on source order.
+   The ring owns its own size and keeps the touch target through ::after. */
 
 /* ─── Search / textarea / card-menu polish (Phase 6) ────────── */
 
@@ -1496,9 +1505,9 @@ mark {
 
 /* Sizing lives on .icon-btn--ring; this rule existed only to restate a
    touch target the modifier already guarantees through its ::after. */
-.note-menu-btn { line-height: 1; }
+.card-menu-btn { line-height: 1; }
 
-.note-menu {
+.card-menu {
   position: absolute;
   right: 10px;
   /* Drop DOWN from the ⋯ button. Opening upward (was `bottom: 38px`) overflowed
@@ -1517,7 +1526,7 @@ mark {
   overflow: hidden;
 }
 
-.note-menu-item {
+.card-menu-item {
   font-family: var(--font);
   font-size: 15px;
   text-align: left;
@@ -1533,10 +1542,10 @@ mark {
   gap: 6px;
 }
 
-.note-menu-item:hover { background: var(--accent-glow); }
-.note-menu-item svg { width: 17px; height: 17px; flex: none; color: var(--text-dim); }
+.card-menu-item:hover { background: var(--accent-glow); }
+.card-menu-item svg { width: 17px; height: 17px; flex: none; color: var(--text-dim); }
 
-.note-menu-hint {
+.card-menu-hint {
   font-size: 13px;
   color: var(--text-muted);
   padding: 8px 12px;
@@ -2085,7 +2094,9 @@ mark {
   align-items: center;
   gap: 9px;
 }
-.safebox-topbar h2 { margin: 0; font-size: 1.05rem; flex: 1; min-width: 0; }
+/* Size comes from the type scale — this rule used to pin 1.05rem here and
+   quietly beat the 30px screen title, the same way .section-title did. */
+.safebox-topbar h2 { margin: 0; flex: 1; min-width: 0; }
 
 /* Locked gate / activation share the centered card look */
 .safebox-gate,
@@ -2124,25 +2135,38 @@ mark {
   align-items: center;
   gap: 8px;
 }
-.safebox-card-title { font-size: 0.95rem; }
+.safebox-card-title { font-size: 19px; font-weight: 600; }
 .safebox-card-login,
 .safebox-card-url {
-  font-size: 0.85rem;
-  color: var(--text-muted);
+  font-size: 15px;
+  color: var(--text-dim);
   word-break: break-all;
 }
-.safebox-card-actions,
-.safebox-card-files {
+/* One row, never wrapping: two buttons and the menu fit 360px by design —
+   that is WHY there are only two. */
+.safebox-card-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
 }
-.safebox-card-actions .btn,
-.safebox-card-files .btn {
-  padding: 4px 10px;
-  font-size: 0.8rem;
+.safebox-action {
   width: auto;
+  padding: 0 18px;
+  height: 44px;
+  min-height: 44px;
+  font-size: 15px;
 }
+.safebox-action svg { width: 15px; height: 15px; }
+
+/* Text + glyph, sized to the row rather than to a full-width form button. */
+.safebox-lock-btn {
+  width: auto;
+  padding: 0 16px;
+  min-height: 44px;
+  font-size: 15px;
+}
+.safebox-lock-btn svg { width: 15px; height: 15px; }
 .safebox-revealed {
   padding: 8px 10px;
   border: 1px dashed var(--border-focus);

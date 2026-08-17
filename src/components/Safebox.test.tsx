@@ -75,7 +75,7 @@ describe('SafeboxSection — unlocked list', () => {
   it('copying a password NEVER puts the plaintext in the DOM', async () => {
     const { container } = render(<SafeboxSection />);
     await act(async () => {
-      fireEvent.click(screen.getByText('Копировать пароль'));
+      fireEvent.click(screen.getByText('Пароль'));
     });
     expect(h.store.copySafeboxPassword).toHaveBeenCalledWith('e1');
     // The store writes to the clipboard straight from the decrypted string.
@@ -85,7 +85,7 @@ describe('SafeboxSection — unlocked list', () => {
 
   it('the copy toast tells the honest clipboard story (best-effort, on return)', async () => {
     render(<SafeboxSection />);
-    await act(async () => { fireEvent.click(screen.getByText('Копировать пароль')); });
+    await act(async () => { fireEvent.click(screen.getByText('Пароль')); });
     expect(screen.getByText(/Пароль скопирован/)).toBeDefined();
     expect(screen.getByText(/~60 с/)).toBeDefined();
   });
@@ -120,6 +120,8 @@ describe('SafeboxSection — unlocked list', () => {
       files: [{ fid: 'f1', name: 'id_ed25519', mime: 'text/plain', size: 400 }],
     })]);
     render(<SafeboxSection />);
+    // Вложения — данные записи, а не действие строки, поэтому они внутри ⋯.
+    fireEvent.click(screen.getByRole('button', { name: /Меню записи/ }));
     await act(async () => { fireEvent.click(screen.getByText(/id_ed25519/)); });
     expect(h.store.downloadSafeboxAttachment).toHaveBeenCalledWith('e1', 'f1');
   });

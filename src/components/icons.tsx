@@ -114,6 +114,21 @@ export const IconHistory = () => (
   <Line><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></Line>
 );
 
+/** Download an attachment. */
+export const IconDownload = () => (
+  <Line><path d="M12 4v11" /><path d="m8 11 4 4 4-4" /><path d="M5 19h14" /></Line>
+);
+
+/** Closed padlock — «Запереть», and the safebox's own state glyph. */
+export const IconLock = () => (
+  <Line><rect x="5" y="11" width="14" height="9" rx="1.5" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></Line>
+);
+
+/** Reveal a secret. */
+export const IconEye = () => (
+  <Line><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z" /><circle cx="12" cy="12" r="3" /></Line>
+);
+
 /** External link — the blockchain transaction. */
 export const IconLink = () => (
   <Line><path d="M14 5h5v5" /><path d="M19 5l-8 8" /><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4" /></Line>

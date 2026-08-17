@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { useNotes } from '../lib/store';
 import { SAFEBOX_WRITER_ENABLED } from '../lib/flags';
 import { badgeFor } from './syncBadge';
+import { CardMenu } from './CardMenu';
+import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload } from './icons';
 import { SafeboxPinPad } from './SafeboxPinPad';
 import { SafeboxActivation, SafeboxSeedReset } from './SafeboxActivation';
 import { SafeboxEntryForm } from './SafeboxEntryForm';
@@ -52,6 +54,9 @@ export function SafeboxSection() {
   const [formOpen, setFormOpen] = useState(false);
   const [historyRoot, setHistoryRoot] = useState<string | null>(null);
   const [historyFocusId, setHistoryFocusId] = useState<string | null>(null);
+  // Одно открытое меню на раздел: правило принадлежит секции, потому что
+  // только она видит остальные карточки.
+  const [openMenuRoot, setOpenMenuRoot] = useState<string | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<{ root: string; version: SafeboxEntryData } | null>(null);
   const [revealed, setRevealed] = useState<{ id: string; value: string } | null>(null);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
@@ -81,6 +86,7 @@ export function SafeboxSection() {
     if (!safeboxUnlocked) {
       setRevealed(null);
       setFormOpen(false);
+      setOpenMenuRoot(null);
       setHistoryRoot(null);
       setRestoreTarget(null);
     }
@@ -149,14 +155,22 @@ export function SafeboxSection() {
 
   return (
     <div className="safebox-section" onPointerDown={touchSafebox} onKeyDown={touchSafebox}>
-      {/* Три конкурирующих веса стояли в один ряд: заголовок, заливная «+ Запись»
-          и «🔒 Закрыть сейф», который на 360px переносился в две строки. По
-          мокапу состояние — это чип, выход — мелкая контурная кнопка, а
-          создание записи уехало на круглую «+» внизу, как в заметках. */}
+      {/* Состояние — ТЕКСТ, выход — КНОПКА. Прежний чип был обведённой
+          капсулой, то есть выглядел ровно как то, на что нажимают, а нажать на
+          него было нельзя; рядом стояла «Запереть» контурной кнопкой того же
+          веса. Два одинаковых по виду элемента, из которых работает один, —
+          это и есть правило «кнопка vs информация», нарушенное в одной
+          строке. */}
       <div className="safebox-topbar">
         <h2 className="section-title" tabIndex={-1}>Сейф</h2>
-        <span className="section-chip section-chip--open">Открыт</span>
-        <button className="btn-tiny" onClick={lockSafebox}>Запереть</button>
+        <span className="state state--quiet" role="status">
+          <span className="state-dot" aria-hidden="true" />
+          открыт
+        </span>
+        <button className="btn btn-outline safebox-lock-btn" onClick={lockSafebox}>
+          <IconLock />
+          Запереть
+        </button>
       </div>
 
 
@@ -170,7 +184,7 @@ export function SafeboxSection() {
       <div className="search-bar">
         <input
           type="text"
-          placeholder="Поиск по сейфу (название, логин, URL, заметка)"
+          placeholder="Поиск по сейфу"
           value={safeboxSearchQuery}
           onChange={e => setSafeboxSearchQuery(e.target.value)}
           aria-label="Поиск по сейфу"
@@ -206,55 +220,71 @@ export function SafeboxSection() {
               {entry.login && <div className="safebox-card-login">{entry.login}</div>}
               {entry.url && <div className="safebox-card-url">{entry.url}</div>}
 
-              {/* Мелкие контурные токены вместо кнопок с эмодзи. Эмодзи здесь
-                  были единственным цветным элементом на монохромном экране и
-                  рисовались платформенным шрифтом — рядом с SVG-штрихом всего
-                  остального интерфейса это читалось как два разных языка. */}
+              {/* TWO buttons, and the rest behind ⋯.
+                  Five outline tokens in a row gave «скопировать пароль» — the
+                  thing done every single time — the same weight as «история
+                  версий», and on 360px they wrapped onto three lines. What
+                  stays out is what the row is FOR: copy the password, look at
+                  it. Everything else is occasional and lives in the menu. */}
               <div className="safebox-card-actions">
-                <button className="btn-tiny" onClick={() => void handleCopy(entry.id)}>
-                  Копировать пароль
+                <button className="btn btn-primary safebox-action" onClick={() => void handleCopy(entry.id)}>
+                  <IconCopy />
+                  Пароль
                 </button>
-                {entry.login && (
-                  <button className="btn-tiny" onClick={() => void handleCopyLogin(entry.login)}>
-                    Логин
-                  </button>
-                )}
-                <button className="btn-tiny" onClick={() => void handleReveal(entry.id)}>
+                <button className="btn btn-outline safebox-action" onClick={() => void handleReveal(entry.id)}>
                   Показать
                 </button>
-                {SAFEBOX_WRITER_ENABLED && (
-                  <button className="btn-tiny" onClick={() => { setFormRoot(chain.root); setFormOpen(true); }}>
-                    Изменить
-                  </button>
-                )}
-                {chain.versions.length > 1 && (
-                  <button
-                    className="btn-tiny"
-                    onClick={() => { setHistoryFocusId(null); setHistoryRoot(chain.root); }}
-                  >
-                    История ({chain.versions.length})
-                  </button>
-                )}
+                <span className="note-meta-gap" />
+                <CardMenu
+                  open={openMenuRoot === chain.root}
+                  onOpenChange={(next, reason) => {
+                    setOpenMenuRoot(next ? chain.root : null);
+                    if (!next && reason === 'escape') return; // CardMenu already restored focus
+                  }}
+                  label={`Меню записи «${entry.title}»`}
+                  id={`safebox-menu-${chain.root}`}
+                  items={[
+                    ...(entry.login
+                      ? [{
+                          key: 'login',
+                          icon: <IconCopy />,
+                          label: 'Копировать логин',
+                          onSelect: () => void handleCopyLogin(entry.login),
+                        }]
+                      : []),
+                    ...(SAFEBOX_WRITER_ENABLED
+                      ? [{
+                          key: 'edit',
+                          icon: <IconEdit />,
+                          label: 'Изменить',
+                          onSelect: () => { setFormRoot(chain.root); setFormOpen(true); },
+                        }]
+                      : []),
+                    ...(chain.versions.length > 1
+                      ? [{
+                          key: 'history',
+                          icon: <IconHistory />,
+                          label: `История версий (${chain.versions.length})`,
+                          onSelect: () => { setHistoryFocusId(null); setHistoryRoot(chain.root); },
+                        }]
+                      : []),
+                    // The attachment list is variable-length and belongs here
+                    // for the same reason as the rest: it is per-entry data,
+                    // not a per-row action.
+                    ...entry.files.map(f => ({
+                      key: `file-${f.fid}`,
+                      icon: <IconDownload />,
+                      label: `${f.name} (${f.size} Б)`,
+                      onSelect: () => void withFeedback(() => downloadSafeboxAttachment(entry.id, f.fid)),
+                    })),
+                  ]}
+                />
               </div>
 
               {revealed?.id === entry.id && (
                 <div className="safebox-revealed" role="status">
                   <code>{revealed.value}</code>
                   <span className="settings-hint"> (скроется автоматически)</span>
-                </div>
-              )}
-
-              {entry.files.length > 0 && (
-                <div className="safebox-card-files">
-                  {entry.files.map(f => (
-                    <button
-                      key={f.fid}
-                      className="btn btn-ghost"
-                      onClick={() => void withFeedback(() => downloadSafeboxAttachment(entry.id, f.fid))}
-                    >
-                      📎 {f.name} ({f.size} Б)
-                    </button>
-                  ))}
                 </div>
               )}
             </div>

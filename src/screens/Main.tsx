@@ -9,8 +9,9 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
+import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate } from '../lib/format-date';
-import { InfinityMark, EllipsisMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose } from '../components/icons';
+import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -118,7 +119,23 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
   useEffect(() => subscribeToPwaUpdate(setUpdateReady), []);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const menuBtnRefs = useRef(new Map<string, HTMLButtonElement>());
+  /**
+   * One ref object per card's ⋯ trigger, handed to CardMenu and reused by
+   * `confirmRestore` to land focus after the modal stack closes.
+   *
+   * Created lazily and CACHED: a fresh `{ current: null }` on every render
+   * would hand CardMenu a new object each time, and the ref the restore flow
+   * reads would never be the one React filled in.
+   */
+  const menuBtnRefs = useRef(new Map<string, React.RefObject<HTMLButtonElement | null>>());
+  function menuTriggerRef(root: string) {
+    let ref = menuBtnRefs.current.get(root);
+    if (!ref) {
+      ref = { current: null };
+      menuBtnRefs.current.set(root, ref);
+    }
+    return ref;
+  }
 
   // The «Получено с других устройств» toast and its handled-run bookkeeping are
   // gone. They existed for ONE reason, stated in their own comment: the result
@@ -291,14 +308,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
   /** Clipboard write with visible success/error feedback — a rejected promise
    *  must not look identical to a successful copy. On failure the menu stays
    *  open so the text can still be selected manually. */
-  async function handleCopyNote(noteText: string) {
-    if (await copyTextToClipboard(noteText)) {
-      setOpenMenuId(null);
-      setCopyFeedback('ok');
-    } else {
-      setCopyFeedback('fail');
-    }
+  /** Returns `false` on failure, which CardMenu reads as «keep the menu open»
+   *  — the fallback for a rejected clipboard write is selecting the text by
+   *  hand, and that needs the note still on screen. */
+  async function handleCopyNote(noteText: string): Promise<void | false> {
+    const ok = await copyTextToClipboard(noteText);
+    setCopyFeedback(ok ? 'ok' : 'fail');
     setTimeout(() => setCopyFeedback(null), 2000);
+    return ok ? undefined : false;
   }
 
   /** Wrap query matches in <mark> (8.1) — case-insensitive, plain text only.
@@ -359,7 +376,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
     const root = restoreTarget.root;
     setRestoreTarget(null);
     setHistoryFocusVersionId(null);
-    requestAnimationFrame(() => menuBtnRefs.current.get(root)?.focus());
+    requestAnimationFrame(() => menuBtnRefs.current.get(root)?.current?.focus());
   }
 
 
@@ -571,66 +588,52 @@ export function Main({ theme, onThemeChange }: MainProps) {
                     </span>
                   )}
                   <span className="note-meta-gap" />
-                  <button
-                    ref={el => {
-                      if (el) menuBtnRefs.current.set(chain.root, el);
-                      else menuBtnRefs.current.delete(chain.root);
-                    }}
-                    className="icon-btn icon-btn--ring note-menu-btn"
-                    onClick={() => setOpenMenuId(openMenuId === chain.root ? null : chain.root)}
-                    title="Меню заметки"
-                    aria-label="Меню заметки"
-                    aria-expanded={openMenuId === chain.root}
-                  >
-                    <EllipsisMark />
-                  </button>
+                  <CardMenu
+                    open={openMenuId === chain.root}
+                    onOpenChange={next => setOpenMenuId(next ? chain.root : null)}
+                    label="Меню заметки"
+                    id={`note-menu-${chain.root}`}
+                    triggerRef={menuTriggerRef(chain.root)}
+                    items={[
+                      {
+                        key: 'copy',
+                        icon: <IconCopy />,
+                        label: 'Копировать текст',
+                        onSelect: () => handleCopyNote(note.text),
+                      },
+                      ...(V3_WRITER_ENABLED
+                        ? [{
+                            key: 'edit',
+                            icon: <IconEdit />,
+                            label: 'Редактировать',
+                            onSelect: () => setEditChainRoot(chain.root),
+                          }]
+                        : []),
+                      ...(V3_WRITER_ENABLED && chain.versions.length > 1
+                        ? [{
+                            key: 'history',
+                            icon: <IconHistory />,
+                            label: `История версий (${chain.versions.length})`,
+                            onSelect: () => {
+                              setHistoryFocusVersionId(null);
+                              setHistoryChainRoot(chain.root);
+                            },
+                          }]
+                        : []),
+                      ...(info.status === 'confirmed' && info.txId
+                        ? [{
+                            key: 'tx',
+                            icon: <IconLink />,
+                            label: 'Транзакция в блокчейне',
+                            href: `https://viewblock.io/arweave/tx/${info.txId}`,
+                          }]
+                        : []),
+                    ]}
+                    hint={V3_WRITER_ENABLED
+                      ? 'Каждая версия навсегда сохраняется в блокчейне: редактирование добавляет новую версию, старые остаются в истории. Удалить опубликованные данные невозможно.'
+                      : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
+                  />
                 </div>
-                {openMenuId === chain.root && (
-                  <div className="note-menu">
-                    <button
-                      className="note-menu-item"
-                      onClick={() => void handleCopyNote(note.text)}
-                    >
-                      <IconCopy /> Копировать текст
-                    </button>
-                    {V3_WRITER_ENABLED && (
-                      <button
-                        className="note-menu-item"
-                        onClick={() => { setOpenMenuId(null); setEditChainRoot(chain.root); }}
-                      >
-                        <IconEdit /> Редактировать
-                      </button>
-                    )}
-                    {V3_WRITER_ENABLED && chain.versions.length > 1 && (
-                      <button
-                        className="note-menu-item"
-                        onClick={() => {
-                          setOpenMenuId(null);
-                          setHistoryFocusVersionId(null);
-                          setHistoryChainRoot(chain.root);
-                        }}
-                      >
-                        <IconHistory /> История версий ({chain.versions.length})
-                      </button>
-                    )}
-                    {info?.status === 'confirmed' && info.txId && (
-                      <a
-                        className="note-menu-item"
-                        href={`https://viewblock.io/arweave/tx/${info.txId}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={() => setOpenMenuId(null)}
-                      >
-                        <IconLink /> Транзакция в блокчейне
-                      </a>
-                    )}
-                    <div className="note-menu-hint">
-                      {V3_WRITER_ENABLED
-                        ? 'Каждая версия навсегда сохраняется в блокчейне: редактирование добавляет новую версию, старые остаются в истории. Удалить опубликованные данные невозможно.'
-                        : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
-                    </div>
-                  </div>
-                )}
               </div>
             );
           })
