@@ -240,10 +240,15 @@ body {
 }
 .state--quiet { color: var(--text-dim); }
 
-/* A reading off an instrument, not prose: clock times and byte counts. */
+/* A reading off an instrument, not prose: clock times and byte counts.
+   NO size adjustment. The 0.95em here was meant to optically match PT Mono to
+   Literata, and inside the 13.5px status line it resolved to 12.825px — a
+   third exception to the 13px floor, invented by a rounding nobody approved
+   and invisible to a check that reads declared sizes. Optical matching is not
+   worth a silent floor breach; if the mono ever looks too large, fix it where
+   the size is actually set. */
 .mono {
   font-family: var(--mono);
-  font-size: 0.95em;
 }
 
 /* The drawn marks (∞, ⋯ — see components/icons.tsx). Sized in em so they
