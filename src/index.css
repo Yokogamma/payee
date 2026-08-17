@@ -368,7 +368,8 @@ textarea:focus-visible {
   background: var(--accent);
   color: var(--accent-text);
 }
-.btn-primary:hover:not(:disabled) {
+.btn-primary:hover:not(:disabled),
+.btn-primary:active:not(:disabled) {
   background: var(--accent-hover);
 }
 
@@ -380,16 +381,34 @@ textarea:focus-visible {
   color: var(--text);
   border: 1.5px solid var(--border-control);
 }
-.btn-outline:hover {
+.btn-outline:hover:not(:disabled) {
   border-color: var(--border-focus);
   background: var(--accent-glow);
 }
+.btn-outline:active:not(:disabled) {
+  border-color: var(--border-focus);
+  background: var(--bg-hover);
+}
 
+/* The one sanctioned exception to «a control is a fill or a 1.5px rule», and
+   it comes from the mockup rather than from convenience: the composer pairs a
+   filled «Сохранить навечно» with a text «Отмена», and draws «Свернуть» as
+   text with a 1px rule UNDER it. So a text action is not bare — the underline
+   is what separates it from the prose around it, at a weight that does not
+   compete with the primary action. */
 .btn-ghost {
   background: transparent;
   color: var(--text-dim);
+  border-bottom: 1px solid var(--border-control);
+  border-radius: 0;
+  width: auto;
+  padding: 6px 2px;
 }
-.btn-ghost:hover {
+.btn-ghost:hover:not(:disabled) {
+  color: var(--text);
+  border-bottom-color: var(--border-focus);
+}
+.btn-ghost:active:not(:disabled) {
   color: var(--text);
   background: var(--accent-glow);
 }
@@ -402,7 +421,8 @@ textarea:focus-visible {
   color: var(--red);
   border: 1.5px solid currentColor;
 }
-.btn-danger:hover {
+.btn-danger:hover:not(:disabled),
+.btn-danger:active:not(:disabled) {
   background: var(--accent-glow);
 }
 
@@ -2129,10 +2149,13 @@ mark {
   flex: 0 0 auto;
 }
 
+/* LAYOUT ONLY. This used to also declare font-size: 16px, at the same
+   specificity as the type scale near the top of the file and 1900 lines
+   later — so it silently won, and the 30px screen title the redesign is built
+   around never rendered anywhere. Nothing failed: the suite was green and the
+   only screen anyone had looked at (landing) has no .section-title on it.
+   Size, weight and tracking belong to the type scale; keep them there. */
 .section-title {
-  font-size: 16px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
   flex: 1;
   margin: 0;
 }
