@@ -23,7 +23,22 @@
 
    --text-muted is now var(--text-dim) everywhere. Two secondary inks were a
    distinction the old palette needed for contrast on cards; this one does not.
-   Aliasing rather than deleting keeps 25 call sites out of this commit. */
+   Aliasing rather than deleting keeps 25 call sites out of this commit.
+
+   TWO RULE COLOURS, NOT ONE. The handoff draws every 1.5px line in #c9bda1 and
+   makes that line one of the two things meaning «this is a button». It cannot
+   do both jobs: #c9bda1 measures 1.56:1 against the screen ground, and WCAG
+   2.2 SC 1.4.11 asks 3:1 of anything that IDENTIFIES a control. Reaching it
+   needs a visibly darker colour — not a rounding the way --text-dim was.
+   So the two jobs split:
+
+     --border-strong   #c9bda1   decoration: the search underline, group rules,
+                                 anything a pointer cannot act on
+     --border-control  #93856a   identity: button and field boundaries, 3.07:1
+
+   A line that promises nothing keeps the paper look; a line that promises a
+   press is legible to someone who cannot see the difference between paper and
+   parchment. Pinned in scripts/check-contrast.test.mjs. */
 
 :root,
 [data-theme="dark"] {
@@ -33,6 +48,7 @@
   --bg-hover: #2a251d;
   --border: #3a3428;
   --border-strong: #4a4335;
+  --border-control: #736a58;
   --border-inner: #2b261f;
   --border-focus: #ece4d3;
   --text: #ece4d3;
@@ -71,6 +87,7 @@
   --bg-hover: #e9e1cd;
   --border: #d9cfb8;
   --border-strong: #c9bda1;
+  --border-control: #93856a;
   --border-inner: #e7ddc8;
   --border-focus: #292317;
   --text: #292317;
@@ -101,6 +118,7 @@
   --bg-hover: #ecdcc0;
   --border: #e0cfae;
   --border-strong: #cbb389;
+  --border-control: #8f8060;
   --border-inner: #eee0c6;
   --border-focus: #2e2415;
   --text: #2e2415;
@@ -125,6 +143,7 @@
     --bg-hover: #e9e1cd;
     --border: #d9cfb8;
     --border-strong: #c9bda1;
+    --border-control: #93856a;
     --border-inner: #e7ddc8;
     --border-focus: #292317;
     --text: #292317;

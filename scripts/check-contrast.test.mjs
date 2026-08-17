@@ -33,6 +33,10 @@ const CSS_PATH = 'src/index.css';
  *  this palette qualifies for the relaxed 3:1. */
 const AA_NORMAL = 4.5;
 
+/** SC 1.4.11, non-text contrast: the visual boundary that identifies a control
+ *  must clear 3:1 against what it sits on. */
+const AA_NON_TEXT = 3;
+
 function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, c => '\n'.repeat((c.match(/\n/g) ?? []).length));
 }
@@ -154,6 +158,28 @@ describe('WCAG contrast of the theme palettes', () => {
     });
   }
 
+  for (const [name, body] of Object.entries(PALETTES)) {
+    it(`${name}: --border-control clears ${AA_NON_TEXT}:1 — it is what identifies a control`, () => {
+      // SC 1.4.11. The handoff draws every 1.5px line in one colour and makes
+      // that line one of the two signals for «this is a button»; #c9bda1 is
+      // 1.56:1 and cannot carry that. --border-strong keeps the specified
+      // value for rules that promise nothing, and is NOT asserted here.
+      const map = tokens(body ?? '');
+      const fg = parseHex(resolve(map, '--border-control'));
+      expect(fg, '--border-control is missing or not a plain hex').toBeTruthy();
+      const failures = [];
+      for (const bgName of GROUNDS) {
+        const bg = parseHex(resolve(map, bgName));
+        if (!bg) continue;
+        const ratio = contrast(fg, bg);
+        if (ratio < AA_NON_TEXT) {
+          failures.push(`  --border-control on ${bgName} (${resolve(map, bgName)}): ${ratio.toFixed(2)}:1`);
+        }
+      }
+      expect(failures, `${name} fails SC 1.4.11:\n${failures.join('\n')}`).toEqual([]);
+    });
+  }
+
   it('the handoff value for --text-dim is the one this deviates from', () => {
     // Pinning the REASON, not just the outcome: if someone restores #77705e
     // from the design file, this states plainly what it measures and why the
@@ -168,14 +194,11 @@ describe('WCAG contrast of the theme palettes', () => {
   });
 });
 
-/* SC 1.4.11 (non-text contrast, 3:1) is deliberately absent for now.
+/* --border-strong is deliberately NOT asserted at 3:1. It keeps the handoff's
+ * #c9bda1 and is only ever a decorative rule — the search underline, the line
+ * between feed entries, group boundaries. SC 1.4.11 governs what identifies a
+ * control, and none of those do; --border-control took that job precisely so
+ * this one could stay at the specified colour.
  *
- * The handoff makes a 1.5px --border-strong rule one of the two things that
- * says «this is a button» — and #c9bda1 measures 1.56:1 against #f2ecdf.
- * Reaching 3:1 needs roughly #93856a, which is a visibly darker interface, not
- * a rounding of the specified colour the way --text-dim was.
- *
- * That is a design decision rather than a defect fix, it belongs to the pass
- * that actually applies borders to controls, and it is open with the design
- * owner. When it lands, assert --border-strong against --bg and --bg-card at
- * 3:1 here. */
+ * If a control ever borrows --border-strong for its boundary, that is the bug,
+ * and it is a code review question rather than something this file can see. */
