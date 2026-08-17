@@ -19,17 +19,25 @@ import { EllipsisMark } from './icons';
  * FOCUS IS RETURNED BY REASON, not on every close. Returning it always looks
  * tidy and is wrong in two of the four cases:
  *
- *   Escape, programmatic  → back to the trigger. The user asked to leave the
- *                           menu and is still where they were.
- *   outside click         → leave it. The click has its own target, and
- *                           dragging focus back to the trigger would undo a
- *                           deliberate move.
- *   item selected         → leave it. The action usually opens a dialog that
- *                           wants focus; stealing it first makes the dialog's
- *                           own focus management fight this one.
- *   unmount / lock        → nothing to do. The trigger is gone with the rest
- *                           of the section, and touching a detached node is
- *                           how a lock ends up throwing.
+ *   Escape          → moved back to the trigger. The user asked to leave the
+ *                     menu and is still where they were.
+ *   outside click   → left alone. The click has its own target, and dragging
+ *                     focus back to the trigger would undo a deliberate move.
+ *   item selected   → left alone. The action usually opens a dialog that wants
+ *                     focus; stealing it first makes the dialog's own focus
+ *                     management fight this one.
+ *   Tab             → left alone, deliberately. Tab means «move on»; catching
+ *                     the focus and putting it back would trap the user in the
+ *                     one place they just asked to leave. It closes with the
+ *                     `programmatic` reason but takes no focus action.
+ *   trigger clicked → nothing to do: focus is already on the trigger, because
+ *                     clicking it is what put it there.
+ *   unmount / lock  → nothing to do. The trigger is gone with the rest of the
+ *                     section, and touching a detached node is how a lock ends
+ *                     up throwing.
+ *
+ * So exactly ONE path moves focus, and it is the one where the user is left
+ * with nowhere else to be.
  */
 
 export type CardMenuCloseReason = 'escape' | 'outside' | 'select' | 'programmatic';
@@ -78,17 +86,73 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
   const ownRef = useRef<HTMLButtonElement | null>(null);
   const triggerRef = externalRef ?? ownRef;
   const popupRef = useRef<HTMLDivElement | null>(null);
+  /** Set when the menu was opened from the keyboard, so focus enters it. */
+  const focusOnOpenRef = useRef<'first' | 'last' | null>(null);
+
+  /** The focusable items, in DOM order. */
+  function itemNodes(): HTMLElement[] {
+    return popupRef.current
+      ? Array.from(popupRef.current.querySelectorAll<HTMLElement>('[role="menuitem"]'))
+      : [];
+  }
+
+  function moveFocus(delta: number | 'first' | 'last') {
+    const nodes = itemNodes();
+    if (nodes.length === 0) return;
+    if (delta === 'first') return nodes[0].focus();
+    if (delta === 'last') return nodes[nodes.length - 1].focus();
+    const current = nodes.indexOf(document.activeElement as HTMLElement);
+    // Wraps, per the APG pattern: Down on the last item lands on the first.
+    const next = (current + delta + nodes.length) % nodes.length;
+    nodes[next].focus();
+  }
+
+  function closeAndRestore(reason: CardMenuCloseReason) {
+    onOpenChange(false, reason);
+    triggerRef.current?.focus();
+  }
+
+  // Focus into the menu when it was opened by keyboard. APG puts focus on the
+  // first item for Enter/Space/Down and on the last for Up.
+  useEffect(() => {
+    if (!open || !focusOnOpenRef.current) return;
+    const where = focusOnOpenRef.current;
+    focusOnOpenRef.current = null;
+    moveFocus(where);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
 
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== 'Escape') return;
-      // Stop the event before an outer handler reads it as «close the modal»
-      // or «clear the search» — the innermost open layer owns Escape.
-      e.stopPropagation();
-      onOpenChange(false, 'escape');
-      triggerRef.current?.focus();
+      // Only while this menu holds focus — otherwise two open menus on a page
+      // would both answer an arrow key.
+      const inside = popupRef.current?.contains(document.activeElement)
+        || document.activeElement === triggerRef.current;
+
+      if (e.key === 'Escape') {
+        // Stop the event before an outer handler reads it as «close the modal»
+        // or «clear the search» — the innermost open layer owns Escape.
+        e.stopPropagation();
+        closeAndRestore('escape');
+        return;
+      }
+      if (!inside) return;
+
+      // The APG menu-button keyboard model. Announcing role="menu" and then
+      // not implementing this is the mismatch worth avoiding: a screen-reader
+      // user is told «menu» and then finds arrow keys do nothing.
+      switch (e.key) {
+        case 'ArrowDown': e.preventDefault(); moveFocus(1); break;
+        case 'ArrowUp': e.preventDefault(); moveFocus(-1); break;
+        case 'Home': e.preventDefault(); moveFocus('first'); break;
+        case 'End': e.preventDefault(); moveFocus('last'); break;
+        // Tab leaves the menu entirely rather than walking its items — a menu
+        // is one stop in the tab order, not a container of stops.
+        case 'Tab': onOpenChange(false, 'programmatic'); break;
+        default: break;
+      }
     }
 
     function onPointerDown(e: PointerEvent) {
@@ -107,6 +171,10 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
       document.removeEventListener('keydown', onKeyDown, true);
       document.removeEventListener('pointerdown', onPointerDown, true);
     };
+    // `triggerRef` is stable for the life of a card — either the caller's ref
+    // object or `ownRef`, both created once — so it is not a dependency that
+    // can change under this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, onOpenChange]);
 
   return (
@@ -116,8 +184,27 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
         type="button"
         className="icon-btn icon-btn--ring card-menu-btn"
         onClick={() => onOpenChange(!open, open ? 'programmatic' : undefined)}
+        onKeyDown={e => {
+          if (open) return;
+          // Down/Up open the menu AND enter it, which is the whole point of
+          // the pattern: a keyboard user should not have to press twice.
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            focusOnOpenRef.current = 'first';
+            onOpenChange(true);
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            focusOnOpenRef.current = 'last';
+            onOpenChange(true);
+          } else if (e.key === 'Enter' || e.key === ' ') {
+            // The click handler still fires and does the opening; this only
+            // records that focus should follow.
+            focusOnOpenRef.current = 'first';
+          }
+        }}
         title={label}
         aria-label={label}
+        aria-haspopup="true"
         aria-expanded={open}
         aria-controls={open ? id : undefined}
       >

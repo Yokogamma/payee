@@ -354,3 +354,131 @@ describe('SafeboxEntryForm — attachment intake', () => {
     expect(screen.queryByText(/Суммарный размер вложений/)).toBeNull();
   });
 });
+
+describe('SafeboxSection — действия, уехавшие в меню', () => {
+  const openMenu = () =>
+    fireEvent.click(screen.getByRole('button', { name: /Меню записи/ }));
+
+  it('логин копируется через меню', async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    h.store = baseStore([entry({ id: 'e1', login: 'yoko' })]);
+    render(<SafeboxSection />);
+    openMenu();
+    await act(async () => { fireEvent.click(screen.getByText('Копировать логин')); });
+    expect(writeText).toHaveBeenCalledWith('yoko');
+  });
+
+  it('у записи без логина пункта копирования логина нет', () => {
+    h.store = baseStore([entry({ id: 'e1', login: '' })]);
+    render(<SafeboxSection />);
+    openMenu();
+    expect(screen.queryByText('Копировать логин')).toBeNull();
+  });
+
+  it('история версий открывается через меню', () => {
+    const chainEntries = [
+      entry({ id: 'e1', rev: 1, root: 'e1' }),
+      entry({ id: 'e2', rev: 2, root: 'e1', title: 'GitHub v2' }),
+    ];
+    h.store = baseStore(chainEntries);
+    render(<SafeboxSection />);
+    openMenu();
+    fireEvent.click(screen.getByText(/История версий \(2\)/));
+    expect(screen.getByRole('dialog')).toBeDefined();
+  });
+
+  it('пункт «Изменить» открывает форму записи', () => {
+    h.store = baseStore();
+    render(<SafeboxSection />);
+    openMenu();
+    fireEvent.click(screen.getByText('Изменить'));
+    expect(screen.getByRole('dialog')).toBeDefined();
+  });
+
+  it('НАСТОЯЩАЯ блокировка раздела закрывает открытое меню', () => {
+    // Не имитация: перерисовываем секцию с safeboxUnlocked=false, как это
+    // делает замок по таймеру или из другой вкладки. Меню, пережившее замок,
+    // осталось бы висеть над PIN-падом.
+    h.store = baseStore();
+    const { rerender } = render(<SafeboxSection />);
+    openMenu();
+    expect(screen.getByRole('menu')).toBeDefined();
+
+    (h.store as ReturnType<typeof baseStore>).safeboxUnlocked = false;
+    rerender(<SafeboxSection />);
+    expect(screen.queryByRole('menu')).toBeNull();
+
+    // И при обратном отпирании меню не воскресает.
+    (h.store as ReturnType<typeof baseStore>).safeboxUnlocked = true;
+    rerender(<SafeboxSection />);
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  it('подтверждённая запись показывает ∞ рядом со словом', () => {
+    h.store = baseStore();
+    (h.store as ReturnType<typeof baseStore>).syncStatuses = { e1: { status: 'confirmed' } };
+    render(<SafeboxSection />);
+    const state = document.querySelector('.sync-state--permanent')!;
+    expect(state.textContent).toContain('навечно');
+    expect(state.querySelector('svg'), 'знак вечности рисуется, а не пишется глифом').not.toBeNull();
+  });
+
+  it('неподтверждённая запись знака не получает', () => {
+    h.store = baseStore();
+    (h.store as ReturnType<typeof baseStore>).syncStatuses = { e1: { status: 'queued' } };
+    render(<SafeboxSection />);
+    expect(document.querySelector('.sync-state')!.querySelector('svg')).toBeNull();
+  });
+});
+
+describe('CardMenu в сейфе — клавиатура по образцу WAI-ARIA', () => {
+  const trigger = () => screen.getByRole('button', { name: /Меню записи/ });
+
+  beforeEach(() => { h.store = baseStore(); });
+
+  it('триггер объявляет наличие попапа', () => {
+    render(<SafeboxSection />);
+    expect(trigger().getAttribute('aria-haspopup')).toBe('true');
+  });
+
+  it('стрелка вниз открывает меню И входит в него', () => {
+    render(<SafeboxSection />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowDown' });
+    const items = screen.getAllByRole('menuitem');
+    expect(document.activeElement).toBe(items[0]);
+  });
+
+  it('стрелка вверх открывает меню на последнем пункте', () => {
+    render(<SafeboxSection />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowUp' });
+    const items = screen.getAllByRole('menuitem');
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it('стрелки ходят по кругу, Home и End прыгают к краям', () => {
+    render(<SafeboxSection />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowDown' });
+    const items = screen.getAllByRole('menuitem');
+
+    fireEvent.keyDown(document, { key: 'ArrowUp' });
+    expect(document.activeElement, 'вверх с первого — на последний').toBe(items[items.length - 1]);
+
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    expect(document.activeElement, 'вниз с последнего — на первый').toBe(items[0]);
+
+    fireEvent.keyDown(document, { key: 'End' });
+    expect(document.activeElement).toBe(items[items.length - 1]);
+
+    fireEvent.keyDown(document, { key: 'Home' });
+    expect(document.activeElement).toBe(items[0]);
+  });
+
+  it('Tab уводит из меню, а не бродит по его пунктам', () => {
+    // Меню — одна остановка в порядке обхода, а не контейнер остановок.
+    render(<SafeboxSection />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowDown' });
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+});

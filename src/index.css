@@ -2129,11 +2129,15 @@ mark {
   flex-direction: column;
   gap: 10px;
 }
-.safebox-card { display: flex; flex-direction: column; gap: 6px; }
+/* A RULED LINE, like a note — no fill, no border box. The mockup draws
+   safebox entries exactly as it draws feed entries: a row on the page with a
+   divider beneath. .note-card lost its card surface in Ф3 and this inherits
+   that on purpose; there is no surface to «restore» here. */
+.safebox-card { display: flex; flex-direction: column; gap: 4px; }
 .safebox-card-head {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: baseline;
+  gap: 12px;
 }
 .safebox-card-title { font-size: 19px; font-weight: 600; }
 .safebox-card-login,

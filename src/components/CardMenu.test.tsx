@@ -119,6 +119,27 @@ describe('CardMenu — фокус возвращается ПО ПРИЧИНЕ',
   });
 });
 
+describe('CardMenu — Tab и повторный клик по триггеру', () => {
+  it('Tab закрывает, но НЕ возвращает фокус — это отменило бы переход', () => {
+    render(<Harness />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowDown' });
+    const first = screen.getAllByRole('menuitem')[0];
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(document.activeElement, 'фокус остаётся там, откуда Tab его понесёт дальше').not.toBe(trigger());
+  });
+
+  it('повторный клик по триггеру закрывает, фокус и так на нём', () => {
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    open();
+    fireEvent.click(trigger());
+    expect(onClose).toHaveBeenCalledWith('programmatic');
+    expect(screen.queryByRole('menu')).toBeNull();
+  });
+});
+
 describe('CardMenu — пункт может отменить закрытие', () => {
   function VetoHarness({ result }: { result: void | false }) {
     const [open, setOpen] = useState(true);

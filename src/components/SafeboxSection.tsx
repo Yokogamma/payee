@@ -3,7 +3,7 @@ import { useNotes } from '../lib/store';
 import { SAFEBOX_WRITER_ENABLED } from '../lib/flags';
 import { badgeFor } from './syncBadge';
 import { CardMenu } from './CardMenu';
-import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload } from './icons';
+import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, InfinityMark } from './icons';
 import { SafeboxPinPad } from './SafeboxPinPad';
 import { SafeboxActivation, SafeboxSeedReset } from './SafeboxActivation';
 import { SafeboxEntryForm } from './SafeboxEntryForm';
@@ -206,18 +206,21 @@ export function SafeboxSection() {
           const badge = badgeFor(info, syncActive);
           return (
             <div className="note-card safebox-card" key={chain.root}>
+              {/* Название и логин НА ОДНОЙ строке, статус — у правого края.
+                  Логин стоял отдельной строкой под заголовком, и запись
+                  занимала три строки там, где по макету занимает одну. */}
               <div className="safebox-card-head">
                 <strong className="safebox-card-title">{entry.title}</strong>
+                {entry.login && <span className="safebox-card-login">{entry.login}</span>}
                 {chain.versions.length > 1 && (
-                  <span className="note-rev-badge" aria-label={`Версий: ${chain.versions.length}`}>
-                    v{chain.versions.length}
-                  </span>
+                  <span className="state state--quiet">{chain.versions.length}-я версия</span>
                 )}
+                <span className="note-meta-gap" />
                 <span className={`state sync-state ${badge.className}`} title={badge.label} role="status" aria-label={badge.label}>
+                  {badge.permanent && <InfinityMark />}
                   {badge.word}
                 </span>
               </div>
-              {entry.login && <div className="safebox-card-login">{entry.login}</div>}
               {entry.url && <div className="safebox-card-url">{entry.url}</div>}
 
               {/* TWO buttons, and the rest behind ⋯.
