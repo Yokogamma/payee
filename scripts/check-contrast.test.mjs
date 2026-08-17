@@ -272,12 +272,20 @@ describe('colour lives in the palettes and nowhere else', () => {
     // Split on `;` rather than on line starts. `.foo { color: #fff; }` written
     // on ONE line has no declaration at the beginning of a line, and the first
     // version of this scan walked straight past it.
+    // A MASK STOP IS NOT A COLOUR. `mask-image` uses only the alpha channel of
+    // its gradient; the `#000` in it is the conventional way to write «opaque»
+    // and has no visual colour at all. Exempted by property rather than by
+    // rewriting it as `black` to slip past the pattern — the rule is about
+    // colours that should have answered to a theme, and this one never could.
+    const ALPHA_ONLY = /^(-webkit-)?mask(-image)?\s*:/;
+
     const literals = [
       ...new Set(
         rules
           .split(/[;{}]/)
           .map(d => d.trim())
           .filter(d => /^[a-z-]+\s*:/.test(d))
+          .filter(d => !ALPHA_ONLY.test(d))
           .filter(d => /rgba?\([0-9]|#[0-9a-fA-F]{3,6}\b/.test(d)),
       ),
     ];

@@ -2019,6 +2019,19 @@ mark {
   margin: -3px;
 }
 .composer-toolbar-scroll::-webkit-scrollbar { display: none; }
+
+/* A FADE AT THE SCROLLING EDGE. Without it the row simply ends mid-button and
+   the half-visible «<>» reads as a broken glyph rather than as «there is more
+   this way» — spotted on a 375px screenshot, where the clipped bracket looked
+   like a rendering fault.
+   The mask is unconditional, and that is safe here only because «Превью» is
+   pinned OUTSIDE this scroller: when the seven format buttons fit, the fading
+   22px fall on empty space rather than on a control. Move the toggle back
+   inside and this rule starts dimming it. */
+.composer-toolbar-scroll {
+  mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+}
 .composer-tool {
   position: relative;
   flex: none;
