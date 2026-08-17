@@ -526,6 +526,7 @@ describe('Main — пункт сейфа в навигации', () => {
       openComposer();
 
       const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/Синхронизация выключена/);
       expect(intro).toMatch(/только на этом устройстве/);
       expect(intro).not.toMatch(/навечно|вечной/);
       // На кнопке нет ни знака, ни слова «навечно».
@@ -587,14 +588,23 @@ describe('Main — пункт сейфа в навигации', () => {
       expect(document.activeElement).not.toBe(safeboxFab);
     });
 
-    it('ключ не зарегистрирован — обещания тоже нет', () => {
+    it('устройство не подключено — причина названа своя, не «выключена»', () => {
+      // Три способа остаться локальным, и они не взаимозаменяемы. Свести этот
+      // случай к «синхронизация выключена» — верно про исход и неверно про
+      // причину: синхронизация как раз включена, не хватает invite-кода. Это
+      // то, что пользователь может пойти и исправить, в отличие от
+      // выключателя, который он сам выключил.
       const s = h.store as ReturnType<typeof baseStore>;
       s.arweave.enabled = true;
       s.arweave.registered = false;
       const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
       openComposer();
-      expect(container.querySelector('.composer-intro')!.textContent)
-        .toMatch(/только на этом устройстве/);
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/не подключено к хранилищу/);
+      expect(intro).toMatch(/invite-кода/);
+      expect(intro, 'синхронизация включена — так говорить нельзя')
+        .not.toMatch(/Синхронизация выключена/);
+      expect(intro).not.toMatch(/навечно|вечной/);
     });
 
     it('«Свернуть» возвращает фокус на FAB, а не на body', async () => {

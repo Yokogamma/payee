@@ -147,10 +147,18 @@ export function Main({ theme, onThemeChange }: MainProps) {
    * text that only checked enabled/registered promised the blockchain in
    * exactly the state where nothing is being sent — see the matching rung in
    * StatusLine, which is the warning this paragraph replaces on this screen.
+   *
+   * Three ways to stay local, and they are NOT interchangeable. Collapsing the
+   * unregistered case into «синхронизация выключена» was accurate about the
+   * outcome and wrong about the cause: sync is on, and what is missing is an
+   * invite code — which is a thing the user can go and fix, unlike a switch
+   * they deliberately turned off. A destination line that misnames the reason
+   * sends them to the wrong screen.
    */
-  const composerDestination =
-    !arweave.enabled || !arweave.registered
-      ? 'Синхронизация выключена — запись останется только на этом устройстве.'
+  const composerDestination = !arweave.enabled
+    ? 'Синхронизация выключена — запись останется только на этом устройстве.'
+    : !arweave.registered
+      ? 'Устройство не подключено к хранилищу — до ввода invite-кода запись останется только на нём.'
       : v3Paused
         ? 'Загрузка приостановлена — запись останется на устройстве до возобновления.'
         : 'Она отправится в блокчейн и станет вечной после подтверждения сети.';
