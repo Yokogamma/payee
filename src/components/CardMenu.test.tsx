@@ -230,3 +230,52 @@ describe('CardMenu — меню это ОДНА остановка в поряд
     expect(trigger().getAttribute('tabindex')).toBeNull();
   });
 });
+
+describe('CardMenu — у меню есть имя, у пустого меню нет триггера', () => {
+  it('попап именуется кнопкой, которая им управляет', () => {
+    // role="menu" без имени объявляется как голое «меню» — единственное
+    // слово, которое ничего не говорит о том, в какой карточке слушатель
+    // находится, на экране с десятком одинаковых триггеров.
+    render(<Harness />);
+    open();
+    const popup = screen.getByRole('menu');
+    const labelledBy = popup.getAttribute('aria-labelledby');
+    expect(labelledBy).toBeTruthy();
+    const namer = document.getElementById(labelledBy!);
+    expect(namer).toBe(trigger());
+    expect(namer!.getAttribute('aria-label')).toBe('Меню записи');
+  });
+
+  it('без пунктов триггер не рисуется вовсе', () => {
+    // Откат по SAFEBOX_WRITER_ENABLED=false: запись без логина, без вложений
+    // и в одной версии не даёт НИ ОДНОГО пункта. Кнопка, открывающая пустую
+    // коробку, хуже отсутствующей кнопки.
+    render(
+      <CardMenu
+        open={false}
+        onOpenChange={() => {}}
+        label="Меню записи"
+        id="menu-empty"
+        items={[]}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Меню записи' })).toBeNull();
+  });
+
+  it('появление первого пункта возвращает триггер', () => {
+    const { rerender } = render(
+      <CardMenu open={false} onOpenChange={() => {}} label="Меню записи" id="menu-empty" items={[]} />,
+    );
+    expect(screen.queryByRole('button', { name: 'Меню записи' })).toBeNull();
+    rerender(
+      <CardMenu
+        open={false}
+        onOpenChange={() => {}}
+        label="Меню записи"
+        id="menu-empty"
+        items={[{ key: 'a', label: 'Действие', onSelect: vi.fn() }]}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Меню записи' })).toBeTruthy();
+  });
+});

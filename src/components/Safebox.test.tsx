@@ -482,3 +482,23 @@ describe('CardMenu в сейфе — клавиатура по образцу WA
     expect(screen.queryByRole('menu')).toBeNull();
   });
 });
+
+describe('SafeboxSection — откат по SAFEBOX_WRITER_ENABLED', () => {
+  // Флаг существует ради отката; при выключенном писателе запись без логина,
+  // без вложений и в одной версии не даёт меню ни одного пункта.
+  it('у записи, которой нечего показать в меню, триггера нет', async () => {
+    vi.resetModules();
+    vi.doMock('../lib/flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false }));
+    const { SafeboxSection: Section } = await import('./SafeboxSection');
+
+    h.store = baseStore([entry({ id: 'e1', login: '', files: [] })]);
+    render(<Section />);
+    expect(screen.queryByRole('button', { name: /Меню записи/ })).toBeNull();
+    // Две основные кнопки на месте — пропала только пустая ⋯.
+    expect(screen.getByText('Пароль')).toBeTruthy();
+    expect(screen.getByText('Показать')).toBeTruthy();
+
+    vi.doUnmock('../lib/flags');
+    vi.resetModules();
+  });
+});

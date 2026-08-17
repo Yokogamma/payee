@@ -197,10 +197,19 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, onOpenChange]);
 
+  // A trigger with nothing behind it is a button that opens an empty box.
+  // It happens for real: with SAFEBOX_WRITER_ENABLED off — the rollback path
+  // the flag exists for — a single-version entry with no login and no
+  // attachments contributes no items at all.
+  if (items.length === 0) return null;
+
+  const triggerId = `${id}-trigger`;
+
   return (
     <>
       <button
         ref={triggerRef}
+        id={triggerId}
         type="button"
         className="icon-btn icon-btn--ring card-menu-btn"
         onClick={() => onOpenChange(!open, open ? 'programmatic' : undefined)}
@@ -232,7 +241,11 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
       </button>
 
       {open && (
-        <div ref={popupRef} id={id} className="card-menu" role="menu">
+        // Named by the button that controls it, per APG. A `role="menu"` with
+        // no accessible name is announced as a bare «menu» — the one word that
+        // tells the listener nothing about which card they are in, on a screen
+        // that can hold a dozen identical triggers.
+        <div ref={popupRef} id={id} className="card-menu" role="menu" aria-labelledby={triggerId}>
           {items.map(item => {
             const className = `card-menu-item${item.danger ? ' card-menu-item--danger' : ''}`;
             // A link, so it keeps middle-click and «open in new tab» — an
