@@ -10,7 +10,7 @@ import { VersionHistoryModal, RestoreVersionDialog } from '../components/Version
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { formatNoteDate } from '../lib/format-date';
-import { InfinityMark, EllipsisMark, IconCopy, IconEdit, IconHistory, IconLink } from '../components/icons';
+import { InfinityMark, EllipsisMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -330,7 +330,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
             title="Скрыть"
             aria-label="Скрыть сообщение о PIN"
           >
-            ✕
+            <IconClose />
           </button>
         </div>
       )}
@@ -387,7 +387,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
               {filteredChains.length} из {chains.length}
             </span>
             <button className="search-clear" onClick={() => setSearchQuery('')} title="Очистить" aria-label="Очистить поиск">
-              ✕
+              <IconClose />
             </button>
           </>
         )}
@@ -460,8 +460,10 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       the rest of the emoji: every note is encrypted, so a
                       padlock on each one carried no information — it was a
                       property of the app repeated per row. */}
-                  {info && (
-                    info.status === 'error' && arweave.enabled && arweave.registered ? (
+                  {/* No `info &&` guard: `info` falls back to
+                      `{ status: 'queued' }` above, so the condition was always
+                      true and read as if a card could have no sync state. */}
+                  {info.status === 'error' && arweave.enabled && arweave.registered ? (
                       <button
                         className={`state sync-state ${badge.className}`}
                         onClick={retrySync}
@@ -480,13 +482,9 @@ export function Main({ theme, onThemeChange }: MainProps) {
                         {badge.permanent && <InfinityMark />}
                         {badge.word}
                       </span>
-                    )
-                  )}
+                    )}
                   {chain.versions.length > 1 && (
-                    <span
-                      className="state state--quiet"
-                      title={`Версий: ${chain.versions.length}`}
-                    >
+                    <span className="state state--quiet">
                       {chain.versions.length}-я версия
                     </span>
                   )}
@@ -581,7 +579,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
             title="Позже"
             aria-label="Отложить обновление"
           >
-            ✕
+            <IconClose />
           </button>
         </div>
       )}

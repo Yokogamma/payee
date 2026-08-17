@@ -844,6 +844,17 @@ h1 {
   flex: 1;
 }
 
+/* The feed stopped using this when the date moved to the top of the entry, and
+   I deleted the rule with it — but both history modals still print version
+   dates through it, so they lost their styling and inherited 16.5px body text
+   inside a dense list of rows. The modals get their real pass later; this is
+   the date treatment they had. */
+.note-time {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
 /* Empty state */
 .empty-state {
   display: flex;
