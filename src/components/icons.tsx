@@ -114,6 +114,72 @@ export const IconHistory = () => (
   <Line><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></Line>
 );
 
+/** Something needs attention. Replaces ⚠️, which arrived as a colour emoji —
+ *  the one saturated object on a monochrome page, and at a size the platform
+ *  font chose. */
+export const IconWarning = () => (
+  <Line><path d="M12 4.5 2.8 20h18.4L12 4.5Z" /><path d="M12 10v4.5" /><path d="M12 17.4v.2" /></Line>
+);
+
+/** Done, confirmed. Replaces ✓. */
+export const IconCheck = () => <Line><path d="m4.5 12.5 5 5 10-11" /></Line>;
+
+/** Hide a revealed secret — the counterpart of IconEye. */
+export const IconEyeOff = () => (
+  <Line>
+    <path d="M3 3l18 18" />
+    <path d="M10.6 6.3A9.9 9.9 0 0 1 12 6c6.5 0 10 6 10 6a17 17 0 0 1-3.3 3.9" />
+    <path d="M6.6 7.6C3.9 9.2 2 12 2 12s3.5 6 10 6c1.5 0 2.9-.3 4.1-.9" />
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+  </Line>
+);
+
+/** Generate a new random password. A pair of shuffling arrows rather than a
+ *  die: 🎲 promised chance, and what the button offers is regeneration. */
+export const IconShuffle = () => (
+  <Line><path d="M3 7h4l10 10h4" /><path d="M17 3l4 4-4 4" /><path d="M3 17h4l3-3" /><path d="M17 21l4-4" /></Line>
+);
+
+/** Bring an old version back. Replaces ↩. */
+export const IconRestore = () => (
+  <Line><path d="M4 10h9a5 5 0 0 1 0 10H8" /><path d="m8 6-4 4 4 4" /></Line>
+);
+
+/** The vault. Replaces 🔐 in the safebox activation, the PIN pad and the
+ *  landing feature list. */
+export const IconVault = () => (
+  <Line>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <circle cx="12" cy="12" r="3.5" />
+    <path d="M12 15.5V18" />
+  </Line>
+);
+
+/** Waiting on the network. Replaces ⏳. */
+export const IconHourglass = () => (
+  <Line><path d="M7 3h10" /><path d="M7 21h10" /><path d="M7 3c0 5 5 6 5 9s-5 4-5 9" /><path d="M17 3c0 5-5 6-5 9s5 4 5 9" /></Line>
+);
+
+/** Uploads are paused. Replaces ⏸. */
+export const IconPause = () => (
+  <Line><path d="M9 5v14" /><path d="M15 5v14" /></Line>
+);
+
+/** A written note — the empty state. Replaces 📝. */
+export const IconNote = () => (
+  <Line><path d="M5 4h14v16H5z" /><path d="M9 9h6M9 13h6M9 17h3" /></Line>
+);
+
+/** The seed phrase: twelve words that are the only key. Replaces 🌱. */
+export const IconKey = () => (
+  <Line><circle cx="8" cy="12" r="4" /><path d="M12 12h9" /><path d="M17 12v4" /><path d="M20.5 12v3" /></Line>
+);
+
+/** An image in rendered markdown. Replaces 🖼. */
+export const IconImage = () => (
+  <Line><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8.5" cy="9.5" r="1.5" /><path d="m4 17 5-5 4 4 2-2 5 5" /></Line>
+);
+
 /** Download an attachment. */
 export const IconDownload = () => (
   <Line><path d="M12 4v11" /><path d="m8 11 4 4 4-4" /><path d="M5 19h14" /></Line>

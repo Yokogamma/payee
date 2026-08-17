@@ -3,6 +3,7 @@ import { useModalA11y } from '../lib/useModalA11y';
 import { NoteComposer } from './NoteComposer';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
+import { IconClose } from './icons';
 
 /**
  * Edit modal (W3): prefilled with the CURRENT version's text; saving creates a
@@ -72,14 +73,14 @@ export function EditNoteModal({ open, chain, onClose, onSave }: EditNoteModalPro
       >
         <div className="modal-header">
           <h2>Редактирование</h2>
-          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть">✕</button>
+          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть"><IconClose /></button>
         </div>
         <NoteComposer
           value={text}
           onChange={setText}
           onSubmit={() => void handleSave()}
           submitLabel="Сохранить новую версию"
-          submitBusyLabel="🔐..."
+          submitBusyLabel="Шифруем…"
           busy={busy}
           markdown
           autoFocus

@@ -46,7 +46,7 @@ const components: Components = {
   // and the same URL policy (href already passed through urlTransform).
   img: ({ src, alt }) => {
     const href = typeof src === 'string' ? src : '';
-    const label = `🖼 ${alt || 'изображение'}`;
+    const label = `${alt || 'изображение'}`;
     return href
       ? <a className="md-img-chip" href={href} target="_blank" rel="noopener noreferrer">{label}</a>
       : <span className="md-img-chip">{label}</span>;

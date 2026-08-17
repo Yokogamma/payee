@@ -1,5 +1,5 @@
 import { useNotes } from '../lib/store';
-import { InfinityMark } from '../components/icons';
+import { InfinityMark, IconVault, IconKey } from '../components/icons';
 
 export function Landing() {
   const { goToOnboarding, goToRestore } = useNotes();
@@ -17,7 +17,7 @@ export function Landing() {
 
         <div className="landing-features">
           <div className="feature">
-            <span className="feature-icon">🔐</span>
+            <span className="feature-icon"><IconVault /></span>
             <div>
               <div className="feature-title">Шифрование на устройстве</div>
               <div className="feature-desc">AES-256-GCM. Только вы можете прочитать свои заметки.</div>
@@ -25,7 +25,7 @@ export function Landing() {
           </div>
 
           <div className="feature">
-            <span className="feature-icon">♾️</span>
+            <span className="feature-icon"><InfinityMark /></span>
             <div>
               <div className="feature-title">Вечное хранение — по желанию</div>
               <div className="feature-desc">
@@ -36,7 +36,7 @@ export function Landing() {
           </div>
 
           <div className="feature">
-            <span className="feature-icon">🌱</span>
+            <span className="feature-icon"><IconKey /></span>
             <div>
               <div className="feature-title">12 слов = полный доступ</div>
               <div className="feature-desc">Seed-фраза — единственный ключ. Никаких паролей и аккаунтов.</div>

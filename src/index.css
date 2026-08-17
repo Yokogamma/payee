@@ -522,11 +522,13 @@ h1 {
 }
 
 .seed-cover-icon {
-  font-size: 28px;
+  display: block;
+  color: var(--text-dim);
 }
+.seed-cover-icon svg { width: 30px; height: 30px; }
 
 .seed-cover-hint {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-dim);
 }
 
@@ -940,11 +942,15 @@ h1 {
   color: var(--text-dim);
 }
 
+/* Sized in px, not in font-size: the glyph it used to hold decided its own
+   dimensions and the platform decided its colour. */
 .empty-icon {
-  font-size: 40px;
-  margin-bottom: 12px;
-  opacity: 0.6;
+  display: flex;
+  justify-content: center;
+  margin-bottom: 14px;
+  color: var(--text-dim);
 }
+.empty-icon svg { width: 34px; height: 34px; }
 
 .empty-sub {
   color: var(--text-muted);
@@ -1307,10 +1313,13 @@ h1 {
 }
 
 .feature-icon {
-  font-size: 22px;
+  display: flex;
   flex-shrink: 0;
   margin-top: 2px;
+  color: var(--text-dim);
 }
+.feature-icon svg,
+.feature-icon .mark { width: 22px; height: 22px; vertical-align: 0; }
 
 .feature-title {
   font-size: 14px;
@@ -1628,10 +1637,15 @@ mark {
   display: none;
 }
 
+/* The padlock is drawn now. Sizing moved from font-size to the svg box —
+   the ONLY change the gate takes in this redesign; everything else about it
+   (always mounted, imperative [hidden], opaque background, z-index 100) is
+   load-bearing and untouched. */
 .lock-gate-icon {
-  font-size: 28px;
-  opacity: 0.6;
+  display: block;
+  color: var(--text-dim);
 }
+.lock-gate-icon svg { width: 30px; height: 30px; }
 
 /* The gate's dead-man's handle. Both start `hidden` and are revealed
    imperatively (armGateReveal in store.tsx): a gate that outstays a second

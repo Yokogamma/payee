@@ -7,6 +7,7 @@ import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
+import { IconClose, IconRestore } from './icons';
 
 /**
  * Version history of one chain (current-first). Versions are numbered by
@@ -76,7 +77,7 @@ export function VersionHistoryModal({
       >
         <div className="modal-header">
           <h2>История версий</h2>
-          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть">✕</button>
+          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть"><IconClose /></button>
         </div>
 
         <div className="history-list">
@@ -125,7 +126,7 @@ export function VersionHistoryModal({
                       >
                         {/* «Вернуть», не «Восстановить» — восстановление в
                             продукте уже значит restore-по-seed из блокчейна. */}
-                        ↩️ Вернуть эту версию
+                        <IconRestore /> Вернуть эту версию
                       </button>
                     )}
                   </div>

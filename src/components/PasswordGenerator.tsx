@@ -108,7 +108,7 @@ export function PasswordGenerator({ onGenerate }: PasswordGeneratorProps) {
       )}
 
       <button type="button" className="btn btn-outline full-width" onClick={build}>
-        🎲 Сгенерировать пароль
+        Сгенерировать пароль
       </button>
     </div>
   );

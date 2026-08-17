@@ -225,7 +225,7 @@ describe('Main W3 — history + restore-version flow', () => {
 
     // Expand the OLD version → restore button appears.
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть эту версию'));
 
     // Modal-stack: history replaced by the confirm — still exactly ONE dialog.
     const dialogs = screen.getAllByRole('dialog');
@@ -244,7 +244,7 @@ describe('Main W3 — history + restore-version flow', () => {
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть эту версию'));
     fireEvent.click(screen.getByText('Отмена'));
 
     // History back, one dialog, the old-version row focused + expanded.
@@ -263,7 +263,7 @@ describe('Main W3 — history + restore-version flow', () => {
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
-    fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
+    fireEvent.click(screen.getByText('Вернуть эту версию'));
     fireEvent.click(screen.getByText('Вернуть'));
 
     expect(await screen.findByText(/Не удалось вернуть версию/)).toBeTruthy();

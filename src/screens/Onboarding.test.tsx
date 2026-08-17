@@ -63,7 +63,7 @@ describe('Onboarding — seed copy honesty', () => {
     fireEvent.click(screen.getByText('Копировать'));
 
     expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
-    expect(screen.queryByText('✓ Скопировано')).toBeNull();
+    expect(screen.queryByText('Скопировано')).toBeNull();
   });
 
   it('resolved clipboard write → «Скопировано» (warning already shown pre-copy)', async () => {
@@ -73,7 +73,7 @@ describe('Onboarding — seed copy honesty', () => {
 
     fireEvent.click(screen.getByText('Копировать'));
 
-    expect(await screen.findByText('✓ Скопировано')).toBeTruthy();
+    expect(await screen.findByText('Скопировано')).toBeTruthy();
     expect(writeText).toHaveBeenCalledWith(MNEMONIC);
     expect(screen.getByText(/мастер-ключ/)).toBeTruthy();
   });

@@ -156,7 +156,7 @@ describe('Main — note card menu', () => {
     fireEvent.click(screen.getByLabelText('Меню заметки'));
     fireEvent.click(screen.getByText('Копировать текст'));
 
-    expect(await screen.findByText('✓ Скопировано')).toBeTruthy();
+    expect(await screen.findByText('Скопировано')).toBeTruthy();
     expect(screen.queryByText('Копировать текст')).toBeNull(); // menu closed
   });
 
@@ -167,7 +167,7 @@ describe('Main — note card menu', () => {
     fireEvent.click(screen.getByText('Копировать текст'));
 
     expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
-    expect(screen.queryByText('✓ Скопировано')).toBeNull();
+    expect(screen.queryByText('Скопировано')).toBeNull();
     expect(screen.getByText('Копировать текст')).toBeTruthy(); // still open
   });
 });

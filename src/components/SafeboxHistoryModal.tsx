@@ -6,6 +6,7 @@ import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { SafeboxChain } from '../lib/chains';
 import type { SafeboxEntryData } from '../lib/crypto';
+import { IconClose, IconEye, IconRestore } from './icons';
 
 /**
  * Version history of one safebox entry (current-first), mirroring
@@ -96,7 +97,7 @@ export function SafeboxHistoryModal({
       >
         <div className="modal-header">
           <h2>История версий</h2>
-          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть">✕</button>
+          <button className="icon-btn" onClick={onClose} title="Закрыть" aria-label="Закрыть"><IconClose /></button>
         </div>
 
         <div className="history-list">
@@ -142,7 +143,7 @@ export function SafeboxHistoryModal({
                       className="btn btn-ghost"
                       onClick={() => void reveal(version.id)}
                     >
-                      👁 Показать пароль этой версии
+                      <IconEye /> Показать пароль этой версии
                     </button>
                     {revealed?.id === version.id && (
                       <div className="safebox-revealed" role="status">
@@ -155,7 +156,7 @@ export function SafeboxHistoryModal({
                         className="btn btn-ghost history-restore-btn"
                         onClick={() => onRequestRestore(version)}
                       >
-                        ↩️ Вернуть эту версию
+                        <IconRestore /> Вернуть эту версию
                       </button>
                     )}
                   </div>

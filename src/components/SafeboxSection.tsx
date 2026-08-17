@@ -3,7 +3,7 @@ import { useNotes } from '../lib/store';
 import { SAFEBOX_WRITER_ENABLED } from '../lib/flags';
 import { badgeFor } from './syncBadge';
 import { CardMenu } from './CardMenu';
-import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, InfinityMark } from './icons';
+import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, IconVault, InfinityMark } from './icons';
 import { SafeboxPinPad } from './SafeboxPinPad';
 import { SafeboxActivation, SafeboxSeedReset } from './SafeboxActivation';
 import { SafeboxEntryForm } from './SafeboxEntryForm';
@@ -197,7 +197,7 @@ export function SafeboxSection() {
       <div className="safebox-list">
         {filteredSafeboxChains.length === 0 ? (
           <div className="empty-state">
-            <div className="empty-icon">🔐</div>
+            <div className="empty-icon"><IconVault /></div>
             <p>{safeboxChains.length === 0 ? 'В сейфе пока пусто.' : 'Ничего не найдено.'}</p>
           </div>
         ) : filteredSafeboxChains.map(chain => {

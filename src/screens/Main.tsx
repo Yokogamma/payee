@@ -11,7 +11,7 @@ import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate } from '../lib/format-date';
-import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose } from '../components/icons';
+import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -401,8 +401,8 @@ export function Main({ theme, onThemeChange }: MainProps) {
         <div className="error-banner" role="alert">
           <span>
             {pinSetupNotice === 'already-set'
-              ? '⚠️ PIN уже установлен на этом устройстве (в другой вкладке) — ваш новый PIN не применён. Сменить PIN можно в настройках.'
-              : '⚠️ Не удалось сохранить PIN. Вход выполнен; установите PIN в настройках.'}
+              ? 'PIN уже установлен на этом устройстве (в другой вкладке) — ваш новый PIN не применён. Сменить PIN можно в настройках.'
+              : 'Не удалось сохранить PIN. Вход выполнен; установите PIN в настройках.'}
           </span>
           <button
             className="banner-btn banner-close"
@@ -518,7 +518,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
       <div className="notes-feed">
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
-            <div className="empty-icon">📝</div>
+            <div className="empty-icon"><IconNote /></div>
             <p>Первая заметка — самая важная.</p>
             <p className="empty-sub">Просто начните печатать.</p>
           </div>
@@ -674,14 +674,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
       {/* Prominent save confirmation (2.5) */}
       {justSaved && (
         <div className="toast toast--success" role="status">
-          ✓ Сохранено и зашифровано
+          Сохранено и зашифровано
         </div>
       )}
 
 
       {/* Clipboard feedback — success and failure must look different */}
       {copyFeedback === 'ok' && (
-        <div className="toast toast--success" role="status">✓ Скопировано</div>
+        <div className="toast toast--success" role="status">Скопировано</div>
       )}
       {copyFeedback === 'fail' && (
         <div className="toast toast--error" role="alert">

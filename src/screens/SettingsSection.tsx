@@ -152,13 +152,13 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
   const resetRiskTotal = arweave.resetRisk.notes + arweave.resetRisk.safebox;
   const resetWarningMessage = !arweave.countsReady
     // Until the first sync-count read completes we cannot know what is safe.
-    ? '⚠️ Состояние синхронизации ещё загружается — сейчас нельзя определить, '
+    ? 'Состояние синхронизации ещё загружается — сейчас нельзя определить, '
       + 'какие заметки уже подтверждены в блокчейне.\nВсе локальные данные будут '
       + 'удалены; неподтверждённые заметки пропадут безвозвратно.'
     : resetRiskTotal > 0
       // Only CONFIRMED records are recoverable: an `accepted` transaction can
       // still be dropped, and after a wipe there is no local ciphertext left.
-      ? `⚠️ ${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
+      ? `${resetRiskTotal} записей ещё НЕ подтверждены в блокчейне и будут потеряны безвозвратно `
         + '(включая версии в истории заметок и записи, ожидающие подтверждения — такая транзакция ещё может не дойти).\n'
         + (arweave.resetRisk.safebox > 0
           ? `Из них в защищённом сейфе: ${arweave.resetRisk.safebox} — пароли и вложения.\n`
@@ -218,7 +218,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
   const arweaveChip = !arweave.enabled
     ? 'выключено'
-    : arweave.online ? '● Онлайн' : '○ Оффлайн';
+    : arweave.online ? 'Онлайн' : 'Оффлайн';
   const arweaveChipClass = arweave.enabled && arweave.online ? 'text-green' : '';
 
 
@@ -293,7 +293,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
             {mnemonic && (
               <div className="seed-reveal">
                 <div className="seed-warning">
-                  ⚠️ Никому не показывайте! Кто знает фразу — имеет доступ ко всем заметкам.
+                  Никому не показывайте! Кто знает фразу — имеет доступ ко всем заметкам.
                   На время сессии фраза хранится в памяти вкладки (sessionStorage) и
                   очищается при закрытии браузера.
                 </div>
@@ -361,26 +361,26 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
             <div className="settings-info">
               <div>Статус: <strong className={arweave.online ? 'text-green' : 'text-red'}>
-                {arweave.online ? '● Онлайн' : '○ Оффлайн'}
+                {arweave.online ? 'Онлайн' : 'Оффлайн'}
               </strong></div>
               {/* The per-note and per-version counters now live in the status
                   line's expandable panel — one place, one computation. A copy
                   here meant two answers to «how much is safely on chain», and
                   the user would have had to reconcile them. */}
               {arweave.acceptedCount > 0 && (
-                <div>⏳ Ожидают подтверждения версий: <strong>{arweave.acceptedCount}</strong></div>
+                <div>Ожидают подтверждения версий: <strong>{arweave.acceptedCount}</strong></div>
               )}
               {arweave.unsyncedCount > 0 && (
-                <div>⏳ Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>
+                <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>
               )}
               {arweave.errorCount > 0 && (
-                <div className="text-red">⚠️ Ошибки: <strong>{arweave.errorCount}</strong></div>
+                <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>
               )}
               {arweave.quarantinedCount > 0 && (
                 // Permanent by design — deliberately NOT lumped into «Ошибки»:
                 // no «Повторить» can ever fix a quarantined record.
                 <div>
-                  ⏸ Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
+                  Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
                 </div>
               )}
               {arweave.lastSync && (
@@ -399,7 +399,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
                 onClick={retrySync}
                 disabled={arweave.syncing}
               >
-                {arweave.syncing ? '⏳ Загрузка...' : '↻ Повторить загрузку'}
+                {arweave.syncing ? 'Загрузка…' : 'Повторить загрузку'}
               </button>
             )}
 
@@ -409,7 +409,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
             {arweave.registered && (
               <div className="settings-info">
-                <div className="text-green">✓ Синхронизация доступна</div>
+                <div className="text-green">Синхронизация доступна</div>
               </div>
             )}
           </SettingsBlock>
@@ -536,7 +536,7 @@ function SafeboxSettingsSection({ configured, changeSafeboxPin, deactivateSafebo
     return (
       <div className="settings-hint">
         На устройстве есть записи сейфа, но PIN не установлен. Откройте раздел
-        «🔐 Сейф» и восстановите доступ, введя полную seed-фразу — записи не
+        «Сейф» и восстановите доступ, введя полную seed-фразу — записи не
         пострадали.
       </div>
     );
