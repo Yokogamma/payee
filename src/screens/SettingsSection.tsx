@@ -21,10 +21,19 @@ interface SettingsSectionProps {
   onThemeChange: (t: ThemePref) => void;
 }
 
+/**
+ * «Чернильная», not «Тёмная».
+ *
+ * The theme IDs stay `dark`/`light`/`warm` — they are what `localStorage`
+ * holds and what an older build degrades from, so renaming them would break a
+ * rollback. Only the words change, and they change because the palettes did:
+ * this is no longer «light and its dimmed twin» but three papers, one of
+ * which is inked. The mockup names them exactly this way.
+ */
 const THEME_LABELS: Record<ThemePref, string> = {
   system: 'Системная',
-  dark: 'Тёмная',
   light: 'Светлая',
+  dark: 'Чернильная',
   warm: 'Тёплая',
 };
 
@@ -216,7 +225,10 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
 
   return (
     <section className="settings-section" aria-labelledby="settings-title">
-      <div>
+      {/* The scroller. The section itself is a two-row grid now, so the
+          footnote below can sit on its own row instead of trailing the
+          content — see `.settings-section` in index.css. */}
+      <div className="settings-scroll">
         <div className="settings-topbar">
           {/* tabIndex={-1}: the shell moves focus here on every section change,
               which is the a11y invariant that replaces the modal focus trap —
@@ -442,16 +454,20 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
         </div>
 
-        {/* Was a meta line directly under the title, where it took the most
-            valuable strip on the screen to say something nobody opens settings
-            to read. The note count is in the status line; the cipher name is
-            reassurance. Both belong at the end. */}
-        <p className="settings-footnote">
-          Заметок: {chains.length}
-          {notes.length !== chains.length && <> · записей: {notes.length}</>}
-          {' · '}AES-256-GCM
-        </p>
       </div>
+
+      {/* OUT OF THE SCROLL, sitting on the section's own last row, right above
+          the tab bar — where the mockup puts it.
+          It used to be the last child of the scrolling column, which meant the
+          one line that describes the whole vault was visible only to someone
+          who had already scrolled past everything else. It is not a control
+          and not urgent; it is a footer, and a footer that scrolls away is
+          just a paragraph. */}
+      <p className="settings-footnote">
+        Заметок: {chains.length}
+        {notes.length !== chains.length && <> · записей: {notes.length}</>}
+        {' · '}AES-256-GCM
+      </p>
 
       {/* The reset confirm lives HERE now. Settings is no longer aria-modal, so
           the old «close settings before opening the confirm» dance is

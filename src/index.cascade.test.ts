@@ -161,6 +161,37 @@ describe('base layer, as the browser resolves it', () => {
     ).toBe(true);
   });
 
+  it('settings rows are the mockup pitch and the values are italic', () => {
+    expect(resolved('settings-block-header', 'min-height')).toBe('54px');
+    expect(resolved('settings-block-header', 'font-size')).toBe('16.5px');
+    expect(resolved('settings-block-chip', 'font-style')).toBe('italic');
+    expect(parseFloat(resolved('settings-block-chip', 'font-size'))).toBeGreaterThanOrEqual(13);
+  });
+
+  it('the settings footer sits on its own grid row, out of the scroll', () => {
+    // It used to be the last child of the scrolling column, so the one line
+    // describing the whole vault was visible only after scrolling past
+    // everything else.
+    expect(declaresIn('.settings-section', /grid-template-rows:\s*1fr auto/)).toBe(true);
+    expect(declaresIn('.settings-scroll', /overflow-y:\s*auto/)).toBe(true);
+    expect(declaresIn('.settings-section', /overflow-y/)).toBe(false);
+  });
+
+  it('the chosen theme is filled, not tinted', () => {
+    // A 1.5px border plus a 5% wash was the same signal the inactive options
+    // already carry, only slightly stronger.
+    expect(declaresIn('.theme-option--active', /background:\s*var\(--accent\)/)).toBe(true);
+    expect(declaresIn('.theme-option--active', /color:\s*var\(--accent-text\)/)).toBe(true);
+  });
+
+  it('settings text clears the floor', () => {
+    for (const cls of ['settings-hint', 'settings-footnote', 'settings-group-title']) {
+      const size = parseFloat(resolved(cls, 'font-size'));
+      const floor = cls === 'settings-group-title' ? 12 : 13; // group label = named exception
+      expect(size, `.${cls} is ${size}px`).toBeGreaterThanOrEqual(floor);
+    }
+  });
+
   it('the section label is the ONE thing allowed under the floor', () => {
     // The handoff sets the floor at 13px and then specifies these labels at
     // PT Mono 12px itself. It is not prose: uppercase, spaced 0.12em, mono,

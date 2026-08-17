@@ -82,7 +82,8 @@ describe('SettingsSection a11y (Phase 7)', () => {
     // also appears as the block's status chip, so target the buttons by role.
     fireEvent.click(screen.getByText('Тема'));
     const system = screen.getByRole('button', { name: 'Системная' });
-    const dark = screen.getByRole('button', { name: 'Тёмная' });
+    // «Тёмная» → «Чернильная»: id темы прежний, изменилось только слово.
+    const dark = screen.getByRole('button', { name: 'Чернильная' });
     expect(system.getAttribute('aria-pressed')).toBe('true');
     expect(dark.getAttribute('aria-pressed')).toBe('false');
   });
