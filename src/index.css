@@ -2121,12 +2121,15 @@ mark {
   border: none;
   color: var(--text);
   font-family: inherit;
-  font-size: 0.9rem;
+  font-size: 15px;
   cursor: pointer;
   text-align: left;
 }
 .history-row-head:hover { background: var(--bg-hover); }
-.history-current-mark { color: var(--green); font-size: 0.8em; }
+/* 0.8em ОТ 0.9rem — это 11.5px, третье исключение из пола, спрятанное за
+   двумя относительными единицами. Размер задан явно: в этом файле font-size
+   объявляется в px именно для того, чтобы его можно было проверить. */
+.history-current-mark { color: var(--green); font-size: 13px; }
 .history-row-meta {
   display: inline-flex;
   align-items: center;

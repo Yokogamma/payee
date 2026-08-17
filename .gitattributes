@@ -1,0 +1,29 @@
+# Line endings, pinned.
+#
+# WHY THIS FILE EXISTS. The «Архив» redesign branch committed src/index.css
+# with CRLF into a repository that stores LF, and the result was a diff of
+# 2568 insertions against 2070 deletions for a file where a few hundred lines
+# had actually changed — every untouched line rewritten because its invisible
+# terminator differed. `git diff --check` reported 5136 whitespace errors, and
+# review, `git blame` and any later merge all inherited the noise.
+#
+# `core.autocrlf` is a per-developer setting and cannot be relied on: it is a
+# property of whoever happens to clone next. This file makes the answer a
+# property of the REPOSITORY, which is where it belongs.
+#
+# LF in the object database, always. Windows editors handle LF fine; the
+# working tree may be converted by autocrlf locally, and that is nobody else's
+# business because it never reaches a commit.
+* text=auto eol=lf
+
+# Binaries: never touched, never normalised, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary

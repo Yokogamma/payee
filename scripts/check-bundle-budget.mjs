@@ -32,9 +32,15 @@
  *     plus the WAI-ARIA keyboard model that neither of them had.
  *   - src/lib/format-date.ts — moved out of a screen component, not new code.
  *
- * `npm ls` is unchanged: no dependency was added on this branch. The new
- * ceiling restores roughly 10 KB of headroom, which is what the gate had
- * before this work started.
+ * NO DEPENDENCY WAS ADDED — and to be exact about it, package.json did change:
+ * @fontsource/manrope and @fontsource/jetbrains-mono were replaced by
+ * @fontsource-variable/literata and @fontsource/pt-mono. Those ship CSS and
+ * woff2, not JavaScript, so the JS dependency graph this gate measures is the
+ * same as on main; the font payload is a separate number and lives in
+ * scripts/report-precache.mjs.
+ *
+ * The new ceiling restores roughly 10 KB of headroom, which is what the gate
+ * had before this work started.
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';

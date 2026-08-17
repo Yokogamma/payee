@@ -105,13 +105,40 @@ describe('base layer, as the browser resolves it', () => {
       ['.app-nav-item', 12.5],  // «подпись 12.5px»
     ]);
 
+    /**
+     * Relative sizes that are verified BY HAND, with the resolved value.
+     *
+     * `em` compounds, so a scan cannot resolve it without walking the whole
+     * cascade — and that is exactly where a violation hid: 0.8em inside a rule
+     * at 0.9rem is 11.52px, two relative units deep, and the earlier version
+     * of this check read only `px|rem` and never saw it. Anything relative now
+     * has to be listed here with the size it actually resolves to, or written
+     * in px.
+     */
+    const VERIFIED_RELATIVE = new Map([
+      ['.note-md code', 15.8],      // 0.88em of .note-text 18px
+      ['.note-md pre code', 15.3],  // 0.85em of .note-text 18px
+      ['.md-img-chip', 15.3],       // 0.85em of .note-text 18px
+    ]);
+
     const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
     const offenders: string[] = [];
     for (const m of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
       const selector = m[1].trim().replace(/\s+/g, ' ');
       if (selector.startsWith('@')) continue;
-      const decl = m[2].match(/font-size:\s*([0-9.]+)(px|rem)/);
+      const decl = m[2].match(/font-size:\s*([0-9.]+)(px|rem|em|%)/);
       if (!decl) continue;
+
+      if (decl[2] === 'em' || decl[2] === '%') {
+        const verified = VERIFIED_RELATIVE.get(selector);
+        if (verified === undefined) {
+          offenders.push(`  ${selector} → ${decl[1]}${decl[2]} (относительный размер не проверен)`);
+        } else if (verified < 13) {
+          offenders.push(`  ${selector} → ${decl[1]}${decl[2]} = ${verified}px`);
+        }
+        continue;
+      }
+
       const px = decl[2] === 'rem' ? parseFloat(decl[1]) * 16 : parseFloat(decl[1]);
       if (px >= 13 || EXEMPT.get(selector) === px) continue;
       offenders.push(`  ${selector} → ${px}px`);
