@@ -22,8 +22,8 @@ import { readFileSync } from 'node:fs';
  * numbers are recomputed on every run, and restoring the specified value turns
  * the suite red with the measured ratio in the message.
  *
- * Non-text contrast (SC 1.4.11, 3:1 for control boundaries) is NOT asserted
- * here yet — see the note at the bottom.
+ * Non-text contrast (SC 1.4.11, 3:1 for control boundaries) is asserted for
+ * --border-control, the token that identifies a control.
  */
 
 const CSS_PATH = 'src/index.css';
@@ -161,9 +161,11 @@ describe('WCAG contrast of the theme palettes', () => {
   for (const [name, body] of Object.entries(PALETTES)) {
     it(`${name}: --border-control clears ${AA_NON_TEXT}:1 — it is what identifies a control`, () => {
       // SC 1.4.11. The handoff draws every 1.5px line in one colour and makes
-      // that line one of the two signals for «this is a button»; #c9bda1 is
-      // 1.56:1 and cannot carry that. --border-strong keeps the specified
-      // value for rules that promise nothing, and is NOT asserted here.
+      // that line one of the two signals for «this is a button»; the specified
+      // #c9bda1 is 1.56:1 and cannot carry that, so --border-control holds a
+      // darker value. (A second token kept #c9bda1 for decorative rules until
+      // Ф7 — by then it had no users, because every 1.5px line in the mockups
+      // turned out to sit on a control. See the palette comment.)
       const map = tokens(body ?? '');
       const fg = parseHex(resolve(map, '--border-control'));
       expect(fg, '--border-control is missing or not a plain hex').toBeTruthy();

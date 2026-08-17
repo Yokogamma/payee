@@ -73,15 +73,18 @@ export function InfinityMark({ className }: MarkProps) {
  * wrong icon instead of a broken layout, and any container that wants a
  * specific size still overrides this from CSS.
  *
- * `flex: none` for the same reason: in a flex row an icon must not be the
- * thing that shrinks.
+ * `flex: none` comes from the `.icon` CLASS, not from a style attribute. The
+ * production CSP is `style-src 'self'` with no `'unsafe-inline'`, so React's
+ * inline style would be dropped by the browser — the protection would exist in
+ * development and be silently absent in the one build that ships. `width` and
+ * `height` are presentation ATTRIBUTES rather than styles, so they survive.
  */
 const Line = ({ children }: { children: React.ReactNode }) => (
   <svg
+    className="icon"
     viewBox="0 0 24 24"
     width="1em"
     height="1em"
-    style={{ flex: 'none' }}
     fill="none"
     stroke="currentColor"
     strokeWidth="1.8"

@@ -257,6 +257,13 @@ body {
   font-family: var(--mono);
 }
 
+/* Every drawn icon.  lives HERE and not on a style attribute:
+   the production CSP is , so an inline style is dropped by
+   the browser and the guard would exist only in development. */
+.icon {
+  flex: none;
+}
+
 /* The drawn marks (∞, ⋯ — see components/icons.tsx). Sized in em so they
    track the text they sit in, and nudged off the baseline because an
    optically centred glyph sits lower than a geometrically centred box. */
@@ -618,7 +625,7 @@ h1 {
 .seed-num {
   color: var(--text-dim);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   min-width: 16px;
 }
 
@@ -985,7 +992,10 @@ h1 {
   justify-content: center;
   padding: 20px;
   z-index: 100;
-  backdrop-filter: blur(4px);
+  /* No backdrop blur. Blur is a photographic effect: it says «there is glass
+     between you and the page». Paper has no glass — the ink scrim above
+     already separates the layers, and dropping the filter also gives back a
+     compositing pass on the phones that need it most. */
 }
 
 .modal {
@@ -1756,7 +1766,7 @@ mark {
   background: var(--bg-card);
   border: 1px solid var(--border);
   box-shadow: 0 8px 32px var(--scrim);
-  font-size: 13px;
+  font-size: 13.5px;
   z-index: 50;
 }
 
@@ -2061,7 +2071,7 @@ mark {
 .modal-header h2 { margin: 0; }
 .modal-note {
   margin: 12px 0 0;
-  font-size: 0.8rem;
+  font-size: 13.5px;
   color: var(--text-muted);
 }
 .edit-note-modal { width: min(640px, 94vw); }
@@ -2228,7 +2238,7 @@ mark {
 }
 .safebox-file-name { flex: 1; word-break: break-all; }
 .safebox-file-size { color: var(--text-muted); flex-shrink: 0; }
-.safebox-size { font-size: 0.8rem; color: var(--text-muted); margin-top: 6px; }
+.safebox-size { font-size: 13px; color: var(--text-muted); margin-top: 6px; }
 .safebox-field { font-size: 0.85rem; padding-top: 6px; }
 .safebox-field span { color: var(--text-muted); }
 
@@ -2510,15 +2520,12 @@ mark {
 
 .settings-group + .settings-group { margin-top: 22px; }
 
-/* Same treatment as .section-label — 12px is the one size the handoff names
-   for a group label. */
+/* LAYOUT ONLY. The type comes from .section-label, which the markup now
+   carries alongside this class — it IS a section label, and duplicating its
+   12px here made it look like a THIRD exception to the 13px floor when it is
+   the same one. Same split as .section-title: the scale owns the type, the
+   component owns the box. */
 .settings-group-title {
-  font-family: var(--mono);
-  font-size: 12px;
-  font-weight: 400;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-dim);
   padding: 0 2px 8px;
 }
 .settings-group-title--danger { color: var(--red); }

@@ -270,10 +270,18 @@ describe('Main W3 — history + restore-version flow', () => {
     expect(screen.getByRole('dialog', { name: 'Вернуть эту версию?' })).toBeTruthy();
   });
 
-  it('the updated immutability hint mentions versions', () => {
+  it('подсказка говорит о неизменяемости ОПУБЛИКОВАННОГО, а не о факте публикации', () => {
+    // Прежний текст обещал «каждая версия навсегда сохраняется в блокчейне»
+    // под КАЖДОЙ заметкой — включая лежащую только на устройстве. Здесь
+    // синхронизация выключена (baseStore), и подсказка не должна ничего
+    // обещать про блокчейн для этой записи.
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    expect(screen.getByText(/редактирование добавляет новую версию/)).toBeTruthy();
+    const hint = document.querySelector('.card-menu-hint')!.textContent!;
+    expect(hint).toMatch(/добавляет новую версию/);
+    expect(hint).toMatch(/уже опубликованную/);
+    expect(hint, 'безусловного обещания «каждая версия сохраняется» быть не должно')
+      .not.toMatch(/Каждая версия навсегда сохраняется/);
   });
 });
 

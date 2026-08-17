@@ -243,7 +243,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               theme picker and the reset button, so nothing told the user that
               the app PIN and the safebox PIN are DIFFERENT contours. */}
           <div className="settings-group">
-            <h3 className="settings-group-title">Доступ и замки</h3>
+            <h3 className="section-label settings-group-title">Доступ и замки</h3>
             <div className="settings-rows">
           <SettingsBlock title="Seed-фраза">
             <button
@@ -343,7 +343,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
 
           <div className="settings-group">
-            <h3 className="settings-group-title">Синхронизация</h3>
+            <h3 className="section-label settings-group-title">Синхронизация</h3>
             <div className="settings-rows">
           <SettingsBlock
             title="Вечное хранилище"
@@ -418,7 +418,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
 
           <div className="settings-group">
-            <h3 className="settings-group-title">Вид</h3>
+            <h3 className="section-label settings-group-title">Вид</h3>
             <div className="settings-rows">
           <SettingsBlock title="Тема" chip={THEME_LABELS[theme]}>
             <div className="theme-picker" role="group" aria-label="Тема оформления">
@@ -439,7 +439,7 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
           </div>
 
           <div className="settings-group">
-            <h3 className="settings-group-title settings-group-title--danger">Опасная зона</h3>
+            <h3 className="section-label settings-group-title settings-group-title--danger">Опасная зона</h3>
             <div className="settings-rows">
           <SettingsBlock title="Сброс приложения" danger>
             <div className="settings-hint">

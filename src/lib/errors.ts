@@ -27,7 +27,7 @@ export function userFacingUploadError(kind: string, errText?: string): string {
     case 'rate_limited':
       return 'Лимит загрузок исчерпан. Повторите примерно через час.';
     case 'not_registered':
-      return 'Для синхронизации нужен invite-код (Настройки → Вечное хранилище).';
+      return 'Для синхронизации нужен invite-код (в настройках, раздел «Вечное хранилище»).';
     case 'in_progress':
       return 'Загрузка этой заметки уже выполняется.';
     case 'unavailable':

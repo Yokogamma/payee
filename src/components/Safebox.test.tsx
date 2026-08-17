@@ -48,6 +48,7 @@ function baseStore(entries: SafeboxEntryData[] = [entry({ id: 'e1' })]) {
     restoreSafeboxVersion: vi.fn(async () => {}),
     revealSafeboxSecret: vi.fn(async () => 'PLAINTEXT-PASSWORD'),
     copySafeboxPassword: vi.fn(async () => true),
+    retrySync: vi.fn(),
     downloadSafeboxAttachment: vi.fn(async () => {}),
     unlockSafebox: vi.fn(async () => {}),
     activateSafebox: vi.fn(async () => {}),
@@ -500,5 +501,35 @@ describe('SafeboxSection — откат по SAFEBOX_WRITER_ENABLED', () => {
 
     vi.doUnmock('../lib/flags');
     vi.resetModules();
+  });
+});
+
+describe('SafeboxSection — ошибка синхронизации предлагает повтор', () => {
+  it('состояние error рендерится КНОПКОЙ, как в ленте', () => {
+    // Один и тот же syncBadge на двух списках должен давать одинаковые
+    // возможности, а не только одинаковые слова: в ленте ошибка — кнопка
+    // «повторить», а в сейфе была строкой, оставлявшей без действия.
+    h.store = baseStore();
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.enabled = true;
+    s.arweave.registered = true;
+    s.syncStatuses = { e1: { status: 'error' } };
+    render(<SafeboxSection />);
+
+    const btn = screen.getByRole('button', { name: /Ошибка загрузки/ });
+    expect(btn.tagName).toBe('BUTTON');
+    expect(btn.textContent).toMatch(/повторить/);
+    fireEvent.click(btn);
+    expect(s.retrySync).toHaveBeenCalled();
+  });
+
+  it('при выключенной синхронизации кнопки нет — повторять нечего', () => {
+    h.store = baseStore();
+    const s = h.store as ReturnType<typeof baseStore>;
+    s.arweave.enabled = false;
+    s.syncStatuses = { e1: { status: 'error' } };
+    render(<SafeboxSection />);
+    expect(screen.queryByRole('button', { name: /Ошибка загрузки/ })).toBeNull();
+    expect(document.querySelector('.sync-state')!.textContent).toMatch(/на устройстве/);
   });
 });

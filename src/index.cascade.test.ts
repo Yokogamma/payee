@@ -93,13 +93,34 @@ describe('base layer, as the browser resolves it', () => {
     expect(getComputedStyle(document.body).fontSize).toBe('16.5px');
   });
 
-  it('nothing in the base layer drops below the 13px floor', () => {
-    // The floor was 12 here, which made the name of this test a lie: a
-    // regression of .state or .btn-tiny to 12px would have passed.
-    for (const cls of ['state', 'search-count', 'btn-tiny', 'subtitle']) {
-      const size = parseFloat(resolved(cls, 'font-size'));
-      expect(size, `.${cls} is ${size}px, under the 13px floor`).toBeGreaterThanOrEqual(13);
+  it('NOTHING in the stylesheet drops below the 13px floor', () => {
+    // Was four hand-picked classes, which is not a floor — it is four spot
+    // checks wearing the name of one. `.seed-num`, `.modal-note` and
+    // `.safebox-size` all sat under 13px while this passed green.
+    //
+    // Scans every rule instead. Two selectors are exempt and both are named in
+    // the handoff at their exact size; a third would mean the floor is gone.
+    const EXEMPT = new Map([
+      ['.section-label', 12],   // «Метки секций: PT Mono 12px»
+      ['.app-nav-item', 12.5],  // «подпись 12.5px»
+    ]);
+
+    const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+    const offenders: string[] = [];
+    for (const m of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const selector = m[1].trim().replace(/\s+/g, ' ');
+      if (selector.startsWith('@')) continue;
+      const decl = m[2].match(/font-size:\s*([0-9.]+)(px|rem)/);
+      if (!decl) continue;
+      const px = decl[2] === 'rem' ? parseFloat(decl[1]) * 16 : parseFloat(decl[1]);
+      if (px >= 13 || EXEMPT.get(selector) === px) continue;
+      offenders.push(`  ${selector} → ${px}px`);
     }
+    expect(
+      offenders,
+      'Пол 13px. Исключения — только названные хендоффом поимённо ' +
+        `(${[...EXEMPT.keys()].join(', ')}):\n${offenders.join('\n')}`,
+    ).toEqual([]);
   });
 
   it('a clamped note fades into the page, not into a surface that is gone', () => {
@@ -184,20 +205,23 @@ describe('base layer, as the browser resolves it', () => {
     expect(declaresIn('.theme-option--active', /color:\s*var\(--accent-text\)/)).toBe(true);
   });
 
-  it('settings text clears the floor', () => {
-    for (const cls of ['settings-hint', 'settings-footnote', 'settings-group-title']) {
-      const size = parseFloat(resolved(cls, 'font-size'));
-      const floor = cls === 'settings-group-title' ? 12 : 13; // group label = named exception
-      expect(size, `.${cls} is ${size}px`).toBeGreaterThanOrEqual(floor);
+  it('the settings group label takes its type from .section-label', () => {
+    // It no longer declares a size of its own — that duplicate 12px read as a
+    // third exception to the floor when it is the same one. The markup carries
+    // both classes; this checks the resolved result rather than the rule.
+    expect(resolved('section-label settings-group-title', 'font-size')).toBe('12px');
+    expect(resolved('section-label settings-group-title', 'text-transform')).toBe('uppercase');
+    for (const cls of ['settings-hint', 'settings-footnote']) {
+      expect(parseFloat(resolved(cls, 'font-size')), `.${cls}`).toBeGreaterThanOrEqual(13);
     }
   });
 
-  it('the section label is the ONE thing allowed under the floor', () => {
-    // The handoff sets the floor at 13px and then specifies these labels at
-    // PT Mono 12px itself. It is not prose: uppercase, spaced 0.12em, mono,
-    // and never longer than two words. Naming it as an exception is what
-    // keeps «13px floor» honest for everything else.
+  it('both named exceptions are still exactly their specified size', () => {
+    // The handoff sets the floor at 13px and then names these two smaller,
+    // each for a specific element. Neither is prose: one is a mono uppercase
+    // group label, the other the tab caption.
     expect(parseFloat(resolved('section-label', 'font-size'))).toBe(12);
+    expect(parseFloat(resolved('app-nav-item', 'font-size'))).toBe(12.5);
   });
 
   it('every button variant keeps the 44px target', () => {

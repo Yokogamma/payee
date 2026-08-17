@@ -44,6 +44,7 @@ export function SafeboxSection() {
     revealSafeboxSecret,
     copySafeboxPassword,
     downloadSafeboxAttachment,
+    retrySync,
     syncStatuses,
     arweave,
     isEncrypting,
@@ -216,10 +217,27 @@ export function SafeboxSection() {
                   <span className="state state--quiet">{chain.versions.length}-я версия</span>
                 )}
                 <span className="note-meta-gap" />
-                <span className={`state sync-state ${badge.className}`} title={badge.label} role="status" aria-label={badge.label}>
-                  {badge.permanent && <InfinityMark />}
-                  {badge.word}
-                </span>
+                {/* Ошибка — единственный статус, на который можно нажать, и в
+                    сейфе она этого не предлагала: строка говорила «ошибка» и
+                    оставляла пользователя без действия, тогда как в ленте
+                    ровно то же состояние — кнопка «повторить». Один и тот же
+                    syncBadge на двух списках должен давать и одинаковые
+                    возможности, а не только одинаковые слова. */}
+                {info.status === 'error' && syncActive ? (
+                  <button
+                    className={`state sync-state ${badge.className}`}
+                    onClick={retrySync}
+                    title={badge.label}
+                    aria-label={badge.label}
+                  >
+                    {badge.word} · повторить
+                  </button>
+                ) : (
+                  <span className={`state sync-state ${badge.className}`} title={badge.label} role="status" aria-label={badge.label}>
+                    {badge.permanent && <InfinityMark />}
+                    {badge.word}
+                  </span>
+                )}
               </div>
               {entry.url && <div className="safebox-card-url">{entry.url}</div>}
 
