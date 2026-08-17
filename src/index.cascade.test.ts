@@ -121,6 +121,27 @@ describe('base layer, as the browser resolves it', () => {
     expect(parseFloat(resolved('status-hint', 'font-size'))).toBeGreaterThanOrEqual(13);
   });
 
+  it('the composer sheet fills the screen instead of sitting in a strip', () => {
+    expect(resolved('note-composer', 'flex-grow')).toBe('1');
+    // Without min-width:0 the toolbar's min-content width (~398px) becomes a
+    // floor and the grid overflows a 375px phone.
+    expect(parseFloat(resolved('note-composer', 'min-width'))).toBe(0);
+    expect(resolved('note-input', 'font-size')).toBe('18px');
+  });
+
+  it('the toolbar scrolls rather than wrapping, and keeps 44px targets', () => {
+    expect(resolved('composer-toolbar-scroll', 'overflow-x')).toBe('auto');
+    expect(resolved('composer-tool', 'height')).toBe('38px');
+    expect(declaresIn('.composer-tool::after', /inset:\s*-3px/)).toBe(true);
+  });
+
+  it('composing collapses the grid instead of layering over the privacy gate', () => {
+    // A z-index here would beat .lock-gate and paint plaintext over it.
+    expect(declaresIn('.main-screen--composing', /z-index/)).toBe(false);
+    expect(declaresIn('.main-screen--composing', /position/)).toBe(false);
+    expect(declaresIn('.main-screen--composing', /grid-template-rows:\s*1fr/)).toBe(true);
+  });
+
   it('the section label is the ONE thing allowed under the floor', () => {
     // The handoff sets the floor at 13px and then specifies these labels at
     // PT Mono 12px itself. It is not prose: uppercase, spaced 0.12em, mono,

@@ -83,6 +83,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // screen permanently, competing with the feed for the only vertical space a
   // phone has.
   const [composerOpen, setComposerOpen] = useState(false);
+  // FULL SCREEN, and by UNMOUNTING the rest — not by hiding it.
+  //
+  // The mockup gives writing the whole screen: no status line, no search, no
+  // feed, no FAB, no tab bar. Hiding those visually would leave every one of
+  // them in the tab order and in the accessibility tree, so a keyboard user
+  // would tab from the composer into a feed they cannot see.
+  //
+  // It is a GRID STATE, not an overlay. `.lock-gate` sits at z-index 100 and
+  // beats every modal on source order; a composer layered above it would put
+  // plaintext over the privacy gate — see the note in AppNav.
+  const composing = view === 'notes' && composerOpen;
   // Set by an explicit «Свернуть». Blocks auto-expansion until the user LEAVES
   // and re-enters the section; without it a manually collapsed composer would
   // re-open by itself as soon as hydration resolves.
@@ -302,11 +313,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
 
 
   return (
-    <div className="main-screen">
+    <div className={`main-screen${composing ? ' main-screen--composing' : ''}`}>
       {/* Grid areas, not a flat flex column: on a wide screen the nav becomes a
           full-height left rail, and three loose siblings would each turn into a
           column instead. Toasts and modal overlays are position:fixed, so they
           never become grid items. */}
+      {!composing && (
       <div className="main-top">
         {/* One line replaces the restore banners, both pause banners, the
             offline banner, the Arweave badge, the note count and the ↻
@@ -335,6 +347,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
         </div>
       )}
       </div>
+      )}
 
       <div className="main-content">
       {/* KEYED ON THE LOCK GENERATION: every section lock (including a
@@ -361,17 +374,25 @@ export function Main({ theme, onThemeChange }: MainProps) {
           list, within thumb reach, and gives the header back to the title. */}
       <div className="notes-topbar">
         <h2 className="section-title" tabIndex={-1}>
-          {composerOpen ? 'Новая заметка' : 'Заметки'}
+          {composing ? 'Новая заметка' : 'Заметки'}
         </h2>
-        {composerOpen && (
-          <button className="btn-tiny" onClick={collapseComposer}>
+        {composing && (
+          <button className="btn btn-ghost" onClick={collapseComposer}>
             Свернуть
           </button>
         )}
       </div>
 
-      {/* Always on screen — its own field, scoped to this section. The old
-          Ctrl+K toggle is gone with the toggle it drove. */}
+      {composing && (
+        <p className="composer-intro">
+          Запись сохранится навечно: её нельзя удалить — только дополнить новой
+          версией.
+        </p>
+      )}
+
+      {/* The composer takes the whole screen, so the search field goes with the
+          feed it filters. */}
+      {!composing && (
       <div className="search-bar">
         <input
           type="text"
@@ -392,16 +413,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
           </>
         )}
       </div>
+      )}
 
       {/* Draft hydration/persistence stays in the shell (value/onChange above),
           so collapsing or unmounting the composer never touches the draft. */}
-      {composerOpen && (
+      {composing && (
       <div className="note-input-wrap">
         <NoteComposer
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
           onSubmit={() => void handleSave()}
-          submitLabel="Сохранить"
+          submitLabel="Сохранить навечно"
           submitBusyLabel="Сохраняем…"
           busy={isEncrypting}
           placeholder="Быстрая заметка..."
@@ -409,13 +431,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
           textareaRef={inputRef}
           error={saveError}
           hint={justSaved
-            ? '✓ Сохранено и зашифровано'
-            : <span className="kbd-hint">Ctrl+Enter — сохранить</span>}
+            ? 'Сохранено и зашифровано'
+            : <span className="mono">зашифровано · AES-256</span>}
         />
       </div>
       )}
 
       {/* Feed — one card per version chain; fields come from chain.current. */}
+      {!composing && (
       <div className="notes-feed">
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
@@ -554,8 +577,9 @@ export function Main({ theme, onThemeChange }: MainProps) {
           })
         )}
       </div>
+      )}
 
-      {!composerOpen && (
+      {!composing && (
         // The dot is the only thing standing between a collapsed composer and
         // silently hiding an unsaved draft.
         <Fab
@@ -637,7 +661,10 @@ export function Main({ theme, onThemeChange }: MainProps) {
         onCancel={cancelRestore}
       />
 
-      <AppNav safeboxDimmed={safeboxDimmed} />
+      {/* Unmounted while composing. The composer is a place you finish or
+          leave by «Свернуть», and a tab bar under it is both a distraction and
+          a tab stop past the save button. */}
+      {!composing && <AppNav safeboxDimmed={safeboxDimmed} />}
     </div>
   );
 }

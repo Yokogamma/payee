@@ -365,7 +365,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'длинный текст' } });
-    fireEvent.click(screen.getByText('Сохранить'));
+    fireEvent.click(screen.getByText('Сохранить навечно'));
 
     expect(await screen.findByText(/слишком длинная/)).toBeTruthy();
     expect(input.value).toBe('длинный текст'); // draft NOT cleared
@@ -386,7 +386,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'двойной клик' } });
 
-    const saveBtn = screen.getByText('Сохранить');
+    const saveBtn = screen.getByText('Сохранить навечно');
     fireEvent.click(saveBtn);
     fireEvent.click(saveBtn); // second submit before the first resolves
 
@@ -471,6 +471,10 @@ describe('Main — пункт сейфа в навигации', () => {
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'не потеряй меня' } });
 
+    // Композер занимает экран целиком, поэтому выход из него — «Свернуть», а
+    // не таб-бар: таб-бара в этот момент нет. Инвариант теста остался прежним
+    // (черновик не теряется при уходе из раздела), маршрут стал на шаг длиннее.
+    fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
     fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
     expect(container.querySelector('.note-input')).toBeNull();
 
@@ -478,6 +482,47 @@ describe('Main — пункт сейфа в навигации', () => {
     // Auto-expanded because a draft exists, and the text is intact.
     expect((document.querySelector('.note-input') as HTMLTextAreaElement).value)
       .toBe('не потеряй меня');
+  });
+
+  describe('композер занимает экран целиком', () => {
+    // Скрыть визуально было бы недостаточно: скрытые узлы остаются в порядке
+    // обхода и в дереве доступности, и клавиатурный пользователь ушёл бы из
+    // композера в ленту, которой не видно.
+    it('статусная строка, поиск, лента, FAB и навигация РАЗМОНТИРОВАНЫ', () => {
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      expect(container.querySelector('.status-line')).not.toBeNull();
+      expect(container.querySelector('.app-nav')).not.toBeNull();
+
+      openComposer();
+
+      expect(container.querySelector('.status-line'), 'статусная строка').toBeNull();
+      expect(container.querySelector('.search-bar'), 'поиск').toBeNull();
+      expect(container.querySelector('.notes-feed'), 'лента').toBeNull();
+      expect(container.querySelector('.fab'), 'FAB').toBeNull();
+      expect(container.querySelector('.app-nav'), 'навигация').toBeNull();
+      // Ни одного скрытого узла вместо размонтированных.
+      expect(container.querySelectorAll('[hidden]')).toHaveLength(0);
+    });
+
+    it('это состояние сетки, а не слой поверх privacy-гейта', () => {
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const screenEl = container.querySelector('.main-screen');
+      expect(screenEl?.className).toContain('main-screen--composing');
+      // Никакого position/z-index: гейт держит z-index 100 и обязан остаться
+      // выше всего, что рисует приложение.
+      expect(container.querySelector('.note-composer')).not.toBeNull();
+    });
+
+    it('«Свернуть» возвращает оболочку целиком', () => {
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
+      expect(container.querySelector('.status-line')).not.toBeNull();
+      expect(container.querySelector('.app-nav')).not.toBeNull();
+      expect(container.querySelector('.notes-feed')).not.toBeNull();
+      expect(container.querySelector('.note-input')).toBeNull();
+    });
   });
 
   it('«Закрыть сейф» живёт ВНУТРИ раздела — в шапке дубля больше нет', () => {

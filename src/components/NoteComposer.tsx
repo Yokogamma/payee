@@ -2,6 +2,7 @@ import { useRef, useState, type RefObject } from 'react';
 import { applyFormat, type MarkdownFormat } from '../lib/markdown-insert';
 import { noteJsonByteLength, MAX_NOTE_JSON_BYTES } from '../lib/limits';
 import { NoteMarkdown } from './NoteMarkdown';
+import { IconLink, InfinityMark } from './icons';
 
 /**
  * Controlled, presentational composer shared by the Main screen and the edit
@@ -15,14 +16,16 @@ import { NoteMarkdown } from './NoteMarkdown';
  * able to explain it.
  */
 
-const TOOLBAR: Array<{ format: MarkdownFormat; label: string; title: string }> = [
+const TOOLBAR: Array<{ format: MarkdownFormat; label: React.ReactNode; title: string }> = [
   { format: 'bold',    label: 'Ж',  title: 'Жирный' },
   { format: 'italic',  label: 'К',  title: 'Курсив' },
   { format: 'heading', label: 'H',  title: 'Заголовок' },
   { format: 'ul',      label: '•',  title: 'Список' },
   { format: 'ol',      label: '1.', title: 'Нумерованный список' },
   { format: 'code',    label: '<>', title: 'Код' },
-  { format: 'link',    label: '🔗', title: 'Ссылка' },
+  // The only emoji left in the toolbar; it drew in colour at a size the
+  // platform font chose, beside six monochrome labels.
+  { format: 'link',    label: <IconLink />, title: 'Ссылка' },
 ];
 
 /** Counter appears when the note is within this many bytes of the cap. */
@@ -97,20 +100,26 @@ export function NoteComposer({
     <div className="note-composer" onKeyDown={handleKeyDown}>
       {markdown && (
         <div className="composer-toolbar" role="toolbar" aria-label="Форматирование">
-          {TOOLBAR.map(({ format, label, title }) => (
-            <button
-              key={format}
-              type="button"
-              className="composer-tool"
-              onClick={() => handleFormat(format)}
-              disabled={preview || busy}
-              title={title}
-              aria-label={title}
-            >
-              {label}
-            </button>
-          ))}
-          <div className="composer-toolbar-spacer" />
+          {/* The format buttons scroll horizontally; «Превью» stays pinned
+              outside the scroller. Seven 38px targets plus the toggle want
+              ~398px and a 360px phone has 320 — wrapping to a second row would
+              cost the sheet a line of writing space on the narrowest screen
+              that has the least of it. */}
+          <div className="composer-toolbar-scroll">
+            {TOOLBAR.map(({ format, label, title }) => (
+              <button
+                key={format}
+                type="button"
+                className="composer-tool"
+                onClick={() => handleFormat(format)}
+                disabled={preview || busy}
+                title={title}
+                aria-label={title}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <button
             type="button"
             className={`composer-tool composer-tool--toggle ${preview ? 'composer-tool--active' : ''}`}
@@ -149,11 +158,15 @@ export function NoteComposer({
             </span>
           ) : hint}
         </span>
+        {/* The mark rides the button, not the label string: every save through
+            this composer is permanent — a new note and a new version alike —
+            so it belongs to the action rather than to one caller's wording. */}
         <button
           className="btn btn-save"
           onClick={onSubmit}
           disabled={!value.trim() || busy || overLimit}
         >
+          {!busy && <InfinityMark />}
           {busy ? submitBusyLabel : submitLabel}
         </button>
       </div>

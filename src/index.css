@@ -670,6 +670,44 @@ h1 {
 
 .main-top { grid-area: top; min-width: 0; }
 
+/* WRITING TAKES THE SCREEN. Not an overlay — a grid state: .lock-gate holds
+   z-index 100 and wins over every modal on source order, so a composer
+   layered above it would paint plaintext over the privacy gate. Collapsing
+   the grid to a single row leaves nothing to layer.
+
+   Main UNMOUNTS the status line, search, feed, FAB and tab bar rather than
+   hiding them. Hidden nodes keep their place in the tab order and in the
+   accessibility tree, so a keyboard user would tab out of the composer into a
+   feed nobody can see. */
+.main-screen--composing {
+  grid-template-areas: 'content';
+  grid-template-rows: 1fr;
+}
+
+/* The composer fills its wrapper: toolbar and footer take their height, the
+   sheet takes the rest. This class had NO rule of its own before — the
+   composer held together entirely through its children, which is why it could
+   never have filled a screen. */
+.note-composer {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Without this the toolbar row sets a min-content floor and the composer
+     refuses to shrink below ~398px, taking the grid past the viewport. */
+  min-width: 0;
+  flex: 1;
+}
+
+/* The one thing a first-time writer needs to know before pressing save, in
+   the same italic the settings use for values. */
+.composer-intro {
+  padding: 0 var(--pad-screen) 14px;
+  font-size: 14.5px;
+  line-height: 1.6;
+  font-style: italic;
+  color: var(--text-dim);
+}
+
 .main-content {
   grid-area: content;
   display: flex;
@@ -754,31 +792,33 @@ h1 {
   white-space: nowrap;
 }
 
-/* Note input */
+/* Note input — the SHEET. While composing this is the whole screen (see
+   .main-screen--composing), so it takes the slack instead of sitting in a
+   fixed strip above the feed. */
 .note-input-wrap {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 var(--pad-screen) 18px;
 }
 
 .note-input {
   width: 100%;
-  background: var(--bg-input);
+  flex: 1;
+  background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   color: var(--text);
   font-family: var(--font);
-  font-size: 15px;
-  line-height: 1.5;
-  padding: 12px;
+  font-size: 18px;
+  line-height: 1.7;
+  padding: 18px;
   resize: none;
   outline: none;
-  min-height: 52px;
   transition: border-color 0.15s;
 }
 .note-input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-glow);
+  border-color: var(--border-control);
 }
 .note-input::placeholder {
   color: var(--text-muted);
@@ -787,13 +827,14 @@ h1 {
 .input-footer {
   display: flex;
   align-items: center;
+  gap: 12px;
   justify-content: space-between;
-  margin-top: 8px;
+  padding-top: 12px;
 }
 
 .input-hint {
-  font-size: 12px;
-  color: var(--text-muted);
+  font-size: 13.5px;
+  color: var(--text-dim);
 }
 
 /* Notes feed */
@@ -1892,30 +1933,50 @@ mark {
 }
 
 /* Composer toolbar (W3) */
+/* Seven 38px buttons plus «Превью» need ~398px and a 360px phone offers 320.
+   The format strip scrolls; the preview toggle is pinned outside it, because
+   it is the one control here you reach for without knowing where it is. */
 .composer-toolbar {
   display: flex;
-  gap: 4px;
+  gap: 8px;
   align-items: center;
-  margin-bottom: 6px;
+  padding-bottom: 12px;
 }
+.composer-toolbar-scroll {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  /* Focus rings must not be clipped by the scroll container. */
+  padding: 3px;
+  margin: -3px;
+}
+.composer-toolbar-scroll::-webkit-scrollbar { display: none; }
 .composer-tool {
-  min-width: 30px;
-  height: 28px;
-  padding: 0 8px;
-  border: 1px solid var(--border);
+  position: relative;
+  flex: none;
+  min-width: 38px;
+  height: 38px;
+  padding: 0 10px;
+  border: 1.5px solid var(--border-control);
   border-radius: var(--radius-sm);
-  background: var(--bg-input);
-  color: var(--text-dim);
-  font-family: var(--mono);
-  font-size: 0.8rem;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
   cursor: pointer;
 }
+/* 38px box, 44px target — the .status-btn trick again. */
+.composer-tool::after { content: ''; position: absolute; inset: -3px; }
 .composer-tool:hover:not(:disabled) {
-  color: var(--text);
   border-color: var(--border-focus);
+  background: var(--accent-glow);
 }
 .composer-tool:disabled { opacity: 0.45; cursor: default; }
-.composer-toolbar-spacer { flex: 1; }
+.composer-toolbar-spacer { display: none; }
 .composer-tool--toggle { font-family: var(--font); }
 .composer-tool--active {
   color: var(--accent);
