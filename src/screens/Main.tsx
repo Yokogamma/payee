@@ -503,7 +503,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       if (el) menuBtnRefs.current.set(chain.root, el);
                       else menuBtnRefs.current.delete(chain.root);
                     }}
-                    className="icon-btn note-menu-btn"
+                    className="icon-btn icon-btn--ring note-menu-btn"
                     onClick={() => setOpenMenuId(openMenuId === chain.root ? null : chain.root)}
                     title="Меню заметки"
                     aria-label="Меню заметки"
