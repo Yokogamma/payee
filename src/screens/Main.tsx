@@ -627,7 +627,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
         onClose={() => { setHistoryChainRoot(null); setHistoryFocusVersionId(null); }}
         onRequestRestore={requestRestore}
         focusVersionId={historyFocusVersionId}
-       
+
       />
 
       <RestoreVersionDialog

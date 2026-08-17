@@ -102,6 +102,25 @@ describe('base layer, as the browser resolves it', () => {
     }
   });
 
+  it('a clamped note fades into the page, not into a surface that is gone', () => {
+    // The entry stopped being a filled card in Ф3; a gradient still ending in
+    // --bg-card painted a lighter band across the bottom of every long note.
+    expect(declaresIn('.note-text--clamped::after', /linear-gradient\(transparent, var\(--bg\)\)/)).toBe(true);
+    expect(declaresIn('.note-text--clamped::after', /var\(--bg-card\)/)).toBe(false);
+  });
+
+  it('«Развернуть» is a control, not a coloured word', () => {
+    expect(resolved('note-expand-btn', 'font-size')).toBe('14px');
+    expect(declaresIn('.note-expand-btn', /border-bottom:\s*1px solid var\(--border-control\)/)).toBe(true);
+    // 44px of touch out of a ~26px box, the .status-btn trick.
+    expect(declaresIn('.note-expand-btn::after', /inset:\s*-10px -6px/)).toBe(true);
+  });
+
+  it('the status panel respects the floor too', () => {
+    expect(parseFloat(resolved('status-details', 'font-size'))).toBeGreaterThanOrEqual(13);
+    expect(parseFloat(resolved('status-hint', 'font-size'))).toBeGreaterThanOrEqual(13);
+  });
+
   it('the section label is the ONE thing allowed under the floor', () => {
     // The handoff sets the floor at 13px and then specifies these labels at
     // PT Mono 12px itself. It is not prose: uppercase, spaced 0.12em, mono,
@@ -136,6 +155,10 @@ describe('base layer, as the browser resolves it', () => {
   it('the nav carries its active state in weight as well as colour', () => {
     // Colour alone would be the only channel — the nav has no underline and no
     // fill — and ink-vs-dim is a step a low-vision user may not resolve.
+    // 12.5px is under the 13px floor and is the SECOND named exception, after
+    // .section-label: the handoff specifies this size for the tab label
+    // outright. Two exceptions is the limit — a third means the floor is not a
+    // floor. Everything else answers to the check above.
     expect(resolved('app-nav-item', 'font-size')).toBe('12.5px');
     expect(resolved('app-nav-item app-nav-item--active', 'font-weight')).toBe('600');
     // The inactive item declares no weight at all — jsdom reports '' rather

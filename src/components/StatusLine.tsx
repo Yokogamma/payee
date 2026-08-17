@@ -35,7 +35,12 @@ type Tone = 'ok' | 'busy' | 'warn' | 'error';
 
 interface Rung {
   tone: Tone;
-  text: string;
+  /** ReactNode rather than string so ONE rung can set the clock in PT Mono —
+   *  «Проверено в 14:32» is the only place the interface prints a time, and a
+   *  time in a serif reads as prose rather than as a reading off an
+   *  instrument. Splitting it into a span leaves `textContent` unchanged, so
+   *  the live region and the assertions on it are untouched. */
+  text: React.ReactNode;
   action?: { label: string; onClick: () => void };
   dismiss?: () => void;
 }
@@ -167,7 +172,12 @@ export function StatusLine() {
       return {
         // `partial` is a WARNING, not a failure: what arrived was merged.
         tone: partial ? 'warn' : 'ok',
-        text: `Проверено в ${time} · ${detail}` + (partial ? ' · часть данных недоступна' : ''),
+        text: (
+          <>
+            Проверено в <span className="mono">{time}</span> · {detail}
+            {partial ? ' · часть данных недоступна' : ''}
+          </>
+        ),
       };
     }
     if (updateCheck.status === 'error') {
