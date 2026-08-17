@@ -91,6 +91,34 @@ export const IconSearch = () => (
   <Line><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></Line>
 );
 
+/* Card-menu icons. These replace 📋 ✏️ 🕓 🔗 — platform emoji that arrived in
+   colour, at a size the font decided, beside monochrome strokes everywhere
+   else. */
+
+/** Copy to clipboard. */
+export const IconCopy = () => (
+  <Line>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+  </Line>
+);
+
+/** Edit — a nib, not a pencil: this archive appends versions, it does not rub
+ *  anything out, and an eraser-ended pencil says the opposite. */
+export const IconEdit = () => (
+  <Line><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4Z" /><path d="M14 6l4 4" /></Line>
+);
+
+/** Version history. */
+export const IconHistory = () => (
+  <Line><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></Line>
+);
+
+/** External link — the blockchain transaction. */
+export const IconLink = () => (
+  <Line><path d="M14 5h5v5" /><path d="M19 5l-8 8" /><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4" /></Line>
+);
+
 /**
  * The card-menu trigger. Filled dots, not strokes: at 40px inside a ring, a
  * stroked circle of this size renders as a smudge on a 1x display.

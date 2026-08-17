@@ -155,6 +155,35 @@ describe('base layer, as the browser resolves it', () => {
     expect(resolved('status-btn', 'border-radius')).toBe('50%');
   });
 
+  it('a feed entry is a ruled line, not a card', () => {
+    // The box is what made a list of notes read as a dashboard. Checked
+    // statically: an ABSENT property reads back as '' in jsdom, which is
+    // indistinguishable from a property the parser choked on, so «no radius»
+    // has to be asserted against the source.
+    expect(declaresIn('.note-card', /border-radius/)).toBe(false);
+    expect(declaresIn('.note-card', /background/)).toBe(false);
+    expect(declaresIn('.note-card', /box-shadow/)).toBe(false);
+    expect(declaresIn('.note-card', /border-bottom:\s*1px solid var\(--border\)/)).toBe(true);
+  });
+
+  it('note text is the reading size and the date leads it', () => {
+    expect(resolved('note-text', 'font-size')).toBe('18px');
+    expect(resolved('note-date section-label', 'text-transform')).toBe('uppercase');
+    expect(declaresIn('.section-label', /font-family:\s*var\(--mono\)/)).toBe(true);
+  });
+
+  it('sync state is words without a capsule — except the retry, which is a button', () => {
+    expect(declaresIn('.sync-state', /border:\s*none/)).toBe(true);
+    // The one status you can press keeps its rule and its touch target.
+    expect(declaresIn('.sync-state--error', /border:\s*1\.5px solid currentColor/)).toBe(true);
+    expect(resolved('state sync-state sync-state--error', 'min-height')).toBe('44px');
+  });
+
+  it('the FAB is the mockup size', () => {
+    expect(resolved('fab', 'width')).toBe('56px');
+    expect(resolved('fab', 'border-radius')).toBe('50%');
+  });
+
   it('a text action is underlined rather than bare', () => {
     // The one sanctioned exception to «fill or 1.5px rule»: the mockup draws
     // «Свернуть» as text with a rule under it. Bare text would be

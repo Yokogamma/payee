@@ -143,10 +143,10 @@ describe('Main — note card menu', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     // A CONFIRMED note keeps its honest badge even with sync switched off —
     // it really is on-chain (unlike a merely local one, which says so).
-    expect(document.querySelector('.sync-badge')?.getAttribute('aria-label'))
-      .toBe('Сохранена в блокчейне');
+    expect(document.querySelector('.sync-state')?.getAttribute('aria-label'))
+      .toBe('Сохранена в блокчейне навсегда');
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    const link = screen.getByText('🔗 Транзакция в блокчейне') as HTMLAnchorElement;
+    const link = screen.getByText('Транзакция в блокчейне') as HTMLAnchorElement;
     expect(link.getAttribute('href')).toContain('TX123'); // link is NOT gated
   });
 
@@ -154,21 +154,21 @@ describe('Main — note card menu', () => {
     stubClipboard(vi.fn(async () => {}));
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('📋 Копировать текст'));
+    fireEvent.click(screen.getByText('Копировать текст'));
 
     expect(await screen.findByText('✓ Скопировано')).toBeTruthy();
-    expect(screen.queryByText('📋 Копировать текст')).toBeNull(); // menu closed
+    expect(screen.queryByText('Копировать текст')).toBeNull(); // menu closed
   });
 
   it('clipboard REJECTION: error toast shown, menu stays open (no false success)', async () => {
     stubClipboard(vi.fn(async () => { throw new Error('NotAllowedError'); }));
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('📋 Копировать текст'));
+    fireEvent.click(screen.getByText('Копировать текст'));
 
     expect(await screen.findByText(/Не удалось скопировать/)).toBeTruthy();
     expect(screen.queryByText('✓ Скопировано')).toBeNull();
-    expect(screen.getByText('📋 Копировать текст')).toBeTruthy(); // still open
+    expect(screen.getByText('Копировать текст')).toBeTruthy(); // still open
   });
 });
 
@@ -243,16 +243,16 @@ describe('Main — modal exclusivity + live badge (round 12)', () => {
     s.arweave.enabled = false;
     s.syncStatuses = { n1: { status: 'queued' as const } };
     render(<Main theme="system" onThemeChange={vi.fn()} />);
-    const badge = document.querySelector('.sync-badge');
+    const badge = document.querySelector('.sync-state');
     expect(badge?.getAttribute('aria-label')).toMatch(/Только на этом устройстве/);
   });
 
   it('per-note sync badge is a live role=status region', () => {
     (h.store as ReturnType<typeof baseStore>).arweave.enabled = true;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
-    const badge = document.querySelector('.sync-badge');
+    const badge = document.querySelector('.sync-state');
     expect(badge?.getAttribute('role')).toBe('status');
-    expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне');
+    expect(badge?.getAttribute('aria-label')).toBe('Сохранена в блокчейне навсегда');
   });
 });
 

@@ -21,7 +21,6 @@ import { MAX_SAFEBOX_ATTACHMENTS_RAW_BYTES } from '../lib/limits';
 import { groupSafeboxChains } from '../lib/chains';
 import type { SafeboxEntryData } from '../lib/crypto';
 
-const formatDate = (ts: number) => String(ts);
 
 function entry(over: Partial<SafeboxEntryData> & { id: string }): SafeboxEntryData {
   return {
@@ -67,14 +66,14 @@ afterEach(cleanup);
 
 describe('SafeboxSection — unlocked list', () => {
   it('shows the entry with its login and the sync badge, but NO password anywhere', () => {
-    const { container } = render(<SafeboxSection formatDate={formatDate} />);
+    const { container } = render(<SafeboxSection />);
     expect(screen.getByText('GitHub')).toBeDefined();
     expect(screen.getByText('yoko')).toBeDefined();
     expect(container.textContent).not.toContain('PLAINTEXT-PASSWORD');
   });
 
   it('copying a password NEVER puts the plaintext in the DOM', async () => {
-    const { container } = render(<SafeboxSection formatDate={formatDate} />);
+    const { container } = render(<SafeboxSection />);
     await act(async () => {
       fireEvent.click(screen.getByText('Копировать пароль'));
     });
@@ -85,7 +84,7 @@ describe('SafeboxSection — unlocked list', () => {
   });
 
   it('the copy toast tells the honest clipboard story (best-effort, on return)', async () => {
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     await act(async () => { fireEvent.click(screen.getByText('Копировать пароль')); });
     expect(screen.getByText(/Пароль скопирован/)).toBeDefined();
     expect(screen.getByText(/~60 с/)).toBeDefined();
@@ -94,7 +93,7 @@ describe('SafeboxSection — unlocked list', () => {
   it('«Показать» reveals the password and it auto-hides', async () => {
     vi.useFakeTimers();
     try {
-      const { container } = render(<SafeboxSection formatDate={formatDate} />);
+      const { container } = render(<SafeboxSection />);
       await act(async () => { fireEvent.click(screen.getByText('Показать')); });
       expect(container.textContent).toContain('PLAINTEXT-PASSWORD');
 
@@ -106,12 +105,12 @@ describe('SafeboxSection — unlocked list', () => {
   });
 
   it('a lock clears an already-revealed password immediately', async () => {
-    const { container, rerender } = render(<SafeboxSection formatDate={formatDate} />);
+    const { container, rerender } = render(<SafeboxSection />);
     await act(async () => { fireEvent.click(screen.getByText('Показать')); });
     expect(container.textContent).toContain('PLAINTEXT-PASSWORD');
 
     h.store = { ...baseStore(), safeboxUnlocked: false };
-    rerender(<SafeboxSection formatDate={formatDate} />);
+    rerender(<SafeboxSection />);
     expect(container.textContent).not.toContain('PLAINTEXT-PASSWORD');
   });
 
@@ -120,13 +119,13 @@ describe('SafeboxSection — unlocked list', () => {
       id: 'e1',
       files: [{ fid: 'f1', name: 'id_ed25519', mime: 'text/plain', size: 400 }],
     })]);
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     await act(async () => { fireEvent.click(screen.getByText(/id_ed25519/)); });
     expect(h.store.downloadSafeboxAttachment).toHaveBeenCalledWith('e1', 'f1');
   });
 
   it('search is scoped to the safebox and reports the filtered count', () => {
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     const input = screen.getByLabelText('Поиск по сейфу');
     fireEvent.change(input, { target: { value: 'git' } });
     expect(h.store.setSafeboxSearchQuery).toHaveBeenCalledWith('git');
@@ -137,13 +136,13 @@ describe('SafeboxSection — unlocked list', () => {
   // every other section. Covered by StatusLine.test.tsx («пауза v4 тоже»).
   it('пауза v4 больше НЕ дублируется внутри секции', () => {
     h.store = { ...baseStore(), v4Paused: true };
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     expect(screen.queryByText(/приостановлена/)).toBeNull();
   });
 
   it('warns when «Вечное хранилище» is inactive (entries are LOCAL only)', () => {
     h.store = { ...baseStore(), arweave: { enabled: false, registered: false } };
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     expect(screen.getByText(/только на этом устройстве/)).toBeDefined();
   });
 });
@@ -151,14 +150,14 @@ describe('SafeboxSection — unlocked list', () => {
 describe('SafeboxSection — locked / not configured', () => {
   it('renders the PIN pad when a config exists but the section is locked', async () => {
     h.store = { ...baseStore(), safeboxUnlocked: false };
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     await waitFor(() => expect(screen.getByText('Сейф заблокирован')).toBeDefined());
     expect(screen.getByText(/PIN сейфа можно сбросить только вводом полной seed-фразы/)).toBeDefined();
   });
 
   it('the PIN pad input carries the FULL anti-autofill set and a non-heuristic name', async () => {
     h.store = { ...baseStore(), safeboxUnlocked: false };
-    const { container } = render(<SafeboxSection formatDate={formatDate} />);
+    const { container } = render(<SafeboxSection />);
     await waitFor(() => expect(screen.getByText('Сейф заблокирован')).toBeDefined());
 
     const input = container.querySelector('input.pin-input')!;
@@ -173,7 +172,7 @@ describe('SafeboxSection — locked / not configured', () => {
 
   it('renders the activation flow when no PIN is configured', () => {
     h.store = { ...baseStore(), safeboxUnlocked: false, safeboxPinConfigured: false };
-    render(<SafeboxSection formatDate={formatDate} />);
+    render(<SafeboxSection />);
     expect(screen.getByText('Защищённый сейф')).toBeDefined();
   });
 });

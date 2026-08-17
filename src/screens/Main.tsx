@@ -9,6 +9,8 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
+import { formatNoteDate } from '../lib/format-date';
+import { InfinityMark, EllipsisMark, IconCopy, IconEdit, IconHistory, IconLink } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -224,23 +226,6 @@ export function Main({ theme, onThemeChange }: MainProps) {
     userCollapsedRef.current = false; // saved, not dismissed
   }
 
-  function formatDate(ts: number): string {
-    const d = new Date(ts);
-    const now = new Date();
-    const diff = now.getTime() - d.getTime();
-
-    if (diff < 60000) return 'только что';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)} мин назад`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)} ч назад`;
-
-    const isThisYear = d.getFullYear() === now.getFullYear();
-    const day = d.getDate().toString().padStart(2, '0');
-    const month = d.toLocaleString('ru', { month: 'short' });
-
-    if (isThisYear) return `${day} ${month}`;
-    return `${day} ${month} ${d.getFullYear()}`;
-  }
-
   /** Clipboard write with visible success/error feedback — a rejected promise
    *  must not look identical to a successful copy. On failure the menu stays
    *  open so the text can still be selected manually. */
@@ -357,7 +342,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
           whole subtree, so no local secret state — a half-typed PIN, or the
           seed-reset grid holding all 12 words — can survive it. */}
       {view === 'safebox' && (
-        <SafeboxSection key={safeboxLockGeneration} formatDate={formatDate} />
+        <SafeboxSection key={safeboxLockGeneration} />
       )}
 
       {view === 'settings' && (
@@ -455,6 +440,11 @@ export function Main({ theme, onThemeChange }: MainProps) {
             const clamped = long && !expanded;
             return (
               <div className="note-card" key={chain.root}>
+                {/* The date leads the entry instead of trailing it. A line in
+                    a ledger is found by when it was written; putting the date
+                    under the text made every entry start with an unanchored
+                    sentence. */}
+                <div className="note-date section-label">{formatNoteDate(note.createdAt)}</div>
                 <div className={`note-text ${clamped ? 'note-text--clamped' : ''}`}>
                   {note.fmt === 'md' && !searchQuery.trim()
                     ? <NoteMarkdown text={note.text} />
@@ -466,38 +456,41 @@ export function Main({ theme, onThemeChange }: MainProps) {
                   </button>
                 )}
                 <div className="note-meta">
-                  <span className="note-time">{formatDate(note.createdAt)}</span>
-                  {chain.versions.length > 1 && (
-                    <span
-                      className="note-rev-badge"
-                      title={`Версий: ${chain.versions.length}`}
-                      aria-label={`Версий: ${chain.versions.length}`}
-                    >
-                      v{chain.versions.length}
-                    </span>
-                  )}
-                  {badge && info && (
+                  {/* Status in words. The 🔒 that used to sit here is gone with
+                      the rest of the emoji: every note is encrypted, so a
+                      padlock on each one carried no information — it was a
+                      property of the app repeated per row. */}
+                  {info && (
                     info.status === 'error' && arweave.enabled && arweave.registered ? (
                       <button
-                        className={`sync-badge ${badge.className}`}
+                        className={`state sync-state ${badge.className}`}
                         onClick={retrySync}
                         title={badge.label}
                         aria-label={badge.label}
                       >
-                        {badge.icon} повторить
+                        {badge.word} · повторить
                       </button>
                     ) : (
                       <span
-                        className={`sync-badge ${badge.className}`}
+                        className={`state sync-state ${badge.className}`}
                         title={badge.label}
                         role="status"
                         aria-label={badge.label}
                       >
-                        {badge.icon}
+                        {badge.permanent && <InfinityMark />}
+                        {badge.word}
                       </span>
                     )
                   )}
-                  <span className="note-lock" aria-hidden="true">🔒</span>
+                  {chain.versions.length > 1 && (
+                    <span
+                      className="state state--quiet"
+                      title={`Версий: ${chain.versions.length}`}
+                    >
+                      {chain.versions.length}-я версия
+                    </span>
+                  )}
+                  <span className="note-meta-gap" />
                   <button
                     ref={el => {
                       if (el) menuBtnRefs.current.set(chain.root, el);
@@ -509,7 +502,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
                     aria-label="Меню заметки"
                     aria-expanded={openMenuId === chain.root}
                   >
-                    ⋯
+                    <EllipsisMark />
                   </button>
                 </div>
                 {openMenuId === chain.root && (
@@ -518,14 +511,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       className="note-menu-item"
                       onClick={() => void handleCopyNote(note.text)}
                     >
-                      📋 Копировать текст
+                      <IconCopy /> Копировать текст
                     </button>
                     {V3_WRITER_ENABLED && (
                       <button
                         className="note-menu-item"
                         onClick={() => { setOpenMenuId(null); setEditChainRoot(chain.root); }}
                       >
-                        ✏️ Редактировать
+                        <IconEdit /> Редактировать
                       </button>
                     )}
                     {V3_WRITER_ENABLED && chain.versions.length > 1 && (
@@ -537,7 +530,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
                           setHistoryChainRoot(chain.root);
                         }}
                       >
-                        🕓 История версий ({chain.versions.length})
+                        <IconHistory /> История версий ({chain.versions.length})
                       </button>
                     )}
                     {info?.status === 'confirmed' && info.txId && (
@@ -548,7 +541,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
                         rel="noopener noreferrer"
                         onClick={() => setOpenMenuId(null)}
                       >
-                        🔗 Транзакция в блокчейне
+                        <IconLink /> Транзакция в блокчейне
                       </a>
                     )}
                     <div className="note-menu-hint">
@@ -636,7 +629,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
         onClose={() => { setHistoryChainRoot(null); setHistoryFocusVersionId(null); }}
         onRequestRestore={requestRestore}
         focusVersionId={historyFocusVersionId}
-        formatDate={formatDate}
+       
       />
 
       <RestoreVersionDialog

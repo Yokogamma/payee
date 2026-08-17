@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { formatNoteDate } from '../lib/format-date';
 import { useModalA11y } from '../lib/useModalA11y';
 import { badgeFor } from './syncBadge';
 import { type NoteSyncInfo } from '../lib/store';
@@ -28,12 +29,11 @@ interface SafeboxHistoryModalProps {
   onRequestRestore: (version: SafeboxEntryData) => void;
   onRevealVersion: (versionId: string) => Promise<string>;
   focusVersionId?: string | null;
-  formatDate: (ts: number) => string;
 }
 
 export function SafeboxHistoryModal({
   open, chain, syncStatuses, syncActive, canRestore,
-  onClose, onRequestRestore, onRevealVersion, focusVersionId, formatDate,
+  onClose, onRequestRestore, onRevealVersion, focusVersionId,
 }: SafeboxHistoryModalProps) {
   const containerRef = useModalA11y<HTMLDivElement>(open, onClose);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -121,9 +121,9 @@ export function SafeboxHistoryModal({
                     {isCurrent && <span className="history-current-mark"> · текущая</span>}
                   </span>
                   <span className="history-row-meta">
-                    <span className="note-time">{formatDate(version.createdAt)}</span>
-                    <span className={`sync-badge ${badge.className}`} title={badge.label} aria-label={badge.label}>
-                      {badge.icon}
+                    <span className="note-time">{formatNoteDate(version.createdAt)}</span>
+                    <span className={`state sync-state ${badge.className}`} title={badge.label} aria-label={badge.label}>
+                      {badge.word}
                     </span>
                   </span>
                 </button>

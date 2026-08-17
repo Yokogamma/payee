@@ -133,8 +133,8 @@ describe('Main W3 — markdown rendering', () => {
     expect(document.querySelector('.note-md strong')?.textContent).toBe('жирный');
     // one card per chain
     expect(document.querySelectorAll('.note-card')).toHaveLength(1);
-    // version badge visible
-    expect(screen.getByText('v2')).toBeTruthy();
+    // «v2» был жаргоном системы контроля версий на экране для людей
+    expect(screen.getByText('2-я версия')).toBeTruthy();
   });
 
   it('falls back to PLAIN text with <mark> while a search query is active', () => {
@@ -181,7 +181,7 @@ describe('Main W3 — edit flow', () => {
     const s = h.store as ReturnType<typeof makeStore>;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('✏️ Редактировать'));
+    fireEvent.click(screen.getByText('Редактировать'));
 
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;
@@ -198,7 +198,7 @@ describe('Main W3 — edit flow', () => {
     s.editNote = vi.fn(async () => { throw new Error('quota'); });
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('✏️ Редактировать'));
+    fireEvent.click(screen.getByText('Редактировать'));
 
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;
@@ -216,7 +216,7 @@ describe('Main W3 — history + restore-version flow', () => {
     const s = h.store as ReturnType<typeof makeStore>;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('🕓 История версий (2)'));
+    fireEvent.click(screen.getByText('История версий (2)'));
 
     // History modal open — exactly one dialog.
     expect(screen.getAllByRole('dialog')).toHaveLength(1);
@@ -242,7 +242,7 @@ describe('Main W3 — history + restore-version flow', () => {
   it('cancelling the confirm reopens history focused on the same version row', async () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('🕓 История версий (2)'));
+    fireEvent.click(screen.getByText('История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
     fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
     fireEvent.click(screen.getByText('Отмена'));
@@ -261,7 +261,7 @@ describe('Main W3 — history + restore-version flow', () => {
     s.editNote = vi.fn(async () => { throw new Error('offline db'); });
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('🕓 История версий (2)'));
+    fireEvent.click(screen.getByText('История версий (2)'));
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
     fireEvent.click(screen.getByText('↩️ Вернуть эту версию'));
     fireEvent.click(screen.getByText('Вернуть'));
@@ -282,7 +282,7 @@ describe('Main W3 — edit buffer survives background chain rebuilds (review reg
     const s = h.store as ReturnType<typeof makeStore>;
     const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
     fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('✏️ Редактировать'));
+    fireEvent.click(screen.getByText('Редактировать'));
 
     const dialog = screen.getByRole('dialog', { name: 'Редактирование заметки' });
     const textarea = dialog.querySelector('.note-input') as HTMLTextAreaElement;

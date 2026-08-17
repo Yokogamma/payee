@@ -20,11 +20,11 @@ import type { SafeboxNewEntry } from '../lib/store';
  * decrypted string).
  */
 
-interface SafeboxSectionProps {
-  formatDate: (ts: number) => string;
-}
-
-export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
+/* No props. It used to take `formatDate` — a closure defined in Main and
+   threaded down through here into the history modal, so that three components
+   could call one pure function of a timestamp. It lives in lib/format-date
+   now and each caller imports it. */
+export function SafeboxSection() {
   const {
     safeboxUnlocked,
     safeboxPinConfigured,
@@ -199,8 +199,8 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
                     v{chain.versions.length}
                   </span>
                 )}
-                <span className={`sync-badge ${badge.className}`} title={badge.label} role="status" aria-label={badge.label}>
-                  {badge.icon}
+                <span className={`state sync-state ${badge.className}`} title={badge.label} role="status" aria-label={badge.label}>
+                  {badge.word}
                 </span>
               </div>
               {entry.login && <div className="safebox-card-login">{entry.login}</div>}
@@ -296,7 +296,6 @@ export function SafeboxSection({ formatDate }: SafeboxSectionProps) {
         }}
         onRevealVersion={revealSafeboxSecret}
         focusVersionId={historyFocusId}
-        formatDate={formatDate}
       />
 
       <SafeboxRestoreDialog
