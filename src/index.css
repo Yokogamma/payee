@@ -724,6 +724,18 @@ h1 {
     grid-template-rows: auto 1fr;
     max-width: 980px;
   }
+
+  /* MUST come after the rule above, and must name both classes.
+     `.main-screen--composing` is declared far earlier at the same specificity,
+     so this media block was silently winning: on a wide screen the composer
+     kept a 220px rail column with nothing in it (the nav is unmounted while
+     composing) and a `top` row that no longer exists. Fullscreen means
+     fullscreen at every width. */
+  .main-screen.main-screen--composing {
+    grid-template-areas: 'content';
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+  }
 }
 
 

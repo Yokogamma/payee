@@ -2,7 +2,7 @@ import { useRef, useState, type RefObject } from 'react';
 import { applyFormat, type MarkdownFormat } from '../lib/markdown-insert';
 import { noteJsonByteLength, MAX_NOTE_JSON_BYTES } from '../lib/limits';
 import { NoteMarkdown } from './NoteMarkdown';
-import { IconLink, InfinityMark } from './icons';
+import { IconLink } from './icons';
 
 /**
  * Controlled, presentational composer shared by the Main screen and the edit
@@ -158,15 +158,20 @@ export function NoteComposer({
             </span>
           ) : hint}
         </span>
-        {/* The mark rides the button, not the label string: every save through
-            this composer is permanent — a new note and a new version alike —
-            so it belongs to the action rather than to one caller's wording. */}
+        {/* NO ∞ HERE, and the reasoning is worth keeping.
+            It sat on this button for one commit, on the grounds that «every
+            save through this composer is permanent». It is not. `addNote`
+            queues an upload only when sync is enabled, and even then the note
+            becomes permanent at `confirmed`, not at save. So the mark promised
+            an outcome the press cannot deliver — and it promised it hardest in
+            the state where the user has no other signal, because the composer
+            unmounts the status line that would have said «всё на устройстве».
+            The mark belongs to `confirmed` and nowhere else; see syncBadge. */}
         <button
           className="btn btn-save"
           onClick={onSubmit}
           disabled={!value.trim() || busy || overLimit}
         >
-          {!busy && <InfinityMark />}
           {busy ? submitBusyLabel : submitLabel}
         </button>
       </div>

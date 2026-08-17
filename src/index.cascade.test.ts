@@ -142,6 +142,25 @@ describe('base layer, as the browser resolves it', () => {
     expect(declaresIn('.main-screen--composing', /grid-template-rows:\s*1fr/)).toBe(true);
   });
 
+  it('the desktop rail does not survive into the composer', () => {
+    // `.main-screen--composing` is declared ~1000 lines before the ≥768px
+    // block, at the same specificity, so the media query silently won: a wide
+    // screen kept a 220px column for a nav that is unmounted while composing.
+    // jsdom does not evaluate media queries for styling, so this is a source
+    // check — the resolved-value pass cannot reach inside a media block.
+    const desktop = CSS.replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('@media (min-width: 768px)')
+      .slice(1)
+      .join('\n');
+    expect(desktop, 'no ≥768px block found').toBeTruthy();
+    expect(
+      /\.main-screen\.main-screen--composing\s*\{[^}]*grid-template-columns:\s*1fr/.test(desktop),
+      'the ≥768px block must re-assert the composing grid, and must name BOTH ' +
+        'classes — a bare .main-screen--composing there would tie on specificity ' +
+        'with the .main-screen rule above it and lose on order',
+    ).toBe(true);
+  });
+
   it('the section label is the ONE thing allowed under the floor', () => {
     // The handoff sets the floor at 13px and then specifies these labels at
     // PT Mono 12px itself. It is not prose: uppercase, spaced 0.12em, mono,

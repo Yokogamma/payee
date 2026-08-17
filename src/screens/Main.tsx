@@ -154,11 +154,30 @@ export function Main({ theme, onThemeChange }: MainProps) {
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
+  /**
+   * Leaving the fullscreen composer takes the pressed button with it, so focus
+   * has to be placed deliberately — otherwise it lands on `<body>` and a
+   * keyboard user loses their position in an interface that just replaced
+   * itself entirely. The FAB is the right landing: it is what reopens the
+   * composer, so the user is left holding the door they came through.
+   *
+   * A DOM query rather than a threaded ref, matching the section-title focus
+   * handling below: the FAB is remounted by this very state change, so any ref
+   * captured earlier points at a detached node.
+   */
+  function focusFabAfterCollapse() {
+    requestAnimationFrame(() => {
+      const fab = document.querySelector('.fab') as HTMLElement | null;
+      fab?.focus();
+    });
+  }
+
   function collapseComposer() {
     // Never clears `text`: collapsing hides, it does not discard. Clearing here
     // would let the debounced mirror persist '' and DELETE the stored draft.
     userCollapsedRef.current = true;
     setComposerOpen(false);
+    focusFabAfterCollapse();
   }
 
   // Focus follows the section. Losing the modal's «focus returns to the
@@ -235,6 +254,8 @@ export function Main({ theme, onThemeChange }: MainProps) {
     setTimeout(() => setJustSaved(false), 2000);
     setComposerOpen(false);
     userCollapsedRef.current = false; // saved, not dismissed
+    // Same reason as «Свернуть»: the save button unmounts under the press.
+    focusFabAfterCollapse();
   }
 
   /** Clipboard write with visible success/error feedback — a rejected promise
@@ -384,9 +405,19 @@ export function Main({ theme, onThemeChange }: MainProps) {
       </div>
 
       {composing && (
+        // TWO SENTENCES, and only the first is unconditional.
+        //
+        // The mockup prints «Запись сохранится навечно» flat, and for one
+        // commit so did this. That is false with sync off — the note stays on
+        // this device — and false-until-`confirmed` with sync on. It was also
+        // the worst possible place to overpromise: going fullscreen unmounts
+        // the status line, so this paragraph is the ONLY thing on screen that
+        // could have told the user where their note is about to live.
         <p className="composer-intro">
-          Запись сохранится навечно: её нельзя удалить — только дополнить новой
-          версией.
+          Запись нельзя удалить — только дополнить новой версией.{' '}
+          {arweave.enabled && arweave.registered
+            ? 'Она отправится в блокчейн и станет вечной после подтверждения сети.'
+            : 'Синхронизация выключена — запись останется только на этом устройстве.'}
         </p>
       )}
 
@@ -423,7 +454,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
           value={text}
           onChange={next => { draftDirtyRef.current = true; setText(next); }}
           onSubmit={() => void handleSave()}
-          submitLabel="Сохранить навечно"
+          submitLabel="Сохранить"
           submitBusyLabel="Сохраняем…"
           busy={isEncrypting}
           placeholder="Быстрая заметка..."

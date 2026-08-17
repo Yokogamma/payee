@@ -365,7 +365,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     openComposer();
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'длинный текст' } });
-    fireEvent.click(screen.getByText('Сохранить навечно'));
+    fireEvent.click(screen.getByText('Сохранить'));
 
     expect(await screen.findByText(/слишком длинная/)).toBeTruthy();
     expect(input.value).toBe('длинный текст'); // draft NOT cleared
@@ -386,7 +386,7 @@ describe('Main — R3 (writer OFF) surface', () => {
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'двойной клик' } });
 
-    const saveBtn = screen.getByText('Сохранить навечно');
+    const saveBtn = screen.getByText('Сохранить');
     fireEvent.click(saveBtn);
     fireEvent.click(saveBtn); // second submit before the first resolves
 
@@ -512,6 +512,73 @@ describe('Main — пункт сейфа в навигации', () => {
       // Никакого position/z-index: гейт держит z-index 100 и обязан остаться
       // выше всего, что рисует приложение.
       expect(container.querySelector('.note-composer')).not.toBeNull();
+    });
+
+    it('композер не обещает вечность при выключенной синхронизации', () => {
+      // Полноэкранный режим размонтирует статусную строку, поэтому этот абзац —
+      // ЕДИНСТВЕННОЕ, что может сказать, где окажется запись. Кнопка «Сохранить
+      // навечно» и безусловный ∞ обещали здесь то, чего нажатие не делает:
+      // addNote ставит загрузку в очередь только при включённой синхронизации,
+      // а вечной запись становится на confirmed, не при сохранении.
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = false;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/только на этом устройстве/);
+      expect(intro).not.toMatch(/навечно|вечной/);
+      // На кнопке нет ни знака, ни слова «навечно».
+      const save = screen.getByRole('button', { name: 'Сохранить' });
+      expect(save.querySelector('svg')).toBeNull();
+    });
+
+    it('при включённой синхронизации вечность привязана к подтверждению сети', () => {
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = true;
+      s.arweave.registered = true;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+
+      const intro = container.querySelector('.composer-intro')!.textContent!;
+      expect(intro).toMatch(/после подтверждения сети/);
+      // Даже здесь знака нет: он принадлежит confirmed, а не нажатию.
+      expect(screen.getByRole('button', { name: 'Сохранить' }).querySelector('svg')).toBeNull();
+    });
+
+    it('ключ не зарегистрирован — обещания тоже нет', () => {
+      const s = h.store as ReturnType<typeof baseStore>;
+      s.arweave.enabled = true;
+      s.arweave.registered = false;
+      const { container } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      expect(container.querySelector('.composer-intro')!.textContent)
+        .toMatch(/только на этом устройстве/);
+    });
+
+    it('«Свернуть» возвращает фокус на FAB, а не на body', async () => {
+      // Нажатая кнопка размонтируется вместе с полноэкранным режимом. Без
+      // явного переноса фокус падает на body, и клавиатурный пользователь
+      // теряет позицию в интерфейсе, который целиком сменился.
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      fireEvent.click(screen.getByRole('button', { name: 'Свернуть' }));
+      await waitFor(() => {
+        expect(document.activeElement).toBe(document.querySelector('.fab'));
+      });
+    });
+
+    it('после сохранения фокус тоже уходит на FAB', async () => {
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      openComposer();
+      const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+      fireEvent.change(input, { target: { value: 'текст' } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+      });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(document.querySelector('.fab'));
+      });
     });
 
     it('«Свернуть» возвращает оболочку целиком', () => {
