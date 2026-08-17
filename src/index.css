@@ -53,7 +53,8 @@
   --bg-card: #201c17;
   --bg-input: #201c17;
   --bg-hover: #2a251d;
-  --border: #3a3428;  --border-control: #736a58;
+  --border: #3a3428;
+  --border-control: #736a58;
   --border-inner: #2b261f;
   --border-focus: #ece4d3;
   --text: #ece4d3;
@@ -91,7 +92,8 @@
   --bg-card: #faf6ea;
   --bg-input: #faf6ea;
   --bg-hover: #e9e1cd;
-  --border: #d9cfb8;  --border-control: #93856a;
+  --border: #d9cfb8;
+  --border-control: #93856a;
   --border-inner: #e7ddc8;
   --border-focus: #292317;
   --text: #292317;
@@ -121,7 +123,8 @@
   --bg-card: #fdf3e2;
   --bg-input: #fdf3e2;
   --bg-hover: #ecdcc0;
-  --border: #e0cfae;  --border-control: #8f8060;
+  --border: #e0cfae;
+  --border-control: #8f8060;
   --border-inner: #eee0c6;
   --border-focus: #2e2415;
   --text: #2e2415;
@@ -145,7 +148,8 @@
     --bg-card: #faf6ea;
     --bg-input: #faf6ea;
     --bg-hover: #e9e1cd;
-    --border: #d9cfb8;    --border-control: #93856a;
+    --border: #d9cfb8;
+    --border-control: #93856a;
     --border-inner: #e7ddc8;
     --border-focus: #292317;
     --text: #292317;
@@ -2023,6 +2027,18 @@ mark {
   /* Focus rings must not be clipped by the scroll container. */
   padding: 3px;
   margin: -3px;
+  /* …and a tail wide enough to carry the fade. The mask below dims the last
+     22px of the BOX, which at scroll-end would sit on top of the final button
+     and its focus ring — a control half-erased with nothing left to scroll to.
+     Scrollable padding puts empty space under the fade instead, so the button
+     clears it. Trailing padding on a flex scroller is honoured at the end of
+     the scroll range in every engine this app targets. */
+  /* 30px, не 22: затухание шириной 22px должно быть перекрыто ещё и КОЛЬЦОМ
+     ФОКУСА, которое выходит за кнопку примерно на 5px (2.7px обводка плюс
+     2px offset). При 25px внешний край кольца ложился ровно на начало
+     градиента — измерено в браузере, 22 при 22. Впритык здесь означает
+     «иногда нет». */
+  padding-right: 30px;
 }
 .composer-toolbar-scroll::-webkit-scrollbar { display: none; }
 
@@ -2030,10 +2046,10 @@ mark {
    the half-visible «<>» reads as a broken glyph rather than as «there is more
    this way» — spotted on a 375px screenshot, where the clipped bracket looked
    like a rendering fault.
-   The mask is unconditional, and that is safe here only because «Превью» is
-   pinned OUTSIDE this scroller: when the seven format buttons fit, the fading
-   22px fall on empty space rather than on a control. Move the toggle back
-   inside and this rule starts dimming it. */
+   The mask is unconditional in BOTH directions — at rest and at scroll-end —
+   which is safe only because the scroller carries 25px of trailing padding
+   (see above) and «Превью» is pinned OUTSIDE it. Take either away and this
+   rule starts dimming a real control. */
 .composer-toolbar-scroll {
   mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
   -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);

@@ -106,20 +106,35 @@ describe('base layer, as the browser resolves it', () => {
     ]);
 
     /**
-     * Relative sizes that are verified BY HAND, with the resolved value.
+     * Relative sizes, resolved against a DECLARED parent — not against a
+     * number somebody typed here.
      *
-     * `em` compounds, so a scan cannot resolve it without walking the whole
-     * cascade — and that is exactly where a violation hid: 0.8em inside a rule
-     * at 0.9rem is 11.52px, two relative units deep, and the earlier version
-     * of this check read only `px|rem` and never saw it. Anything relative now
-     * has to be listed here with the size it actually resolves to, or written
-     * in px.
+     * The previous version listed the computed px by hand («0.88em of 18px =
+     * 15.8»), which pins nothing: change `.note-text` to 13px and 0.85em
+     * silently becomes 11.05px while this test stays green. The map now names
+     * the SELECTOR the em resolves against, and the parent's size is read out
+     * of the stylesheet, so the arithmetic follows the CSS instead of
+     * remembering it.
+     *
+     * `em` compounds, so a scan cannot resolve it in general — this is the
+     * narrow case where the parent is a single known rule. Anything else has
+     * to be written in px.
      */
-    const VERIFIED_RELATIVE = new Map([
-      ['.note-md code', 15.8],      // 0.88em of .note-text 18px
-      ['.note-md pre code', 15.3],  // 0.85em of .note-text 18px
-      ['.md-img-chip', 15.3],       // 0.85em of .note-text 18px
+    const RELATIVE_PARENT = new Map([
+      ['.note-md code', '.note-text'],
+      ['.note-md pre code', '.note-text'],
+      ['.md-img-chip', '.note-text'],
     ]);
+
+    /** Declared px size of a selector, or null if it is not a plain px rule. */
+    const declaredPx = (selector: string): number | null => {
+      for (const r of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+        if (r[1].trim().replace(/\s+/g, ' ') !== selector) continue;
+        const d = r[2].match(/font-size:\s*([0-9.]+)px/);
+        if (d) return parseFloat(d[1]);
+      }
+      return null;
+    };
 
     const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
     const offenders: string[] = [];
@@ -130,11 +145,20 @@ describe('base layer, as the browser resolves it', () => {
       if (!decl) continue;
 
       if (decl[2] === 'em' || decl[2] === '%') {
-        const verified = VERIFIED_RELATIVE.get(selector);
-        if (verified === undefined) {
-          offenders.push(`  ${selector} → ${decl[1]}${decl[2]} (относительный размер не проверен)`);
-        } else if (verified < 13) {
-          offenders.push(`  ${selector} → ${decl[1]}${decl[2]} = ${verified}px`);
+        const parent = RELATIVE_PARENT.get(selector);
+        if (!parent) {
+          offenders.push(`  ${selector} → ${decl[1]}${decl[2]} — относительный размер без объявленного родителя`);
+          continue;
+        }
+        const base = declaredPx(parent);
+        if (base === null) {
+          offenders.push(`  ${selector} → родитель ${parent} не задаёт font-size в px, разрешить нечем`);
+          continue;
+        }
+        const factor = decl[2] === '%' ? parseFloat(decl[1]) / 100 : parseFloat(decl[1]);
+        const resolved = base * factor;
+        if (resolved < 13) {
+          offenders.push(`  ${selector} → ${decl[1]}${decl[2]} от ${parent} (${base}px) = ${resolved.toFixed(2)}px`);
         }
         continue;
       }

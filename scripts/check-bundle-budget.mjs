@@ -32,7 +32,7 @@
  *     plus the WAI-ARIA keyboard model that neither of them had.
  *   - src/lib/format-date.ts — moved out of a screen component, not new code.
  *
- * NO DEPENDENCY WAS ADDED — and to be exact about it, package.json did change:
+ * NO JAVASCRIPT DEPENDENCY WAS ADDED — and to be exact, package.json did change:
  * @fontsource/manrope and @fontsource/jetbrains-mono were replaced by
  * @fontsource-variable/literata and @fontsource/pt-mono. Those ship CSS and
  * woff2, not JavaScript, so the JS dependency graph this gate measures is the
