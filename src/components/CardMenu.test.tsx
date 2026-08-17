@@ -186,3 +186,47 @@ describe('CardMenu — Escape не всплывает наружу', () => {
     }
   });
 });
+
+describe('CardMenu — фокус входит в меню при любом открытии', () => {
+  it('открытие мышью ставит фокус на первый пункт', () => {
+    // Раньше фокус входил только при открытии с клавиатуры, и после клика он
+    // оставался на триггере — а каждая стрелка после этого толковалась
+    // относительно «не пункта». Отсюда и брался промах ArrowUp на единицу.
+    render(<Harness />);
+    open();
+    expect(document.activeElement).toBe(screen.getAllByRole('menuitem')[0]);
+  });
+
+  it('ArrowUp с триггера открывает меню на ПОСЛЕДНЕМ пункте', () => {
+    render(<Harness />);
+    fireEvent.keyDown(trigger(), { key: 'ArrowUp' });
+    const items = screen.getAllByRole('menuitem');
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it('ArrowUp с первого пункта заворачивает на последний', () => {
+    render(<Harness />);
+    open();
+    fireEvent.keyDown(document, { key: 'ArrowUp' });
+    const items = screen.getAllByRole('menuitem');
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+});
+
+describe('CardMenu — меню это ОДНА остановка в порядке обхода', () => {
+  it('пункты не участвуют в обходе по Tab', () => {
+    // APG: до пунктов добираются стрелками, не Tab. Без tabindex=-1 они были
+    // обычными кнопками и ссылками, то есть Tab шёл БЫ по ним — закрытие по
+    // Tab маскировало это, но не отменяло.
+    render(<Harness />);
+    open();
+    for (const item of screen.getAllByRole('menuitem')) {
+      expect(item.getAttribute('tabindex'), item.textContent ?? '').toBe('-1');
+    }
+  });
+
+  it('триггер остаётся обычной остановкой', () => {
+    render(<Harness />);
+    expect(trigger().getAttribute('tabindex')).toBeNull();
+  });
+});

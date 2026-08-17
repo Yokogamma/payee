@@ -102,6 +102,13 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
     if (delta === 'first') return nodes[0].focus();
     if (delta === 'last') return nodes[nodes.length - 1].focus();
     const current = nodes.indexOf(document.activeElement as HTMLElement);
+    if (current === -1) {
+      // Focus is on the TRIGGER — the menu was opened by mouse and never
+      // entered. Arithmetic on -1 happened to give the right answer for Down
+      // (index 0) and the wrong one for Up: `(-1 - 1 + n) % n` is the
+      // SECOND-to-last item, not the last. Enter from the appropriate end.
+      return (delta > 0 ? nodes[0] : nodes[nodes.length - 1]).focus();
+    }
     // Wraps, per the APG pattern: Down on the last item lands on the first.
     const next = (current + delta + nodes.length) % nodes.length;
     nodes[next].focus();
@@ -112,11 +119,24 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
     triggerRef.current?.focus();
   }
 
-  // Focus into the menu when it was opened by keyboard. APG puts focus on the
-  // first item for Enter/Space/Down and on the last for Up.
+  /**
+   * Focus enters the menu on open — ALWAYS, not only when it was opened from
+   * the keyboard.
+   *
+   * The first version only did this for keyboard opens, which left a real hole:
+   * after a mouse click focus sits on the trigger (or, where the browser does
+   * not focus buttons on click, on `<body>`), and every arrow key then had to
+   * be interpreted relative to «not an item». That is what produced the
+   * off-by-one on ArrowUp, and patching the arithmetic only fixed the symptom.
+   * APG's model assumes focus is inside an open menu; putting it there removes
+   * the case instead of handling it.
+   *
+   * Only Up asks for the last item — that is the one keystroke whose whole
+   * meaning is «start from the bottom».
+   */
   useEffect(() => {
-    if (!open || !focusOnOpenRef.current) return;
-    const where = focusOnOpenRef.current;
+    if (!open) return;
+    const where = focusOnOpenRef.current ?? 'first';
     focusOnOpenRef.current = null;
     moveFocus(where);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -224,6 +244,7 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
                 role="menuitem"
                 className={className}
                 href={item.href}
+                tabIndex={-1}
                 target="_blank"
                 rel="noopener noreferrer"
                 onClick={() => onOpenChange(false, 'select')}
@@ -237,6 +258,7 @@ export function CardMenu({ open, onOpenChange, label, id, items, hint, triggerRe
                 type="button"
                 role="menuitem"
                 className={className}
+                tabIndex={-1}
                 onClick={() => {
                   // Awaited so an action can veto the close — see `onSelect`.
                   void Promise.resolve(item.onSelect?.()).then(result => {
