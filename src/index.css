@@ -32,20 +32,20 @@
    needs a visibly darker colour — not a rounding the way --text-dim was.
    So the two jobs split:
 
-     --border-strong   #c9bda1   a heavy rule that promises nothing
      --border-control  #93856a   identity: button and field boundaries, 3.07:1
 
    A line that promises nothing keeps the paper look; a line that promises a
    press is legible to someone who cannot see the difference between paper and
    parchment. Pinned in scripts/check-contrast.test.mjs.
 
-   WORTH KNOWING while reading the mockups: they draw EVERY 1.5px rule in
-   #c9bda1, and every one of them turns out to sit on a control — the search
-   underline, the refresh ring, the ⋯ ring, the outline buttons, the composer
-   toolbar. So --border-strong may well end up with no users at all. It is
-   kept rather than removed because «no users yet» and «no users ever» look
-   identical halfway through a redesign; if it is still unused when the last
-   screen lands, delete it then. */
+   THERE WAS A SECOND TOKEN HERE, --border-strong, holding the handoff's
+   #c9bda1 for «a heavy rule that promises nothing». Its own comment predicted
+   it would end up unused, because the mockups draw EVERY 1.5px rule in that
+   colour and every one of them sits on a control — the search underline, the
+   refresh ring, the ⋯ ring, the outline buttons, the composer toolbar. It was
+   kept anyway, since halfway through a redesign «no users yet» and «no users
+   ever» look identical, with the note: delete it when the last screen lands.
+   The last screen has landed and it had no users. Deleted. */
 
 :root,
 [data-theme="dark"] {
@@ -53,9 +53,7 @@
   --bg-card: #201c17;
   --bg-input: #201c17;
   --bg-hover: #2a251d;
-  --border: #3a3428;
-  --border-strong: #4a4335;
-  --border-control: #736a58;
+  --border: #3a3428;  --border-control: #736a58;
   --border-inner: #2b261f;
   --border-focus: #ece4d3;
   --text: #ece4d3;
@@ -65,6 +63,7 @@
   --accent-text: #191612;
   --accent-hover: #f6efdd;
   --accent-glow: rgba(236, 228, 211, 0.08);
+  --scrim: rgba(10, 8, 6, 0.72);
   --green: #ece4d3;
   --red: #c9705c;
   --yellow: #b99a4a;
@@ -92,9 +91,7 @@
   --bg-card: #faf6ea;
   --bg-input: #faf6ea;
   --bg-hover: #e9e1cd;
-  --border: #d9cfb8;
-  --border-strong: #c9bda1;
-  --border-control: #93856a;
+  --border: #d9cfb8;  --border-control: #93856a;
   --border-inner: #e7ddc8;
   --border-focus: #292317;
   --text: #292317;
@@ -104,6 +101,7 @@
   --accent-text: #f2ecdf;
   --accent-hover: #14110b;
   --accent-glow: rgba(41, 35, 23, 0.05);
+  --scrim: rgba(41, 35, 23, 0.55);
   --green: #292317;
   --red: #9a3a28;
   --yellow: #806119;
@@ -123,9 +121,7 @@
   --bg-card: #fdf3e2;
   --bg-input: #fdf3e2;
   --bg-hover: #ecdcc0;
-  --border: #e0cfae;
-  --border-strong: #cbb389;
-  --border-control: #8f8060;
+  --border: #e0cfae;  --border-control: #8f8060;
   --border-inner: #eee0c6;
   --border-focus: #2e2415;
   --text: #2e2415;
@@ -135,6 +131,7 @@
   --accent-text: #f4e7d0;
   --accent-hover: #191204;
   --accent-glow: rgba(46, 36, 21, 0.05);
+  --scrim: rgba(46, 36, 21, 0.55);
   --green: #2e2415;
   --red: #99381f;
   --yellow: #7a5b12;
@@ -148,9 +145,7 @@
     --bg-card: #faf6ea;
     --bg-input: #faf6ea;
     --bg-hover: #e9e1cd;
-    --border: #d9cfb8;
-    --border-strong: #c9bda1;
-    --border-control: #93856a;
+    --border: #d9cfb8;    --border-control: #93856a;
     --border-inner: #e7ddc8;
     --border-focus: #292317;
     --text: #292317;
@@ -160,6 +155,7 @@
     --accent-text: #f2ecdf;
     --accent-hover: #14110b;
     --accent-glow: rgba(41, 35, 23, 0.05);
+    --scrim: rgba(41, 35, 23, 0.55);
     --green: #292317;
     --red: #9a3a28;
     --yellow: #806119;
@@ -477,12 +473,15 @@ h1 {
 
 /* ─── Seed Phrase ────────────────────────────────────────────── */
 
+/* Была янтарная подложка на 8% и рамка на 20% — цвет, взятый из палитры,
+   которой больше нет. Предупреждение теперь выглядит как всё остальное на
+   этой бумаге: карточка с рамкой, а тревогу несёт цвет ТЕКСТА. */
 .seed-warning {
-  background: rgba(251, 191, 36, 0.08);
-  border: 1px solid rgba(251, 191, 36, 0.2);
+  background: var(--bg-card);
+  border: 1px solid var(--yellow);
   border-radius: var(--radius-sm);
-  padding: 12px;
-  font-size: 13px;
+  padding: 14px;
+  font-size: 13.5px;
   color: var(--yellow);
   line-height: 1.5;
   text-align: left;
@@ -570,9 +569,10 @@ h1 {
 }
 
 .pin-attempts {
-  font-size: 12px;
+  font-size: 13.5px;
   color: var(--yellow);
-  background: rgba(251, 191, 36, 0.08);
+  background: var(--bg-card);
+  border: 1px solid var(--yellow);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   width: 100%;
@@ -599,13 +599,16 @@ h1 {
   border-radius: 6px;
   padding: 8px 10px;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15px;
 }
 
+/* Номер слова — индекс, не проза: моно, как метки секций, и по той же
+   причине ему позволено быть 12px. 10px было просто мелко. */
 .seed-num {
-  color: var(--text-muted);
-  font-size: 10px;
-  min-width: 14px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 16px;
 }
 
 .seed-text {
@@ -656,9 +659,10 @@ h1 {
 
 .error-msg {
   color: var(--red);
-  font-size: 13px;
-  padding: 8px;
-  background: rgba(240, 83, 101, 0.08);
+  font-size: 13.5px;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--red);
   border-radius: 6px;
   width: 100%;
 }
@@ -962,7 +966,9 @@ h1 {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.7);
+  /* Ink, not black: a neutral scrim over paper reads as a photograph of the
+     screen rather than as a layer of the same interface. */
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1044,24 +1050,9 @@ h1 {
 
 /* ─── Section chip, tiny token, FAB ─────────────────────────── */
 
-/* State as a label, not as a button. «Открыт»/«Заперт» used to be readable
-   only from the presence of a big «🔒 Закрыть сейф», which is a control. */
-.section-chip {
-  flex: 0 0 auto;
-  font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 3px 7px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  color: var(--text-dim);
-}
-/* The capsule itself goes away in the safebox pass — the handoff states the
-   open/locked state as text with a lock glyph, because a bordered pill reads
-   as a button and this is not one. Until then it borrows the ordinary rule. */
-.section-chip--open { color: var(--green); border-color: var(--border-strong); }
-.section-chip--shut { color: var(--yellow); border-color: var(--border-strong); }
+/*  and its two modifiers are gone. The bordered capsule was
+   the safebox state, and Ф5 replaced it with plain text and a dot — a pill
+   that looks pressable and is not is exactly what the redesign removes. */
 
 /* The row-action token: a real 44px touch target without a 44px BOX, same
    trick as .status-btn. Buttons sized to their own text let four actions sit
@@ -1264,7 +1255,9 @@ h1 {
 @media (max-width: 480px) {
   .card { padding: 24px 20px; }
   .seed-grid { grid-template-columns: repeat(3, 1fr); gap: 6px; }
-  .seed-word { padding: 6px 8px; font-size: 12px; }
+  /* Даже на 480px слово seed-фразы не уменьшается: его переписывают от руки
+     и по нему потом восстанавливают весь архив. Ужимаются отступы. */
+  .seed-word { padding: 6px 8px; }
   h1 { font-size: 20px; }
 }
 
@@ -1351,8 +1344,8 @@ h1 {
 /* ─── Offline Banner ──────────────────────────────────────── */
 
 .offline-banner {
-  background: rgba(240, 83, 101, 0.08);
-  border-bottom: 1px solid rgba(240, 83, 101, 0.2);
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--yellow);
   color: var(--red);
   font-size: 13px;
   padding: 8px 16px;
@@ -1374,8 +1367,8 @@ h1 {
 }
 
 .error-banner {
-  background: rgba(240, 83, 101, 0.08);
-  border-bottom: 1px solid rgba(240, 83, 101, 0.2);
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--red);
   color: var(--red);
 }
 
@@ -1751,23 +1744,25 @@ mark {
   border-radius: var(--radius);
   background: var(--bg-card);
   border: 1px solid var(--border);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 32px var(--scrim);
   font-size: 13px;
   z-index: 50;
 }
 
 .toast--error {
-  border-color: rgba(240, 83, 101, 0.4);
+  border-color: var(--red);
   color: var(--red);
 }
 
 .toast--success {
-  border-color: rgba(45, 212, 168, 0.4);
+  border-color: var(--border-control);
   color: var(--green);
 }
 
+/* Последний фиолетовый в файле. Ф0 обещала убрать его полностью и это
+   правило пропустила — нашлось сканированием, а не глазами. */
 .toast--update {
-  border-color: rgba(108, 99, 255, 0.4);
+  border-color: var(--border-control);
   color: var(--accent);
 }
 

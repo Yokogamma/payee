@@ -242,6 +242,42 @@ describe('themed fills carry a themed label', () => {
   });
 });
 
+/**
+ * No literal colours outside the palettes.
+ *
+ * The last violet in the codebase survived seven phases inside
+ * `.toast--update { border-color: rgba(108, 99, 255, 0.4) }` — a value nobody
+ * reads, on a rule nobody opens, in a state that appears once per release.
+ * Ф0 said the violet was gone; it was gone from everywhere anyone looked.
+ *
+ * A colour written as a literal cannot answer to a theme, so this is also the
+ * check that keeps the three palettes meaningful: every colour in the
+ * stylesheet either IS a palette entry or refers to one.
+ */
+describe('colour lives in the palettes and nowhere else', () => {
+  it('no rule outside the palette blocks carries a literal colour', () => {
+    // Everything before the reset is palette; everything after is rules.
+    const rules = css.slice(css.indexOf('*, *::before'));
+    const literals = [
+      ...new Set(
+        [...rules.matchAll(/^\s*[a-z-]+:\s*[^;]*(?:rgba?\([0-9]|#[0-9a-fA-F]{3,6})[^;]*;/gm)]
+          .map(m => m[0].trim()),
+      ),
+    ];
+    expect(
+      literals,
+      'A literal colour cannot answer to a theme. Add a token to all four ' +
+        `palettes instead:\n${literals.map(l => `  ${l}`).join('\n')}`,
+    ).toEqual([]);
+  });
+
+  it('the violet is gone from the whole file, palettes included', () => {
+    for (const gone of ['#6c63ff', '#5b52ee', '#5b4fd1', '108, 99, 255']) {
+      expect(css.toLowerCase(), `the pre-redesign accent ${gone} is back`).not.toContain(gone);
+    }
+  });
+});
+
 /* --border-strong is deliberately NOT asserted at 3:1. It keeps the handoff's
  * #c9bda1 and is only ever a decorative rule — the search underline, the line
  * between feed entries, group boundaries. SC 1.4.11 governs what identifies a
