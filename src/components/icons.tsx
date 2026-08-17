@@ -53,6 +53,44 @@ export function InfinityMark({ className }: MarkProps) {
   );
 }
 
+/* ─── Line icons ───────────────────────────────────────────────
+   24-box, stroke 1.8, no fill — the weight AppNav and the settings rows
+   already use. Sizing is the caller's business (.icon-btn svg, .status-btn
+   svg), so these carry no dimensions of their own. */
+
+const Line = ({ children }: { children: React.ReactNode }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.8"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    {children}
+  </svg>
+);
+
+/** «Проверить обновления». */
+export const IconRefresh = () => (
+  <Line><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></Line>
+);
+
+/** Disclosure. Rotated by the caller when expanded. */
+export const IconChevron = () => <Line><path d="m6 9 6 6 6-6" /></Line>;
+
+/** Dismiss. Replaces the ✕ character, which is not one glyph across platforms
+ *  and was the last piece of text pretending to be an icon in this line. */
+export const IconClose = () => (
+  <Line><path d="M6 6l12 12M18 6L6 18" /></Line>
+);
+
+/** Search. */
+export const IconSearch = () => (
+  <Line><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></Line>
+);
+
 /**
  * The card-menu trigger. Filled dots, not strokes: at 40px inside a ring, a
  * stroked circle of this size renders as a smudge on a 1x display.

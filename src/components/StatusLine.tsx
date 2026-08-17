@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useNotes } from '../lib/store';
 import { computeSyncCounters, QUARANTINE_EXPLANATION } from '../lib/syncCounters';
+import { InfinityMark, IconRefresh, IconChevron, IconClose } from './icons';
 
 /**
  * One line instead of five header icons and a stack of banners.
@@ -28,19 +29,9 @@ import { computeSyncCounters, QUARANTINE_EXPLANATION } from '../lib/syncCounters
 
 type Tone = 'ok' | 'busy' | 'warn' | 'error';
 
-/* Line icons, 24-box, matching AppNav and SettingsSection. The glyphs ↻ ⌄ ⏳
-   that used to sit here render in whatever the platform ships — a colour
-   emoji hourglass next to monochrome SVG everywhere else. */
-const IconRefresh = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-    <path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" />
-  </svg>
-);
-const IconChevron = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-    <path d="m6 9 6 6 6-6" />
-  </svg>
-);
+/* Icons moved to components/icons.tsx — StatusLine, AppNav and the settings
+   rows were each drawing their own copy of the same chevron at a different
+   stroke weight. */
 
 interface Rung {
   tone: Tone;
@@ -168,7 +159,13 @@ export function StatusLine() {
 
   return (
     <div className={`status-line status-line--${rung.tone}`}>
-      <span className="status-dot" aria-hidden="true" />
+      {/* ∞ only on the good rung. It is a claim — «everything is saved,
+          forever» — and printing it beside «Оффлайн» or «Не удалось проверить
+          обновления» would be the interface contradicting itself in its own
+          vocabulary. Every other state gets a toned dot. */}
+      {rung.tone === 'ok'
+        ? <InfinityMark className="status-mark" />
+        : <span className="status-dot" aria-hidden="true" />}
       {/* An explicit aria-live OVERRIDES the implicit `assertive` that comes
           with role="alert", so setting both would announce errors politely —
           the exact flattening this ladder must not do. Only the non-error
@@ -185,7 +182,7 @@ export function StatusLine() {
       )}
       {rung.dismiss && (
         <button className="banner-btn banner-close" onClick={rung.dismiss} title="Скрыть" aria-label="Скрыть сообщение">
-          ✕
+          <IconClose />
         </button>
       )}
       {/* Reading Arweave needs neither the sync toggle nor a registered key —

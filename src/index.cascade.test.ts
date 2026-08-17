@@ -133,6 +133,28 @@ describe('base layer, as the browser resolves it', () => {
     expect(w, 'the menu trigger lost its ring to a later rule').toBe('50%');
   });
 
+  it('the nav carries its active state in weight as well as colour', () => {
+    // Colour alone would be the only channel — the nav has no underline and no
+    // fill — and ink-vs-dim is a step a low-vision user may not resolve.
+    expect(resolved('app-nav-item', 'font-size')).toBe('12.5px');
+    expect(resolved('app-nav-item app-nav-item--active', 'font-weight')).toBe('600');
+    // The inactive item declares no weight at all — jsdom reports '' rather
+    // than the inherited '400', so the check is that it is not the bold one.
+    expect(resolved('app-nav-item', 'font-weight')).not.toBe('600');
+  });
+
+  it('the status line reserves both of its lines', () => {
+    // The row is sized for two lines whether it uses them or not: the feed
+    // must not move when the message changes length.
+    expect(resolved('status-line', 'min-height')).toBe('62px');
+    expect(resolved('status-text', '-webkit-line-clamp')).toBe('2');
+  });
+
+  it('the status refresh is the mockup ring, not a square', () => {
+    expect(resolved('status-btn', 'width')).toBe('36px');
+    expect(resolved('status-btn', 'border-radius')).toBe('50%');
+  });
+
   it('a text action is underlined rather than bare', () => {
     // The one sanctioned exception to «fill or 1.5px rule»: the mockup draws
     // «Свернуть» as text with a rule under it. Bare text would be
