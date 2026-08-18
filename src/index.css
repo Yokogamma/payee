@@ -2439,17 +2439,34 @@ mark {
 
 /* One line for ambient state. Never pushes content: the grid gives it a fixed
    row, so a pause or an error changes what it says, not where the feed is. */
+/* A COLUMN of two things: the status row, and the details panel under it.
+   It used to be one wrapping flex with the panel as a `flex-basis: 100%` item,
+   and the 62px reservation sat on the CONTAINER. That reservation exists for
+   one reason — the status TEXT can wrap to two lines — but a container cannot
+   tell which of its children fills it. Opening the details satisfied the 62px
+   with the panel, so the top row fell back to its natural height and visibly
+   shrank the moment the chevron was pressed. Reported from a phone, with the
+   two screenshots side by side.
+
+   The reservation is a property of the ROW. It lives on the row now. */
 .status-line {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
   padding: 10px var(--pad-screen);
   border-bottom: 1px solid var(--border);
   font-size: 13.5px; /* was 12.5 — under the floor */
   color: var(--text-dim);
-  /* 2 × (13.5 × 1.55) + 2 × 10 padding, rounded. See .status-text. */
-  min-height: 62px;
+}
+
+.status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  /* 2 × (13.5 × 1.55), rounded — the container's padding is no longer part of
+     the sum, because the reservation no longer sits on the container.
+     See .status-text, which clamps to exactly those two lines. */
+  min-height: 42px;
 }
 
 /* THE INDICATOR IS TWO SHAPES, on purpose.
@@ -2521,7 +2538,7 @@ mark {
 .status-btn[aria-expanded='true'] svg { transform: rotate(180deg); }
 
 /* THE TWO-LINE RESERVATION IS A MOBILE MEASURE, and it has to be released
-   here — AFTER `.status-line`, not in the ≥768px block a thousand lines above.
+   here — AFTER `.status-row`, not in the ≥768px block a thousand lines above.
    That block sits before this rule, so at equal specificity the base wins and
    the override does nothing; I wrote it there first and measured 62px in a
    browser afterwards, which is the only reason it did not ship silently.
@@ -2533,14 +2550,16 @@ mark {
    reserve against, and reserving anyway left 41px of permanent emptiness
    above the feed. */
 @media (min-width: 768px) {
-  .status-line {
+  .status-row {
     min-height: 0;
   }
 }
 
 /* Breaks to its own row inside the same flex container. */
+/* `flex-basis: 100%` is gone with the wrapping container that needed it — in a
+   COLUMN flex the same declaration would size this panel to the whole line
+   instead of breaking it onto its own row. */
 .status-details {
-  flex-basis: 100%;
   display: flex;
   flex-direction: column;
   gap: 3px;

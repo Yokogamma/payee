@@ -286,3 +286,33 @@ describe('StatusLine — знак ∞ утверждает вечность, а 
     expect(dot()).not.toBeNull();
   });
 });
+
+// Панель подробностей — СЕСТРА строки статуса, а не элемент внутри неё.
+// Пока она лежала в том же оборачивающемся flex, резерв в 62px закрывался
+// панелью, и первая строка проседала ровно в момент нажатия на шеврон.
+describe('StatusLine — раскрытие подробностей не трогает строку', () => {
+  it('подробности лежат рядом с .status-row, а не внутри неё', () => {
+    s().arweave.confirmedCount = 3;
+    const { container } = render(<StatusLine />);
+    fireEvent.click(screen.getByLabelText('Показать подробности'));
+
+    const row = container.querySelector('.status-row');
+    const details = container.querySelector('.status-details');
+    expect(row, 'строка статуса обязана быть отдельным элементом').not.toBeNull();
+    expect(details).not.toBeNull();
+    expect(row!.contains(details!), 'панель внутри строки снова съест резерв').toBe(false);
+    expect(details!.parentElement).toBe(container.querySelector('.status-line'));
+  });
+
+  it('всё содержимое строки лежит в .status-row', () => {
+    const { container } = render(<StatusLine />);
+    const row = container.querySelector('.status-row')!;
+    // Текст, обе круглые кнопки и индикатор — одна строка, один резерв.
+    expect(row.querySelector('.status-text')).not.toBeNull();
+    expect(row.querySelectorAll('.status-btn')).toHaveLength(2);
+    expect(
+      container.querySelector('.status-mark') ?? container.querySelector('.status-dot'),
+    ).not.toBeNull();
+    expect(row.contains(container.querySelector('.status-mark') ?? container.querySelector('.status-dot')!)).toBe(true);
+  });
+});
