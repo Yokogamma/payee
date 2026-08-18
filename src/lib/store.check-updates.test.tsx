@@ -50,7 +50,8 @@ Object.defineProperty(globalThis, 'crypto', {
 
 import { NotesProvider, useNotes } from './store';
 import {
-  initStorage, resetAll, setMeta, getAllNotes as getStoredNotes, countSafeboxEntries,
+  initStorage, resetAll, setMeta, getMeta, sanitizeFullSweepAt,
+  getAllNotes as getStoredNotes, countSafeboxEntries,
 } from './storage';
 import { isArweaveOnline, fetchAllNotes, ArweaveIndexUnavailableError } from './arweave';
 import type { FetchAllNotesResult, RestoredNote, RestoredSafeboxEntry } from './arweave';
@@ -448,5 +449,198 @@ describe('checkForUpdates: lifecycle', () => {
     });
 
     expect(await countSafeboxEntries()).toBe(0);
+  });
+});
+
+// ─── Фаза 1: инкрементальный режим проверки, полное восстановление ──
+//
+// fetchAllNotes здесь замокан, поэтому сторовые тесты проверяют КОНТРАКТ между
+// store и sweep'ом: какую карту `known` store передаёт (или не передаёт) и как
+// живёт метка полной сверки `sweep-full-at`. Sentinel-семантика самой карты
+// покрыта в arweave.incremental.test.ts.
+
+/** opts последнего вызова fetchAllNotes (4-й аргумент). */
+function lastSweepOpts() {
+  const call = vi.mocked(fetchAllNotes).mock.calls.at(-1);
+  return call?.[3] as { known?: Map<string, { noteId: string; kind: 'note' | 'safebox' }> } | undefined;
+}
+
+describe('checkForUpdates: инкрементальный режим (Фаза 1)', () => {
+  it('первая проверка без метки — ПОЛНАЯ (known не передаётся), успех пишет метку', async () => {
+    renderStore();
+    await openMain();
+
+    await act(async () => { await store.checkForUpdates(); });
+
+    expect(lastSweepOpts()?.known).toBeUndefined();          // тест 17: нет метки → полный
+    expect(typeof await getMeta('sweep-full-at')).toBe('number'); // успех продвинул метку
+  });
+
+  it('повторная проверка при свежей метке — инкрементальная: known из confirmed-записей', async () => {
+    renderStore();
+    await openMain();
+    const key = await deriveKey(MN);
+    const remote = await makeRemoteChain(key, ['известная после merge']);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({ ...EMPTY, notes: remote });
+
+    await act(async () => { await store.checkForUpdates(); }); // полная, merge + метка
+    await act(async () => { await store.checkForUpdates(); }); // инкрементальная
+
+    const known = lastSweepOpts()?.known;
+    expect(known).toBeInstanceOf(Map);
+    expect(known!.get(remote[0].txId)).toEqual({ noteId: remote[0].encrypted.noteId, kind: 'note' });
+  });
+
+  it('restore ВСЕГДА полный: known не передаётся даже при свежей метке (тест 10)', async () => {
+    renderStore();
+    await openMain();
+    const key = await deriveKey(MN);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY, notes: await makeRemoteChain(key, ['уже известная']),
+    });
+    await act(async () => { await store.checkForUpdates(); }); // есть и записи, и метка
+
+    await act(async () => { await store.retryRestore(); });
+
+    expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(2);
+    expect(lastSweepOpts()?.known).toBeUndefined();
+  });
+
+  it('граница ремонта сейфа (тест 11): запись закрытой секции остаётся в known до полной сверки', async () => {
+    renderStore();
+    await openMain();
+    const [metaKey, secretKey] = await Promise.all([deriveSafeboxMetaKey(MN), deriveSafeboxSecretKey(MN)]);
+    const remote = await makeRemoteSafeboxChain(metaKey, secretKey, ['в сейфе']);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({ ...EMPTY, safeboxEntries: remote });
+
+    await act(async () => { await store.checkForUpdates(); }); // полная: merge сейфа + метка
+    await act(async () => { await store.checkForUpdates(); }); // инкрементальная
+
+    // Секция закрыта, повреждение её записи детектировать нечем — запись
+    // остаётся «известной» (sentinel, не качается). Ремонт — у полной сверки.
+    const known = lastSweepOpts()?.known;
+    expect(known!.get(remote[0].txId)).toEqual({ noteId: remote[0].encrypted.entryId, kind: 'safebox' });
+  });
+
+  it('полностью известная выборка → done с нулями, partial=false (тест 12)', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); }); // метка
+    await act(async () => { await store.checkForUpdates(); }); // инкрементальная, EMPTY
+
+    expect(store.updateCheck).toMatchObject({
+      status: 'done', addedNotes: 0, updatedNotes: 0, changedSafebox: 0, partial: false,
+    });
+  });
+
+  it('метка старше суток → проверка снова ПОЛНАЯ (тест 13)', async () => {
+    renderStore();
+    await openMain();
+    await setMeta('sweep-full-at', Date.now() - 25 * 60 * 60 * 1000);
+
+    await act(async () => { await store.checkForUpdates(); });
+
+    expect(lastSweepOpts()?.known).toBeUndefined();
+  });
+
+  it('успешный restore продвигает метку (тест 13, wasFull)', async () => {
+    renderStore();
+    await openMain();
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+
+    await act(async () => { await store.retryRestore(); });
+
+    expect(typeof await getMeta('sweep-full-at')).toBe('number');
+  });
+
+  it('incomplete НЕ продвигает метку — частичная полная сверка полной не считается (тест 14)', async () => {
+    renderStore();
+    await openMain();
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({ ...EMPTY, incomplete: true });
+
+    await act(async () => { await store.checkForUpdates(); }); // полная, но partial
+
+    expect(store.updateCheck).toMatchObject({ status: 'done', partial: true });
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+  });
+
+  it('блокировка в середине полной сверки: метка не пишется (тест 15)', async () => {
+    renderStore();
+    await openMain();
+    const gate = parkSweep();
+
+    let run!: Promise<void>;
+    await act(async () => { run = store.checkForUpdates(); });
+    await waitFor(() => expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(1));
+    act(() => { store.lockApp(); });
+
+    await act(async () => { gate.release(); await run; });
+
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+  });
+
+  it('прямой resetAll в середине: generation-гейт блокирует запись метки (тест 16)', async () => {
+    // Изолирует НОВЫЙ гейт от эпохи: resetAll двигает только поколение БД.
+    // Пустой результат (merge-циклы не бегут) доводит sweep ровно до записи
+    // метки — единственной строки, которую здесь охраняет generation-проверка.
+    renderStore();
+    await openMain();
+    const gate = parkSweep();
+
+    let run!: Promise<void>;
+    await act(async () => { run = store.checkForUpdates(); });
+    await waitFor(() => expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(1));
+    await resetAll(); // эпоха нетронута — только dbGeneration
+
+    await act(async () => { gate.release(); await run; });
+
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+  });
+
+  it('свежая метка + ноль sync-записей → инкрементальная с ПУСТОЙ картой, merge работает (тест 17)', async () => {
+    renderStore();
+    await openMain();
+    await setMeta('sweep-full-at', Date.now());
+    const key = await deriveKey(MN);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY, notes: await makeRemoteChain(key, ['первая на устройстве']),
+    });
+
+    await act(async () => { await store.checkForUpdates(); });
+
+    const known = lastSweepOpts()?.known;
+    expect(known).toBeInstanceOf(Map);
+    expect(known!.size).toBe(0);           // нечего пропускать — поведение полного
+    expect(store.chains).toHaveLength(1);  // merge не пострадал
+  });
+});
+
+// ─── Тест 19: runtime-валидация метки (§6.2г) ───────────────────────
+
+describe('sanitizeFullSweepAt', () => {
+  const NOW = 1_755_600_000_000;
+  const SKEW = 5 * 60 * 1000;
+
+  it.each([
+    ['строка', 'вчера'],
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+    ['-Infinity', -Infinity],
+    ['отрицательное', -1],
+    ['дробное', 1.5],
+    ['будущее за границей (+5 мин + 1 мс)', NOW + SKEW + 1],
+    ['объект', { at: 1 }],
+    ['undefined', undefined],
+  ])('битое значение (%s) → 0: следующая проверка будет ПОЛНОЙ', (_label, raw) => {
+    expect(sanitizeFullSweepAt(raw, NOW)).toBe(0);
+  });
+
+  it('границы диапазона принимаются: 0 и ровно now + 5 мин', () => {
+    expect(sanitizeFullSweepAt(0, NOW)).toBe(0);
+    expect(sanitizeFullSweepAt(NOW + SKEW, NOW)).toBe(NOW + SKEW);
+  });
+
+  it('валидная свежая метка возвращается как есть', () => {
+    expect(sanitizeFullSweepAt(NOW - 1000, NOW)).toBe(NOW - 1000);
   });
 });

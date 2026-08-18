@@ -80,10 +80,14 @@ import {
   getTxStatus,
   getWorkerCapabilities,
   UnsupportedSafeboxVersionError,
+  type KnownTxRecord,
 } from './arweave';
 import {
   initStorage,
   getAllNotes,
+  getAllNoteIds,
+  getAllSafeboxEntryIds,
+  sanitizeFullSweepAt,
   saveNote,
   mergeRestoredNote,
   getAllSafeboxEntries,
@@ -599,6 +603,10 @@ const STALE_UPLOADING_MS = 10 * 60 * 1000; // 10 minutes (matches server reserva
 const RECHECK_BACKOFF_MS = 5 * 60 * 1000;  // min gap between recheck re-attempts (503 backoff)
 const TX_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TX_CONFIRM_THRESHOLD = 25;            // Arweave confirmations needed
+/** Максимальный возраст полной сверки: старше — очередная проверка идёт полной
+ *  (страховка ремонта, §6.2в плана Фазы 1). Сутки подтверждены владельцем
+ *  2026-08-19; ослаблять только по реальным данным о размере хранилищ. */
+const FULL_SWEEP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TX_TIMEOUT_MS = 60 * 60 * 1000;      // 1 hour — mark pending TX as error
 
 // ─── Vault snapshot (prepare/commit split, §4) ──────────────────────
@@ -2313,8 +2321,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *               never touch a restore banner (a different screen shows it).
    * Both are serialized by the SAME `restoringRef`: two concurrent sweeps would
    * double-fetch and race each other's merges.
+   *
+   * Incrementality (Phase 1): a plain check skips the payloads of KNOWN
+   * transactions (sentinel model in fetchAllNotes). 'restore' is ALWAYS full —
+   * it is the «repair my device» path and must keep overwriting local
+   * ciphertext with known-good on-chain copies. `opts.full` forces a check to
+   * be full too (the daily safety sweep, see checkForUpdates).
    */
-  async function runArweaveSweep(mode: 'restore' | 'check') {
+  async function runArweaveSweep(mode: 'restore' | 'check', opts: { full?: boolean } = {}) {
     const key = cryptoKeyRef.current;
     const mn = mnemonicRef.current;
     if (!key || !ownerHashRef.current || !mn) return;
@@ -2349,6 +2363,29 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       ]);
       if (vaultEpochRef.current !== myEpoch) return;
 
+      // «Известное» для инкрементальной проверки: есть sync-отметка с txId И
+      // сама запись физически лежит в СВОЁМ сторе (отметка без записи — потеря
+      // строки хранилищем — обязана ремонтироваться перекачкой). Существование
+      // проверяется по виду записи: sync-запись сейфа не может «подтвердить»
+      // заметку. Карта, а не множество — fetchAllNotes дополнительно сверяет
+      // тег Note-Id и класс версии, чтобы битая sync-запись не объявила
+      // известным чужой TX.
+      let known: Map<string, KnownTxRecord> | undefined;
+      if (mode === 'check' && !opts.full) {
+        const [noteIds, safeboxIds, records] = await Promise.all([
+          getAllNoteIds(), getAllSafeboxEntryIds(), getAllSyncRecords(),
+        ]);
+        if (vaultEpochRef.current !== myEpoch) return; // await'ы выше — эпоха могла уйти
+        const noteIdSet = new Set(noteIds);
+        const safeboxIdSet = new Set(safeboxIds);
+        known = new Map();
+        for (const r of records) {
+          if (!r.txId) continue;
+          if (!(r.kind === 'safebox' ? safeboxIdSet : noteIdSet).has(r.noteId)) continue;
+          known.set(r.txId, { noteId: r.noteId, kind: r.kind });
+        }
+      }
+
       // fetchAllNotes decrypts + validates (v1–v4) and drops any TX not signed
       // by a trusted owner or that fails to decrypt.
       const { notes: remoteNotes, safeboxEntries: remoteSafebox, incomplete } = await fetchAllNotes(
@@ -2359,7 +2396,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           if (mode === 'restore') setRestoreProgress({ done, total });
           else setUpdateCheck({ status: 'checking', progress: { done, total } });
         },
-        { signal: abort.signal },
+        { signal: abort.signal, known },
       );
       if (vaultEpochRef.current !== myEpoch) return; // locked mid-sweep — publish nothing
 
@@ -2473,6 +2510,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           partial: incomplete,
         });
       }
+
+      // §6.2г: успешная ПОЛНАЯ сверка продвигает метку — включая restore (это
+      // та же полная сверка, заставлять следующую проверку снова быть полной
+      // нет причин). `incomplete` метку НЕ продвигает: частичная полная сверка
+      // полной не считается. Проверка поколения — синхронно перед записью, по
+      // той же дисциплине, что mergeRestoredNote: иначе ключ воскреснет в
+      // только что очищенной базе.
+      const wasFull = mode === 'restore' || opts.full === true;
+      if (wasFull && !incomplete) {
+        if (getDbGeneration() !== myDbGen) return; // ничего не await'ится до setMeta
+        await setMeta('sweep-full-at', Date.now());
+      }
     } catch (err) {
       // A wipe is not a failed sweep: the merge refused to write because the
       // database this run belonged to no longer exists. Stand down silently,
@@ -2523,7 +2572,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (restoringRef.current) return; // a sweep is already running
     restoringRef.current = true;
     try {
-      await runArweaveSweep('check');
+      // Суточная страховочная сверка (§6.2в): метка старше суток (или битая —
+      // sanitizeFullSweepAt читает её как unknown и отбрасывает всё, кроме
+      // конечного целого в допустимом диапазоне) → проверка идёт полной.
+      // Ошибка данных обязана давать ЛИШНЮЮ полную сверку, а не отключить её.
+      const lastFull = sanitizeFullSweepAt(await getMeta('sweep-full-at'), Date.now());
+      await runArweaveSweep('check', { full: Date.now() - lastFull > FULL_SWEEP_MAX_AGE_MS });
     } finally {
       restoringRef.current = false;
     }
