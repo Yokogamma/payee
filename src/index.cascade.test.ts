@@ -126,14 +126,22 @@ describe('base layer, as the browser resolves it', () => {
       ['.md-img-chip', '.note-text'],
     ]);
 
-    /** Declared px size of a selector, or null if it is not a plain px rule. */
-    const declaredPx = (selector: string): number | null => {
-      for (const r of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-        if (r[1].trim().replace(/\s+/g, ' ') !== selector) continue;
-        const d = r[2].match(/font-size:\s*([0-9.]+)px/);
-        if (d) return parseFloat(d[1]);
-      }
-      return null;
+    /**
+     * Parent size through the REAL cascade, not through the first matching
+     * declaration in the file.
+     *
+     * `declaredPx()` used to walk the stylesheet text and return the first
+     * `.note-text { font-size: … }` it found. That resolves the case where
+     * someone EDITS the existing rule, and misses the one where someone ADDS a
+     * later one — which is the ordering trap this stylesheet has already
+     * sprung three times. jsdom has the cascade mounted a few lines up; asking
+     * it costs nothing and cannot disagree with the browser.
+     */
+    const cascadedPx = (selector: string): number | null => {
+      const cls = selector.startsWith('.') ? selector.slice(1) : null;
+      if (!cls) return null; // only simple class parents are supported
+      const px = parseFloat(resolved(cls, 'font-size'));
+      return Number.isFinite(px) ? px : null;
     };
 
     const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
@@ -141,8 +149,22 @@ describe('base layer, as the browser resolves it', () => {
     for (const m of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
       const selector = m[1].trim().replace(/\s+/g, ' ');
       if (selector.startsWith('@')) continue;
-      const decl = m[2].match(/font-size:\s*([0-9.]+)(px|rem|em|%)/);
-      if (!decl) continue;
+
+      // EVERY font-size has to be understood. The previous version matched
+      // `px|rem|em|%` and let everything else fall through the `continue`
+      // below — so `calc()`, `var()`, `clamp()` and the keywords would have
+      // passed unseen, which is the same silent gap as the unresolved `em`.
+      const anySize = m[2].match(/(?:^|;)\s*font-size:\s*([^;]+)/);
+      if (!anySize) continue;
+      // `!important` is a valid form and the scan found a real one on its first
+      // run — `.invite-btn` carries it. Stripped, not reported: the flag
+      // changes who wins, not what the size is.
+      const value = anySize[1].replace(/!important/i, '').trim();
+      const decl = value.match(/^([0-9.]+)(px|rem|em|%)$/);
+      if (!decl) {
+        offenders.push(`  ${selector} → font-size: ${value} — форма не разбирается, размер не проверен`);
+        continue;
+      }
 
       if (decl[2] === 'em' || decl[2] === '%') {
         const parent = RELATIVE_PARENT.get(selector);
@@ -150,9 +172,9 @@ describe('base layer, as the browser resolves it', () => {
           offenders.push(`  ${selector} → ${decl[1]}${decl[2]} — относительный размер без объявленного родителя`);
           continue;
         }
-        const base = declaredPx(parent);
+        const base = cascadedPx(parent);
         if (base === null) {
-          offenders.push(`  ${selector} → родитель ${parent} не задаёт font-size в px, разрешить нечем`);
+          offenders.push(`  ${selector} → родитель ${parent} не разрешается в px, считать не от чего`);
           continue;
         }
         const factor = decl[2] === '%' ? parseFloat(decl[1]) / 100 : parseFloat(decl[1]);
@@ -205,6 +227,25 @@ describe('base layer, as the browser resolves it', () => {
     expect(resolved('composer-toolbar-scroll', 'overflow-x')).toBe('auto');
     expect(resolved('composer-tool', 'height')).toBe('38px');
     expect(declaresIn('.composer-tool::after', /inset:\s*-3px/)).toBe(true);
+  });
+
+  it('the toolbar fade never reaches the last button or its focus ring', () => {
+    // The fix could be undone by editing either number, and nothing here
+    // noticed: the mask dims the trailing N px of the box, so the scroller's
+    // trailing padding has to exceed the fade by at least the focus ring —
+    // measured at ~5px in a browser (2.7px outline + 2px offset). At 25px the
+    // ring's outer edge landed exactly on the gradient's start.
+    const RING = 5;
+    const fade = Number(CSS.match(/mask-image:[^;]*calc\(100% - (\d+)px\)/)?.[1]);
+    const pad = parseFloat(resolved('composer-toolbar-scroll', 'padding-right'));
+
+    expect(fade, 'ширина затухания не найдена в маске').toBeGreaterThan(0);
+    expect(pad, 'хвостовой отступ скроллера не задан').toBeGreaterThan(0);
+    expect(
+      pad,
+      `хвостовой отступ ${pad}px не перекрывает затухание ${fade}px плюс кольцо фокуса ${RING}px — ` +
+        'последняя кнопка на конце прокрутки окажется полупрозрачной',
+    ).toBeGreaterThanOrEqual(fade + RING);
   });
 
   it('composing collapses the grid instead of layering over the privacy gate', () => {

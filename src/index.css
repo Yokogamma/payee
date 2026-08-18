@@ -2047,7 +2047,7 @@ mark {
    this way» — spotted on a 375px screenshot, where the clipped bracket looked
    like a rendering fault.
    The mask is unconditional in BOTH directions — at rest and at scroll-end —
-   which is safe only because the scroller carries 25px of trailing padding
+   which is safe only because the scroller carries 30px of trailing padding
    (see above) and «Превью» is pinned OUTSIDE it. Take either away and this
    rule starts dimming a real control. */
 .composer-toolbar-scroll {
