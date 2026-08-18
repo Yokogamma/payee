@@ -1795,24 +1795,29 @@ mark {
 
 /* ─── Global toast ──────────────────────────────────────────── */
 
-/* CENTRED BY MARGINS, not by `left: 50%` + a transform.
-   The old pair centred it visually and lied about its width: a fixed box with
-   `left: 50%` gets only the half-viewport to its right to lay out in, so
-   shrink-to-fit resolved to MIN-CONTENT and the declared `max-width` never
-   applied. On a 375px phone the toast came out 275px wide instead of 345 —
-   «Доступна новая версия приложения» broke across three lines and «Обновить»
-   was squeezed to a 59px box around a 67px label, so its own border ran
-   through the middle of the word. Reported from a phone; measured here.
-   `left/right: 0` gives the box the whole viewport to fit into, `width:
-   fit-content` keeps it hugging its content, and `margin-inline: auto` does
-   the centring. */
+/* IN THE GRID, not floating over the viewport.
+   Two defects, one cause. It was `position: fixed; left: 50%` +
+   `translateX(-50%)`, which centres VISUALLY and lies about width: a fixed box
+   anchored at the midpoint has only the right half of the viewport to lay out
+   in, so shrink-to-fit resolved to MIN-CONTENT and the declared `max-width`
+   never applied. On a 390px phone that gave a 275px toast instead of 345 —
+   «Доступна новая версия приложения» over three lines and «Обновить» squeezed
+   into a 57px box around 79px of label, 22px of the word drawn outside its own
+   border. And being fixed to the viewport, it also sat squarely ON TOP of the
+   bottom navigation, which for a toast that waits for a press rather than
+   fading is simply covering the way out.
+   `.main-screen` already has a `content` area, and it is the one area that
+   exists in ALL FOUR of its grid states (mobile, composing, ≥768px rail, and
+   ≥768px composing — checked). Placing the toast there puts it above the nav
+   on a phone and at the foot of the screen everywhere the nav is not below it,
+   with no nav-height constant to keep in sync. It shares the cell with
+   `.main-content`, so it still floats over the feed rather than pushing it. */
 .toast {
-  position: fixed;
-  left: 0;
-  right: 0;
+  grid-area: content;
+  align-self: end;
+  justify-self: center;
   width: fit-content;
-  margin-inline: auto;
-  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  margin-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   max-width: min(92vw, 560px);
   display: flex;
   align-items: center;

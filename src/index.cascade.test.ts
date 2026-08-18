@@ -431,12 +431,28 @@ describe('base layer, as the browser resolves it', () => {
     // приложения» broken over three lines, and «Обновить» squeezed into a
     // 57px box around 79px of label — 22px of the word drawn OUTSIDE its own
     // border, because nothing clips it.
+    // Being fixed to the viewport also put it ON TOP of the bottom navigation
+    // — for a toast that waits to be pressed rather than fading, that is
+    // covering the way out. It lives in the grid's `content` area now, which
+    // is the ONE area present in all four of `.main-screen`'s grid states, so
+    // «above the nav» needs no nav-height constant to drift out of sync.
+    expect(declaresIn('.toast', /position:\s*fixed/)).toBe(false);
     expect(declaresIn('.toast', /left:\s*50%/)).toBe(false);
     expect(declaresIn('.toast', /transform:\s*translateX/)).toBe(false);
-    expect(declaresIn('.toast', /left:\s*0/)).toBe(true);
-    expect(declaresIn('.toast', /right:\s*0/)).toBe(true);
-    expect(declaresIn('.toast', /margin-inline:\s*auto/)).toBe(true);
+    expect(resolved('toast', 'grid-area')).toContain('content');
+    expect(resolved('toast', 'align-self')).toBe('end');
+    expect(resolved('toast', 'justify-self')).toBe('center');
     expect(resolved('toast', 'width')).toBe('fit-content');
+
+    // The area the toast is placed into has to exist in EVERY grid state, or
+    // it silently falls back to auto-placement and lands in a row of its own,
+    // pushing the feed instead of floating over it.
+    const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+    const areaBlocks = [...clean.matchAll(/grid-template-areas:\s*([^;]+);/g)].map(m => m[1]);
+    expect(areaBlocks.length, 'grid-template-areas не найдены').toBeGreaterThan(0);
+    for (const decl of areaBlocks) {
+      expect(decl, `в состоянии сетки ${decl.trim()} нет области content`).toContain('content');
+    }
 
     // And the second half: a control may not shrink below its own label. This
     // button lives in flex rows next to text that will happily take the room.
