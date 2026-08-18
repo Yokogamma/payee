@@ -7,7 +7,7 @@ import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
-import { IconClose, IconRestore } from './icons';
+import { IconClose, IconRestore, InfinityMark } from './icons';
 
 /**
  * Version history of one chain (current-first). Versions are numbered by
@@ -108,6 +108,7 @@ export function VersionHistoryModal({
                       title={badge.label}
                       aria-label={badge.label}
                     >
+                      {badge.permanent && <InfinityMark />}
                       {badge.word}
                     </span>
                   </span>

@@ -229,6 +229,26 @@ describe('base layer, as the browser resolves it', () => {
     expect(declaresIn('.composer-tool::after', /inset:\s*-3px/)).toBe(true);
   });
 
+  it('очистка поиска держит 44px касания, не занимая высоту строки', () => {
+    // Кнопка МОНТИРУЕТСЯ ВМЕСТЕ С ЗАПРОСОМ, поэтому её высота становится
+    // высотой строки поиска ровно в момент набора. При литеральных 44px строка
+    // росла 45.5 → 64.9 (замер в браузере на 390px): поле уезжало вниз из-под
+    // пальца, который в него печатал. Порог касания жив, он в ::after.
+    const h = parseFloat(resolved('search-clear', 'height'));
+    expect(h, 'у .search-clear нет собственной коробки').toBeGreaterThan(0);
+    expect(
+      h,
+      `видимая коробка ${h}px — всё, что выше строчного бокса поля, снова сдвинет строку`,
+    ).toBeLessThanOrEqual(24);
+
+    // min-height здесь опаснее height: он переживает любую правку height.
+    const minH = parseFloat(resolved('search-clear', 'min-height')) || 0;
+    expect(minH, `min-height: ${minH}px вернёт тот же скачок`).toBeLessThanOrEqual(h);
+
+    // 24 + 2 × 10 = 44.
+    expect(declaresIn('.search-clear::after', /inset:\s*-10px/)).toBe(true);
+  });
+
   it('the toolbar fade never reaches the last button or its focus ring', () => {
     // The fix could be undone by editing either number, and nothing here
     // noticed: the mask dims the trailing N px of the box, so the scroller's
