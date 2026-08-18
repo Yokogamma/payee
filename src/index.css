@@ -1488,8 +1488,10 @@ h1 {
   }
 }
 
-/* Touch targets ≥44px for the small inline controls. */
-.search-clear,
+/* Touch targets ≥44px for the small inline controls.
+   `.search-clear` used to be here and is NOT any more — see its own rule
+   below. A banner button sits on a row of its own, so a literal 44px box
+   costs nothing; the search row is a different situation entirely. */
 .banner-btn {
   min-height: 44px;
   min-width: 44px;
@@ -1509,17 +1511,29 @@ h1 {
   background: var(--accent-glow);
 }
 
+/* 24px BOX, 44px TARGET — the same split as `.status-btn` and for the same
+   reason, one row down.
+   This button MOUNTS WITH THE QUERY, so its height is the search row's height
+   the instant a user starts typing. At a literal 44px the row went 45.5 → 64.9
+   (measured, 390px wide): the field jumped 19px down under the thumb that was
+   still typing into it, and everything below it lurched. The touch floor is
+   unchanged — it lives in an overlay that takes no space in the flex row. */
 .search-clear {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
   border: none;
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
   font-size: 14px;
-  padding: 6px 8px;
-  /* a11y: this rule comes AFTER the Phase-7 block — keep ≥44px here too */
-  min-height: 44px;
-  min-width: 44px;
 }
+/* (44 - 24) / 2 */
+.search-clear::after { content: ''; position: absolute; inset: -10px; }
 
 .search-clear:hover { color: var(--text); }
 

@@ -142,7 +142,15 @@ describe('Main W3 — markdown rendering', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(document.querySelector('.note-md')).toBeNull(); // markdown off
     expect(document.querySelector('mark')?.textContent).toBe('жирный');
-    expect(document.querySelector('.note-text')?.textContent).toContain('**жирный**'); // raw markdown text
+
+    // …but PLAIN text, not SOURCE. This line used to assert `**жирный**` —
+    // it was describing the bug rather than guarding against it, and the
+    // asterisks reached a real phone: typing a query turned every markdown
+    // note in the feed into its own syntax. The markers are stripped for
+    // display only; the stored note is untouched.
+    const shown = document.querySelector('.note-text')?.textContent ?? '';
+    expect(shown).toContain('жирный');
+    expect(shown, 'разметка не должна показываться читателю').not.toMatch(/[*#`]/);
   });
 
   it('a plain-fmt current version renders as text even without a query', () => {

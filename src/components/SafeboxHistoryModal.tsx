@@ -6,7 +6,7 @@ import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { SafeboxChain } from '../lib/chains';
 import type { SafeboxEntryData } from '../lib/crypto';
-import { IconClose, IconEye, IconRestore } from './icons';
+import { IconClose, IconEye, IconRestore, InfinityMark } from './icons';
 
 /**
  * Version history of one safebox entry (current-first), mirroring
@@ -124,6 +124,7 @@ export function SafeboxHistoryModal({
                   <span className="history-row-meta">
                     <span className="note-time">{formatNoteDate(version.createdAt)}</span>
                     <span className={`state sync-state ${badge.className}`} title={badge.label} aria-label={badge.label}>
+                      {badge.permanent && <InfinityMark />}
                       {badge.word}
                     </span>
                   </span>

@@ -11,6 +11,7 @@ import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate } from '../lib/format-date';
+import { stripMarkdown } from '../lib/strip-markdown';
 import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
@@ -545,9 +546,19 @@ export function Main({ theme, onThemeChange }: MainProps) {
                     sentence. */}
                 <div className="note-date section-label">{formatNoteDate(note.createdAt)}</div>
                 <div className={`note-text ${clamped ? 'note-text--clamped' : ''}`}>
+                  {/* While a query is active the card renders PLAIN text so the
+                      matches can be wrapped in <mark> — but a markdown note's
+                      plain text is its SOURCE, and typing a query turned
+                      «Первая мадаун **заметка**» into exactly that on screen.
+                      The markers are stripped for display; the note itself is
+                      untouched. Only `fmt: 'md'` is stripped, so a plain note
+                      that really contains asterisks keeps them. */}
                   {note.fmt === 'md' && !searchQuery.trim()
                     ? <NoteMarkdown text={note.text} />
-                    : highlight(note.text, searchQuery)}
+                    : highlight(
+                        note.fmt === 'md' ? stripMarkdown(note.text) : note.text,
+                        searchQuery,
+                      )}
                 </div>
                 {long && (
                   <button className="note-expand-btn" onClick={() => toggleExpanded(chain.root)}>
