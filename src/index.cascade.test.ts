@@ -150,16 +150,16 @@ describe('base layer, as the browser resolves it', () => {
       const selector = m[1].trim().replace(/\s+/g, ' ');
       if (selector.startsWith('@')) continue;
 
-      // EVERY font-size has to be understood. The previous version matched
-      // `px|rem|em|%` and let everything else fall through the `continue`
-      // below — so `calc()`, `var()`, `clamp()` and the keywords would have
-      // passed unseen, which is the same silent gap as the unresolved `em`.
       // EVERY declaration in the block, then the one the browser actually
       // applies. Reading only the first left `.x { font-size:16px;
       // font-size:10px }` green while the page rendered 10px — a guard that
       // reports the losing value is worse than no guard, because it reads as
       // coverage. Later wins; an `!important` beats every plain one, and among
       // `!important`s the last still wins.
+      //
+      // And every FORM has to be understood too: anything that is not a plain
+      // `px|rem|em|%` is reported below rather than skipped, so `calc()`,
+      // `var()`, `clamp()` and the keywords cannot pass unseen.
       const all = [...m[2].matchAll(/(?:^|;)\s*font-size:\s*([^;]+)/g)].map(d => d[1].trim());
       if (all.length === 0) continue;
       const important = all.filter(v => /!important/i.test(v));
