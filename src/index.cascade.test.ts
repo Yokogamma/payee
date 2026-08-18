@@ -422,6 +422,27 @@ describe('base layer, as the browser resolves it', () => {
     ).toBe(false);
   });
 
+  it('a toast is centred by margins, and its buttons keep their own width', () => {
+    // `left: 50%` + `translateX(-50%)` centred the toast visually and lied
+    // about its width: a fixed box anchored at the midpoint has only the right
+    // HALF of the viewport to lay out in, so shrink-to-fit resolved to
+    // min-content and the declared max-width never applied. Measured on a
+    // 390px phone: toast 275px instead of 345, «Доступна новая версия
+    // приложения» broken over three lines, and «Обновить» squeezed into a
+    // 57px box around 79px of label — 22px of the word drawn OUTSIDE its own
+    // border, because nothing clips it.
+    expect(declaresIn('.toast', /left:\s*50%/)).toBe(false);
+    expect(declaresIn('.toast', /transform:\s*translateX/)).toBe(false);
+    expect(declaresIn('.toast', /left:\s*0/)).toBe(true);
+    expect(declaresIn('.toast', /right:\s*0/)).toBe(true);
+    expect(declaresIn('.toast', /margin-inline:\s*auto/)).toBe(true);
+    expect(resolved('toast', 'width')).toBe('fit-content');
+
+    // And the second half: a control may not shrink below its own label. This
+    // button lives in flex rows next to text that will happily take the room.
+    expect(declaresIn('.banner-btn', /flex:\s*none/)).toBe(true);
+  });
+
   it('the status refresh is the mockup ring, not a square', () => {
     expect(resolved('status-btn', 'width')).toBe('36px');
     expect(resolved('status-btn', 'border-radius')).toBe('50%');

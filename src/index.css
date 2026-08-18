@@ -1418,6 +1418,13 @@ h1 {
   background: transparent;
   color: inherit;
   cursor: pointer;
+  /* NEVER narrower than its own label. Flex items shrink by default, and this
+     button sits in rows — the toast, the status line, the error banners —
+     where the text beside it is happy to take the space. Nothing clips the
+     overflow, so shrinking did not truncate the word, it drew the border
+     through it. A control that cannot contain its own name is broken however
+     little room is left; the text next to it is what should wrap. */
+  flex: none;
 }
 
 /* Was a white wash at 6% — invisible on paper and a grey haze on the ink
@@ -1788,10 +1795,23 @@ mark {
 
 /* ─── Global toast ──────────────────────────────────────────── */
 
+/* CENTRED BY MARGINS, not by `left: 50%` + a transform.
+   The old pair centred it visually and lied about its width: a fixed box with
+   `left: 50%` gets only the half-viewport to its right to lay out in, so
+   shrink-to-fit resolved to MIN-CONTENT and the declared `max-width` never
+   applied. On a 375px phone the toast came out 275px wide instead of 345 —
+   «Доступна новая версия приложения» broke across three lines and «Обновить»
+   was squeezed to a 59px box around a 67px label, so its own border ran
+   through the middle of the word. Reported from a phone; measured here.
+   `left/right: 0` gives the box the whole viewport to fit into, `width:
+   fit-content` keeps it hugging its content, and `margin-inline: auto` does
+   the centring. */
 .toast {
   position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 0;
+  right: 0;
+  width: fit-content;
+  margin-inline: auto;
   bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   max-width: min(92vw, 560px);
   display: flex;
