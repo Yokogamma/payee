@@ -9,10 +9,11 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
+import { SyncStateBadge } from '../components/SyncStateBadge';
 import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate } from '../lib/format-date';
-import { stripMarkdown } from '../lib/strip-markdown';
-import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
+import { noteSearchText } from '../lib/note-search-text';
+import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -550,15 +551,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       matches can be wrapped in <mark> — but a markdown note's
                       plain text is its SOURCE, and typing a query turned
                       «Первая мадаун **заметка**» into exactly that on screen.
-                      The markers are stripped for display; the note itself is
-                      untouched. Only `fmt: 'md'` is stripped, so a plain note
-                      that really contains asterisks keeps them. */}
+                      `noteSearchText` is what the STORE filtered on, so what is
+                      highlighted here is exactly what was matched there; the
+                      stored note is untouched either way. */}
                   {note.fmt === 'md' && !searchQuery.trim()
                     ? <NoteMarkdown text={note.text} />
-                    : highlight(
-                        note.fmt === 'md' ? stripMarkdown(note.text) : note.text,
-                        searchQuery,
-                      )}
+                    : highlight(noteSearchText(note), searchQuery)}
                 </div>
                 {long && (
                   <button className="note-expand-btn" onClick={() => toggleExpanded(chain.root)}>
@@ -573,26 +571,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
                   {/* No `info &&` guard: `info` falls back to
                       `{ status: 'queued' }` above, so the condition was always
                       true and read as if a card could have no sync state. */}
-                  {info.status === 'error' && arweave.enabled && arweave.registered ? (
-                      <button
-                        className={`state sync-state ${badge.className}`}
-                        onClick={retrySync}
-                        title={badge.label}
-                        aria-label={badge.label}
-                      >
-                        {badge.word} · повторить
-                      </button>
-                    ) : (
-                      <span
-                        className={`state sync-state ${badge.className}`}
-                        title={badge.label}
-                        role="status"
-                        aria-label={badge.label}
-                      >
-                        {badge.permanent && <InfinityMark />}
-                        {badge.word}
-                      </span>
-                    )}
+                  <SyncStateBadge
+                    badge={badge}
+                    onRetry={
+                      info.status === 'error' && arweave.enabled && arweave.registered
+                        ? retrySync
+                        : undefined
+                    }
+                  />
                   {chain.versions.length > 1 && (
                     <span className="state state--quiet">
                       {chain.versions.length}-я версия

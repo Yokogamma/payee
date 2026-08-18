@@ -55,6 +55,7 @@ import {
   type SafeboxSecretData,
 } from './crypto';
 import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } from './chains';
+import { noteSearchText } from './note-search-text';
 import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from './flags';
 import {
   isNoteTooLong,
@@ -3647,10 +3648,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // array identity on every provider render while a query is active,
   // invalidating the L4 context-value memo below on renders that changed
   // nothing else.
+  // `noteSearchText`, NOT `n.text` — the feed highlights matches in the same
+  // string, and reading the raw markdown here made the two disagree: a note
+  // rendering as «до важное» was unfindable by that phrase, and a query that
+  // hit only a link's URL returned a card with nothing marked in it.
   const filteredNotes = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return notes;
-    return notes.filter(n => n.text.toLowerCase().includes(q));
+    return notes.filter(n => noteSearchText(n).toLowerCase().includes(q));
   }, [notes, searchQuery]);
 
   // Reader view: ALWAYS derived, at both flag values (see NotesStore.chains).
@@ -3660,7 +3665,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const filteredChains = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return chains;
-    return chains.filter(c => c.current.text.toLowerCase().includes(q));
+    return chains.filter(c => noteSearchText(c.current).toLowerCase().includes(q));
   }, [chains, searchQuery]);
 
   // Safebox chains, grouped over the AUTHENTICATED envelope fields. Search is
