@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import { useNotes } from '../lib/store';
 import { SAFEBOX_WRITER_ENABLED } from '../lib/flags';
 import { badgeFor } from './syncBadge';
+import { SyncStateBadge } from './SyncStateBadge';
 import { CardMenu } from './CardMenu';
-import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, IconVault, InfinityMark } from './icons';
+import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, IconVault } from './icons';
 import { SafeboxPinPad } from './SafeboxPinPad';
 import { SafeboxActivation, SafeboxSeedReset } from './SafeboxActivation';
 import { SafeboxEntryForm } from './SafeboxEntryForm';
@@ -223,21 +224,10 @@ export function SafeboxSection() {
                     ровно то же состояние — кнопка «повторить». Один и тот же
                     syncBadge на двух списках должен давать и одинаковые
                     возможности, а не только одинаковые слова. */}
-                {info.status === 'error' && syncActive ? (
-                  <button
-                    className={`state sync-state ${badge.className}`}
-                    onClick={retrySync}
-                    title={badge.label}
-                    aria-label={badge.label}
-                  >
-                    {badge.word} · повторить
-                  </button>
-                ) : (
-                  <span className={`state sync-state ${badge.className}`} title={badge.label} role="status" aria-label={badge.label}>
-                    {badge.permanent && <InfinityMark />}
-                    {badge.word}
-                  </span>
-                )}
+                <SyncStateBadge
+                  badge={badge}
+                  onRetry={info.status === 'error' && syncActive ? retrySync : undefined}
+                />
               </div>
               {entry.url && <div className="safebox-card-url">{entry.url}</div>}
 

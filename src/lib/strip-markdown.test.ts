@@ -29,11 +29,12 @@ describe('stripMarkdown — блочные конструкции', () => {
 
   it('цитата и горизонтальная линия', () => {
     expect(stripMarkdown('> цитата')).toBe('цитата');
-    expect(stripMarkdown('текст\n---\nещё')).toBe('текст\n\nещё');
+    // Разделитель не оставляет за собой пустой строки: на карточке его нет.
+    expect(stripMarkdown('текст\n---\nещё')).toBe('текст\nещё');
   });
 
   it('ограждённый блок кода теряет забор, но не содержимое', () => {
-    expect(stripMarkdown('```js\nconst x = 1;\n```')).toBe('const x = 1;\n');
+    expect(stripMarkdown('```js\nconst x = 1;\n```')).toBe('const x = 1;');
   });
 });
 
@@ -59,12 +60,18 @@ describe('stripMarkdown — буквальный текст неприкосно
   });
 
   it('внутри ограждённого блока — тоже', () => {
-    expect(stripMarkdown('```\n**literal**\n```')).toBe('**literal**\n');
+    expect(stripMarkdown('```\n**literal**\n```')).toBe('**literal**');
   });
 
   it('закрывающий забор должен совпадать с открывающим', () => {
     // ``` внутри ~~~ не закрывает блок.
-    expect(stripMarkdown('~~~\n```\n**x**\n~~~')).toBe('```\n**x**\n');
+    expect(stripMarkdown('~~~\n```\n**x**\n~~~')).toBe('```\n**x**');
+  });
+
+  it('забор из четырёх кавычек не закрывается внутренним из трёх', () => {
+    // Ровно для этого его и пишут длиннее. Regex-версия закрывала блок на
+    // внутреннем заборе, и защищаемый им **x** всё-таки снимался.
+    expect(stripMarkdown('````\n```\n**x**\n```\n````')).toBe('```\n**x**\n```');
   });
 
   it('двойные обратные кавычки — один span, а не два', () => {
@@ -89,6 +96,42 @@ describe('stripMarkdown — буквальный текст неприкосно
   });
 });
 
+// Всё в этом блоке regex-версия не умела, и каждый пункт был виден на карточке
+// либо, хуже того, попадал в корпус поиска как текст, которого на экране нет.
+describe('stripMarkdown — GFM и то, что достаётся только парсером', () => {
+  it('reference link: скобки уходят, адрес в корпус не попадает', () => {
+    const note = 'см. [документацию][doc] тут\n\n[doc]: https://example.invalid/secret';
+    expect(stripMarkdown(note)).toBe('см. документацию тут');
+  });
+
+  it('reference image берёт подпись, как и чип на карточке', () => {
+    expect(stripMarkdown('![схема][s]\n\n[s]: https://example.invalid/i.png')).toBe('схема');
+  });
+
+  it('картинка без подписи называется так же, как чип', () => {
+    // NoteMarkdown рисует «изображение», когда alt пуст.
+    expect(stripMarkdown('![](https://example.invalid/i.png)')).toBe('изображение');
+  });
+
+  it('чек-лист не показывает [x] и [ ]', () => {
+    expect(stripMarkdown('- [x] куплено\n- [ ] нет')).toBe('куплено\nнет');
+  });
+
+  it('таблица теряет трубы и разделители, но не ячейки', () => {
+    const table = '| имя | цена |\n| --- | --- |\n| хлеб | 50 |';
+    expect(stripMarkdown(table)).toBe('имя цена\nхлеб 50');
+  });
+
+  it('сырой HTML не попадает в корпус — он и не рисуется', () => {
+    // NoteMarkdown идёт со skipHtml.
+    expect(stripMarkdown('текст <b>жирный</b> дальше')).toBe('текст жирный дальше');
+  });
+
+  it('автоссылка GFM оставляет только видимый адрес', () => {
+    expect(stripMarkdown('пиши на https://example.invalid/x')).toBe('пиши на https://example.invalid/x');
+  });
+});
+
 describe('stripMarkdown — что трогать НЕЛЬЗЯ', () => {
   it('обычный текст не меняется', () => {
     const text = 'Просто заметка без разметки. Цена 5 * 3 рубля.';
@@ -107,6 +150,7 @@ describe('stripMarkdown — что трогать НЕЛЬЗЯ', () => {
 
   it('пустая строка и строка из пробелов', () => {
     expect(stripMarkdown('')).toBe('');
-    expect(stripMarkdown('   ')).toBe('   ');
+    // Заметка из одних пробелов не рисует ничего — корпус тоже пуст.
+    expect(stripMarkdown('   ')).toBe('');
   });
 });

@@ -9,10 +9,11 @@ import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
+import { SyncStateBadge } from '../components/SyncStateBadge';
 import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate } from '../lib/format-date';
 import { noteSearchText } from '../lib/note-search-text';
-import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
+import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -570,26 +571,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
                   {/* No `info &&` guard: `info` falls back to
                       `{ status: 'queued' }` above, so the condition was always
                       true and read as if a card could have no sync state. */}
-                  {info.status === 'error' && arweave.enabled && arweave.registered ? (
-                      <button
-                        className={`state sync-state ${badge.className} sync-state--retry`}
-                        onClick={retrySync}
-                        title={`${badge.label} — повторить`}
-                        aria-label={`${badge.label} — повторить`}
-                      >
-                        {badge.word} · повторить
-                      </button>
-                    ) : (
-                      <span
-                        className={`state sync-state ${badge.className}`}
-                        title={badge.label}
-                        role="status"
-                        aria-label={badge.label}
-                      >
-                        {badge.permanent && <InfinityMark />}
-                        {badge.word}
-                      </span>
-                    )}
+                  <SyncStateBadge
+                    badge={badge}
+                    onRetry={
+                      info.status === 'error' && arweave.enabled && arweave.registered
+                        ? retrySync
+                        : undefined
+                    }
+                  />
                   {chain.versions.length > 1 && (
                     <span className="state state--quiet">
                       {chain.versions.length}-я версия
