@@ -52,6 +52,43 @@ describe('stripMarkdown — ссылки', () => {
   });
 });
 
+describe('stripMarkdown — буквальный текст неприкосновенен', () => {
+  it('внутри code span разметка НЕ обрабатывается', () => {
+    // Заметка, объясняющая markdown, — самый обычный случай.
+    expect(stripMarkdown('пиши `*literal*` для курсива')).toBe('пиши *literal* для курсива');
+  });
+
+  it('внутри ограждённого блока — тоже', () => {
+    expect(stripMarkdown('```\n**literal**\n```')).toBe('**literal**\n');
+  });
+
+  it('закрывающий забор должен совпадать с открывающим', () => {
+    // ``` внутри ~~~ не закрывает блок.
+    expect(stripMarkdown('~~~\n```\n**x**\n~~~')).toBe('```\n**x**\n');
+  });
+
+  it('двойные обратные кавычки — один span, а не два', () => {
+    expect(stripMarkdown('``a`b`` конец')).toBe('a`b конец');
+  });
+
+  it('экранированная звёздочка остаётся звёздочкой без обратного слэша', () => {
+    expect(stripMarkdown('\\*literal\\*')).toBe('*literal*');
+  });
+
+  it('экранированное подчёркивание не разваливает слово', () => {
+    expect(stripMarkdown('snake\\_case')).toBe('snake_case');
+  });
+
+  it('скобки в адресе ссылки не оставляют хвоста', () => {
+    expect(stripMarkdown('[видимый](https://ru.wikipedia.org/wiki/Ключ_(значения))'))
+      .toBe('видимый');
+  });
+
+  it('незакрытый забор всё же убирается', () => {
+    expect(stripMarkdown('```js\nconst x = 1;')).toBe('const x = 1;');
+  });
+});
+
 describe('stripMarkdown — что трогать НЕЛЬЗЯ', () => {
   it('обычный текст не меняется', () => {
     const text = 'Просто заметка без разметки. Цена 5 * 3 рубля.';

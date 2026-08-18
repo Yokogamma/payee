@@ -20,19 +20,30 @@ vi.mock('../lib/theme', () => ({ useTheme: () => ['system', vi.fn()] }));
 import { Main } from './Main';
 import { resetRoute } from '../test-stubs/route-reset';
 import { groupChains } from '../lib/chains';
+import { noteSearchText } from '../lib/note-search-text';
 import type { NoteData } from '../lib/crypto';
 
 function note(over: Partial<NoteData> & { id: string; text: string }): NoteData {
   return { createdAt: Date.now() - 60_000, fmt: 'md', rev: 1, root: over.id, ...over };
 }
 
-function makeStore(notes: NoteData[]) {
+// `filteredChains` used to be handed in as the FULL list whatever the query
+// was, so this matrix could not have noticed the store filtering on raw
+// markdown while the card printed stripped text. It mirrors the real filter in
+// store.tsx now — same helper, same comparison.
+function applyQuery<T extends { text: string; fmt?: string }>(items: T[], query: string): T[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return items;
+  return items.filter(n => noteSearchText(n).toLowerCase().includes(q));
+}
+
+function makeStore(notes: NoteData[], searchQuery = '') {
   const chains = groupChains(notes);
   return {
-    filteredNotes: notes,
+    filteredNotes: applyQuery(notes, searchQuery),
     notes,
     chains,
-    filteredChains: chains,
+    filteredChains: chains.filter(c => applyQuery([c.current], searchQuery).length > 0),
     v3Paused: false,
     v4Paused: false,
     resumeV4Uploads: vi.fn(async () => {}),
@@ -61,7 +72,7 @@ function makeStore(notes: NoteData[]) {
     copySafeboxPassword: vi.fn(async () => true),
     downloadSafeboxAttachment: vi.fn(async () => {}),
     isEncrypting: false,
-    searchQuery: '',
+    searchQuery,
     addNote: vi.fn(async () => {}),
     editNote: vi.fn(async () => {}),
     resumeV3Uploads: vi.fn(async () => {}),
@@ -138,7 +149,7 @@ describe('Main W3 — markdown rendering', () => {
   });
 
   it('falls back to PLAIN text with <mark> while a search query is active', () => {
-    (h.store as ReturnType<typeof makeStore>).searchQuery = 'жирный';
+    h.store = makeStore(chainNotes(), 'жирный');
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(document.querySelector('.note-md')).toBeNull(); // markdown off
     expect(document.querySelector('mark')?.textContent).toBe('жирный');
@@ -151,6 +162,25 @@ describe('Main W3 — markdown rendering', () => {
     const shown = document.querySelector('.note-text')?.textContent ?? '';
     expect(shown).toContain('жирный');
     expect(shown, 'разметка не должна показываться читателю').not.toMatch(/[*#`]/);
+  });
+
+  it('фраза через маркер жирности находится и подсвечивается', () => {
+    // Фильтр и подсветка обязаны читать одну строку. Пока фильтр смотрел в
+    // исходник, карточка с «до **важное**» не находилась по «до важное» —
+    // ровно по той фразе, которую пользователь видит на экране.
+    h.store = makeStore([note({ id: 'r2', text: 'до **важное** после' })], 'до важное');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(document.querySelectorAll('.note-card')).toHaveLength(1);
+    expect(document.querySelector('mark')?.textContent).toBe('до важное');
+  });
+
+  it('совпадение в адресе ссылки не даёт карточку без видимой подсветки', () => {
+    h.store = makeStore(
+      [note({ id: 'r3', text: 'см. [документацию](https://example.invalid/secret-path)' })],
+      'secret-path',
+    );
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(document.querySelectorAll('.note-card')).toHaveLength(0);
   });
 
   it('a plain-fmt current version renders as text even without a query', () => {

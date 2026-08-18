@@ -54,6 +54,7 @@ Object.defineProperty(globalThis, 'crypto', {
 });
 
 import { NotesProvider, useNotes, OperationInFlightError } from './store';
+import { noteSearchText } from './note-search-text';
 import {
   initStorage, resetAll, setMeta, saveNote, getAllNotes as getStoredNotes,
   getAllSyncRecords, readV3PauseMeta, getSyncRecord,
@@ -508,5 +509,48 @@ describe('W3: exclusive reset refuses a late v3 pause marker (P1)', () => {
     // Neither the pause marker nor the failure record may haunt the next vault.
     expect(await readV3PauseMeta()).toBeNull();
     expect(await getAllSyncRecords()).toEqual([]);
+  });
+});
+
+// The UI matrix in Main.v3.test.tsx hands the screen a ready-made
+// `filteredChains`, so it can prove what a card RENDERS but never that the
+// store agrees. This block runs the real NotesProvider filter.
+describe('W3: search filters on what the card shows, not on the source', () => {
+  it('a phrase that spans a bold marker is findable — and its markers are gone', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.addNote('до **важное** после'); });
+
+    // On screen the note reads «до важное после»; that is what a user types.
+    await act(async () => { store.setSearchQuery('до важное'); });
+    expect(store.filteredChains).toHaveLength(1);
+
+    // And the string the card highlights is the string that matched.
+    expect(noteSearchText(store.filteredChains[0].current)).toBe('до важное после');
+  });
+
+  it('markup and link targets are NOT searchable — they are not on screen', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.addNote('см. [документацию](https://example.invalid/secret-path)'); });
+
+    // Either of these used to return a card with nothing highlighted in it.
+    await act(async () => { store.setSearchQuery('secret-path'); });
+    expect(store.filteredChains).toHaveLength(0);
+    await act(async () => { store.setSearchQuery('](http'); });
+    expect(store.filteredChains).toHaveLength(0);
+
+    await act(async () => { store.setSearchQuery('документацию'); });
+    expect(store.filteredChains).toHaveLength(1);
+  });
+
+  it('filteredNotes and filteredChains agree', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.addNote('# Заголовок и **текст**'); });
+
+    await act(async () => { store.setSearchQuery('Заголовок и текст'); });
+    expect(store.filteredNotes).toHaveLength(1);
+    expect(store.filteredChains).toHaveLength(1);
   });
 });

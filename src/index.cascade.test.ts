@@ -154,12 +154,20 @@ describe('base layer, as the browser resolves it', () => {
       // `px|rem|em|%` and let everything else fall through the `continue`
       // below — so `calc()`, `var()`, `clamp()` and the keywords would have
       // passed unseen, which is the same silent gap as the unresolved `em`.
-      const anySize = m[2].match(/(?:^|;)\s*font-size:\s*([^;]+)/);
-      if (!anySize) continue;
+      // EVERY declaration in the block, then the one the browser actually
+      // applies. Reading only the first left `.x { font-size:16px;
+      // font-size:10px }` green while the page rendered 10px — a guard that
+      // reports the losing value is worse than no guard, because it reads as
+      // coverage. Later wins; an `!important` beats every plain one, and among
+      // `!important`s the last still wins.
+      const all = [...m[2].matchAll(/(?:^|;)\s*font-size:\s*([^;]+)/g)].map(d => d[1].trim());
+      if (all.length === 0) continue;
+      const important = all.filter(v => /!important/i.test(v));
+      const winner = important.length ? important[important.length - 1] : all[all.length - 1];
       // `!important` is a valid form and the scan found a real one on its first
       // run — `.invite-btn` carries it. Stripped, not reported: the flag
       // changes who wins, not what the size is.
-      const value = anySize[1].replace(/!important/i, '').trim();
+      const value = winner.replace(/!important/i, '').trim();
       const decl = value.match(/^([0-9.]+)(px|rem|em|%)$/);
       if (!decl) {
         offenders.push(`  ${selector} → font-size: ${value} — форма не разбирается, размер не проверен`);
@@ -404,9 +412,19 @@ describe('base layer, as the browser resolves it', () => {
 
   it('sync state is words without a capsule — except the retry, which is a button', () => {
     expect(declaresIn('.sync-state', /border:\s*none/)).toBe(true);
-    // The one status you can press keeps its rule and its touch target.
-    expect(declaresIn('.sync-state--error', /border:\s*1\.5px solid currentColor/)).toBe(true);
-    expect(resolved('state sync-state sync-state--error', 'min-height')).toBe('44px');
+
+    // The button chrome hangs on `--retry`, NOT on `--error`. The error STATE
+    // shows up in three places and only the feed card can act on it: both
+    // history modals render it inside the row's own expand <button>, where a
+    // rule, a pointer cursor and a 44px floor promised a retry that pressing
+    // it could not perform — and made an errored row twice its neighbours'
+    // height into the bargain.
+    expect(declaresIn('.sync-state--retry', /border:\s*1\.5px solid currentColor/)).toBe(true);
+    expect(resolved('state sync-state sync-state--error sync-state--retry', 'min-height')).toBe('44px');
+
+    // The bare state carries colour and nothing else.
+    expect(declaresIn('.sync-state--error', /border|cursor|min-height|padding/)).toBe(false);
+    expect(resolved('state sync-state sync-state--error', 'min-height')).not.toBe('44px');
   });
 
   it('the FAB is the mockup size', () => {

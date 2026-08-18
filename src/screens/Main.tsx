@@ -11,7 +11,7 @@ import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate } from '../lib/format-date';
-import { stripMarkdown } from '../lib/strip-markdown';
+import { noteSearchText } from '../lib/note-search-text';
 import { InfinityMark, IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash } from '../lib/route';
@@ -550,15 +550,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       matches can be wrapped in <mark> — but a markdown note's
                       plain text is its SOURCE, and typing a query turned
                       «Первая мадаун **заметка**» into exactly that on screen.
-                      The markers are stripped for display; the note itself is
-                      untouched. Only `fmt: 'md'` is stripped, so a plain note
-                      that really contains asterisks keeps them. */}
+                      `noteSearchText` is what the STORE filtered on, so what is
+                      highlighted here is exactly what was matched there; the
+                      stored note is untouched either way. */}
                   {note.fmt === 'md' && !searchQuery.trim()
                     ? <NoteMarkdown text={note.text} />
-                    : highlight(
-                        note.fmt === 'md' ? stripMarkdown(note.text) : note.text,
-                        searchQuery,
-                      )}
+                    : highlight(noteSearchText(note), searchQuery)}
                 </div>
                 {long && (
                   <button className="note-expand-btn" onClick={() => toggleExpanded(chain.root)}>
@@ -575,10 +572,10 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       true and read as if a card could have no sync state. */}
                   {info.status === 'error' && arweave.enabled && arweave.registered ? (
                       <button
-                        className={`state sync-state ${badge.className}`}
+                        className={`state sync-state ${badge.className} sync-state--retry`}
                         onClick={retrySync}
-                        title={badge.label}
-                        aria-label={badge.label}
+                        title={`${badge.label} — повторить`}
+                        aria-label={`${badge.label} — повторить`}
                       >
                         {badge.word} · повторить
                       </button>

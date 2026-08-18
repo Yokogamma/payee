@@ -746,7 +746,12 @@ describe('hydration and PIN lifecycle', () => {
 
     // Ten activations with DIFFERENT pins: the raw check must not meter.
     for (let i = 0; i < 10; i++) {
-      await expect(store.activateSafebox(PIN)).resolves.toBeUndefined().catch(() => {});
+      // NOT an assertion. `.catch()` returns a new promise, so the assertion
+      // it was chained onto was never awaited (vitest said so on every run) —
+      // and the catch swallowed its failure anyway, making it dead code that
+      // looked like coverage. What is under test here is the METER, asserted
+      // after the loop; the verdict of any single activation is irrelevant.
+      await store.activateSafebox(PIN).catch(() => {});
       await act(async () => { await store.deactivateSafebox(PIN); });
     }
     expect(await getMeta('pin-attempts')).toBeUndefined();

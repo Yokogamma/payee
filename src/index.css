@@ -1458,8 +1458,17 @@ h1 {
 .sync-state--local { color: var(--text-dim); }
 .sync-state--permanent { color: var(--text); }
 
+/* THE COLOUR ONLY. The error state appears in the feed card AND in both
+   history modals, and only the first of those is a control — inside a modal
+   row it lives within the row's own expand <button>. Giving the state class
+   button chrome dressed all three as pressable, and in the modals it also made
+   an errored row 44px tall while its neighbours were half that. */
 .sync-state--error {
   color: var(--red);
+}
+
+/* Worn by the feed card's retry <button> and nothing else. */
+.sync-state--retry {
   cursor: pointer;
   border: 1.5px solid currentColor;
   border-radius: var(--radius-sm);
@@ -1468,7 +1477,7 @@ h1 {
   min-height: 44px;
 }
 
-.sync-state--error:hover {
+.sync-state--retry:hover {
   background: var(--accent-glow);
 }
 

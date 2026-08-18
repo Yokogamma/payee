@@ -64,6 +64,11 @@ export function VersionHistoryModal({
   if (!open || !chain) return null;
 
   const total = chain.versions.length;
+  // Same source as each row's own badge, so the closing sentence can never
+  // contradict the statuses printed right above it.
+  const allPermanent = chain.versions.every(
+    v => badgeFor(syncStatuses[v.id], syncActive).permanent,
+  );
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -137,9 +142,16 @@ export function VersionHistoryModal({
           })}
         </div>
 
+        {/* «Каждая версия навсегда сохранена в блокчейне» stood here
+            unconditionally — directly under rows that can read «на устройстве»,
+            «в очереди» or «ошибка». Eternity is a claim, and it is made in
+            exactly one place in this app: a CONFIRMED status. Same rule as the
+            ∞ mark beside each row and as the composer's destination sentence. */}
         <p className="modal-note">
-          Каждая версия навсегда сохранена в блокчейне. Возврат старой версии
-          создаёт новую версию с её текстом.
+          {allPermanent
+            ? 'Каждая версия навсегда сохранена в блокчейне.'
+            : 'Опубликованную версию изменить нельзя. Версии со статусом «на устройстве», «в очереди» или «ошибка» ещё не сохранены в блокчейне.'}{' '}
+          Возврат старой версии создаёт новую версию с её текстом.
         </p>
       </div>
     </div>

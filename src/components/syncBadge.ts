@@ -69,7 +69,13 @@ export const SYNC_BADGE: Record<NoteSyncStatus, SyncBadge> = {
   },
   error: {
     word: 'ошибка',
-    label: 'Ошибка загрузки — повторить',
+    // THE FACT, not the offer. This badge appears in three places and only one
+    // of them can retry: the feed card wraps it in a real <button> and appends
+    // «— повторить» itself. The history modals render it inside the row's
+    // expand <button> (a nested button is invalid HTML), where pressing it
+    // opens the version and retries nothing — so promising a retry there was
+    // simply untrue, to screen readers most of all.
+    label: 'Ошибка загрузки',
     permanent: false,
     className: 'sync-state--error',
   },
