@@ -335,7 +335,13 @@ describe('W3: v3 upload pause (kill switch, client side)', () => {
 
     // recovery-critical: v3_disabled must never markUnregistered — the v1
     // upload's accepted auto-discovery set registered=true and it must stay.
-    expect(store.arweave.registered).toBe(true);
+    //
+    // `waitFor`, not a bare expect: the flag is set by the SAME auto-discovery
+    // that the accepted record above comes from, but it reaches the store one
+    // render later. A synchronous assertion here won the race on every local
+    // run and lost it on a loaded CI runner — flaky in the direction that
+    // reads as a real recovery regression, which is the worst kind.
+    await waitFor(() => expect(store.arweave.registered).toBe(true));
   });
 
   it('the pause survives a remount (lock/reload): banner state re-derived from the marker', async () => {

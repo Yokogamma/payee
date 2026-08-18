@@ -150,16 +150,16 @@ describe('base layer, as the browser resolves it', () => {
       const selector = m[1].trim().replace(/\s+/g, ' ');
       if (selector.startsWith('@')) continue;
 
-      // EVERY font-size has to be understood. The previous version matched
-      // `px|rem|em|%` and let everything else fall through the `continue`
-      // below — so `calc()`, `var()`, `clamp()` and the keywords would have
-      // passed unseen, which is the same silent gap as the unresolved `em`.
       // EVERY declaration in the block, then the one the browser actually
       // applies. Reading only the first left `.x { font-size:16px;
       // font-size:10px }` green while the page rendered 10px — a guard that
       // reports the losing value is worse than no guard, because it reads as
       // coverage. Later wins; an `!important` beats every plain one, and among
       // `!important`s the last still wins.
+      //
+      // And every FORM has to be understood too: anything that is not a plain
+      // `px|rem|em|%` is reported below rather than skipped, so `calc()`,
+      // `var()`, `clamp()` and the keywords cannot pass unseen.
       const all = [...m[2].matchAll(/(?:^|;)\s*font-size:\s*([^;]+)/g)].map(d => d[1].trim());
       if (all.length === 0) continue;
       const important = all.filter(v => /!important/i.test(v));
@@ -420,6 +420,43 @@ describe('base layer, as the browser resolves it', () => {
       /\.status-line\s*\{[^}]*min-height/.test(desktop),
       'releasing .status-line is a no-op: it has no min-height to release',
     ).toBe(false);
+  });
+
+  it('a toast is centred by margins, and its buttons keep their own width', () => {
+    // `left: 50%` + `translateX(-50%)` centred the toast visually and lied
+    // about its width: a fixed box anchored at the midpoint has only the right
+    // HALF of the viewport to lay out in, so shrink-to-fit resolved to
+    // min-content and the declared max-width never applied. Measured on a
+    // 390px phone: toast 275px instead of 345, «Доступна новая версия
+    // приложения» broken over three lines, and «Обновить» squeezed into a
+    // 57px box around 79px of label — 22px of the word drawn OUTSIDE its own
+    // border, because nothing clips it.
+    // Being fixed to the viewport also put it ON TOP of the bottom navigation
+    // — for a toast that waits to be pressed rather than fading, that is
+    // covering the way out. It lives in the grid's `content` area now, which
+    // is the ONE area present in all four of `.main-screen`'s grid states, so
+    // «above the nav» needs no nav-height constant to drift out of sync.
+    expect(declaresIn('.toast', /position:\s*fixed/)).toBe(false);
+    expect(declaresIn('.toast', /left:\s*50%/)).toBe(false);
+    expect(declaresIn('.toast', /transform:\s*translateX/)).toBe(false);
+    expect(resolved('toast', 'grid-area')).toContain('content');
+    expect(resolved('toast', 'align-self')).toBe('end');
+    expect(resolved('toast', 'justify-self')).toBe('center');
+    expect(resolved('toast', 'width')).toBe('fit-content');
+
+    // The area the toast is placed into has to exist in EVERY grid state, or
+    // it silently falls back to auto-placement and lands in a row of its own,
+    // pushing the feed instead of floating over it.
+    const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+    const areaBlocks = [...clean.matchAll(/grid-template-areas:\s*([^;]+);/g)].map(m => m[1]);
+    expect(areaBlocks.length, 'grid-template-areas не найдены').toBeGreaterThan(0);
+    for (const decl of areaBlocks) {
+      expect(decl, `в состоянии сетки ${decl.trim()} нет области content`).toContain('content');
+    }
+
+    // And the second half: a control may not shrink below its own label. This
+    // button lives in flex rows next to text that will happily take the room.
+    expect(declaresIn('.banner-btn', /flex:\s*none/)).toBe(true);
   });
 
   it('the status refresh is the mockup ring, not a square', () => {
