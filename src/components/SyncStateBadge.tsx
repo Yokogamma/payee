@@ -24,8 +24,9 @@ export function SyncStateBadge({
   onRetry?: (() => void) | undefined;
 }) {
   if (onRetry) {
-    // The badge's own label is the FACT («Ошибка загрузки»); the offer belongs
-    // to the control, and only this one can keep it — see syncBadge.ts.
+    // The badge's own label is the FACT («Ошибка загрузки»); the OFFER is
+    // added here, in the only branch that can actually honour it — see the
+    // note on SYNC_BADGE.error.
     const label = `${badge.label} — повторить`;
     return (
       <button

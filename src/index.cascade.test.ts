@@ -413,12 +413,13 @@ describe('base layer, as the browser resolves it', () => {
   it('sync state is words without a capsule — except the retry, which is a button', () => {
     expect(declaresIn('.sync-state', /border:\s*none/)).toBe(true);
 
-    // The button chrome hangs on `--retry`, NOT on `--error`. The error STATE
-    // shows up in three places and only the feed card can act on it: both
-    // history modals render it inside the row's own expand <button>, where a
-    // rule, a pointer cursor and a 44px floor promised a retry that pressing
-    // it could not perform — and made an errored row twice its neighbours'
-    // height into the bargain.
+    // The button chrome hangs on `--retry`, NOT on `--error`. Being an error
+    // and being a control are different facts: the feed card and the safebox
+    // card both offer a retry, while both history modals render the same state
+    // inside the row's own expand <button>, where a rule, a pointer cursor and
+    // a 44px floor promised a retry that pressing it could not perform — and
+    // made an errored row twice its neighbours' height into the bargain.
+    // SyncStateBadge is the one place that decides which of the two it is.
     expect(declaresIn('.sync-state--retry', /border:\s*1\.5px solid currentColor/)).toBe(true);
     expect(resolved('state sync-state sync-state--error sync-state--retry', 'min-height')).toBe('44px');
 

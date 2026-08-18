@@ -1458,16 +1458,19 @@ h1 {
 .sync-state--local { color: var(--text-dim); }
 .sync-state--permanent { color: var(--text); }
 
-/* THE COLOUR ONLY. The error state appears in the feed card AND in both
-   history modals, and only the first of those is a control — inside a modal
-   row it lives within the row's own expand <button>. Giving the state class
-   button chrome dressed all three as pressable, and in the modals it also made
-   an errored row 44px tall while its neighbours were half that. */
+/* THE COLOUR ONLY. The error state is shown in four places — the feed card,
+   the safebox card and both history modals — and whether it is a CONTROL is
+   not a property of the state. In a modal it lives inside the row's own
+   expand <button> and cannot be pressed on its own. Chrome on the state class
+   dressed all four as pressable, and in the modals it also made an errored row
+   44px tall while its neighbours were half that. */
 .sync-state--error {
   color: var(--red);
 }
 
-/* Worn by the feed card's retry <button> and nothing else. */
+/* Worn by the retry <button> — feed card and safebox card — and by nothing
+   that merely reports the state. SyncStateBadge is the single place that
+   decides, so this class and that component move together. */
 .sync-state--retry {
   cursor: pointer;
   border: 1.5px solid currentColor;
