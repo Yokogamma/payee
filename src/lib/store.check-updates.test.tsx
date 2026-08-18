@@ -52,12 +52,14 @@ import { NotesProvider, useNotes } from './store';
 import {
   initStorage, resetAll, setMeta, getMeta, sanitizeFullSweepAt,
   getAllNotes as getStoredNotes, countSafeboxEntries,
+  mergeRestoredNote, setSyncRecord, getDbGeneration,
 } from './storage';
 import { isArweaveOnline, fetchAllNotes, ArweaveIndexUnavailableError } from './arweave';
 import type { FetchAllNotesResult, RestoredNote, RestoredSafeboxEntry } from './arweave';
 import {
   deriveKey, decryptNote, encryptEnvelopeV3,
   deriveSafeboxMetaKey, deriveSafeboxSecretKey, encryptSafeboxEntry, decryptSafeboxMeta,
+  base64ToBuffer, bufferToBase64, type EncryptedNote,
 } from './crypto';
 
 // jsdom has no BroadcastChannel — minimal stand-in (no cross-tab needs here).
@@ -612,6 +614,130 @@ describe('checkForUpdates: инкрементальный режим (Фаза 1
     expect(known).toBeInstanceOf(Map);
     expect(known!.size).toBe(0);           // нечего пропускать — поведение полного
     expect(store.chains).toHaveLength(1);  // merge не пострадал
+  });
+});
+
+// ─── Тесты 20–24: прицельный ремонт заметок (§6.4) ──────────────────
+
+/** Побить base64-шифротекст: GCM гарантированно откажет при расшифровке. */
+function corruptB64(b64: string): string {
+  const buf = base64ToBuffer(b64);
+  buf[0] ^= 0xff;
+  return bufferToBase64(buf);
+}
+
+describe('checkForUpdates: прицельный ремонт заметок (§6.4)', () => {
+  const now = () => Date.now();
+
+  /** Планты ДО renderStore: разблокировка должна застать строки в базе. */
+  async function plantGoodAndBroken() {
+    const key = await deriveKey(MN);
+    const good = await encryptEnvelopeV3(key, 'целая', { fmt: 'md', rev: 1 });
+    const broken = await encryptEnvelopeV3(key, 'починится из сети', { fmt: 'md', rev: 1 });
+    await mergeRestoredNote(good, 'TX-GOOD', 1, getDbGeneration());
+    await mergeRestoredNote(
+      { ...broken, ciphertext: corruptB64(broken.ciphertext) }, 'TX-BROKEN', 1, getDbGeneration(),
+    );
+    await setMeta('sweep-full-at', now()); // проверки — инкрементальные
+    return { key, good, broken };
+  }
+
+  it('тест 20: битая строка детектится при разблокировке, чинится инкрементально и больше не качается', async () => {
+    const { key, broken } = await plantGoodAndBroken();
+    renderStore();
+    await openMain(); // разблокировка собирает ремонтный набор
+
+    await act(async () => { await store.checkForUpdates(); });
+    let known = lastSweepOpts()?.known;
+    expect(known!.has('TX-GOOD')).toBe(true);
+    expect(known!.has('TX-BROKEN')).toBe(false); // кандидат ремонта
+
+    // Сеть отдаёт целую копию — merge чинит строку и убирает id из ремонта.
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY,
+      notes: [{ encrypted: broken, text: 'починится из сети', txId: 'TX-BROKEN', meta: (await decryptNote(key, broken)).meta }],
+    });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.notes.some(n => n.text === 'починится из сети')).toBe(true);
+
+    await act(async () => { await store.checkForUpdates(); });
+    known = lastSweepOpts()?.known;
+    expect(known!.has('TX-BROKEN')).toBe(true); // починено — снова известно
+  });
+
+  it('тест 21: sync-отметка без строки — кандидат качается и запись восстанавливается', async () => {
+    renderStore();
+    await openMain();
+    const key = await deriveKey(MN);
+    const ghost = await encryptEnvelopeV3(key, 'строку потеряло хранилище', { fmt: 'md', rev: 1 });
+    await setSyncRecord({
+      noteId: ghost.noteId, kind: 'note', txId: 'TX-GHOST',
+      status: 'confirmed', transport: 'proxy', updatedAt: 1,
+    });
+    await setMeta('sweep-full-at', now());
+
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-GHOST')).toBe(false);
+
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY,
+      notes: [{ encrypted: ghost, text: 'строку потеряло хранилище', txId: 'TX-GHOST', meta: (await decryptNote(key, ghost)).meta }],
+    });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.notes.some(n => n.id === ghost.noteId)).toBe(true);
+
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.get('TX-GHOST')).toEqual({ noteId: ghost.noteId, kind: 'note' });
+  });
+
+  it('тест 22: строка от более новой версии приложения — НЕ ремонт, остаётся известной', async () => {
+    const key = await deriveKey(MN);
+    const good = await encryptEnvelopeV3(key, 'целая', { fmt: 'md', rev: 1 });
+    const future = {
+      ...(await encryptEnvelopeV3(key, 'из будущего', { fmt: 'md', rev: 1 })), v: 5,
+    } as unknown as EncryptedNote;
+    await mergeRestoredNote(good, 'TX-GOOD', 1, getDbGeneration());
+    await mergeRestoredNote(future, 'TX-FUTURE', 1, getDbGeneration());
+    await setMeta('sweep-full-at', now());
+
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); });
+
+    // UnsupportedNoteVersionError — не повреждение: перекачивание не поможет,
+    // строка остаётся sentinel'ом и не выкачивается на каждой проверке.
+    expect(lastSweepOpts()?.known!.has('TX-FUTURE')).toBe(true);
+  });
+
+  it('тест 23: id остаётся в ремонте, пока починка реально не случилась', async () => {
+    await plantGoodAndBroken();
+    renderStore();
+    await openMain();
+
+    await act(async () => { await store.checkForUpdates(); }); // EMPTY — ремонта не было
+    await act(async () => { await store.checkForUpdates(); });
+
+    expect(lastSweepOpts()?.known!.has('TX-BROKEN')).toBe(false); // всё ещё кандидат
+  });
+
+  it('тест 24: блокировка приложения чистит набор, разблокировка пересобирает его из фактов', async () => {
+    const { broken } = await plantGoodAndBroken();
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-BROKEN')).toBe(false); // собран
+
+    // Строка починена МИМО sweep'а — ref хранит устаревший факт «битая».
+    await mergeRestoredNote(broken, 'TX-BROKEN', 2, getDbGeneration());
+
+    act(() => { store.lockApp(); });
+    await act(async () => { await store.confirmMnemonic(MN); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+
+    await act(async () => { await store.checkForUpdates(); });
+    // Пересборка при разблокировке: строка расшифровалась → снова известна.
+    // Устаревший факт из прошлой сессии блокировку не пережил.
+    expect(lastSweepOpts()?.known!.has('TX-BROKEN')).toBe(true);
   });
 });
 

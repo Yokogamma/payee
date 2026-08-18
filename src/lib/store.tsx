@@ -622,6 +622,12 @@ export interface VaultSnapshot {
   ownerHash: string;
   notes: NoteData[];
   savedEnabled: boolean;
+  /** Кандидаты на прицельный ремонт (§6.4): id записей ПОДДЕРЖИВАЕМОЙ версии,
+   *  которые не расшифровались при разблокировке. Их txId выпадают из
+   *  «известного», и ближайшая инкрементальная проверка перекачает on-chain
+   *  копию. Записи от более новой версии приложения сюда НЕ попадают —
+   *  перекачивание им не поможет. */
+  undecryptableIds: string[];
 }
 
 /**
@@ -657,6 +663,7 @@ export async function prepareVaultSnapshot(
   // Decrypt all notes into LOCALS (never state — commit publishes them).
   const encrypted = await getAllNotes();
   const decrypted: NoteData[] = [];
+  const undecryptableIds: string[] = [];
   let decryptedCount = 0;
   for (const enc of encrypted) {
     throwIfAborted();
@@ -664,10 +671,16 @@ export async function prepareVaultSnapshot(
       const decoded = await decryptNote(key, enc);
       decrypted.push({ id: enc.noteId, text: decoded.text, createdAt: decoded.createdAt, ...decoded.meta });
       decryptedCount++;
-    } catch {
+    } catch (err) {
       // Skip notes that can't be decrypted (wrong key, corrupted, or an
       // unsupported version written by a NEWER client — fail-closed dispatch).
       // Invisible records still count in the storage-backed resetRiskCount.
+      //
+      // Ремонт (§6.4): отказ расшифровки ПОДДЕРЖИВАЕМОЙ версии — локальное
+      // повреждение; id собирается, чтобы инкрементальный sweep перекачал
+      // on-chain копию и починил строку. UnsupportedNoteVersionError — не
+      // повреждение (запись новее этой сборки), перекачка снова упадёт.
+      if (!(err instanceof UnsupportedNoteVersionError)) undecryptableIds.push(enc.noteId);
     }
   }
   decrypted.sort((a, b) => b.createdAt - a.createdAt);
@@ -682,7 +695,7 @@ export async function prepareVaultSnapshot(
   }
 
   const savedEnabled = !!(await getMeta<boolean>('ar-enabled'));
-  return { mnemonic: mn, key, privateKey, publicKey, pkB64, ownerHash, notes: decrypted, savedEnabled };
+  return { mnemonic: mn, key, privateKey, publicKey, pkB64, ownerHash, notes: decrypted, savedEnabled, undecryptableIds };
 }
 
 /** PerformanceNavigationTiming.type mapped to the §5 matrix. */
@@ -721,6 +734,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [restoring, setRestoring] = useState(false);
   const restoringRef = useRef(false);
+  /** Прицельный ремонт (§6.4): id записей, чья расшифровка поддерживаемой
+   *  версии упала — при разблокировке (заметки), открытии секции сейфа (meta)
+   *  или показе секрета. Эти id исключаются из «известного» инкрементального
+   *  sweep'а, и он перекачивает их on-chain копии. Per-tab, в памяти; чистится
+   *  ТОЛЬКО блокировкой приложения (clearVaultState) — блокировка одной секции
+   *  сейфа ремонтные id заметок не трогает. Публикации из сейфовых путей —
+   *  строго объединением и строго под эпохами своей сессии. */
+  const undecryptableIdsRef = useRef<Set<string>>(new Set());
   const [restoreProgress, setRestoreProgress] = useState<{ done: number; total: number } | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoredCount, setRestoredCount] = useState<number | null>(null);
@@ -1531,6 +1552,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     signingKeyRef.current = snap.privateKey;
     publicKeyRef.current = snap.publicKey;
     mnemonicRef.current = snap.mnemonic;
+    // Разблокировка ПЕРЕСОБИРАЕТ ремонтный набор с нуля (§6.4): починенное
+    // между сессиями сюда уже не попадает, а публикация вместе со снапшотом
+    // наследует его epoch-гейт — устаревший prepare сюда не доходит.
+    undecryptableIdsRef.current = new Set(snap.undecryptableIds);
     setMnemonic(snap.mnemonic);
     setNotes(snap.notes);
     // Mirror synchronously: a restore may start before React flushes the state
@@ -1676,6 +1701,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // would otherwise leave 'checking' pinned forever (its own state writes are
     // gated on the epoch it no longer owns).
     setUpdateCheck({ status: 'idle' });
+    // Ремонтный набор принадлежит закрываемой сессии; следующая разблокировка
+    // пересоберёт его заново из фактов СВОЕЙ расшифровки (§6.4).
+    undecryptableIdsRef.current = new Set();
     // The persisted marker survives; the mirror re-reads on next unlock.
     setV3Paused(false);
 
@@ -2382,6 +2410,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         for (const r of records) {
           if (!r.txId) continue;
           if (!(r.kind === 'safebox' ? safeboxIdSet : noteIdSet).has(r.noteId)) continue;
+          // Кандидат прицельного ремонта (§6.4): запись есть, но не
+          // расшифровалась — «известной» не считать, перекачать и починить.
+          if (undecryptableIdsRef.current.has(r.noteId)) continue;
           known.set(r.txId, { noteId: r.noteId, kind: r.kind });
         }
       }
@@ -2425,6 +2456,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
         await mergeRestoredNote(remote.encrypted, remote.txId, Date.now(), myDbGen);
+        // Починено known-good копией — из ремонтного набора id выходит, чтобы
+        // следующая инкрементальная проверка его больше не перекачивала.
+        undecryptableIdsRef.current.delete(remote.encrypted.noteId);
 
         if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
         if (vaultEpochRef.current !== myEpoch) return;
@@ -2465,6 +2499,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (vaultEpochRef.current !== myEpoch) return;
         if (getDbGeneration() !== myDbGen) return;
         await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now(), myDbGen);
+        // Как и у заметок: починенная запись покидает ремонтный набор.
+        undecryptableIdsRef.current.delete(remote.encrypted.entryId);
         safeboxMerged++;
         // Claim BEFORE the id joins the known set, so several new versions of
         // one root still count their root exactly once.
@@ -3139,9 +3175,34 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!entry) throw new Error('Запись сейфа не найдена.');
     const metaKey = safeboxMetaKeyRef.current;
     if (!metaKey || safeboxSectionEpochRef.current !== session.section) throw new SafeboxLockedError();
-    const meta = await decryptSafeboxMeta(metaKey, entry);
+    // Ремонт (§6.4): отказ расшифровки/валидации ЛЮБОЙ половины поддерживаемой
+    // версии — локальное повреждение; id выпадает из «известного», и ближайшая
+    // инкрементальная проверка перекачает обе половины. Пометка — только в
+    // СВОЕЙ сессии: блокировка, догнавшая расшифровку, не пишет в ref чужой
+    // эпохи. SafeboxLockedError сюда не попадает (бросается выше), а сбой
+    // деривации ключа не помечается — деривация вынесена из ремонтных try.
+    const markRepair = () => {
+      if (entry.v === 4
+          && vaultEpochRef.current === session.epoch
+          && safeboxSectionEpochRef.current === session.section) {
+        undecryptableIdsRef.current.add(entry.entryId);
+      }
+    };
+    let meta: SafeboxEntryData;
+    try {
+      meta = await decryptSafeboxMeta(metaKey, entry);
+    } catch (err) {
+      markRepair();
+      throw err;
+    }
     const secretKey = await deriveSafeboxSecretKey(session.mnemonic);
-    const secret = await decryptSafeboxSecret(secretKey, entry, meta.files);
+    let secret: SafeboxSecretData;
+    try {
+      secret = await decryptSafeboxSecret(secretKey, entry, meta.files);
+    } catch (err) {
+      markRepair();
+      throw err;
+    }
     return { entry, meta, secret };
   }
 
@@ -3167,12 +3228,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   ): Promise<boolean> {
     const stored = await getAllSafeboxEntries();
     const metas: SafeboxEntryData[] = [];
+    // Ремонтные кандидаты копятся в ЛОКАЛЬНЫЙ набор и публикуются в ref одним
+    // шагом ПОСЛЕ финальных проверок эпох и configId (§6.4): расшифровка
+    // тянется через несколько await, и запись в ref прямо из catch могла бы
+    // произойти уже после блокировки, очистившей ref, — воскресив чужие id в
+    // свежей сессии.
+    const failedIds: string[] = [];
     for (const e of stored) {
       try {
         metas.push(await decryptSafeboxMeta(metaKey, e));
       } catch {
         // A row that cannot be decrypted/validated is skipped individually —
         // it stays counted in the storage-backed reset risk.
+        // Ремонт — только для поддерживаемой версии: v новее этой сборки
+        // перекачиванием не чинится (двойной гейт с App-Version на индексе).
+        if (e.v === 4) failedIds.push(e.entryId);
       }
     }
     if (vaultEpochRef.current !== epoch || safeboxSectionEpochRef.current !== section) return false;
@@ -3190,6 +3260,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!stillOurs) {
       lockSafeboxNow();
       throw new SafeboxConfigChangedError();
+    }
+    // Публикация ремонтных id — ОБЪЕДИНЕНИЕМ, не присваиванием: присваивание
+    // стёрло бы ремонтные id заметок, собранные при разблокировке приложения.
+    // Обе эпохи и configId только что подтверждены, между проверками и этой
+    // строкой ничего не await'ится.
+    if (failedIds.length > 0) {
+      undecryptableIdsRef.current = new Set([...undecryptableIdsRef.current, ...failedIds]);
     }
     safeboxMetaKeyRef.current = metaKey;
     safeboxConfigIdRef.current = configId;
