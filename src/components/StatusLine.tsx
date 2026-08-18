@@ -197,50 +197,57 @@ export function StatusLine() {
 
   return (
     <div className={`status-line status-line--${rung.tone}`}>
-      {/* See the Indicator type: the mark answers «is everything permanent»,
-          not «is anything broken». */}
-      {indicator === 'permanent'
-        ? <InfinityMark className="status-mark" />
-        : <span className="status-dot" aria-hidden="true" />}
-      {/* An explicit aria-live OVERRIDES the implicit `assertive` that comes
-          with role="alert", so setting both would announce errors politely —
-          the exact flattening this ladder must not do. Only the non-error
-          rungs get the polite hint. */}
-      <span
-        className="status-text"
-        role={rung.tone === 'error' ? 'alert' : 'status'}
-        aria-live={rung.tone === 'error' ? undefined : 'polite'}
-      >
-        {rung.text}
-      </span>
-      {rung.action && (
-        <button className="banner-btn" onClick={rung.action.onClick}>{rung.action.label}</button>
-      )}
-      {rung.dismiss && (
-        <button className="banner-btn banner-close" onClick={rung.dismiss} title="Скрыть" aria-label="Скрыть сообщение">
-          <IconClose />
+      {/* THE ROW IS ITS OWN ELEMENT, and that is the whole point: the two-line
+          reservation belongs to this row, not to the block that also holds the
+          details panel. While the panel was a sibling inside one wrapping flex,
+          it satisfied the reservation itself and the row shrank the moment the
+          chevron was pressed. */}
+      <div className="status-row">
+        {/* See the Indicator type: the mark answers «is everything permanent»,
+            not «is anything broken». */}
+        {indicator === 'permanent'
+          ? <InfinityMark className="status-mark" />
+          : <span className="status-dot" aria-hidden="true" />}
+        {/* An explicit aria-live OVERRIDES the implicit `assertive` that comes
+            with role="alert", so setting both would announce errors politely —
+            the exact flattening this ladder must not do. Only the non-error
+            rungs get the polite hint. */}
+        <span
+          className="status-text"
+          role={rung.tone === 'error' ? 'alert' : 'status'}
+          aria-live={rung.tone === 'error' ? undefined : 'polite'}
+        >
+          {rung.text}
+        </span>
+        {rung.action && (
+          <button className="banner-btn" onClick={rung.action.onClick}>{rung.action.label}</button>
+        )}
+        {rung.dismiss && (
+          <button className="banner-btn banner-close" onClick={rung.dismiss} title="Скрыть" aria-label="Скрыть сообщение">
+            <IconClose />
+          </button>
+        )}
+        {/* Reading Arweave needs neither the sync toggle nor a registered key —
+            those gate UPLOADS — so this is available on a read-only device. */}
+        <button
+          className="status-btn"
+          onClick={() => void checkForUpdates()}
+          disabled={checkBusy}
+          title="Проверить обновления"
+          aria-label="Проверить обновления"
+        >
+          <IconRefresh />
         </button>
-      )}
-      {/* Reading Arweave needs neither the sync toggle nor a registered key —
-          those gate UPLOADS — so this is available on a read-only device. */}
-      <button
-        className="status-btn"
-        onClick={() => void checkForUpdates()}
-        disabled={checkBusy}
-        title="Проверить обновления"
-        aria-label="Проверить обновления"
-      >
-        <IconRefresh />
-      </button>
-      <button
-        className="status-btn status-btn--plain"
-        onClick={() => setExpanded(v => !v)}
-        aria-expanded={expanded}
-        aria-label={expanded ? 'Скрыть подробности' : 'Показать подробности'}
-        title="Подробности"
-      >
-        <IconChevron />
-      </button>
+        <button
+          className="status-btn status-btn--plain"
+          onClick={() => setExpanded(v => !v)}
+          aria-expanded={expanded}
+          aria-label={expanded ? 'Скрыть подробности' : 'Показать подробности'}
+          title="Подробности"
+        >
+          <IconChevron />
+        </button>
+      </div>
 
       {expanded && (
         <div className="status-details">

@@ -381,11 +381,45 @@ describe('base layer, as the browser resolves it', () => {
     expect(resolved('app-nav-item', 'font-weight')).not.toBe('600');
   });
 
-  it('the status line reserves both of its lines', () => {
+  it('the status ROW reserves both of its lines, and the container does not', () => {
     // The row is sized for two lines whether it uses them or not: the feed
     // must not move when the message changes length.
-    expect(resolved('status-line', 'min-height')).toBe('62px');
+    expect(resolved('status-row', 'min-height')).toBe('42px');
     expect(resolved('status-text', '-webkit-line-clamp')).toBe('2');
+
+    // AND NOT ON THE CONTAINER. `.status-details` is the container's other
+    // child; while the 62px sat on `.status-line`, opening the details
+    // satisfied the reservation with the PANEL and the top row fell back to
+    // its natural height — the row visibly shrank under the chevron that had
+    // just been pressed. A container cannot tell which child fills it, so the
+    // reservation has to name the row.
+    expect(declaresIn('.status-line', /min-height/)).toBe(false);
+
+    // A column, so the panel breaks onto its own row by being a child — the
+    // `flex-basis: 100%` that did that in the old wrapping row would now size
+    // the panel to the full height instead.
+    expect(resolved('status-line', 'flex-direction')).toBe('column');
+    expect(declaresIn('.status-details', /flex-basis/)).toBe(false);
+  });
+
+  it('the wide-screen release follows the reservation onto the row', () => {
+    // The release names `.status-line` no more: with the reservation moved,
+    // that override would silently stop doing anything and a wide screen would
+    // keep 42px of emptiness it does not need. jsdom does not evaluate media
+    // queries for styling, so this reads the source.
+    const desktop = CSS.replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('@media (min-width: 768px)')
+      .slice(1)
+      .join('\n');
+    expect(desktop, 'no ≥768px block found').toBeTruthy();
+    expect(
+      /\.status-row\s*\{[^}]*min-height:\s*0/.test(desktop),
+      'the ≥768px block must release .status-row — the reservation lives there now',
+    ).toBe(true);
+    expect(
+      /\.status-line\s*\{[^}]*min-height/.test(desktop),
+      'releasing .status-line is a no-op: it has no min-height to release',
+    ).toBe(false);
   });
 
   it('the status refresh is the mockup ring, not a square', () => {
