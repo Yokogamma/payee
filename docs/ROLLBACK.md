@@ -579,6 +579,14 @@ What ships:
 - Undetectable damage (a safebox row corrupted while the section stays locked)
   waits for the daily full sweep — detection requires decryption, which never
   ran.
+- A record whose ON-CHAIN copy is itself undecryptable (corruption that
+  happened BEFORE the upload, so the bad bytes were paid onto Arweave) stays in
+  the repair set forever: an id leaves it only through a successful merge, and
+  a candidate that fails `buildRestoredNote` is an intentional skip that
+  produces no merge. Consequence: one payload fetch per such record per check,
+  indefinitely — bounded, no data loss, no false error. Repair is genuinely
+  impossible for these; giving up after a failed attempt would change repair
+  semantics and belongs in its own review, not in this release.
 
 Acceptance on the live site (DevTools → Network, filter `arweave.net`; there
 are no new user-facing strings, so «grep the bundle» does NOT prove this
