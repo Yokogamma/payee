@@ -1115,6 +1115,37 @@ two revisions of the plan).
   and refusing a «another device» offer leaves the record intact; airplane mode
   works (no network involved).
 
+### `client-qu1` — DEPLOYED 2026-08-19
+
+main `2ed5b98` (PR #59), tag `client-qu1`, run 32292249783 on
+notes.matamata.dev. All gates green in a clean `npm ci` checkout (lint,
+`tsc -b`, **1257 client tests / 64 files**, worker typecheck + 130 tests,
+staging config check, bundle budget **189.3 / 195 KB gz**, font guard),
+`smoke-headers` passed against the deployment URL and re-run against the custom
+domain. **The Worker was NOT deployed** — untouched by this release.
+
+**What actually reached the artifact — read this before assuming «the code is
+baking in production».** Live bundle `index-DpOYaNfh.js` contains
+`quick-unlock-seed` and the «Быстрый вход» strings, and does NOT contain
+`eternal-notes-quick-unlock-v1` or `already-configured`. That is correct and
+expected: the bundler resolves `QUICK_UNLOCK_ENABLED` to `false` and eliminates
+everything behind the two `if (!QUICK_UNLOCK_ENABLED) throw` gates, i.e. the
+bodies of `setupQuickUnlock` and `unlockWithQuickUnlock`. The UNGATED half —
+the record schema, the four-key reader, the commits, the «no pin-seed ⇒ void»
+cleanup, the settings block and its removal button — IS shipped, which is
+exactly the flag contract.
+
+Consequence, and it is the point of the two-release split: this deploy proves
+the ungated half and the absence of a regression; it does NOT exercise the
+ceremonies. Those ship with `client-qu2`. The manual acceptance below therefore
+has to run against a temporary flag-ON build (local or a separate preview), not
+against production — as the release order already states.
+
+**NOT verified by this deploy:** everything the flag gates, plus the four races
+closed in `client-pin1` (timing windows, proven by tests). What IS verified is
+that the app still boots, the PIN path is unchanged, and no quick-unlock UI
+appears for a user who has no record.
+
 ### Rollback
 
 Redeploy **`client-pin1`**. Data is unaffected: `quick-unlock-seed` is an
