@@ -905,6 +905,89 @@ Unchanged: **`client-r4`**. Lifecycle and presentation only — no storage, no
 sync protocol, no crypto. Rolling back to `client-nav2` or any tag at or above
 `client-r4` is a plain Pages redeploy (and reinstates the stuck gate).
 
+## PIN-path and vault-open races — `client-pin1` (client-only)
+
+Stage P of the quick-unlock plan, shipped on its own **before** any of that
+feature: four pre-existing production races, all on paths the feature would
+later reuse. Nothing user-visible changes, no flag was flipped, and no line of
+the quick-unlock feature is in this release.
+
+What it closes:
+
+1. **A reset during Argon2id (~1 s).** `unlockWithPinAction` metered, wrote the
+   lockout and re-wrapped the legacy blob with no reset guard at all, so
+   «Удалить всё» landing inside that second could leave `pin-attempts`,
+   `pin-locked-until` or `pin-seed` behind in a database that had just been
+   cleared — the `resetAll` invariant, broken by the unlock flow finishing
+   afterwards.
+2. **A cross-tab PIN change.** `dbGeneration` does not move for it (same
+   database), so a verdict produced against blob A metered configuration B —
+   and on the 10th strike WIPED it. Each commit now re-reads `pin-seed` inside
+   its own transaction and refuses unless it is still byte-for-byte the blob
+   that was checked (`pinSeedEquals`, every normative field including `v` and
+   the whole Argon2 profile).
+3. **A lock inside the `bindVaultIdentity` window.** `openVault` cleared
+   `vaultOpAbortRef` right after `prepareVaultSnapshot`, so during the identity
+   transaction the tab held nothing lockable: `lockApp()` took its
+   `!vaultPresentInTab()` early exit WITHOUT bumping the epoch, the post-bind
+   epoch check passed, and the vault was published against the lock verdict.
+   Reachable from the ordinary «Сразу» auto-lock on a return to foreground.
+   The controller now lives for the whole run and is cleared only when the ref
+   still holds THIS operation's — the discipline `runArweaveSweep` already
+   followed.
+4. **A reset between the PIN commits and `openVault`.** The commits refuse to
+   write, but `openVault` then captured a FRESH generation, re-bound the old
+   seed into the wiped database and published mnemonic, keys and session. It
+   now accepts an optional `expectedDbGeneration` and stands down
+   synchronously — before touching the shared abort ref, so a departing call
+   cannot cancel somebody else's in-flight operation.
+
+Also recorded as behaviour, not left to chance: **the bind transaction is the
+point of no return for IDENTITY.** A bind that started before a lock or a
+preemption RUNS TO COMPLETION, so with `initialize` both `vault-public-key`
+and `meta.init` land. That is deliberate first-writer-wins — the vault is not
+published, a retry with the SAME seed binds `'same'` and succeeds, a DIFFERENT
+seed gets `'foreign'` → `VaultMismatchError` with its explicit reset.
+Preemption governs PUBLICATION only, never identity.
+
+**DEPLOYED 2026-08-19** (main `5c60857`, PR #56, tag `client-pin1`) on
+notes.matamata.dev, run 32262237375 — all gates green in a clean `npm ci`
+checkout (lint, `tsc -b`, **1086 client tests / 58 files**, worker typecheck +
+130 tests, staging config check, bundle budget and font guards),
+`smoke-headers` passed against the deployment URL. **The Worker was NOT
+deployed** — this release does not touch it.
+
+### Verified on the live origin
+
+Live bundle `index-BTbSf7zD.js`. It contains the string `config-changed`, which
+did not exist anywhere in the source before stage P — direct evidence that the
+artifact carries the new code rather than a cached older build. This release
+adds no user-facing copy, so the usual «grep the bundle for new text» check does
+not apply, exactly as with `client-sync1`. `smoke-headers.mjs` run against
+`https://notes.matamata.dev` reports CSP, `X-Frame-Options`, `nosniff` and
+`Referrer-Policy` present on the custom domain.
+
+**NOT verified in production:** the races themselves. All four are timing
+windows — a reset landing inside a 1-second KDF, two tabs changing a PIN at the
+same moment, a lock arriving during an IndexedDB transaction. They are proven
+by deterministic tests (each new guard test was additionally confirmed to FAIL
+with its fix reverted), not by a production run. The operator's manual check is
+the ordinary PIN path: a correct PIN opens the vault and clears the counter, a
+wrong one counts exactly once, the 4th arms the 30 s lockout, the 10th still
+wipes the configuration to the seed screen, and unlocking after «Сразу»
+auto-lock works.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the old build until
+«Обновить».
+
+### Floor
+
+Unchanged: **`client-r4`** / **`worker-r3`**. `DB_VERSION` stays 2, no schema
+change, no new meta key, no sync-protocol or crypto change — the PIN blob
+format is untouched (the ownership check compares the existing fields; no
+`configId` was added). Rolling back is a plain Pages redeploy of
+`client-sync1`, and it simply reinstates the four races.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
