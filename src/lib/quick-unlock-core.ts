@@ -38,7 +38,8 @@ export class QuickUnlockUnavailableError extends Error {
    * authoritative answer there is (§6: the probes and the support matrix can
    * both lie, in either direction). The store records it so the UI stops
    * offering a setup that would mint another platform credential nobody can
-   * use — and, on `residentKey: 'discouraged'`, may not even be able to see.
+   * use — and whose visibility in the system manager is the platform's call,
+   * not ours, so the user may not even be able to find it and delete it.
    */
   readonly verdict?: QuickUnlockCapability;
 
@@ -312,10 +313,24 @@ export async function createPrfCredential(opts: {
         authenticatorSelection: {
           authenticatorAttachment: 'platform',
           userVerification: USER_VERIFICATION,
-          // Do not clutter the passkey list, and lower the chance of an
-          // accidental deletion. Apple creates a discoverable one anyway —
-          // expected, not an error.
-          residentKey: 'discouraged',
+          // 'preferred', NOT 'discouraged' (changed 2026-08-19 after the first
+          // device acceptance). The original choice was «do not clutter the
+          // passkey list, lower the chance of an accidental deletion», taken
+          // on the assumption that it was free. On Android it is not: a
+          // OnePlus 12 / Android 16 installed PWA created the credential
+          // happily and then returned NO PRF, which is the signature of a
+          // NON-DISCOVERABLE, device-bound credential — the providers that
+          // implement hmac-secret (Google Password Manager and friends) are
+          // the ones that store DISCOVERABLE passkeys.
+          //
+          // 'preferred' asks for discoverable without hard-requiring it, so a
+          // platform that only offers non-discoverable still gets its chance
+          // rather than a refusal. The cost is the one the original comment
+          // was avoiding — the key becomes visible in the system manager, and
+          // therefore deletable by hand. That is the better half of the trade:
+          // a visible key that WORKS beats an invisible one that does not, and
+          // §2 already promises that losing it costs only the accelerator.
+          residentKey: 'preferred',
         },
         attestation: 'none',
         timeout: CEREMONY_TIMEOUT_MS,
@@ -334,9 +349,9 @@ export async function createPrfCredential(opts: {
   if (prf?.enabled !== true && !prf?.results?.first) {
     throw new QuickUnlockUnavailableError(
       // NO JARGON, and no instruction the reader cannot act on. «PRF» means
-      // nothing to a person, and «удалите ключ» is wrong twice over: with
-      // residentKey 'discouraged' the credential may be invisible, and a
-      // leftover one is harmless — it opens nothing.
+      // nothing to a person, and a bare «удалите ключ» would be wrong twice
+      // over: whether the leftover is visible at all is the platform's call,
+      // and leaving it is harmless — it opens nothing. Hence «если появился».
       'Не удалось настроить быстрый вход: устройство не выдало нужный ключ. '
       + 'Ничего не сломалось — вход по PIN-коду и seed-фразе работает как обычно. '
       + 'Если в менеджере паролей появился ключ «Matamata Notes», его можно удалить: он ничего не открывает.',
