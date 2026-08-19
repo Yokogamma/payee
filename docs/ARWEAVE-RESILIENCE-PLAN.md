@@ -1,9 +1,10 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v3 — второй раунд ревью учтён** (ревью 1: 2 critical + 6 high + 4
-medium; ревью 2: 8 findings, все приняты). Дата: 2026-08-19. Строится поверх
-задеплоенного инкрементального sweep (PR #53). Остаются 3 блокера полной
-реализации — см. конец §8.
+Статус: **v4 — третий раунд ревью учтён** (ревью 1: 2 critical + 6 high + 4
+medium; ревью 2: 8; ревью 3: 3 — все приняты). Дата: 2026-08-19. Строится
+поверх задеплоенного инкрементального sweep (PR #53). Остаточные блокеры полной
+реализации — конец §8. Принцип v4: каждое спорное место — ОДНО нормативное
+решение без альтернатив.
 
 Документ адресован ревьюеру: фиксирует решения, объём, разбиение на PR,
 инварианты, тестовые сценарии и границы. Ключевое изменение v2: **PR-3
@@ -229,35 +230,41 @@ anchor+price запросы внутри SDK — из вызовов тольк�
    ТЕМ ЖЕ txId на другой шлюз. `208 Already Reported` — допустимый ответ POST
    /tx, трактуется как принято.
 
-**Нормативная state machine DO (ревью 2, H2) — новый статус `signed`:**
+**Нормативная state machine DO (ревью 2 H2, ревью 3):**
 
 Текущий lifecycle `reserved → posted → committed` (reserved TTL 10 мин)
-расширяется до `reserved → signed → posted → committed`. Поля записи `signed`:
-`{noteId, txId, signedTxBytes|ref, anchorHeight, reserveToken, signedAt, TTL}`.
-Инварианты по crash-point:
+расширяется до `reserved → signed → posted → committed`. Поля `signed`:
+`{noteId, txId, signedTxBytes|ref, anchorHeight, reserveToken, signedAt}`.
+
+**Проблема ревью 3: одно `signed` покрывало ДВА случая (до и после диспатча
+POST), и после crash нельзя доказать, какой именно → нельзя доказать,
+допустим ли release. Нормативное решение (без альтернатив): `signed`
+НИКОГДА не подлежит release и НИКОГДА не TTL-expire.** Как только транзакция
+подписана, единственные допустимые действия — resend ТОГО ЖЕ txId и
+reconciliation по кворуму статуса. Это снимает необходимость различать
+«до/после POST»: оба случая безопасны под одним правилом, а окно дубля
+закрыто по построению (release, стирающий запись о возможно-принятом txId,
+недостижим).
 
 | Состояние на момент сбоя | Что сделать при recheck |
 |---|---|
 | `reserved`, подписи ещё нет | обычный TTL-expire → свободный слот, дубля нет |
-| `signed`, POST ещё НЕ отправлен | повторить POST того же txId; release РАЗРЕШЁН (ничего не отправлено) |
-| `signed`, POST ОТПРАВЛЕН, ответ неизвестен | **release ЗАПРЕЩЁН** — записать `posted`, реконсилировать по кворуму статуса; tx может быть на chain |
+| `signed` (любой под-случай) | **release/TTL ЗАПРЕЩЕНЫ**; только resend того же txId + reconciliation по кворуму → при alive записать `posted` |
 | `posted` | как сегодня: кворум alive→commit, dead→redrop (новая подпись только тут) |
 | `committed` | идемпотентный happy-path |
 
-- **Release-правило (главное по H2):** после ДИСПАТЧА POST любой неоднозначный
-  сбой ОБЯЗАН сохранить `signed`/`posted` — release удалил бы единственную
-  server-authoritative запись о потенциально принятом txId и открыл бы окно
-  дубля. Release допустим ТОЛЬКО (а) до диспатча POST или (б) после
-  доказанного окончательного отказа (кворум dead + age guard).
+- **Освобождение слота для `signed`:** не по TTL, а ТОЛЬКО через переход
+  вперёд (`posted`/`committed`) либо после доказанного окончательного отказа
+  (кворум dead + age guard) — это единственный путь, где создаётся новая
+  подпись.
 - **Истечение anchor:** подписанная tx с протухшим anchor (~50 блоков) на
-  chain уже не попадёт. Пересоздание разрешено, НО только после подтверждения
-  кворумом, что старый txId не alive (иначе двойная публикация). Отдельная
-  ветка state machine с тестом.
-- TTL `signed` ≥ разумного времени доставки POST + запас; НЕ равен reserved-TTL.
+  chain не попадёт. Пересоздание — только после подтверждения кворумом, что
+  старый txId не alive. Это частный случай «доказанного окончательного
+  отказа» выше, отдельная ветка с тестом.
 
 5. Если SDK не гарантирует resend той же подписи — **fail closed ДО первого
-   POST** (не создавать `signed`), без повторного подписания. После диспатча
-   fail-closed через release НЕДОПУСТИМ (см. release-правило).
+   POST** (не создавать `signed`), без повторного подписания. После создания
+   `signed` release НЕДОСТИЖИМ по определению статуса.
 
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 
@@ -305,12 +312,12 @@ anchor+price запросы внутри SDK — из вызовов тольк�
   height (null-политика выше) → и ТОЛЬКО ЗАТЕМ применять sentinel-drop и claim.
   Иначе порядок ответов шлюзов сменит победителя цепочки (нарушение
   инвариантов тестов 9а/9г).
-- **Конфликт metadata одного txId (по ревью, high):** если два индекса вернули
-  для одного txId разные height/Note-Id/version/tags — НЕ «первый выиграл».
-  Детерминированная политика: конфликтующий txId либо отбрасывается и помечает
-  sweep `incomplete=true`, либо перепроверяется; НИКОГДА не разрешается
-  порядком Promise. Точную политику фиксирует PR (рекомендация: mark
-  incomplete + лог).
+- **Конфликт metadata одного txId (ревью 2 high, ревью 3) — НОРМАТИВНО, без
+  альтернатив:** если два индекса вернули для одного txId разные
+  height/Note-Id/version/tags — конфликтующий txId **отбрасывается из union и
+  помечает sweep `incomplete=true`** (+ лог). Не «первый выиграл», не
+  «перепроверяется» — одно правило. (Перепроверка третьим источником могла бы
+  стать будущим улучшением, но НЕ в этом PR.)
 - `opts.known` (sentinel) работает по txId → компонуется с union без изменений
   в карте: та же `KnownTxRecord`-проверка (Note-Id тег + класс версии).
 - `incomplete`-семантика строгая: `incomplete=false` только если ВСЕ индексы
@@ -355,32 +362,36 @@ tx-specific sandbox subdomains.
 распространяется как файл с независимой проверкой SHA-256, НЕ как исполняемая
 страница по gateway-URL.
 
-**Незакрытые механики file-mode (ревью 2, H1) — специфицировать в PR:**
+**Механики file-mode (ревью 2 H1, ревью 3) — нормативно, без альтернатив:**
 
-- **Принудительное скачивание, а не исполнение.** Клик по gateway-URL не
-  должен исполнять HTML. Артефакт публикуется/отдаётся с неисполняемым MIME
-  (`application/octet-stream`) и/или `Content-Disposition: attachment` —
-  именно `attachment` переключает браузер в режим скачивания. Поведение
-  конкретных D7-шлюзов ПРОВЕРЯЕТСЯ acceptance-тестом (шлюз может игнорировать
-  заголовки — тогда полагаться только на явную инструкцию + расширение).
-- **Проверка контрольной суммы — не только человеческая инструкция.**
-  Определить независимый verifier и поддерживаемые потоки для
-  **Windows / Android / iOS** (на десктопе `certutil`/`shasum`; на мобильных
-  штатного средства нет — нужен продуманный поток, напр. отдельная
-  проверочная утилита или инструкция). Эталонный SHA-256 публикуется в README
-  и приложении. Hash mismatch ДОЛЖЕН блокировать процедуру (тест).
-- **file:// = opaque origin `null` + CORS.** Локально открытый файл шлёт
-  запросы к шлюзам с `Origin: null`. GraphQL и `/raw` каждого D7-шлюза
-  ОБЯЗАНЫ отвечать `Access-Control-Allow-Origin: *` (или допускать `null`) —
-  иначе восстановление из файла не прочитает данные. Проверяется из реального
-  `file:///` контекста на поддерживаемых браузерах (acceptance).
-- **Acceptance про SW/sandbox ЗАМЕНЁН:** вместо «sandbox origin защищает от
-  чужого SW» (неприменимо к file-mode) — критерий «**gateway-код не
-  исполняется до checksum verification**».
+Ключевой вывод ревью 3: MIME, `Content-Disposition` и расширение контролирует
+ШЛЮЗ — недоверенный шлюз может исполнить подменённый HTML при прямой
+браузерной навигации ДО проверки SHA-256. Значит барьер НЕ должен зависеть от
+кооперации шлюза и НЕ может быть «инструкцией пользователю». Нормативно:
 
-Вариант A (sandbox-origin + runtime-самопроверка) — возможное будущее
-UX-улучшение для web-режима; sandbox-поведение шлюзов исследуется (реш. 6 §7),
-НЕ на критическом пути.
+- **Доверенный путь = проверка в уже доверенном коде (основной).** Байты
+  restore получает и проверяет НЕ переход по gateway-URL, а **доверенный
+  агент**: (а) само PWA (это уже доверенный код с запиненным эталонным
+  SHA-256) — фонить байты restore с ≥1 шлюза, сверить хеш в приложении и
+  отдать пользователю как проверенный Blob для сохранения/открытия; либо
+  (б) для холодного восстановления, когда приложения нет, — **отдельная
+  неисполняющая проверочная утилита** (downloader/verifier), которая
+  скачивает файл, считает SHA-256 и лишь при совпадении отдаёт его.
+  Прямой клик по gateway-URL НЕ является поддерживаемым способом запуска.
+- **Per-OS потоки verifier специфицируются в PR** для Windows / Android / iOS
+  (десктоп: `certutil`/`shasum` как ручной запасной; мобильные: штатного
+  средства нет → нужен конкретный проверочный инструмент, не текстовая
+  инструкция). Hash mismatch ОБЯЗАН блокировать (тест).
+- **Заголовки шлюза — вспомогательны, не барьер.** Публиковать с
+  `application/octet-stream` / `Content-Disposition: attachment` полезно, но
+  это НЕ считается защитой (шлюз волен игнорировать). Защита — только
+  проверка хеша доверенным агентом выше.
+- **file:// = opaque origin `null` + CORS.** Открытый локально файл шлёт
+  запросы к шлюзам с `Origin: null`. GraphQL и `/raw` каждого D7-шлюза ОБЯЗАНЫ
+  отвечать `Access-Control-Allow-Origin: *` (или допускать `null`). Проверяется
+  из реального `file:///` контекста на поддерживаемых браузерах (acceptance).
+- **Acceptance:** «gateway-код НЕ исполняется до checksum verification»
+  (заменяет неприменимый к file-mode критерий про SW/sandbox).
 
 **Прочее (по ревью, medium):**
 
@@ -450,8 +461,9 @@ gateway-код НЕ исполняется до checksum verification (file-mode
 5. Upload failover ТОЛЬКО с одним signed txId (PR-3b, предусловие: persist
    signed tx).
 6. Multi-index union с conflict/null-height политикой (PR-4).
-7. restore.html — только ПОСЛЕ выбора runtime-verification и sandbox-delivery
-   (PR-5).
+7. restore.html — file-mode (реш. 1): доверенный агент проверяет SHA-256 до
+   исполнения; `Origin:null` CORS-acceptance по D7 (PR-5). Sandbox НЕ требуется
+   для этого пути (research §7 реш. 6 — вне критического пути).
 8. Обновить rollback/rotation runbooks; fault-injection + staging smoke.
 
 ## 7. Решения по семи вопросам ревью (утверждены владельцем 2026-08-19)
@@ -493,13 +505,18 @@ gateway-код НЕ исполняется до checksum verification (file-mode
 | PR-1 ADR | needs clarification | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота |
 | PR-2 метрики | ready после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store |
 | PR-3a read | ready после D7/quorum | MIN_DEAD_WITNESSES=2 (H4), dedup по типу (H5), payload-validation fallback |
-| PR-3b write | **blocked** | нормативная state machine `signed` + release-правило (H2), reader-before-writer floor (H3), anchor expiry |
-| PR-4 union | risky | single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
-| PR-5 restore | ready после file-mechanics | download MIME/Content-Disposition, `Origin:null` CORS, per-OS checksum (H1), safe render |
+| PR-3b write | **blocked** | `signed` не подлежит release/TTL (ревью 3), reader-before-writer floor (H3), anchor expiry |
+| PR-4 union | risky | single-index edge-order сохранён (M2), metadata-конфликт→incomplete (нормативно), nullable height, abort-backoff |
+| PR-5 restore | ready после file-mechanics | доверенный агент сверяет SHA-256 (ревью 3), `Origin:null` CORS, per-OS verifier, safe render |
 | PR-6 CI/deploy | обязателен в каждом | ≥2 status-origin, **Worker rollback floor (H3)**, env/bindings везде |
 
-**Три остаточных блокера к полной реализации (ревью 2):** (1) точная state
-machine `signed` с rollback floor (H2/H3 — PR-3b); (2) `MIN_DEAD_WITNESSES=2`
-и ≥2 status-origin в prod (H4); (3) исполнимый безопасный процесс
-download→checksum→open для restore.html, включая `Origin:null` CORS (H1).
-Остальные 9 из 12 пунктов ревью 1 закрыты; из ревью 2 приняты все 8.
+**Остаточные блокеры к полной реализации (ревью 3):** (1) `signed` неудаляем —
+только resend+reconcile, плюс reader-before-writer floor (PR-3b); (2)
+`MIN_DEAD_WITNESSES=2` и ≥2 status-origin в prod (PR-3a); (3) restore.html
+проверяется доверенным агентом до исполнения (не gateway-MIME), включая
+`Origin:null` CORS (PR-5); (4) **утверждение D7** — реальные шлюзы/операторы/
+CORS — предусловие PR-3a/4/5, тоже блокер, а не «по ходу».
+
+Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 приняты все
+3 (два — снятие противоречий: `signed`-неоднозначность и «sandbox не нужен для
+file-mode»).
