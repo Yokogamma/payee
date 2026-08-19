@@ -524,6 +524,11 @@ interface MetaStoreWriter {
   delete(key: string): Promise<void>;
 }
 
+/** …plus the read, for mutators that re-read inside their own transaction. */
+interface MetaStoreReadWriter extends MetaStoreWriter {
+  get(key: string): Promise<unknown>;
+}
+
 /**
  * The vault this operation belongs to was DESTROYED (resetAll / another tab's
  * reset) while the operation was in flight. Writing now would resurrect the PIN
@@ -908,14 +913,22 @@ export async function getPinConfigMeta(): Promise<{ pinSeed: unknown; autoLockTi
   return { pinSeed, autoLockTimeout };
 }
 
+/** The PIN-configuration wipe itself, as a set of writes on an ALREADY OPEN
+ *  meta store. Shared by `clearPinConfigMeta` and the 10th-strike branch of
+ *  `commitPinUnlockFailure`, so the two can never drift on WHAT a wipe is —
+ *  the strike wipe has to happen inside the metering transaction, and a second
+ *  copy of this list is exactly how a key would get forgotten in one of them. */
+async function wipePinConfigInto(meta: MetaStoreWriter): Promise<void> {
+  await meta.delete('pin-seed');
+  await meta.delete('pin-attempts');
+  await meta.delete('pin-locked-until');
+  await meta.put(null, 'auto-lock-timeout');
+}
+
 export async function clearPinConfigMeta(): Promise<void> {
   const tx = getDB().transaction('meta', 'readwrite');
   try {
-    const meta = tx.objectStore('meta');
-    await meta.delete('pin-seed');
-    await meta.delete('pin-attempts');
-    await meta.delete('pin-locked-until');
-    await meta.put(null, 'auto-lock-timeout');
+    await wipePinConfigInto(tx.objectStore('meta'));
     await tx.done;
   } catch (e) {
     // Same rollback discipline as saveNoteWithSync: an error after the first
@@ -961,6 +974,198 @@ export async function commitPinSeedIfAbsent(
     try { tx.abort(); } catch { /* already aborting/aborted */ }
     throw e;
   }
+}
+
+// ─── Main PIN unlock: generation-guarded atomic commits (stage P) ────
+//
+// The unlock verdict is produced OUTSIDE any transaction (Argon2id runs for
+// ~1 s in the store), so every write it triggers has to survive two things
+// that can happen inside that second:
+//
+//  1. a RESET — this tab's «Удалить всё» or another tab's, arriving as a
+//     dbGeneration bump. Guarded by assertDbGeneration, exactly like every
+//     other write in this file: attempts, a lockout or a re-wrapped blob must
+//     never reappear in a database that was just cleared (the resetAll
+//     invariant the two-step getMeta+setMeta metering used to break);
+//  2. a PIN CHANGE in another tab. dbGeneration does NOT move for that — the
+//     database is the same one — so the guard has to be the blob itself: each
+//     commit re-reads `pin-seed` inside its own transaction and refuses unless
+//     it is still byte-for-byte the blob the verdict was produced against.
+//     Without it a wrong-PIN verdict for blob A would meter (and, on the 10th
+//     strike, WIPE) configuration B.
+//
+// Same shape as the safebox commits above — the difference is only the
+// ownership token: an opaque configId there, the blob itself here (the main
+// PIN's schema has no configId, and adding one would change the stored format
+// for no gain: salt and IV are random per wrap, so equal fields ⇔ same blob).
+
+export const MAIN_MAX_PIN_ATTEMPTS = 10;
+
+/** Progressive lockout for the MAIN PIN — the schedule the unlock path has
+ *  always used, moved next to the metering that applies it. */
+export function mainPinLockSeconds(attempts: number): number {
+  if (attempts <= 3) return 0;
+  if (attempts <= 5) return 30;
+  if (attempts <= 7) return 300;
+  return 1800;
+}
+
+function isPinSeedRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Semantic equality of two stored PIN blobs — the ONE named answer to «is this
+ * still the blob I verified?».
+ *
+ * Every NORMATIVE field is listed explicitly: `ciphertext`, `iv`, `salt`,
+ * `kdf`, `v` and the whole Argon2 profile. Deliberately not `===` (the blob is
+ * re-read from IndexedDB, so it is always a different object) and deliberately
+ * not `JSON.stringify` (key order is not part of any contract, and a silent
+ * schema addition would change the answer without anyone deciding to).
+ *
+ * Anything that is not an object — `undefined` for «no PIN configured»
+ * included — is unequal to everything, which is the fail-safe direction: the
+ * caller then writes nothing at all.
+ */
+export function pinSeedEquals(a: unknown, b: unknown): boolean {
+  if (!isPinSeedRecord(a) || !isPinSeedRecord(b)) return false;
+  if (a.ciphertext !== b.ciphertext) return false;
+  if (a.iv !== b.iv) return false;
+  if (a.salt !== b.salt) return false;
+  if (a.kdf !== b.kdf) return false;
+  if (a.v !== b.v) return false;
+  const pa = a.argon2;
+  const pb = b.argon2;
+  if (pa === undefined || pb === undefined) return pa === pb;
+  if (!isPinSeedRecord(pa) || !isPinSeedRecord(pb)) return false;
+  return pa.iterations === pb.iterations
+    && pa.memorySize === pb.memorySize
+    && pa.parallelism === pb.parallelism
+    && pa.hashLength === pb.hashLength;
+}
+
+/** `'config-changed'` = the `pin-seed` this operation was checking is no
+ *  longer the stored one (replaced or removed by another tab). ZERO writes
+ *  happened; the outcome belongs to a configuration that no longer exists. */
+export type PinCommitOutcome = 'committed' | 'config-changed';
+
+/** Run `apply` in ONE readwrite `meta` transaction, but only while `pin-seed`
+ *  is still `expectedPinSeed`. Generation-checked before the transaction is
+ *  created (single-threaded JS ⇒ no TOCTOU window), rolled back with
+ *  `tx.abort()` on any error — the saveNoteWithSync discipline. */
+async function mutateVerifiedPinConfig<T>(
+  expectedPinSeed: unknown,
+  expectedDbGeneration: number,
+  apply: (meta: MetaStoreReadWriter) => Promise<T>,
+): Promise<T | 'config-changed'> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta: MetaStoreReadWriter = tx.objectStore('meta');
+    const current: unknown = await meta.get('pin-seed');
+    if (!pinSeedEquals(current, expectedPinSeed)) {
+      await tx.done; // nothing was written — let it commit empty
+      return 'config-changed';
+    }
+    const result = await apply(meta);
+    await tx.done;
+    return result;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+export interface PinUnlockFailureOutcome {
+  outcome: PinCommitOutcome;
+  /** Attempts AFTER this one. `0` when `outcome === 'config-changed'` —
+   *  nothing was counted, so there is no number to report. */
+  attempts: number;
+  lockedUntil: number | null;
+  /** The 10th strike removed the whole PIN configuration in THIS transaction.
+   *  Notes and safebox entries are untouched — seed re-entry it is. */
+  wiped: boolean;
+}
+
+/**
+ * Count one wrong-PIN attempt against the configuration that was actually
+ * checked, and apply the progressive lockout — or, on the 10th strike, wipe
+ * the configuration, all inside ONE transaction.
+ *
+ * ONLY a genuine WrongPinError (AES-GCM authentication failure) may reach
+ * here. Environment failures never spend an attempt — a project-wide rule the
+ * caller owns, and this function has no way to re-check.
+ */
+export async function commitPinUnlockFailure(
+  expectedPinSeed: unknown,
+  expectedDbGeneration: number,
+): Promise<PinUnlockFailureOutcome> {
+  const result = await mutateVerifiedPinConfig(
+    expectedPinSeed,
+    expectedDbGeneration,
+    async (meta): Promise<PinUnlockFailureOutcome> => {
+      // A missing, negative or otherwise unusable counter restarts at zero
+      // rather than being arithmetic'd into a wipe: storage damage is an
+      // environment failure, and those never destroy a working PIN (the same
+      // rule that keeps PinUnlockUnavailableError out of the metering).
+      const stored = await meta.get('pin-attempts');
+      const previous = typeof stored === 'number' && Number.isSafeInteger(stored) && stored > 0
+        ? stored
+        : 0;
+      const attempts = previous + 1;
+      if (attempts >= MAIN_MAX_PIN_ATTEMPTS) {
+        await wipePinConfigInto(meta);
+        return { outcome: 'committed', attempts, lockedUntil: null, wiped: true };
+      }
+      await meta.put(attempts, 'pin-attempts');
+      const lockSeconds = mainPinLockSeconds(attempts);
+      const lockedUntil = lockSeconds > 0 ? Date.now() + lockSeconds * 1000 : null;
+      if (lockedUntil !== null) await meta.put(lockedUntil, 'pin-locked-until');
+      return { outcome: 'committed', attempts, lockedUntil, wiped: false };
+    },
+  );
+  if (result === 'config-changed') {
+    return { outcome: 'config-changed', attempts: 0, lockedUntil: null, wiped: false };
+  }
+  return result;
+}
+
+/**
+ * Successful unlock: clear the metering — but only if the counters still
+ * belong to the configuration that was proved. `'config-changed'` is NOT a
+ * failure for the caller: the same seed came out of the blob, so the vault
+ * still opens; it is only the counters that are somebody else's now.
+ */
+export async function commitPinUnlockSuccess(
+  expectedPinSeed: unknown,
+  expectedDbGeneration: number,
+): Promise<PinCommitOutcome> {
+  return mutateVerifiedPinConfig(expectedPinSeed, expectedDbGeneration, async meta => {
+    await meta.delete('pin-attempts');
+    await meta.delete('pin-locked-until');
+    return 'committed' as const;
+  });
+}
+
+/**
+ * Transparent legacy PBKDF2 → Argon2id re-wrap, written ONLY over the exact
+ * legacy blob that was just unwrapped.
+ *
+ * «Still legacy» would not be enough: another (older) client can replace one
+ * legacy blob with a DIFFERENT legacy blob — a PIN change — and this re-wrap
+ * carries the OLD PIN. It would silently make the user's new PIN stop working.
+ */
+export async function commitPinSeedRewrap(
+  expectedPinSeed: unknown,
+  newBlob: PinEncryptedSeed,
+  expectedDbGeneration: number,
+): Promise<PinCommitOutcome> {
+  return mutateVerifiedPinConfig(expectedPinSeed, expectedDbGeneration, async meta => {
+    await meta.put(newBlob, 'pin-seed');
+    return 'committed' as const;
+  });
 }
 
 // ─── Migration from localStorage ────────────────────────────────────

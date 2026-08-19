@@ -121,11 +121,16 @@ import {
   clearPinConfigMeta,
   bindVaultIdentity,
   commitPinSeedIfAbsent,
+  commitPinUnlockFailure,
+  commitPinUnlockSuccess,
+  commitPinSeedRewrap,
+  mainPinLockSeconds,
   resetAll,
   recoverStorage,
   getDbGeneration,
   noteExternalReset,
   isDbVersionError,
+  type PinUnlockFailureOutcome,
   type SyncRecord,
   type VaultBindResult,
 } from './storage';
@@ -1576,81 +1581,134 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * setMeta('init') would be writable into a database that was cleared or
    * re-bound in between, leaving a phantom-initialized empty vault.
    *
+   * `expectedDbGeneration` lets a caller that captured its reset-exclusivity
+   * token EARLIER hand it over instead of letting this function capture a
+   * fresh one. The PIN path needs it: it takes its token before ~1 s of
+   * Argon2id, and a reset landing anywhere in that window (including AFTER
+   * the metering/re-wrap commits, which have their own guard) must not let
+   * this open re-bind the old seed into the freshly wiped database and
+   * publish a vault the user just deleted. Omitted ⇒ captured here, the
+   * previous behaviour for every caller whose token is already current.
+   *
    * ORDER MATTERS (review round 4): every storage-side refusal happens BEFORE
    * commitVaultSnapshot() and the session write, so a rejected open cannot
    * leave a decrypted vault or the seed behind in this tab. What this does NOT
    * catch is a reset by another tab whose 'reset' broadcast has not arrived —
    * the project-wide residual window (see storage.ts, dbGeneration).
+   *
+   * ABORT-CONTROLLER LIFETIME (stage P): the controller stays parked in
+   * `vaultOpAbortRef` for the WHOLE run and is cleared only when the ref still
+   * holds THIS operation's controller — the discipline runArweaveSweep already
+   * follows for its own sweep. Clearing it right after prepareVaultSnapshot
+   * (as this did until stage P) made the tab look empty during the
+   * bindVaultIdentity await: no key, no session seed, no op in flight. A
+   * lockApp() landing in that window — «Сразу» on a return to foreground —
+   * took the `!vaultPresentInTab()` early exit WITHOUT bumping the epoch, the
+   * post-bind epoch check therefore passed, and the vault got published against
+   * the lock verdict. Both owners of this ref abort whatever they find on
+   * entry, so an openVault started during a sweep still cancels it; the two
+   * never overlap in practice (every sweep call site runs after its openVault
+   * has resolved).
    */
   async function openVault(
     mn: string,
-    opts: { initialize?: boolean } = {},
+    opts: { initialize?: boolean; expectedDbGeneration?: number } = {},
   ): Promise<{ epoch: number; pkB64: string } | null> {
+    const myDbGen = opts.expectedDbGeneration ?? getDbGeneration();
+    // Stand down BEFORE touching the shared abort ref: a caller arriving with
+    // a token that a reset has already invalidated must not cancel somebody
+    // else's in-flight operation on its way out. Synchronous ⇒ no TOCTOU
+    // window, the same discipline as assertDbGeneration in storage.ts.
+    if (myDbGen !== getDbGeneration()) return null;
+
     const myEpoch = vaultEpochRef.current;
-    const myDbGen = getDbGeneration();
     const abort = new AbortController();
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = abort;
 
-    let snap: VaultSnapshot;
+    /** This attempt no longer owns the vault — because it was LOCKED/reset
+     *  (epoch) or because a NEWER openVault preempted it (signal). Both halves
+     *  are load-bearing: a new openVault aborts its predecessor but does NOT
+     *  bump the epoch, so without the signal check the preempted call would
+     *  finish its uncancellable bind and publish stale keys over the newer
+     *  open. Superseded ⇒ publish nothing and stay completely silent. */
+    const superseded = () => abort.signal.aborted || vaultEpochRef.current !== myEpoch;
+
     try {
-      snap = await prepareVaultSnapshot(mn, { signal: abort.signal });
+      const snap: VaultSnapshot = await prepareVaultSnapshot(mn, { signal: abort.signal });
+      if (superseded()) return null;
+
+      let bind: VaultBindResult;
+      try {
+        // POINT OF NO RETURN FOR IDENTITY. A readwrite transaction cannot be
+        // cancelled by an AbortSignal — and must not be: identity is linearized
+        // by transaction creation order, exactly like resetAll. A bind that
+        // started before a lock/preemption RUNS TO COMPLETION, so with
+        // `initialize` BOTH `vault-public-key` and `meta.init` land. That is
+        // deliberate first-writer-wins: the vault is not published (no keys, no
+        // seed, no main screen — the app stays on the restore screen), and a
+        // retry with the SAME seed binds 'same' and succeeds, while a DIFFERENT
+        // seed gets 'foreign' → VaultMismatchError with its explicit reset.
+        // Preemption governs PUBLICATION only, never identity.
+        bind = await bindVaultIdentity(snap.pkB64, { initialize: !!opts.initialize }, myDbGen);
+      } catch (err) {
+        // A reset this tab already knows about. Nothing is published yet — stand
+        // down silently, exactly like an abort during preparation.
+        if (err instanceof StorageResetError) return null;
+        throw err;
+      }
+      // The PAIR of checks, BEFORE the 'foreign' verdict is turned into a
+      // user-facing error: a superseded attempt must not raise one either.
+      if (superseded()) return null;
+
+      if (bind === 'foreign') {
+        throw new VaultMismatchError(
+          'На устройстве уже есть данные другого хранилища. ' +
+          'Выполните «Сбросить приложение» перед восстановлением другого seed.'
+        );
+      }
+
+      commitVaultSnapshot(snap);
+      sessionStorage.setItem(SESSION_STORAGE_KEY, mn);
+
+      // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
+      // populate them (and flip countsReady) before the UI is interactive, so the
+      // destructive-reset dialog never renders against empty placeholder state
+      // (round-21 P1).
+      await refreshSyncCounts(myEpoch);
+
+      // Surface a persisted v3-upload pause immediately: a transient toast died
+      // with the lock/reload, but the fail-closed pause itself must never look
+      // like silently-stuck sync. Malformed marker = paused (fail closed).
+      try {
+        const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
+        if (vaultEpochRef.current === myEpoch) {
+          setV3Paused(pause3 !== null);
+          setV4Paused(pause4 !== null);
+        }
+      } catch (err) {
+        console.error('readV3PauseMeta at unlock failed:', err);
+      }
+
+      // Safebox presence (§3 hydration): the PIN-config record + the encrypted
+      // entry COUNT. Both readable with the section locked — they drive the entry
+      // point, the «Найден сейф: N» banner and reset-safety.
+      await refreshSafeboxPresence(myEpoch);
+
+      // Background: network-dependent parts only (online probe + queue kick).
+      void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
+
+      return { epoch: myEpoch, pkB64: snap.pkB64 };
     } catch (err) {
-      if (abort.signal.aborted) return null; // lock during prepare — stand down silently
+      // Every error of a superseded attempt is swallowed — INCLUDING
+      // VaultMismatchError and the AbortError from prepareVaultSnapshot. A
+      // preempted or locked call has no UI left to report into, and surfacing
+      // its verdict would put an error banner on the attempt that replaced it.
+      if (superseded()) return null;
       throw err;
     } finally {
       if (vaultOpAbortRef.current === abort) vaultOpAbortRef.current = null;
     }
-    if (vaultEpochRef.current !== myEpoch) return null; // locked between prepare and commit
-
-    let bind: VaultBindResult;
-    try {
-      bind = await bindVaultIdentity(snap.pkB64, { initialize: !!opts.initialize }, myDbGen);
-    } catch (err) {
-      // A reset this tab already knows about. Nothing is published yet — stand
-      // down silently, exactly like an abort during preparation.
-      if (err instanceof StorageResetError) return null;
-      throw err;
-    }
-    if (bind === 'foreign') {
-      throw new VaultMismatchError(
-        'На устройстве уже есть данные другого хранилища. ' +
-        'Выполните «Сбросить приложение» перед восстановлением другого seed.'
-      );
-    }
-    if (vaultEpochRef.current !== myEpoch) return null; // locked during the transaction
-
-    commitVaultSnapshot(snap);
-    sessionStorage.setItem(SESSION_STORAGE_KEY, mn);
-
-    // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
-    // populate them (and flip countsReady) before the UI is interactive, so the
-    // destructive-reset dialog never renders against empty placeholder state
-    // (round-21 P1).
-    await refreshSyncCounts(myEpoch);
-
-    // Surface a persisted v3-upload pause immediately: a transient toast died
-    // with the lock/reload, but the fail-closed pause itself must never look
-    // like silently-stuck sync. Malformed marker = paused (fail closed).
-    try {
-      const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
-      if (vaultEpochRef.current === myEpoch) {
-        setV3Paused(pause3 !== null);
-        setV4Paused(pause4 !== null);
-      }
-    } catch (err) {
-      console.error('readV3PauseMeta at unlock failed:', err);
-    }
-
-    // Safebox presence (§3 hydration): the PIN-config record + the encrypted
-    // entry COUNT. Both readable with the section locked — they drive the entry
-    // point, the «Найден сейф: N» banner and reset-safety.
-    await refreshSafeboxPresence(myEpoch);
-
-    // Background: network-dependent parts only (online probe + queue kick).
-    void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
-
-    return { epoch: myEpoch, pkB64: snap.pkB64 };
   }
 
   /** Re-read the two locked-safe safebox facts (config presence + entry count)
@@ -3017,6 +3075,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  error mid-cleanup leaves the configuration fully intact, never partial. */
   async function clearPinConfiguration(): Promise<void> {
     await clearPinConfigMeta();
+    publishPinConfigurationCleared();
+  }
+
+  /** The React/broadcast half of the cleanup above, on its own because the
+   *  10-strike wipe no longer runs `clearPinConfigMeta`: it happens INSIDE the
+   *  metering transaction of commitPinUnlockFailure (stage P), and only the
+   *  publication is left for the store. */
+  function publishPinConfigurationCleared(): void {
     // Local write wins over any in-flight reconcile read (round 5).
     reconcileGenerationRef.current++;
     applyHasPin(false);
@@ -3030,6 +3096,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const unlockWithPinAction = useCallback(async (pin: string) => {
+    // Reset-exclusivity token, captured BEFORE the first read (stage P). Every
+    // meta write below carries it, so a wipe landing during the ~1 s Argon2id
+    // derivation can no longer be undone by this flow — the metering, the
+    // lockout and the legacy re-wrap used to resurrect a PIN configuration in
+    // a database that had just been cleared.
+    const myDbGen = getDbGeneration();
+
     // 1. Check lockout
     const lockedUntil = await getMeta<number>('pin-locked-until');
     if (lockedUntil && Date.now() < lockedUntil) {
@@ -3051,47 +3124,65 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // PIN after 10 environment hiccups. Surface it without metering.
         throw err;
       }
-      // Wrong PIN — increment attempts
-      const attempts = ((await getMeta<number>('pin-attempts')) ?? 0) + 1;
-      await setMeta('pin-attempts', attempts);
-
-      if (attempts >= 10) {
-        // Wipe PIN — require seed. Atomic (§8): also resets the auto-lock
-        // timeout and tells the other tabs, or changes nothing on failure.
-        await clearPinConfiguration();
+      // Wrong PIN — meter it atomically against the configuration that was
+      // ACTUALLY checked (re-verified inside the transaction, blob and all).
+      let outcome: PinUnlockFailureOutcome;
+      try {
+        outcome = await commitPinUnlockFailure(pinData, myDbGen);
+      } catch (e) {
+        // The database this attempt belonged to is gone. Stand down silently,
+        // exactly like openVault — there is nothing left to meter.
+        if (e instanceof StorageResetError) return;
+        throw e;
+      }
+      if (outcome.outcome === 'config-changed') {
+        // Another tab replaced (or removed) the PIN while we were deriving:
+        // this verdict is about a configuration that no longer exists. NOTHING
+        // was metered and nothing was wiped — re-read the authoritative state
+        // and leave the user on the PIN screen without an error message.
+        void reconcileLockScreen();
+        return;
+      }
+      if (outcome.wiped) {
+        // The 10th strike wiped the configuration inside the transaction
+        // above; only the React state and the cross-tab notice are left.
+        publishPinConfigurationCleared();
         throw new PinWipedError();
       }
-
-      // Progressive lockout
-      const lockSeconds =
-        attempts <= 3 ? 0 :
-        attempts <= 5 ? 30 :
-        attempts <= 7 ? 300 :
-        1800;
-
-      if (lockSeconds > 0) {
-        await setMeta('pin-locked-until', Date.now() + lockSeconds * 1000);
-        throw new PinLockedError(lockSeconds);
-      }
+      if (outcome.lockedUntil !== null) throw new PinLockedError(mainPinLockSeconds(outcome.attempts));
 
       throw new Error('wrong_pin');
     }
 
-    // 3. Success — reset attempts
-    await deleteMeta('pin-attempts');
-    await deleteMeta('pin-locked-until');
+    // 3. Success — clear the metering, under the same blob check. A
+    // 'config-changed' outcome is NOT a failure: the seed that came out is the
+    // same one, so the vault still opens; the counters simply belong to the
+    // configuration another tab has just written and are not ours to reset.
+    try {
+      await commitPinUnlockSuccess(pinData, myDbGen);
+    } catch (err) {
+      if (err instanceof StorageResetError) return;
+      throw err;
+    }
 
-    // Transparently upgrade a legacy PBKDF2 blob to Argon2id. If the rewrap
-    // fails, keep the working legacy blob and continue — don't block login.
+    // Transparently upgrade a legacy PBKDF2 blob to Argon2id — written ONLY
+    // over the exact legacy blob just unwrapped ('config-changed' otherwise:
+    // an older client may have replaced one legacy blob with another, and this
+    // re-wrap carries the OLD PIN). If it fails, keep the working legacy blob
+    // and continue — don't block login.
     if (isPinKdfLegacy(pinData)) {
       try {
-        await setMeta('pin-seed', await encryptWithPin(mn, pin));
+        await commitPinSeedRewrap(pinData, await encryptWithPin(mn, pin), myDbGen);
       } catch (err) {
+        if (err instanceof StorageResetError) return;
         console.error('PIN rewrap to Argon2id failed (keeping legacy blob):', err);
       }
     }
 
-    const opened = await openVault(mn);
+    // The token captured at the top, NOT a fresh one: a reset that landed
+    // after the commits above (each of which refused to write) must not be
+    // rewarded with a vault re-bound into the wiped database.
+    const opened = await openVault(mn, { expectedDbGeneration: myDbGen });
     if (!opened) return;
     const epoch = opened.epoch;
     // An explicit unlock — a user action the persistence request belongs to.

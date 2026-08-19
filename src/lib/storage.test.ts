@@ -481,3 +481,218 @@ describe('commitPinSeedIfAbsent (first-writer-wins)', () => {
     expect(await getMeta('pin-seed')).toBeUndefined();
   });
 });
+
+// ─── Main PIN unlock commits (stage P) ──────────────────────────────
+
+import {
+  commitPinUnlockFailure,
+  commitPinUnlockSuccess,
+  commitPinSeedRewrap,
+  pinSeedEquals,
+  mainPinLockSeconds,
+  MAIN_MAX_PIN_ATTEMPTS,
+} from './storage';
+
+/** The pinned v1 Argon2id profile — the only one assertValidPinBlob accepts. */
+const ARGON2_V1 = { iterations: 3, memorySize: 65_536, parallelism: 1, hashLength: 32 };
+
+const argon2Blob = (ciphertext: string): PinEncryptedSeed => ({
+  ciphertext, iv: 'iv', salt: 's', kdf: 'argon2id', v: 1, argon2: { ...ARGON2_V1 },
+});
+/** Pre-Argon2id blob (no `kdf` field) — what the re-wrap path upgrades. */
+const legacyBlob = (ciphertext: string): PinEncryptedSeed => ({ ciphertext, iv: 'iv', salt: 's' });
+
+describe('pinSeedEquals (the ONE ownership check for the main PIN)', () => {
+  it('is true for a byte-identical blob read back from storage', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    expect(pinSeedEquals(await getMeta('pin-seed'), argon2Blob('ctA'))).toBe(true);
+  });
+
+  it('is false when ciphertext, iv or salt differ', () => {
+    expect(pinSeedEquals(argon2Blob('ctA'), argon2Blob('ctB'))).toBe(false);
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), iv: 'other' })).toBe(false);
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), salt: 'other' })).toBe(false);
+  });
+
+  it('is false when ONLY the kdf differs', () => {
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), kdf: 'pbkdf2' })).toBe(false);
+  });
+
+  it('is false when ONLY the version differs', () => {
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), v: 2 })).toBe(false);
+  });
+
+  it('is false when ONLY one Argon2 parameter differs — every field is normative', () => {
+    for (const field of ['iterations', 'memorySize', 'parallelism', 'hashLength'] as const) {
+      const tweaked = { ...argon2Blob('ct'), argon2: { ...ARGON2_V1, [field]: ARGON2_V1[field] + 1 } };
+      expect(pinSeedEquals(argon2Blob('ct'), tweaked)).toBe(false);
+    }
+  });
+
+  it('is false when one side carries an Argon2 profile and the other does not', () => {
+    expect(pinSeedEquals(argon2Blob('ct'), legacyBlob('ct'))).toBe(false);
+    expect(pinSeedEquals(legacyBlob('ct'), argon2Blob('ct'))).toBe(false);
+  });
+
+  it('treats two legacy blobs with the same fields as equal', () => {
+    expect(pinSeedEquals(legacyBlob('ct'), legacyBlob('ct'))).toBe(true);
+  });
+
+  it('is false against undefined — "no PIN configured" owns nothing', () => {
+    expect(pinSeedEquals(undefined, argon2Blob('ct'))).toBe(false);
+    expect(pinSeedEquals(argon2Blob('ct'), undefined)).toBe(false);
+    expect(pinSeedEquals(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('commitPinUnlockFailure (atomic metering + lockout + wipe)', () => {
+  it('counts the attempt in ONE transaction — no lockout below the threshold', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out).toEqual({ outcome: 'committed', attempts: 1, lockedUntil: null, wiped: false });
+    expect(await getMeta('pin-attempts')).toBe(1);
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  it('applies the progressive lockout schedule', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('pin-attempts', 3);
+    const before = Date.now();
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.attempts).toBe(4);
+    expect(mainPinLockSeconds(4)).toBe(30);
+    expect(out.lockedUntil ?? 0).toBeGreaterThanOrEqual(before + 30_000);
+    expect(await getMeta('pin-locked-until')).toBe(out.lockedUntil);
+  });
+
+  it('two concurrent failures BOTH count — the increment is inside the transaction', async () => {
+    // The two-step getMeta+setMeta this replaced lost one of them: both reads
+    // returned the same number. IndexedDB serializes readwrite transactions
+    // per store, so re-reading inside the transaction cannot.
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const gen = getDbGeneration();
+    await Promise.all([
+      commitPinUnlockFailure(argon2Blob('ctA'), gen),
+      commitPinUnlockFailure(argon2Blob('ctA'), gen),
+    ]);
+    expect(await getMeta('pin-attempts')).toBe(2);
+  });
+
+  it('the 10th strike wipes the WHOLE configuration in the same transaction', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('pin-attempts', MAIN_MAX_PIN_ATTEMPTS - 1);
+    await setMeta('pin-locked-until', Date.now() + 1_800_000);
+    await setMeta('auto-lock-timeout', 300);
+
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out).toEqual({
+      outcome: 'committed', attempts: MAIN_MAX_PIN_ATTEMPTS, lockedUntil: null, wiped: true,
+    });
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    // No observable "attempts = 10": the counter is gone in the same commit.
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(await getMeta('auto-lock-timeout')).toBeNull();
+  });
+
+  it('a reset during the (slow) KDF does NOT resurrect attempts or a lockout', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const stale = getDbGeneration();
+    await resetAll(); // «Удалить всё» landed while Argon2 was running
+    await expect(commitPinUnlockFailure(argon2Blob('ctA'), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+
+  it('a PIN replaced by another tab during the KDF: config-changed, ZERO writes', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB')); // tab B already wrote its blob
+    await setMeta('pin-attempts', 2);             // …and its own metering
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.outcome).toBe('config-changed');
+    expect(out.attempts).toBe(0);
+    expect(out.wiped).toBe(false);
+    expect(await getMeta('pin-attempts')).toBe(2);      // NOT metered
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('ctB')); // NOT wiped
+  });
+
+  it('does not WIPE a foreign configuration on what would have been the 10th strike', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB'));
+    await setMeta('pin-attempts', MAIN_MAX_PIN_ATTEMPTS - 1);
+    await setMeta('auto-lock-timeout', 300);
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.outcome).toBe('config-changed');
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('ctB'));
+    expect(await getMeta('auto-lock-timeout')).toBe(300);
+  });
+
+  it('a PIN REMOVED by another tab during the KDF: config-changed, nothing written', async () => {
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.outcome).toBe('config-changed');
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+  });
+});
+
+describe('commitPinUnlockSuccess', () => {
+  it('clears the metering of the configuration that was proved', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('pin-attempts', 4);
+    await setMeta('pin-locked-until', Date.now() + 30_000);
+    expect(await commitPinUnlockSuccess(argon2Blob('ctA'), getDbGeneration())).toBe('committed');
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  it('leaves a foreign configuration\'s counters ALONE (the vault still opens)', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB'));
+    await setMeta('pin-attempts', 4);
+    const lockedUntil = Date.now() + 30_000;
+    await setMeta('pin-locked-until', lockedUntil);
+    expect(await commitPinUnlockSuccess(argon2Blob('ctA'), getDbGeneration())).toBe('config-changed');
+    expect(await getMeta('pin-attempts')).toBe(4);
+    expect(await getMeta('pin-locked-until')).toBe(lockedUntil);
+  });
+
+  it('refuses after a reset', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitPinUnlockSuccess(argon2Blob('ctA'), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+  });
+});
+
+describe('commitPinSeedRewrap (legacy → Argon2id)', () => {
+  it('replaces the exact legacy blob that was unwrapped', async () => {
+    await setMeta('pin-seed', legacyBlob('legacyA'));
+    expect(await commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), getDbGeneration()))
+      .toBe('committed');
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('newA'));
+  });
+
+  it('legacy A replaced by legacy B: the re-wrap of A does NOT overwrite B', async () => {
+    // "Still legacy" would have passed here — and silently re-encrypted B's
+    // configuration under A's (old) PIN.
+    await setMeta('pin-seed', legacyBlob('legacyB'));
+    expect(await commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), getDbGeneration()))
+      .toBe('config-changed');
+    expect(await getMeta('pin-seed')).toEqual(legacyBlob('legacyB'));
+  });
+
+  it('a reset during the re-wrap does NOT resurrect pin-seed', async () => {
+    await setMeta('pin-seed', legacyBlob('legacyA'));
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+
+  it('writes nothing once the PIN was removed by another tab', async () => {
+    expect(await commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), getDbGeneration()))
+      .toBe('config-changed');
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+});
