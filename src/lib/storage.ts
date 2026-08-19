@@ -845,8 +845,10 @@ export async function deleteMeta(key: string): Promise<void> {
 
 // ─── Vault identity ─────────────────────────────────────────────────
 
-/** Outcome of binding a seed's public key to THIS database. */
-export type VaultBindResult = 'bound' | 'same' | 'foreign';
+/** Outcome of binding a seed's public key to THIS database.
+ *  `'revoked'` = the caller passed a `requireQuickUnlock` precondition and it
+ *  no longer holds (the record or the PIN went away). NOTHING was written. */
+export type VaultBindResult = 'bound' | 'same' | 'foreign' | 'revoked';
 
 /**
  * Bind the vault identity — and, optionally, mark the database initialized — in
@@ -874,13 +876,39 @@ export type VaultBindResult = 'bound' | 'same' | 'foreign';
  */
 export async function bindVaultIdentity(
   pkB64: string,
-  opts: { initialize: boolean },
+  opts: { initialize: boolean; requireQuickUnlock?: QuickUnlockRecord },
   expectedDbGeneration: number,
 ): Promise<VaultBindResult> {
   assertDbGeneration(expectedDbGeneration);
   const tx = getDB().transaction('meta', 'readwrite');
   try {
     const meta = tx.objectStore('meta');
+
+    // AUTHORIZATION RE-CHECK, inside the transaction that is the point of no
+    // return for identity. Only the quick-unlock path passes this, and only it
+    // needs it: its authorization IS a stored record, so deleting the record —
+    // or the PIN it depends on — is a REVOCATION, not merely a config change.
+    // A check outside this transaction (however late) still leaves the key
+    // derivation in prepareVaultSnapshot as a window; here there is none.
+    //
+    // The PIN path deliberately does NOT use this: its authorization is a
+    // proof of knowledge, and removing the PIN elsewhere does not retroactively
+    // unprove a PIN the user typed correctly.
+    if (opts.requireQuickUnlock) {
+      const [pinSeed, rawQuickUnlock] = await Promise.all([
+        meta.get('pin-seed'),
+        meta.get(QUICK_UNLOCK_META_KEY),
+      ]);
+      // Both halves matter: «no pin-seed ⇒ the record is void» is the rule an
+      // OLDER client trips by clearing the PIN without knowing about the
+      // record, and exact equality catches a removal or a re-configuration.
+      if (pinSeed === undefined
+          || !quickUnlockRecordEquals(parseQuickUnlockRecord(rawQuickUnlock), opts.requireQuickUnlock)) {
+        await tx.done; // nothing written
+        return 'revoked';
+      }
+    }
+
     const saved = await meta.get('vault-public-key') as string | undefined;
     if (saved !== undefined && saved !== pkB64) {
       await tx.done;

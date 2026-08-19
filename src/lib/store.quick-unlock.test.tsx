@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import { useEffect } from 'react';
+import { useEffect, StrictMode } from 'react';
 import { render, act, cleanup, waitFor } from '@testing-library/react';
 
 // «Быстрый вход» — store-level invariants (§8). The FLAG IS ON here; the OFF
@@ -786,6 +786,65 @@ describe('access revoked in another tab DURING the ceremony', () => {
     expect(store.mnemonic).toBeNull();
   });
 
+  it('removal AFTER the final snapshot but BEFORE the bind is still refused', async () => {
+    // The window the pre-publication re-read cannot cover: the key derivation
+    // inside prepareVaultSnapshot. Only the check INSIDE the bind transaction
+    // closes it, and that is where nothing was written when it refuses.
+    renderStore();
+    await untilReady();
+    await configureQuickUnlock();
+    act(() => { store.lockApp(); });
+
+    const realBind = vi.mocked(bindVaultIdentity).getMockImplementation()!;
+    vi.mocked(bindVaultIdentity).mockImplementationOnce(async (pk, opts, gen) => {
+      // Land the removal after openVault started, before its transaction.
+      const db = await import('./storage');
+      await db.deleteMeta(QUICK_UNLOCK_META_KEY);
+      return realBind(pk, opts, gen);
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+
+    // The bind DID run — and wrote nothing, because the precondition failed.
+    expect(vi.mocked(bindVaultIdentity)).toHaveBeenCalled();
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).toBe('pin');
+  });
+
+  it('the PIN removed in that same window is refused by the bind too', async () => {
+    renderStore();
+    await untilReady();
+    await configureQuickUnlock();
+    act(() => { store.lockApp(); });
+
+    const realBind = vi.mocked(bindVaultIdentity).getMockImplementation()!;
+    vi.mocked(bindVaultIdentity).mockImplementationOnce(async (pk, opts, gen) => {
+      const db = await import('./storage');
+      await db.deleteMeta('pin-seed'); // an older client's clearPinConfigMeta
+      return realBind(pk, opts, gen);
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+  });
+
+  it('the ordinary paths pass NO precondition and are unaffected', async () => {
+    // bootstrap / confirm / restore / PIN unlock must keep binding exactly as
+    // before: their authorization is a proof of knowledge, not a stored record.
+    renderStore();
+    await untilReady();
+    vi.mocked(bindVaultIdentity).mockClear();
+    await openMain();
+    const opts = vi.mocked(bindVaultIdentity).mock.calls[0][1];
+    expect(opts.requireQuickUnlock).toBeUndefined();
+  });
+
   it('works WITHOUT BroadcastChannel — the guard is a storage read, not a message', async () => {
     // Older Safari has no BroadcastChannel at all, so nothing tells this tab
     // anything. The re-read is what makes the guard work there too.
@@ -874,19 +933,20 @@ describe('capability probe guards', () => {
     expect(store.quickUnlockCapability).toBe('ready'); // the stale one lost
   });
 
-  it('publishes after a StrictMode-style remount — the mounted flag is re-armed', async () => {
-    // React StrictMode mounts, runs the cleanup, and mounts again. A flag that
-    // is only ever CLEARED would stay false forever after that trial cleanup,
-    // and the verdict would never reach the screen in development.
-    const { unmount } = renderStore();
+  it('publishes under REAL StrictMode — the mounted flag survives the trial cleanup', async () => {
+    // The bug this pins is specific to ONE instance: StrictMode mounts, runs
+    // the effect cleanup, and mounts again. A flag that is only ever CLEARED
+    // stays false forever after that trial cleanup, and the verdict never
+    // reaches the screen in development. Re-rendering a NEW provider would not
+    // catch it — this has to be the same instance going through the cycle.
+    render(<StrictMode><NotesProvider><Probe /></NotesProvider></StrictMode>);
     await untilReady();
-    unmount();
 
-    cleanup();
-    renderStore();
-    await untilReady();
-    vi.mocked(detectQuickUnlockCapability).mockResolvedValueOnce('no-platform');
+    const probe = deferred<'no-platform'>();
+    vi.mocked(detectQuickUnlockCapability).mockImplementationOnce(() => probe.promise);
     act(() => { store.refreshQuickUnlockCapability(); });
+    await act(async () => { probe.resolve('no-platform'); });
+
     await waitFor(() => expect(store.quickUnlockCapability).toBe('no-platform'));
   });
 

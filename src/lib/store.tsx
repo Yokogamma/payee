@@ -269,6 +269,22 @@ export class VaultMismatchError extends Error {
   }
 }
 
+/**
+ * The stored authorization an open was carrying (today: the quick-unlock
+ * record, and the PIN it depends on) was withdrawn while that open was in
+ * flight — detected INSIDE the bind transaction, so nothing was written and
+ * nothing was published.
+ *
+ * Distinct from VaultMismatchError, which is about a DIFFERENT vault: here the
+ * vault is right and the way in is gone.
+ */
+export class VaultAccessRevokedError extends Error {
+  constructor() {
+    super('Доступ был изменён или отозван в другой вкладке — войдите по PIN.');
+    this.name = 'VaultAccessRevokedError';
+  }
+}
+
 export class PinLockedError extends Error {
   secondsLeft: number;
   constructor(secondsLeft: number) {
@@ -1736,7 +1752,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    */
   async function openVault(
     mn: string,
-    opts: { initialize?: boolean; expectedDbGeneration?: number } = {},
+    opts: {
+      initialize?: boolean;
+      expectedDbGeneration?: number;
+      /** Quick-unlock only: the record this open was authorized by. The bind
+       *  transaction refuses (`'revoked'`) unless it is STILL stored and a PIN
+       *  still exists — the one place where no window remains. */
+      requireQuickUnlock?: QuickUnlockRecord;
+    } = {},
   ): Promise<{ epoch: number; pkB64: string } | null> {
     const myDbGen = opts.expectedDbGeneration ?? getDbGeneration();
     // Stand down BEFORE touching the shared abort ref: a caller arriving with
@@ -1774,7 +1797,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // retry with the SAME seed binds 'same' and succeeds, while a DIFFERENT
         // seed gets 'foreign' → VaultMismatchError with its explicit reset.
         // Preemption governs PUBLICATION only, never identity.
-        bind = await bindVaultIdentity(snap.pkB64, { initialize: !!opts.initialize }, myDbGen);
+        bind = await bindVaultIdentity(
+          snap.pkB64,
+          { initialize: !!opts.initialize, requireQuickUnlock: opts.requireQuickUnlock },
+          myDbGen,
+        );
       } catch (err) {
         // A reset this tab already knows about. Nothing is published yet — stand
         // down silently, exactly like an abort during preparation.
@@ -1784,6 +1811,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // The PAIR of checks, BEFORE the 'foreign' verdict is turned into a
       // user-facing error: a superseded attempt must not raise one either.
       if (superseded()) return null;
+
+      if (bind === 'revoked') {
+        // The authorization this open carried was withdrawn while it was in
+        // flight. The transaction wrote nothing — no key, no `init`.
+        throw new VaultAccessRevokedError();
+      }
 
       if (bind === 'foreign') {
         throw new VaultMismatchError(
@@ -3596,9 +3629,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
       // Final synchronous pair, then the shared open path — carrying the
       // generation captured BEFORE the ceremony, so a reset that landed during
-      // those (up to 60) seconds cannot be re-bound over.
+      // those (up to 60) seconds cannot be re-bound over, AND the record this
+      // open is authorized by, which the bind transaction re-verifies with no
+      // window left at all.
       if (superseded()) return;
-      const opened = await openVault(mn, { expectedDbGeneration: myDbGen });
+      const opened = await openVault(mn, {
+        expectedDbGeneration: myDbGen,
+        requireQuickUnlock: record,
+      });
       if (!opened) return;
       const epoch = opened.epoch;
       void ensurePersistentStorage(); // an explicit unlock is a user gesture
@@ -3610,6 +3648,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     } catch (err) {
       if (err instanceof QuickUnlockCancelledError) return; // our own abort — silent
+      // The bind transaction refused: the record (or the PIN) went away in the
+      // window the pre-check above cannot cover. Re-read the state, then say
+      // the same thing the pre-check would have.
+      if (err instanceof VaultAccessRevokedError) {
+        void reconcileLockScreen();
+        throw new QuickUnlockUnavailableError('Быстрый вход был изменён или удалён — войдите по PIN.');
+      }
       throw err;
     } finally {
       endQuickUnlockOp(abort);
