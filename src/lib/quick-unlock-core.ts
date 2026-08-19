@@ -33,9 +33,19 @@ import { isOperationError } from './crypto';
 /** No API, no platform authenticator, no PRF, the feature flag is off, or a
  *  WebCrypto/environment failure. Never destructive, never metered. */
 export class QuickUnlockUnavailableError extends Error {
-  constructor(message: string) {
+  /**
+   * Set when the CEREMONY ITSELF settled a capability question — the only
+   * authoritative answer there is (§6: the probes and the support matrix can
+   * both lie, in either direction). The store records it so the UI stops
+   * offering a setup that would mint another platform credential nobody can
+   * use — and, on `residentKey: 'discouraged'`, may not even be able to see.
+   */
+  readonly verdict?: QuickUnlockCapability;
+
+  constructor(message: string, verdict?: QuickUnlockCapability) {
     super(message);
     this.name = 'QuickUnlockUnavailableError';
+    this.verdict = verdict;
   }
 }
 
@@ -323,7 +333,14 @@ export async function createPrfCredential(opts: {
   const prf = (created.getClientExtensionResults() as { prf?: PrfExtensionResults }).prf;
   if (prf?.enabled !== true && !prf?.results?.first) {
     throw new QuickUnlockUnavailableError(
-      'Ключ создан, но это устройство не выдаёт PRF. Удалите ключ «Matamata Notes» в системном менеджере паролей.',
+      // NO JARGON, and no instruction the reader cannot act on. «PRF» means
+      // nothing to a person, and «удалите ключ» is wrong twice over: with
+      // residentKey 'discouraged' the credential may be invisible, and a
+      // leftover one is harmless — it opens nothing.
+      'Не удалось настроить быстрый вход: устройство не выдало нужный ключ. '
+      + 'Ничего не сломалось — вход по PIN-коду и seed-фразе работает как обычно. '
+      + 'Если в менеджере паролей появился ключ «Matamata Notes», его можно удалить: он ничего не открывает.',
+      'no-prf',
     );
   }
 
@@ -375,7 +392,12 @@ export async function evalPrf(opts: {
   // No output ⇒ UNAVAILABLE, never a key mismatch: nothing was decrypted, so
   // there is nothing to conclude about the stored record — and a record must
   // never be dropped over a platform that simply did not answer.
-  if (!prfOutput) throw new QuickUnlockUnavailableError('Устройство не выдало PRF-значение.');
+  if (!prfOutput) {
+    throw new QuickUnlockUnavailableError(
+      'Устройство не выдало нужный ключ. Войдите по PIN-коду — он работает как обычно.',
+      'no-prf',
+    );
+  }
   return prfOutput;
 }
 
