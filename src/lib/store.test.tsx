@@ -56,6 +56,9 @@ vi.mock('./storage', async importOriginal => {
     setMeta: vi.fn(actual.setMeta),
     saveNote: vi.fn(actual.saveNote),
     getPinConfigMeta: vi.fn(actual.getPinConfigMeta),
+    // The auto-lock VERDICT still reads two keys; everything else (bootstrap
+    // hydration, the cross-tab reconcile) reads this four-key snapshot.
+    readClientConfigSnapshot: vi.fn(actual.readClientConfigSnapshot),
     clearPinConfigMeta: vi.fn(actual.clearPinConfigMeta),
     // Overridable per-test: the vault-identity transaction and the conditional
     // PIN write are exactly where the restore-with-PIN races live.
@@ -102,7 +105,23 @@ import {
   initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords,
   clearPinConfigMeta, saveNote, getAllNotes as getStoredNotes,
   commitPinUnlockFailure, commitPinUnlockSuccess, commitPinSeedRewrap,
+  readClientConfigSnapshot,
 } from './storage';
+
+/** The four-key snapshot `reconcileLockScreen` and bootstrap now read. */
+function configSnapshot(over: {
+  pinSeed?: unknown;
+  autoLockTimeout?: unknown;
+  vaultPublicKey?: unknown;
+} = {}) {
+  return {
+    pinSeed: undefined,
+    autoLockTimeout: undefined,
+    vaultPublicKey: undefined,
+    quickUnlock: { kind: 'none' as const },
+    ...over,
+  };
+}
 import { isArweaveOnline, uploadViaProxy, type UploadResult } from './arweave';
 import { decryptWithPin, WrongPinError, deriveKey, encryptEnvelopeV3, type EncryptedNote } from './crypto';
 import { NoteTooLongError, MAX_NOTE_JSON_BYTES } from './limits';
@@ -809,8 +828,10 @@ describe('config publication ordering and reset lifecycle', () => {
 
     // Reconcile A hangs on its read…
     let releaseRead!: () => void;
-    vi.mocked(getPinConfigMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    vi.mocked(readClientConfigSnapshot).mockImplementationOnce(
+      () => new Promise(res => {
+        releaseRead = () => res(configSnapshot({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }));
+      }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r4-a' });
     await act(async () => {});
@@ -877,8 +898,10 @@ describe('stale verdict vs newer config', () => {
     const { channel } = listenOnChannel();
 
     let releaseRead!: () => void;
-    vi.mocked(getPinConfigMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    vi.mocked(readClientConfigSnapshot).mockImplementationOnce(
+      () => new Promise(res => {
+        releaseRead = () => res(configSnapshot({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }));
+      }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-b' });
     await act(async () => {}); // reconcile A is now pending on the deferred read
@@ -906,8 +929,10 @@ describe('stale verdict vs newer config', () => {
     const { channel } = listenOnChannel();
 
     let releaseRead!: () => void;
-    vi.mocked(getPinConfigMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    vi.mocked(readClientConfigSnapshot).mockImplementationOnce(
+      () => new Promise(res => {
+        releaseRead = () => res(configSnapshot({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }));
+      }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-c' });
     await act(async () => {}); // reconcile A pending with the OLD timeout
