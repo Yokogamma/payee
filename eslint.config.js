@@ -20,4 +20,23 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    // The quick-unlock CORE is WebAuthn + WebCrypto and nothing else: no
+    // storage, no store, no product policy. Enforced HERE rather than by a
+    // test, because both modules import cleanly under Node without executing a
+    // single browser branch — a green suite would not prove the boundary.
+    // Policy, the record schema and the meta commits live in
+    // `quick-unlock.ts` / `storage.ts`, which may import the core freely.
+    files: ['src/lib/quick-unlock-core.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['./storage', './store', './storage.js', './store.js'],
+          message:
+            'quick-unlock-core.ts must not depend on storage or the store — ' +
+            'put policy in quick-unlock.ts and meta commits in storage.ts.',
+        }],
+      }],
+    },
+  },
 ])

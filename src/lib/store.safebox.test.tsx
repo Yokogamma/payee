@@ -8,7 +8,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // REAL storage (fake-indexeddb) and REAL envelope crypto, with only the network
 // and the (deliberately expensive) Argon2 KDF mocked.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true, QUICK_UNLOCK_ENABLED: false }));
 
 // Argon2id is ~1 s per call by design. The REAL KDF profile is exercised in
 // safebox-pin.test.ts; here we only need the PIN gate's LOGIC, so swap in a

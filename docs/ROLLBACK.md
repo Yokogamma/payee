@@ -1007,6 +1007,121 @@ format is untouched (the ownership check compares the existing fields; no
 `configId` was added). Rolling back is a plain Pages redeploy of
 `client-sync1`, and it simply reinstates the four races.
 
+## «Быстрый вход» (WebAuthn PRF) — `client-qu1` / `client-qu2`
+
+A second key to the SAME seed, opened by the device's own verification
+(Windows Hello, Touch ID / Face ID, or a device passcode). It is an
+ACCELERATOR, not a replacement: the PIN stays, which means the attacker still
+picks the weakest wrapper and the vault's strength does not increase. That is
+stated in the settings copy, in those words, and a test asserts the sentences
+are in the DOM.
+
+The feature is never called «биометрия» anywhere the user can see. WebAuthn
+user verification is satisfied by a Windows Hello PIN or a device passcode just
+as well as by a fingerprint, and the platform gives the web no way to tell —
+so naming a modality on the button would be a lie.
+
+### Two releases, deliberately
+
+1. **`client-qu1`** — the whole feature merged with **`QUICK_UNLOCK_ENABLED =
+   false`**. Users see nothing new; the code bakes in production. The flag
+   contract is PER OPERATION: setup and unlock are gated, while READING the
+   record and REMOVING it never are. That asymmetry is what makes a rollback
+   safe — a user who configured quick unlock on a build with the flag on must
+   still find the block, and a «Удалить быстрый вход» button in it, after the
+   flag goes back off.
+2. **`client-qu2`** — one commit flipping the flag, after the manual device
+   acceptance below. Nothing else changes.
+
+### What the format is, and why floors do not move
+
+`quick-unlock-seed` is an ordinary string in the `meta` store: **`DB_VERSION`
+stays 2**, and the floors stay **`client-r4`** / **`worker-r3`**. An older
+client does not know the key and ignores it; a newer one accepts everything an
+older one wrote. The Worker and the on-chain protocol are not involved at all —
+WebAuthn is not a network call, so the **CSP is unchanged** too
+(`publickey-credentials-get`/`-create` are not listed in `Permissions-Policy`;
+their default allowlist is `self`, which is what we need, and the app cannot be
+framed — `frame-ancestors 'none'`).
+
+Crypto, for the record: `HKDF-SHA256(ikm = PRF output, salt = a random 32-byte
+hkdfSalt, info = "eternal-notes-quick-unlock-v1")` → AES-256-GCM over the
+mnemonic. The `info` is mandatory and versioned — using a raw PRF output as a
+key, or skipping `info`, are the two canonical PRF anti-patterns — and it is
+also what would keep a future contour (a safebox one, say) cryptographically
+independent on the SAME passkey. `deriveKey`, the `eternal-notes-v1` salt and
+the Argon2id profile are untouched.
+
+### The compatibility hole, and the rule that closes it
+
+A client from `client-r4` up to `client-pin1` clears the PIN — manually or
+through the 10-strike wipe — with a `clearPinConfigMeta` that knows nothing
+about `quick-unlock-seed`. It would leave a working quick entry to a vault
+whose PIN is gone.
+
+Closed by a rule applied on **every read**, not just at startup: **no
+`pin-seed` ⇒ the record is void** — ignored, and cleaned up. It doubles as the
+product rule («quick unlock only on top of a PIN»), so it is one invariant
+working in both directions rather than a compatibility patch. From this release
+on, the wipe itself is atomic: the record is deleted in the SAME transaction as
+`pin-seed`.
+
+### Invariants worth not rediscovering
+
+- **The PIN meter is untouchable.** No quick-unlock outcome — cancel, timeout,
+  no PRF, corrupt record, GCM mismatch, foreign vault — reads or writes
+  `pin-attempts` / `pin-locked-until`. An active PIN lockout does NOT block
+  quick unlock (different contour, hardware rate limit), and a successful quick
+  unlock does NOT clear the PIN counters.
+- **`userVerification: 'required'` in both ceremonies, forever.** Unwrapping the
+  seed is always behind a system check. Changing the policy ⇒ a new record `v`:
+  the spec does not guarantee the PRF output survives such a change.
+- **Never store a blob we have not opened.** `prf.enabled === true` is a
+  promise, not a fact, and known WebKit bugs (311099, 314934) returned garbage
+  and null on create. So setup always runs a control `get()` and wraps the seed
+  with THAT output — the path every later unlock takes. The price is two system
+  prompts during setup; a blob that cannot be opened is worse than no feature.
+- **`NotAllowedError` is a catch-all BY DESIGN of the spec** — cancel, timeout
+  and «that credential is gone» are indistinguishable for privacy reasons. It
+  therefore deletes nothing and claims nothing. The only silent outcome is our
+  OWN AbortError (a lock, a reset, an unmount).
+- **A record is deleted only on an `OperationError` from `subtle.decrypt`
+  itself**, and even then CONDITIONALLY: another tab may have re-configured
+  meanwhile, and `dbGeneration` does not move for that.
+- **Setup is first-writer-wins.** Two tabs configuring at once: one writes, the
+  other is told so and clobbers nothing.
+
+### Manual acceptance — MANDATORY before `client-qu2`
+
+Automated tests prove nothing about whether PRF works: only hardware knows.
+Re-check the minimum browser/OS versions against live sources immediately
+before running this — support moves fast (Firefox Android gained PRF between
+two revisions of the plan).
+
+- **iPhone (iOS 18.4+)**: Safari AND the installed PWA separately. Setup, entry,
+  cancelling the sheet; delete the key in the Passwords app → a neutral «не
+  выполнен», the record NOT auto-deleted, PIN entry still works. The PWA has
+  its own IndexedDB — configuring again there is expected, not a bug.
+- **Android**: Chrome and the installed PWA. Same, plus entry from the lock
+  screen and behaviour with the fingerprint disabled in the system.
+- **Windows Hello laptop**: Chrome AND Edge, 147+, 25H2 with KB5077181; and
+  separately a machine WITHOUT that update, where the honest «не
+  поддерживается» must appear instead of a silent failure. Test the Hello PIN,
+  not only the fingerprint.
+- **End to end everywhere**: setup at «Сразу» shows the explanation and no
+  button; setup at «5 минут» succeeds and then «Сразу» still unlocks; two tabs
+  reconcile; removing the PIN removes quick unlock; 10 wrong PINs remove both;
+  reset removes the record; the sheet stays local (`transports: ['internal']`)
+  and refusing a «another device» offer leaves the record intact; airplane mode
+  works (no network involved).
+
+### Rollback
+
+Redeploy **`client-pin1`**. Data is unaffected: `quick-unlock-seed` is an
+unknown meta key to that build, which ignores it. The one trace is that
+removing the PIN there leaves the record orphaned — and the next newer client
+deletes it on its first read, by the rule above.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
