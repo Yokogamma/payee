@@ -597,8 +597,21 @@ release — the network profile does):
    a repair candidate or redrop duplicate produces legitimate single `/raw`
    fetches — that is not a failed acceptance);
 3. create a note on the second device, press `↻` — exactly one
-   `/raw/<new txId>`, toast «Получено с других устройств: 1»;
+   `/raw/<new txId>`, and the status line reads «Проверено в HH:MM · …» with
+   the note counted (the «Получено с других устройств» TOAST was removed by
+   the navigation redesign — the always-visible status line replaced it, so do
+   not look for a toast here);
 4. offline — «Не удалось проверить обновления», the app stays alive.
+
+**DEPLOYED 2026-08-19** (main `20b0946`, PR #53) on notes.matamata.dev,
+run 32238403630 — all gates green in a clean `npm ci` checkout (lint, `tsc -b`,
+**1052 client tests / 58 files**, worker typecheck + 130 tests, staging config
+check, bundle budget 186.5/195 KB gz), `smoke-headers` passed against the
+deployment URL. Live bundle `index-D0_-tE-x.js`; CSP and
+`X-Frame-Options: DENY` verified on the origin. The bundle CONTAINS
+`sweep-full-at` — direct evidence the incremental code is in the artifact, not
+merely in the source (this release adds no user-facing string, so the usual
+«grep the bundle for new copy» check does not apply).
 
 Tag `client-sync1` after acceptance. **Floors do not move**: client `client-r4`,
 worker `worker-r3`. This release is NOT a floor — no IndexedDB version change,
