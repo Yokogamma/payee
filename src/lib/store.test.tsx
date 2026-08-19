@@ -13,7 +13,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // inheriting whatever flags.ts currently ships, so the W3 flip stays a pure
 // one-line change and both matrices (here / store.v3-writer.test.tsx) keep
 // asserting their own half forever.
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();

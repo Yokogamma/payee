@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useState, useEffect, type ReactNode } from 'react';
 import { useNotes } from '../lib/store';
 import type { AutoLockTimeout } from '../lib/auto-lock';
 import type { ThemePref } from '../lib/theme';
@@ -6,6 +6,8 @@ import { SECRET_PASSWORD_FIELD_PROPS, SAFEBOX_SECRET_FIELD_CLASS } from '../comp
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { navigate } from '../lib/route';
 import { QUARANTINE_EXPLANATION } from '../lib/syncCounters';
+import { QUICK_UNLOCK_ENABLED } from '../lib/flags';
+import type { QuickUnlockCapability } from '../lib/quick-unlock-core';
 
 /** Settings SECTION — a routed destination, not a dialog. Grouped into four
  *  groups («Доступ и замки», «Синхронизация», «Вид», «Опасная зона»), each
@@ -98,6 +100,12 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
     showMnemonic,
     autoLockTimeout,
     setAutoLockTimeout,
+    quickUnlockMeta,
+    hasQuickUnlock,
+    quickUnlockCapability,
+    setupQuickUnlock,
+    removeQuickUnlock,
+    refreshQuickUnlockCapability,
     safeboxPinConfigured,
     safeboxDataPresent,
     safeboxUnlocked,
@@ -321,6 +329,34 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               />
             )}
           </SettingsBlock>
+
+          {/* Between the PIN and the safebox, as approved. Visible on
+              `QUICK_UNLOCK_ENABLED || hasQuickUnlock` — the same shape the
+              safebox entry point uses: rolling the flag back must never leave
+              a live record with no control for it. */}
+          {(QUICK_UNLOCK_ENABLED || hasQuickUnlock) && (
+            <SettingsBlock
+              title="Быстрый вход"
+              chip={
+                hasQuickUnlock ? 'настроен'
+                : quickUnlockCapability === 'no-api'
+                  || quickUnlockCapability === 'no-platform'
+                  || quickUnlockCapability === 'no-prf' ? 'не поддерживается'
+                : 'не настроен'
+              }
+            >
+              <QuickUnlockSection
+                hasPin={hasPin}
+                hasQuickUnlock={hasQuickUnlock}
+                createdAt={quickUnlockMeta?.createdAt ?? null}
+                capability={quickUnlockCapability}
+                autoLockTimeout={autoLockTimeout}
+                setupQuickUnlock={setupQuickUnlock}
+                removeQuickUnlock={removeQuickUnlock}
+                refreshCapability={refreshQuickUnlockCapability}
+              />
+            </SettingsBlock>
+          )}
 
           {/* Unconditional, like the nav item: the same appear/disappear
               formula lived here too. Nothing configured yet is a STATE, shown
@@ -711,6 +747,141 @@ function PinSection({ hasPin, setupPin, removePin }: {
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * «Быстрый вход» (§9). The ROW ORDER IS THE PRIORITY, and the first row wins:
+ * a capability that disappeared (the passkey provider was removed, the OS was
+ * rolled back) must never hide the removal control for a record that still
+ * exists.
+ *
+ * The block is honest about what the feature is and is not — the same
+ * discipline as the safebox activation copy («гейт доступа, а не
+ * крипто-граница»). It never says «биометрия»: WebAuthn user verification is
+ * satisfied by a device PIN just as well as by a fingerprint, and the web
+ * cannot tell which happened.
+ */
+function QuickUnlockSection({
+  hasPin, hasQuickUnlock, createdAt, capability, autoLockTimeout,
+  setupQuickUnlock, removeQuickUnlock, refreshCapability,
+}: {
+  hasPin: boolean;
+  hasQuickUnlock: boolean;
+  createdAt: number | null;
+  capability: QuickUnlockCapability;
+  autoLockTimeout: AutoLockTimeout;
+  setupQuickUnlock: () => Promise<void>;
+  removeQuickUnlock: () => Promise<void>;
+  refreshCapability: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  // Lazy probe: only when this block is actually on screen.
+  useEffect(() => { refreshCapability(); }, [refreshCapability]);
+
+  async function run(action: () => Promise<void>) {
+    setBusy(true);
+    setError('');
+    try {
+      await action();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось выполнить действие.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // 1. A configured record ALWAYS offers removal — at any capability, with the
+  //    flag off, and at any auto-lock threshold. There is deliberately no
+  //    «Настроить заново»: re-setup goes through an explicit removal, so
+  //    orphaning the old platform credential is always a deliberate act.
+  if (hasQuickUnlock) {
+    return (
+      <div className="pin-actions">
+        {error && <div className="error-msg" role="alert">{error}</div>}
+        <p className="settings-hint">
+          Настроен{createdAt !== null ? ` ${new Date(createdAt).toLocaleDateString('ru-RU')}` : ''}.
+          Вход по PIN-коду приложения по-прежнему работает.
+        </p>
+        <button
+          className="btn btn-ghost full-width"
+          disabled={busy}
+          onClick={() => run(removeQuickUnlock)}
+        >
+          Удалить быстрый вход
+        </button>
+      </div>
+    );
+  }
+
+  // 2. No PIN — quick unlock exists only on top of one.
+  if (!hasPin) {
+    return (
+      <p className="settings-hint">
+        Сначала установите PIN-код — быстрый вход работает поверх него.
+      </p>
+    );
+  }
+
+  // 3. A definite «no» from the platform. Say WHY, and offer nothing instead:
+  //    the weaker fallback («biometrics as a latch») was rejected outright.
+  if (capability === 'no-api' || capability === 'no-platform' || capability === 'no-prf') {
+    return (
+      <p className="settings-hint">
+        {capability === 'no-api'
+          ? 'Этот браузер не поддерживает быстрый вход.'
+          : capability === 'no-platform'
+            ? 'На этом устройстве нет встроенной проверки — Windows Hello, Touch ID, Face ID или кода устройства.'
+            : 'Это устройство не выдаёт нужный криптографический ответ (PRF), поэтому быстрый вход здесь недоступен.'}
+      </p>
+    );
+  }
+
+  // 4. «Сразу» × setup is the one broken combination, closed by TEXT rather
+  //    than by touching the auto-lock lifecycle (the most fragile file in the
+  //    project — two production hotfixes in August).
+  if (autoLockTimeout === 0) {
+    return (
+      <p className="settings-hint">
+        При автоблокировке «Сразу» системное окно сворачивает приложение, и оно
+        блокируется прямо во время настройки. Поставьте порог «Через 5 мин»,
+        настройте быстрый вход — и, если хотите, верните «Сразу».
+        На сам вход порог не влияет.
+      </p>
+    );
+  }
+
+  // 5. Everything else, INCLUDING 'unknown': the detection APIs and the
+  //    support matrix can both lie, so only a real ceremony is authoritative.
+  return (
+    <div className="pin-actions">
+      {error && <div className="error-msg" role="alert">{error}</div>}
+      <p className="settings-hint">
+        Быстрый вход — не замена PIN-коду приложения, а второй ключ к тому же seed.
+        Его открывает системная проверка устройства: Windows Hello (отпечаток, лицо
+        или PIN Windows), Touch ID / Face ID или код устройства. Сохранённая копия
+        ключа не открывается без этой проверки, а вход по PIN-коду приложения
+        остаётся доступен. Общая стойкость хранилища не растёт: PIN-код приложения
+        остаётся и остаётся самым слабым входом. Быстрый вход — про скорость,
+        не про надёжность.
+      </p>
+      <p className="settings-hint">
+        Быстрый вход работает только на этом устройстве — на каждом другом он
+        настраивается отдельно. Системный ключ может синхронизироваться в вашу
+        связку (iCloud / Google) — это нормально. Если удалить его в системном
+        менеджере, сменить устройство или сбросить браузер, вход останется
+        по PIN-коду и seed-фразе.
+      </p>
+      <button
+        className="btn btn-outline full-width"
+        disabled={busy}
+        onClick={() => run(setupQuickUnlock)}
+      >
+        Настроить быстрый вход
+      </button>
+    </div>
   );
 }
 

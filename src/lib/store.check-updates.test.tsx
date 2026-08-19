@@ -11,7 +11,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // is that check and restore share ONE pipeline and differ only in what they
 // report, so the check must be exercised against the real merge path.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true, QUICK_UNLOCK_ENABLED: false }));
 
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();

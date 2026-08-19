@@ -8,7 +8,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // flag mocked ON. Kept in a separate file — a hoisted vi.mock cannot flip a
 // build-time constant between tests inside one statically-importing module.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();
