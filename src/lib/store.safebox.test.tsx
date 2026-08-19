@@ -28,6 +28,7 @@ const cryptoHooks = vi.hoisted(() => ({
   beforeCreatePinBlob: null as null | (() => void | Promise<void>),
   beforeVerifyPin: null as null | (() => void | Promise<void>),
   beforeDecryptMeta: null as null | (() => void | Promise<void>),
+  beforeDeriveSecretKey: null as null | (() => void | Promise<void>),
 }));
 
 vi.mock('./crypto', async importOriginal => {
@@ -53,6 +54,12 @@ vi.mock('./crypto', async importOriginal => {
       cryptoHooks.beforeVerifyPin = null; // one-shot: never re-enter
       await hook?.();
       return actual.verifySafeboxPin(...args);
+    }),
+    deriveSafeboxSecretKey: vi.fn(async (...args: Parameters<typeof actual.deriveSafeboxSecretKey>) => {
+      const hook = cryptoHooks.beforeDeriveSecretKey;
+      cryptoHooks.beforeDeriveSecretKey = null; // one-shot
+      await hook?.();
+      return actual.deriveSafeboxSecretKey(...args);
     }),
   };
 });
@@ -216,6 +223,7 @@ beforeEach(async () => {
   cryptoHooks.beforeCreatePinBlob = null;
   cryptoHooks.beforeVerifyPin = null;
   cryptoHooks.beforeDecryptMeta = null;
+  cryptoHooks.beforeDeriveSecretKey = null;
   await setMeta('init', true);
 });
 afterEach(() => cleanup());
@@ -1391,5 +1399,57 @@ describe('safebox targeted repair (§6.4)', () => {
     await setMeta('sweep-full-at', Date.now());
     await act(async () => { await store.checkForUpdates(); });
     expect(lastSweepOpts()?.known!.has('TX-LOCKED')).toBe(true); // пометки не было
+  });
+
+  it('тест 26 (гонка открытия): блокировка ПРИЛОЖЕНИЯ во время открытия секции не публикует failed ids', async () => {
+    renderStore();
+    await openSafebox();
+    await seedRottenMetaEntry('TX-APP-RACE');
+    act(() => { store.lockSafebox(); });
+
+    // Блокировка приложения бьёт ровно между ранними проверками открытия и
+    // расшифровкой meta: локальный набор battered-id обязан умереть вместе с
+    // сессией, а не просочиться в ref следующей.
+    cryptoHooks.beforeDecryptMeta = () => { store.lockApp(); };
+    await act(async () => { await store.unlockSafebox(PIN).catch(() => {}); });
+
+    // Пере-открываем ХРАНИЛИЩЕ (секцию — нет). Повторное открытие секции
+    // пересобрало бы битые meta заново и спрятало бы утечку — поэтому здесь
+    // только vault: чистый ref означает, что запись осталась «известной».
+    await act(async () => { await store.confirmMnemonic(MN); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+    await setMeta('sweep-full-at', Date.now());
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-APP-RACE')).toBe(true);
+  });
+
+  it('тест 26 (смена конфигурации): SafeboxConfigChangedError не помечает запись', async () => {
+    renderStore();
+    await openSafebox();
+    const entry = await seedEntry(); // ЦЕЛАЯ запись: ошибка — именно смена конфига
+    act(() => { store.lockSafebox(); });
+    await act(async () => { await store.unlockSafebox(PIN); });
+
+    await foreignTabReplacesConfig();
+    await expect(store.revealSafeboxSecret(entry.entryId)).rejects.toBeInstanceOf(SafeboxConfigChangedError);
+
+    await setMeta('sweep-full-at', Date.now());
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-SEED')).toBe(true); // пометки не было
+  });
+
+  it('тест 26 (сбой деривации): отказ KDF секретного ключа — не повреждение, id не помечается', async () => {
+    renderStore();
+    await openSafebox();
+    const entry = await seedEntry(); // ЦЕЛАЯ запись
+    act(() => { store.lockSafebox(); });
+    await act(async () => { await store.unlockSafebox(PIN); });
+
+    cryptoHooks.beforeDeriveSecretKey = () => { throw new Error('kdf упал'); };
+    await expect(store.revealSafeboxSecret(entry.entryId)).rejects.toThrow('kdf упал');
+
+    await setMeta('sweep-full-at', Date.now());
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-SEED')).toBe(true); // деривация вне ремонтных try
   });
 });

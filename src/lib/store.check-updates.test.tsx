@@ -53,6 +53,7 @@ import {
   initStorage, resetAll, setMeta, getMeta, sanitizeFullSweepAt,
   getAllNotes as getStoredNotes, countSafeboxEntries,
   mergeRestoredNote, setSyncRecord, getDbGeneration,
+  saveSafeboxEntryWithSync, getSafeboxEntryById,
 } from './storage';
 import { isArweaveOnline, fetchAllNotes, ArweaveIndexUnavailableError } from './arweave';
 import type { FetchAllNotesResult, RestoredNote, RestoredSafeboxEntry } from './arweave';
@@ -508,20 +509,39 @@ describe('checkForUpdates: инкрементальный режим (Фаза 1
     expect(lastSweepOpts()?.known).toBeUndefined();
   });
 
-  it('граница ремонта сейфа (тест 11): запись закрытой секции остаётся в known до полной сверки', async () => {
+  it('граница ремонта сейфа (тест 11): битую запись ЗАКРЫТОЙ секции инкрементальный sweep не чинит, полный — чинит', async () => {
     renderStore();
     await openMain();
+    // Битая meta-половина при так и не открывавшейся секции: расшифровка не
+    // бежала ни разу, детектировать повреждение нечем — это ровно остаточный
+    // размен §6.5.
     const [metaKey, secretKey] = await Promise.all([deriveSafeboxMetaKey(MN), deriveSafeboxSecretKey(MN)]);
-    const remote = await makeRemoteSafeboxChain(metaKey, secretKey, ['в сейфе']);
-    vi.mocked(fetchAllNotes).mockResolvedValueOnce({ ...EMPTY, safeboxEntries: remote });
+    const intact = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: 'закрытая', login: '', url: '', note: '', password: 'x', files: [], rev: 1,
+    });
+    await saveSafeboxEntryWithSync(
+      { ...intact, metaCiphertext: corruptB64(intact.metaCiphertext) },
+      { noteId: intact.entryId, kind: 'safebox', txId: 'TX-SB', status: 'confirmed', transport: 'proxy', updatedAt: 1 },
+    );
+    await setMeta('sweep-full-at', Date.now());
 
-    await act(async () => { await store.checkForUpdates(); }); // полная: merge сейфа + метка
     await act(async () => { await store.checkForUpdates(); }); // инкрементальная
+    // Недетектированная запись осталась «известной» (sentinel — реальный sweep
+    // её не перекачает, закреплено в arweave.incremental) — и осталась битой.
+    expect(lastSweepOpts()?.known!.get('TX-SB')).toEqual({ noteId: intact.entryId, kind: 'safebox' });
+    await expect(decryptSafeboxMeta(metaKey, (await getSafeboxEntryById(intact.entryId))!)).rejects.toBeDefined();
 
-    // Секция закрыта, повреждение её записи детектировать нечем — запись
-    // остаётся «известной» (sentinel, не качается). Ремонт — у полной сверки.
-    const known = lastSweepOpts()?.known;
-    expect(known!.get(remote[0].txId)).toEqual({ noteId: remote[0].encrypted.entryId, kind: 'safebox' });
+    // Суточная сверка — полная: known не передаётся, merge перезаписывает
+    // строку заведомо целой копией с цепи. Единственный путь ремонта здесь.
+    await setMeta('sweep-full-at', Date.now() - 25 * 60 * 60 * 1000);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY,
+      safeboxEntries: [{ encrypted: intact, meta: await decryptSafeboxMeta(metaKey, intact), txId: 'TX-SB' }],
+    });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known).toBeUndefined(); // полная
+    await expect(decryptSafeboxMeta(metaKey, (await getSafeboxEntryById(intact.entryId))!))
+      .resolves.toMatchObject({ title: 'закрытая' });
   });
 
   it('полностью известная выборка → done с нулями, partial=false (тест 12)', async () => {
