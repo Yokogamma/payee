@@ -1,10 +1,12 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v4 — третий раунд ревью учтён** (ревью 1: 2 critical + 6 high + 4
-medium; ревью 2: 8; ревью 3: 3 — все приняты). Дата: 2026-08-19. Строится
-поверх задеплоенного инкрементального sweep (PR #53). Остаточные блокеры полной
-реализации — конец §8. Принцип v4: каждое спорное место — ОДНО нормативное
-решение без альтернатив.
+Статус: **v5 — вторая серия решений владельца (2026-08-19) + живые пробы
+шлюзов из среды с сетевым доступом; D7 УТВЕРЖДЁН** (§2.1). История: v4 — три
+раунда ревью (ревью 1: 2 critical + 6 high + 4 medium; ревью 2: 8; ревью 3:
+3 — все приняты). Дата: 2026-08-19. Строится поверх задеплоенного
+инкрементального sweep (PR #53). Остаточные блокеры полной реализации — конец
+§8. Принцип v4 сохранён: каждое спорное место — ОДНО нормативное решение без
+альтернатив.
 
 Документ адресован ревьюеру: фиксирует решения, объём, разбиение на PR,
 инварианты, тестовые сценарии и границы. Ключевое изменение v2: **PR-3
@@ -24,7 +26,7 @@ read-path.
 | Клиент | `src/lib/arweave.ts:207` | проба доступности `/info` |
 | Клиент | `src/lib/arweave.ts:242` | статус транзакции `/tx/{id}/status` |
 | Клиент | `src/lib/arweave.ts:513` | GraphQL-поиск при restore |
-| Клиент | `src/lib/arweave.ts:677` | payload `/raw/{txId}` |
+| Клиент | `src/lib/arweave.ts:718` | payload `/raw/{txId}` |
 | Worker | `worker/src/index.ts:144, 747` | `Arweave.init` (anchor+price+post) |
 | Worker | `worker/src/index.ts:933` | серверная перепроверка статуса |
 | CSP | `scripts/postbuild.mjs:39` | `connect-src` пинит только `arweave.net` + proxy |
@@ -68,16 +70,89 @@ Byzantine-модель фиксируется в ADR и, где уместно, 
   txId в README и приложении. Это снимает critical-1.
 - **D7. Конкретные адреса шлюзов утверждаются ДО production-wiring** (не «в PR
   по ходу»): реальные URL, операторы, CORS, GraphQL schema/pagination, limits,
-  status-поведение, sandbox-redirect для HTML. См. §4.PR-3a и открытые вопросы.
+  status-поведение, sandbox-redirect для HTML. **УТВЕРЖДЕНО владельцем
+  2026-08-19 по результатам живых проб — состав в §2.1.** Открытым остаётся
+  только `UPLOAD_GATEWAYS` (утверждается по staging-испытаниям в PR-3b).
 - **D8. Типы endpoint РАЗЛИЧАЮТСЯ + дедуп по РАЗНЫМ ключам (ревью 2, H5).**
-  Индексы — ПОЛНЫЕ публичные HTTPS URL (`INDEX_ENDPOINTS`), т.к. реальные
-  кандидаты (Goldsky) имеют путь `/api/public/.../gn`, а не `origin+/graphql`;
-  два разных endpoint на одном `api.goldsky.com` имеют ОДИН origin, поэтому
+  Индексы — ПОЛНЫЕ публичные HTTPS URL (`INDEX_ENDPOINTS`), т.к. индексный
+  endpoint в общем случае несёт путь. Поправка v5: утверждённый публичный
+  Goldsky-поиск — `https://arweave-search.goldsky.com/graphql` (проверен вживую
+  2026-08-19, форма `origin+/graphql`); Goldsky-subgraph-endpoints вида
+  `/api/public/.../gn` существуют как отдельный продукт — обоснование v4
+  опиралось на них. Решение «полный URL» остаётся верным для обоих случаев:
+  два разных endpoint на одном хосте имеют ОДИН origin, поэтому
   `INDEX_ENDPOINTS` канонизируются и дедуплицируются по **полному URL**.
   `STATUS/PAYLOAD/UPLOAD_GATEWAYS` — bare origins, дедуп по **origin**. CSP
   `connect-src` строится ТОЛЬКО по извлечённым origin. Клиентский bearer для
   приватных индексов НЕ используется. (Ошибка v2 «дедуп всех списков по
   origin» отбросила бы один из двух Goldsky-endpoint — исправлено.)
+
+### 2.1 Утверждённый состав D7 и живые пробы (2026-08-19)
+
+Пробы выполнены из среды с сетевым доступом (в отличие от среды, где писался
+v4): 13 кандидатов, реальная 10-дневная транзакция проекта (EternalNotes) для
+`/raw`, несуществующий валидный txId для status-семантики.
+
+**Утверждённые списки:**
+
+- `STATUS_GATEWAYS` (5 origin): `arweave.net`, `ar-io.dev`, `vilenarios.com`,
+  `frostor.xyz`, `permagate.io` — у всех пяти согласованная семантика
+  (несуществующий txId → `404`, существующий → `200`), требование ≥2
+  status-origin (H4) выполнено с запасом.
+- `INDEX_ENDPOINTS`: `https://arweave.net/graphql`,
+  `https://arweave-search.goldsky.com/graphql` (два НЕЗАВИСИМЫХ индекса) +
+  `https://vilenarios.com/graphql` как transport-fallback (см. оговорку ниже).
+- `PAYLOAD_GATEWAYS`: `arweave.net` (первый), `vilenarios.com`, `ar-io.dev`,
+  `frostor.xyz`. **`permagate.io` в PAYLOAD НЕ входит** — его `/raw` стабильно
+  таймаутит (при рабочих status/graphql).
+- `UPLOAD_GATEWAYS`: НЕ утверждён — определяется staging-испытаниями в PR-3b;
+  владелец разрешил платные транзакции для этих испытаний (staging JWK).
+
+**Факты проб:**
+
+| Кандидат | status | graphql (CORS для `Origin: null`) | `/raw` (реальная нота) |
+|---|---|---|---|
+| arweave.net | ok | ok, `ACAO: *` | 200 за ~0.5s |
+| vilenarios.com | ok | ok, `ACAO: *` | холодный ~13s → из кэша ~0.4s |
+| ar-io.dev | ok | ok, `ACAO: *` | холодный 10–15s (первый раз может 504) |
+| frostor.xyz | ok | ok, `ACAO: *` | холодный ~12–16s |
+| permagate.io | ok | ok, отражает `null` | СЛОМАН (таймаут 25s+) |
+| arweave-search.goldsky.com | — | ok, отражает `null` | — |
+| ar-io.net | DNS не резолвится — исключён | | |
+| love4src.com, g8way.io, adaconna.top | не отвечают — исключены | | |
+| ariospeedwagon.com, arweave.fllstck.dev, aoweave.tech | нестабильны (5xx/частичные отказы) — исключены | | |
+
+- Холодный `/raw` вторичных шлюзов (10–16s) укладывается в текущий
+  `PAYLOAD_TIMEOUT_MS = 20s` (`arweave.ts:590`); после первого запроса ответ
+  кэшируется. Порядок перебора в `PAYLOAD_GATEWAYS` нормативен.
+- **Sandbox-redirect (реш. 6 §7) ПОДТВЕРЖДЁН вживую:** `permagate.io/{txId}` и
+  сам `arweave.net/{txId}` отвечают `302 → https://<base32(txId)>.<шлюз>/…`;
+  `/raw/{txId}` и `/graphql` редиректу НЕ подвержены — текущий CSP не ломается.
+- Analytics Engine доступен на Workers **Free**: 100k записей/день, 10k
+  read-запросов/день — для PR-2 достаточно с большим запасом.
+- Семантика auth для `/admin/metrics` (нет конфига → 503, нет/неверный bearer
+  → 401) УЖЕ реализована для существующих `/admin/*`
+  (`worker/src/index.ts:174–186`) — PR-2 переиспользует её.
+
+**Оговорка независимости (в ADR):** GraphQL ar.io-шлюзов — прокси к тому же
+индексу arweave.net (дефолт ar.io-node), т.е. третий `INDEX_ENDPOINT` даёт
+транспортную избыточность, НЕ независимое мнение; независимых индексов два —
+arweave.net и Goldsky. Отдельно: четыре из пяти status-шлюзов (включая сам
+arweave.net) работают на ar.io-стеке — программная монокультура: общий баг
+затронет всех одновременно. Byzantine-граница §1 остаётся в силе.
+
+**Прочие решения владельца (2026-08-19, вторая серия):**
+
+- платные транзакции для staging-испытаний upload-failover — РАЗРЕШЕНЫ;
+- verifier restore.html — только ПК (§4.PR-5), мобильный cold-restore —
+  отложенная задача в бэклог;
+- release-кошелёк создаётся на этапе PR-5; хранение: генерация оффлайн,
+  основная копия — менеджер паролей, запасная — бумажная, НИКОГДА в
+  repo/CI/облаке в открытом виде и НИКОГДА в самих Eternal Notes
+  (циклическая зависимость: этот ключ нужен, когда приложение умерло);
+- Cloudflare API token для Analytics Engine SQL API создаётся на этапе PR-2
+  (через Claude Chrome), хранится вне репозитория;
+- порядок треков — §6 (автотриггеры вставлены после read-path целиком).
 
 ## 3. Объём и границы
 
@@ -91,8 +166,9 @@ Byzantine-модель фиксируется в ADR и, где уместно, 
 - AO/HyperBEAM/Solana/ArNS — не в цепочке восстановления;
 - Wayfinder SDK — не в PWA-бандл;
 - клиентская телеметрия (D5);
-- автотриггеры sweep + `/feed` — разблокированы, но следующий трек ПОСЛЕ
-  read-path multi-index.
+- автотриггеры sweep + `/feed` — разблокированы; место в очереди утверждено
+  владельцем 2026-08-19: после read-path целиком (PR-3a + PR-4), ДО
+  write-path — см. §6.
 
 **Возвращено В объём по ревью (было «отдельный ADR»):** сохранение подписанной
 транзакции/txId ДО первого POST. Причина — без него безопасный upload failover
@@ -341,8 +417,8 @@ reconciliation по кворуму статуса. Это снимает нео�
 кандидатов одного блока и `block=null` относительно нынешнего GraphQL
 HEIGHT_DESC, а для одинакового Note-Id порядок влияет на sentinel-drop и claim.
 Решение: **в single-index режиме сохраняется исходный edge-order индекса
-(HEIGHT_DESC) без пересортировки** — 16 тестов `arweave.incremental.test.ts`
-проходят бит-в-бит. Новая детерминированная сортировка применяется ТОЛЬКО при
+(HEIGHT_DESC) без пересортировки** — 12 тестов `arweave.incremental.test.ts`
+(поправка v5: пересчитано, в v4 стояло «16») проходят бит-в-бит. Новая детерминированная сортировка применяется ТОЛЬКО при
 union ≥2 индексов, где единого потока и так нет. Новые тесты: equal-height,
 mixed null-height, перестановки ответов индексов не меняют победителя.
 
@@ -378,10 +454,13 @@ tx-specific sandbox subdomains.
   неисполняющая проверочная утилита** (downloader/verifier), которая
   скачивает файл, считает SHA-256 и лишь при совпадении отдаёт его.
   Прямой клик по gateway-URL НЕ является поддерживаемым способом запуска.
-- **Per-OS потоки verifier специфицируются в PR** для Windows / Android / iOS
-  (десктоп: `certutil`/`shasum` как ручной запасной; мобильные: штатного
-  средства нет → нужен конкретный проверочный инструмент, не текстовая
-  инструкция). Hash mismatch ОБЯЗАН блокировать (тест).
+- **Verifier — только ПК (решение владельца 2026-08-19).** Основной путь —
+  проверка внутри PWA (пункт (а) выше); холодный путь — десктоп: Windows
+  `certutil -hashfile`, macOS/Linux `shasum -a 256` как ручной запасной.
+  **Мобильное холодное восстановление БЕЗ приложения объявляется
+  неподдерживаемым** (фиксируется в ADR и README); отдельный мобильный
+  проверочный инструмент — отложенная задача в бэклог, НЕ в PR-5. Hash
+  mismatch ОБЯЗАН блокировать (тест).
 - **Заголовки шлюза — вспомогательны, не барьер.** Публиковать с
   `application/octet-stream` / `Content-Disposition: attachment` полезно, но
   это НЕ считается защитой (шлюз волен игнорировать). Защита — только
@@ -409,6 +488,12 @@ tx-specific sandbox subdomains.
 - публикация ОТДЕЛЬНЫМ release-кошельком и подписанным release-manifest —
   НЕ production upload wallet (не расширять границу секрета на локальную
   машину); скрипт скачивает файл с ≥2 шлюзов и сверяет SHA-256 со сборкой.
+- **Хранение release-кошелька (решение владельца 2026-08-19):** генерация
+  оффлайн на этапе PR-5; основная копия — менеджер паролей, запасная —
+  бумажная в другом месте; НИКОГДА в repo/CI/облачной синхронизации в
+  открытом виде и НИКОГДА в самих Eternal Notes (циклическая зависимость);
+  JWK касается диска только на время релиза; баланс — минимальный (публикация
+  стоит центы).
 - **Immutable restore пинит owners/gateway/форматы навсегда** → при wallet
   rotation порядок ОБЯЗАТЕЛЕН: (1) публикация нового restore с old+new
   owners → (2) обновление ссылок/verifier → (3) клиент → (4) переключение
@@ -452,18 +537,28 @@ gateway-код НЕ исполняется до checksum verification (file-mode
 - restore c `incomplete=true` — недоступна с клиента (D5); прокси-метрику по
   серверным пробам сознательно НЕ вводим.
 
-## 6. Порядок выполнения (по ревью)
+## 6. Порядок выполнения (утверждён владельцем 2026-08-19)
 
-1. Исправить ADR/план по двум critical (сделано — v2) и утвердить в PR-1.
-2. Утвердить endpoint-типы (D8), D7 и quorum truth table ДО wiring.
-3. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
-4. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
-5. Upload failover ТОЛЬКО с одним signed txId (PR-3b, предусловие: persist
-   signed tx).
-6. Multi-index union с conflict/null-height политикой (PR-4).
+Изменение против v4: write-path (PR-3b) сдвинут ПОСЛЕ read-path целиком и
+автотриггеров. Обоснование: сбой чтения бьёт по restore/sync немедленно, а
+сбой загрузки сегодня не теряет заметку («попробуй позже»); PR-3b — самый
+рискованный кусок (state machine DO, два последовательных Worker-релиза с
+floor, платные staging-испытания) и не должен задерживать автотриггеры.
+
+1. PR-1: ADR + этот план v5 (D7 утверждён — §2.1, правки фактов v5).
+2. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
+3. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
+4. Multi-index union с conflict/null-height политикой (PR-4).
+5. **Автотриггеры sweep (+ дальше /feed)** — прежний roadmap-трек, вставлен
+   здесь: авто-sweep сразу ходит по нескольким шлюзам/индексам, а не
+   увеличивает нагрузку на единственный `arweave.net`.
+6. Upload failover ТОЛЬКО с одним signed txId (PR-3b, предусловие: persist
+   signed tx; платные staging-испытания разрешены). Может идти параллельно
+   с п.5 — треки не пересекаются по коду.
 7. restore.html — file-mode (реш. 1): доверенный агент проверяет SHA-256 до
-   исполнения; `Origin:null` CORS-acceptance по D7 (PR-5). Sandbox НЕ требуется
-   для этого пути (research §7 реш. 6 — вне критического пути).
+   исполнения; `Origin:null` CORS-acceptance по D7 (PR-5); release-кошелёк
+   создаётся на этом шаге (§4.PR-5). Sandbox НЕ требуется для этого пути
+   (реш. 6 §7 — подтверждён вживую, вне критического пути).
 8. Обновить rollback/rotation runbooks; fault-injection + staging smoke.
 
 ## 7. Решения по семи вопросам ревью (утверждены владельцем 2026-08-19)
@@ -482,15 +577,14 @@ gateway-код НЕ исполняется до checksum verification (file-mode
 5. **Конфликт metadata / `block=null` — осторожная политика:** конфликтующий
    txId помечает sweep `incomplete=true` (не разрешается порядком Promise);
    `block=null` упорядочивается детерминированно в конец (tie-break txId ASC).
-6. **Sandbox-шлюзы — research-задача (владелец: «исследуй»).** Известно из
-   документации ar.io: gateway отдаёт HTML-контент не с корневого origin, а
-   редиректит (301/302) на **sandbox-поддомен** вида
-   `https://<base32(txId)>.<gateway>/`, изолируя каждую транзакцию в свой
-   origin (чужие cookie/localStorage/SW недоступны). Точный список D7-шлюзов
-   с таким поведением и формат редиректа ПОДЛЕЖАТ проверке на среде с сетевым
-   доступом (здесь egress к ar.io закрыт) и закрепляются acceptance-тестом.
-   Полезно и для основного приложения. НЕ на критическом пути restore, раз
-   выбран скачиваемый файл (реш. 1).
+6. **Sandbox-шлюзы — research ВЫПОЛНЕН (v5, 2026-08-19).** Подтверждено
+   вживую: `permagate.io/{txId}` и сам `arweave.net/{txId}` отвечают
+   `302 → https://<base32(txId)>.<gateway>/…` — каждая транзакция изолируется
+   в собственный origin (чужие cookie/localStorage/SW недоступны). При этом
+   `/raw/{txId}` и `/graphql` редиректу НЕ подвержены — текущий CSP и клиент
+   не затронуты. Остаётся закрепить acceptance-тестом в PR-3a (редирект не
+   ломает `/raw`-путь). НЕ на критическом пути restore, раз выбран
+   скачиваемый файл (реш. 1).
 7. **Wallet rotation — «сначала новый restore», отдельный release-кошелёк.**
    Порядок (runbook в `docs/ROLLBACK.md`): опубликовать новый restore со
    старым+новым owner отдельным release-кошельком → обновить ссылки/verifier
@@ -498,24 +592,25 @@ gateway-код НЕ исполняется до checksum verification (file-mode
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус после ревью 2)
+## 8. Карта соответствия (статус v5)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
-| PR-1 ADR | needs clarification | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота |
-| PR-2 метрики | ready после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store |
-| PR-3a read | ready после D7/quorum | MIN_DEAD_WITNESSES=2 (H4), dedup по типу (H5), payload-validation fallback |
-| PR-3b write | **blocked** | `signed` не подлежит release/TTL (ревью 3), reader-before-writer floor (H3), anchor expiry |
+| PR-1 ADR | **ready** (все clarifications сняты v5) | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, оговорка монокультуры (§2.1) |
+| PR-2 метрики | ready после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
+| PR-3a read | **ready** (D7 утверждён §2.1) | MIN_DEAD_WITNESSES=2 (H4), dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
+| PR-3b write | blocked до своей очереди (§6 п.6) | `signed` не подлежит release/TTL (ревью 3), reader-before-writer floor (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky | single-index edge-order сохранён (M2), metadata-конфликт→incomplete (нормативно), nullable height, abort-backoff |
-| PR-5 restore | ready после file-mechanics | доверенный агент сверяет SHA-256 (ревью 3), `Origin:null` CORS, per-OS verifier, safe render |
+| PR-5 restore | ready (file-mechanics + PC-only verifier решены) | доверенный агент сверяет SHA-256 (ревью 3), `Origin:null` CORS, safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | ≥2 status-origin, **Worker rollback floor (H3)**, env/bindings везде |
 
-**Остаточные блокеры к полной реализации (ревью 3):** (1) `signed` неудаляем —
-только resend+reconcile, плюс reader-before-writer floor (PR-3b); (2)
-`MIN_DEAD_WITNESSES=2` и ≥2 status-origin в prod (PR-3a); (3) restore.html
-проверяется доверенным агентом до исполнения (не gateway-MIME), включая
-`Origin:null` CORS (PR-5); (4) **утверждение D7** — реальные шлюзы/операторы/
-CORS — предусловие PR-3a/4/5, тоже блокер, а не «по ходу».
+**Остаточные блокеры к полной реализации:** (1) `signed` неудаляем — только
+resend+reconcile, плюс reader-before-writer floor (PR-3b); (2)
+`MIN_DEAD_WITNESSES=2` и ≥2 status-origin в prod (PR-3a — состав утверждён);
+(3) restore.html проверяется доверенным агентом до исполнения (не
+gateway-MIME), включая `Origin:null` CORS (PR-5). Бывший блокер (4)
+«утверждение D7» ЗАКРЫТ в v5 (§2.1); открытым в D7 остаётся только
+`UPLOAD_GATEWAYS` — утверждается по staging-испытаниям в PR-3b.
 
 Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 приняты все
 3 (два — снятие противоречий: `signed`-неоднозначность и «sandbox не нужен для
