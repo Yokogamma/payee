@@ -535,6 +535,81 @@ do not re-ask.
 «Обновить». No IndexedDB schema change (existing `meta` keys only) → no client
 floor; rollback = redeploy the previous client build.
 
+## Multi-device sync — Phase 1 (incremental sweep)
+
+Client-only release: the Worker is untouched, no new on-chain format, no new
+endpoint, no feature flag — the «worker first» step does not apply. Plan:
+`eternal-notes-incremental-sweep-phase1.md` (4 review rounds, no blockers;
+the 24-hour full-sweep threshold was confirmed by the owner 2026-08-19).
+
+What ships:
+
+- **Sentinel model** (`fetchAllNotes`, `opts.known`): a manual «Проверить
+  обновления» no longer downloads payloads whose txId is already held locally.
+  A known candidate STAYS in the ordered list and claims its Note-Id in block
+  order, so duplicate resolution is bit-identical to a full sweep. A txId
+  counts as known only when the edge's Note-Id tag and version class match the
+  sync record too. There is deliberately NO block-height cursor — a cursor is
+  the only mechanism in this design that can silently lose straggler
+  transactions forever (gateway replica divergence has no published upper
+  bound), and a regression test pins that no height cutoff exists.
+- **Restore is ALWAYS full.** Seed entry and «Повторить восстановление» keep
+  overwriting local ciphertext with known-good on-chain copies — the blind
+  repair the product has relied on since R.
+- **Daily full safety sweep**: a check runs full when `sweep-full-at` (new
+  optional `meta` key) is older than 24 h. The mark advances only on a SUCCESS
+  that was full (including restore), never on `incomplete`, generation-checked
+  right before the write. The value is runtime-validated on read: corrupted
+  meta (string/NaN/fraction/future) reads as «no mark» and causes an EXTRA
+  full sweep, never a skipped one.
+- **Targeted repair**: ids of SUPPORTED-version records that fail decryption
+  (vault unlock, safebox section open, secret reveal) drop out of the known
+  set, so the next incremental check re-downloads and repairs them without
+  waiting for the daily sweep. In-memory per tab, cleared only by an app lock;
+  a safebox-section lock does not touch note repair ids. Records from a NEWER
+  app version are not «repairable» and stay skipped (double-gated: local `v`
+  and the App-Version index filter).
+
+**Accepted residual trade-offs** (documented, test-pinned):
+
+- A redrop pair where BOTH transactions survived on-chain re-downloads the
+  newer one on every check: `mergeRestoredNote` deliberately preserves a
+  confirmed record's txId (recovery semantics — out of scope). One payload per
+  check, rare by construction.
+- Undetectable damage (a safebox row corrupted while the section stays locked)
+  waits for the daily full sweep — detection requires decryption, which never
+  ran.
+- A record whose ON-CHAIN copy is itself undecryptable (corruption that
+  happened BEFORE the upload, so the bad bytes were paid onto Arweave) stays in
+  the repair set forever: an id leaves it only through a successful merge, and
+  a candidate that fails `buildRestoredNote` is an intentional skip that
+  produces no merge. Consequence: one payload fetch per such record per check,
+  indefinitely — bounded, no data loss, no false error. Repair is genuinely
+  impossible for these; giving up after a failed attempt would change repair
+  semantics and belongs in its own review, not in this release.
+
+Acceptance on the live site (DevTools → Network, filter `arweave.net`; there
+are no new user-facing strings, so «grep the bundle» does NOT prove this
+release — the network profile does):
+
+1. first `↻` press — `/graphql` plus `/raw/…` requests;
+2. second press — `/graphql` present, **zero `/raw/…`** (on a clean state:
+   a repair candidate or redrop duplicate produces legitimate single `/raw`
+   fetches — that is not a failed acceptance);
+3. create a note on the second device, press `↻` — exactly one
+   `/raw/<new txId>`, toast «Получено с других устройств: 1»;
+4. offline — «Не удалось проверить обновления», the app stays alive.
+
+Tag `client-sync1` after acceptance. **Floors do not move**: client `client-r4`,
+worker `worker-r3`. This release is NOT a floor — no IndexedDB version change,
+one backward-compatible optional meta key; an older client ignores it and
+simply does a full sweep every time (traffic degradation, not data loss —
+compatible in both directions).
+
+Rollback: Pages «Rollback to this deployment» to any build not below
+`client-r4`, then re-run `smoke-headers`. Consequence: every check downloads
+everything again, nothing else.
+
 ## Navigation redesign — stages 0–6 (client-only)
 
 Six client-only releases; the Worker is untouched, so the «worker first» step

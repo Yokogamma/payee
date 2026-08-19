@@ -50,13 +50,17 @@ Object.defineProperty(globalThis, 'crypto', {
 
 import { NotesProvider, useNotes } from './store';
 import {
-  initStorage, resetAll, setMeta, getAllNotes as getStoredNotes, countSafeboxEntries,
+  initStorage, resetAll, setMeta, getMeta, sanitizeFullSweepAt,
+  getAllNotes as getStoredNotes, countSafeboxEntries,
+  mergeRestoredNote, setSyncRecord, getDbGeneration,
+  saveSafeboxEntryWithSync, getSafeboxEntryById,
 } from './storage';
 import { isArweaveOnline, fetchAllNotes, ArweaveIndexUnavailableError } from './arweave';
 import type { FetchAllNotesResult, RestoredNote, RestoredSafeboxEntry } from './arweave';
 import {
   deriveKey, decryptNote, encryptEnvelopeV3,
   deriveSafeboxMetaKey, deriveSafeboxSecretKey, encryptSafeboxEntry, decryptSafeboxMeta,
+  base64ToBuffer, bufferToBase64, type EncryptedNote,
 } from './crypto';
 
 // jsdom has no BroadcastChannel — minimal stand-in (no cross-tab needs here).
@@ -448,5 +452,341 @@ describe('checkForUpdates: lifecycle', () => {
     });
 
     expect(await countSafeboxEntries()).toBe(0);
+  });
+});
+
+// ─── Фаза 1: инкрементальный режим проверки, полное восстановление ──
+//
+// fetchAllNotes здесь замокан, поэтому сторовые тесты проверяют КОНТРАКТ между
+// store и sweep'ом: какую карту `known` store передаёт (или не передаёт) и как
+// живёт метка полной сверки `sweep-full-at`. Sentinel-семантика самой карты
+// покрыта в arweave.incremental.test.ts.
+
+/** opts последнего вызова fetchAllNotes (4-й аргумент). */
+function lastSweepOpts() {
+  const call = vi.mocked(fetchAllNotes).mock.calls.at(-1);
+  return call?.[3] as { known?: Map<string, { noteId: string; kind: 'note' | 'safebox' }> } | undefined;
+}
+
+describe('checkForUpdates: инкрементальный режим (Фаза 1)', () => {
+  it('первая проверка без метки — ПОЛНАЯ (known не передаётся), успех пишет метку', async () => {
+    renderStore();
+    await openMain();
+
+    await act(async () => { await store.checkForUpdates(); });
+
+    expect(lastSweepOpts()?.known).toBeUndefined();          // тест 17: нет метки → полный
+    expect(typeof await getMeta('sweep-full-at')).toBe('number'); // успех продвинул метку
+  });
+
+  it('повторная проверка при свежей метке — инкрементальная: known из confirmed-записей', async () => {
+    renderStore();
+    await openMain();
+    const key = await deriveKey(MN);
+    const remote = await makeRemoteChain(key, ['известная после merge']);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({ ...EMPTY, notes: remote });
+
+    await act(async () => { await store.checkForUpdates(); }); // полная, merge + метка
+    await act(async () => { await store.checkForUpdates(); }); // инкрементальная
+
+    const known = lastSweepOpts()?.known;
+    expect(known).toBeInstanceOf(Map);
+    expect(known!.get(remote[0].txId)).toEqual({ noteId: remote[0].encrypted.noteId, kind: 'note' });
+  });
+
+  it('restore ВСЕГДА полный: known не передаётся даже при свежей метке (тест 10)', async () => {
+    renderStore();
+    await openMain();
+    const key = await deriveKey(MN);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY, notes: await makeRemoteChain(key, ['уже известная']),
+    });
+    await act(async () => { await store.checkForUpdates(); }); // есть и записи, и метка
+
+    await act(async () => { await store.retryRestore(); });
+
+    expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(2);
+    expect(lastSweepOpts()?.known).toBeUndefined();
+  });
+
+  it('граница ремонта сейфа (тест 11): битую запись ЗАКРЫТОЙ секции инкрементальный sweep не чинит, полный — чинит', async () => {
+    renderStore();
+    await openMain();
+    // Битая meta-половина при так и не открывавшейся секции: расшифровка не
+    // бежала ни разу, детектировать повреждение нечем — это ровно остаточный
+    // размен §6.5.
+    const [metaKey, secretKey] = await Promise.all([deriveSafeboxMetaKey(MN), deriveSafeboxSecretKey(MN)]);
+    const intact = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: 'закрытая', login: '', url: '', note: '', password: 'x', files: [], rev: 1,
+    });
+    await saveSafeboxEntryWithSync(
+      { ...intact, metaCiphertext: corruptB64(intact.metaCiphertext) },
+      { noteId: intact.entryId, kind: 'safebox', txId: 'TX-SB', status: 'confirmed', transport: 'proxy', updatedAt: 1 },
+    );
+    await setMeta('sweep-full-at', Date.now());
+
+    await act(async () => { await store.checkForUpdates(); }); // инкрементальная
+    // Недетектированная запись осталась «известной» (sentinel — реальный sweep
+    // её не перекачает, закреплено в arweave.incremental) — и осталась битой.
+    expect(lastSweepOpts()?.known!.get('TX-SB')).toEqual({ noteId: intact.entryId, kind: 'safebox' });
+    await expect(decryptSafeboxMeta(metaKey, (await getSafeboxEntryById(intact.entryId))!)).rejects.toBeDefined();
+
+    // Суточная сверка — полная: known не передаётся, merge перезаписывает
+    // строку заведомо целой копией с цепи. Единственный путь ремонта здесь.
+    await setMeta('sweep-full-at', Date.now() - 25 * 60 * 60 * 1000);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY,
+      safeboxEntries: [{ encrypted: intact, meta: await decryptSafeboxMeta(metaKey, intact), txId: 'TX-SB' }],
+    });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known).toBeUndefined(); // полная
+    await expect(decryptSafeboxMeta(metaKey, (await getSafeboxEntryById(intact.entryId))!))
+      .resolves.toMatchObject({ title: 'закрытая' });
+  });
+
+  it('полностью известная выборка → done с нулями, partial=false (тест 12)', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); }); // метка
+    await act(async () => { await store.checkForUpdates(); }); // инкрементальная, EMPTY
+
+    expect(store.updateCheck).toMatchObject({
+      status: 'done', addedNotes: 0, updatedNotes: 0, changedSafebox: 0, partial: false,
+    });
+  });
+
+  it('метка старше суток → проверка снова ПОЛНАЯ (тест 13)', async () => {
+    renderStore();
+    await openMain();
+    await setMeta('sweep-full-at', Date.now() - 25 * 60 * 60 * 1000);
+
+    await act(async () => { await store.checkForUpdates(); });
+
+    expect(lastSweepOpts()?.known).toBeUndefined();
+  });
+
+  it('успешный restore продвигает метку (тест 13, wasFull)', async () => {
+    renderStore();
+    await openMain();
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+
+    await act(async () => { await store.retryRestore(); });
+
+    expect(typeof await getMeta('sweep-full-at')).toBe('number');
+  });
+
+  it('incomplete НЕ продвигает метку — частичная полная сверка полной не считается (тест 14)', async () => {
+    renderStore();
+    await openMain();
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({ ...EMPTY, incomplete: true });
+
+    await act(async () => { await store.checkForUpdates(); }); // полная, но partial
+
+    expect(store.updateCheck).toMatchObject({ status: 'done', partial: true });
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+  });
+
+  it('блокировка в середине полной сверки: метка не пишется (тест 15)', async () => {
+    renderStore();
+    await openMain();
+    const gate = parkSweep();
+
+    let run!: Promise<void>;
+    await act(async () => { run = store.checkForUpdates(); });
+    await waitFor(() => expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(1));
+    act(() => { store.lockApp(); });
+
+    await act(async () => { gate.release(); await run; });
+
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+  });
+
+  it('прямой resetAll в середине: generation-гейт блокирует запись метки (тест 16)', async () => {
+    // Изолирует НОВЫЙ гейт от эпохи: resetAll двигает только поколение БД.
+    // Пустой результат (merge-циклы не бегут) доводит sweep ровно до записи
+    // метки — единственной строки, которую здесь охраняет generation-проверка.
+    renderStore();
+    await openMain();
+    const gate = parkSweep();
+
+    let run!: Promise<void>;
+    await act(async () => { run = store.checkForUpdates(); });
+    await waitFor(() => expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(1));
+    await resetAll(); // эпоха нетронута — только dbGeneration
+
+    await act(async () => { gate.release(); await run; });
+
+    expect(await getMeta('sweep-full-at')).toBeUndefined();
+  });
+
+  it('свежая метка + ноль sync-записей → инкрементальная с ПУСТОЙ картой, merge работает (тест 17)', async () => {
+    renderStore();
+    await openMain();
+    await setMeta('sweep-full-at', Date.now());
+    const key = await deriveKey(MN);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY, notes: await makeRemoteChain(key, ['первая на устройстве']),
+    });
+
+    await act(async () => { await store.checkForUpdates(); });
+
+    const known = lastSweepOpts()?.known;
+    expect(known).toBeInstanceOf(Map);
+    expect(known!.size).toBe(0);           // нечего пропускать — поведение полного
+    expect(store.chains).toHaveLength(1);  // merge не пострадал
+  });
+});
+
+// ─── Тесты 20–24: прицельный ремонт заметок (§6.4) ──────────────────
+
+/** Побить base64-шифротекст: GCM гарантированно откажет при расшифровке. */
+function corruptB64(b64: string): string {
+  const buf = base64ToBuffer(b64);
+  buf[0] ^= 0xff;
+  return bufferToBase64(buf);
+}
+
+describe('checkForUpdates: прицельный ремонт заметок (§6.4)', () => {
+  const now = () => Date.now();
+
+  /** Планты ДО renderStore: разблокировка должна застать строки в базе. */
+  async function plantGoodAndBroken() {
+    const key = await deriveKey(MN);
+    const good = await encryptEnvelopeV3(key, 'целая', { fmt: 'md', rev: 1 });
+    const broken = await encryptEnvelopeV3(key, 'починится из сети', { fmt: 'md', rev: 1 });
+    await mergeRestoredNote(good, 'TX-GOOD', 1, getDbGeneration());
+    await mergeRestoredNote(
+      { ...broken, ciphertext: corruptB64(broken.ciphertext) }, 'TX-BROKEN', 1, getDbGeneration(),
+    );
+    await setMeta('sweep-full-at', now()); // проверки — инкрементальные
+    return { key, good, broken };
+  }
+
+  it('тест 20: битая строка детектится при разблокировке, чинится инкрементально и больше не качается', async () => {
+    const { key, broken } = await plantGoodAndBroken();
+    renderStore();
+    await openMain(); // разблокировка собирает ремонтный набор
+
+    await act(async () => { await store.checkForUpdates(); });
+    let known = lastSweepOpts()?.known;
+    expect(known!.has('TX-GOOD')).toBe(true);
+    expect(known!.has('TX-BROKEN')).toBe(false); // кандидат ремонта
+
+    // Сеть отдаёт целую копию — merge чинит строку и убирает id из ремонта.
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY,
+      notes: [{ encrypted: broken, text: 'починится из сети', txId: 'TX-BROKEN', meta: (await decryptNote(key, broken)).meta }],
+    });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.notes.some(n => n.text === 'починится из сети')).toBe(true);
+
+    await act(async () => { await store.checkForUpdates(); });
+    known = lastSweepOpts()?.known;
+    expect(known!.has('TX-BROKEN')).toBe(true); // починено — снова известно
+  });
+
+  it('тест 21: sync-отметка без строки — кандидат качается и запись восстанавливается', async () => {
+    renderStore();
+    await openMain();
+    const key = await deriveKey(MN);
+    const ghost = await encryptEnvelopeV3(key, 'строку потеряло хранилище', { fmt: 'md', rev: 1 });
+    await setSyncRecord({
+      noteId: ghost.noteId, kind: 'note', txId: 'TX-GHOST',
+      status: 'confirmed', transport: 'proxy', updatedAt: 1,
+    });
+    await setMeta('sweep-full-at', now());
+
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-GHOST')).toBe(false);
+
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      ...EMPTY,
+      notes: [{ encrypted: ghost, text: 'строку потеряло хранилище', txId: 'TX-GHOST', meta: (await decryptNote(key, ghost)).meta }],
+    });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.notes.some(n => n.id === ghost.noteId)).toBe(true);
+
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.get('TX-GHOST')).toEqual({ noteId: ghost.noteId, kind: 'note' });
+  });
+
+  it('тест 22: строка от более новой версии приложения — НЕ ремонт, остаётся известной', async () => {
+    const key = await deriveKey(MN);
+    const good = await encryptEnvelopeV3(key, 'целая', { fmt: 'md', rev: 1 });
+    const future = {
+      ...(await encryptEnvelopeV3(key, 'из будущего', { fmt: 'md', rev: 1 })), v: 5,
+    } as unknown as EncryptedNote;
+    await mergeRestoredNote(good, 'TX-GOOD', 1, getDbGeneration());
+    await mergeRestoredNote(future, 'TX-FUTURE', 1, getDbGeneration());
+    await setMeta('sweep-full-at', now());
+
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); });
+
+    // UnsupportedNoteVersionError — не повреждение: перекачивание не поможет,
+    // строка остаётся sentinel'ом и не выкачивается на каждой проверке.
+    expect(lastSweepOpts()?.known!.has('TX-FUTURE')).toBe(true);
+  });
+
+  it('тест 23: id остаётся в ремонте, пока починка реально не случилась', async () => {
+    await plantGoodAndBroken();
+    renderStore();
+    await openMain();
+
+    await act(async () => { await store.checkForUpdates(); }); // EMPTY — ремонта не было
+    await act(async () => { await store.checkForUpdates(); });
+
+    expect(lastSweepOpts()?.known!.has('TX-BROKEN')).toBe(false); // всё ещё кандидат
+  });
+
+  it('тест 24: блокировка приложения чистит набор, разблокировка пересобирает его из фактов', async () => {
+    const { broken } = await plantGoodAndBroken();
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); });
+    expect(lastSweepOpts()?.known!.has('TX-BROKEN')).toBe(false); // собран
+
+    // Строка починена МИМО sweep'а — ref хранит устаревший факт «битая».
+    await mergeRestoredNote(broken, 'TX-BROKEN', 2, getDbGeneration());
+
+    act(() => { store.lockApp(); });
+    await act(async () => { await store.confirmMnemonic(MN); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+
+    await act(async () => { await store.checkForUpdates(); });
+    // Пересборка при разблокировке: строка расшифровалась → снова известна.
+    // Устаревший факт из прошлой сессии блокировку не пережил.
+    expect(lastSweepOpts()?.known!.has('TX-BROKEN')).toBe(true);
+  });
+});
+
+// ─── Тест 19: runtime-валидация метки (§6.2г) ───────────────────────
+
+describe('sanitizeFullSweepAt', () => {
+  const NOW = 1_755_600_000_000;
+  const SKEW = 5 * 60 * 1000;
+
+  it.each([
+    ['строка', 'вчера'],
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+    ['-Infinity', -Infinity],
+    ['отрицательное', -1],
+    ['дробное', 1.5],
+    ['будущее за границей (+5 мин + 1 мс)', NOW + SKEW + 1],
+    ['объект', { at: 1 }],
+    ['undefined', undefined],
+  ])('битое значение (%s) → 0: следующая проверка будет ПОЛНОЙ', (_label, raw) => {
+    expect(sanitizeFullSweepAt(raw, NOW)).toBe(0);
+  });
+
+  it('границы диапазона принимаются: 0 и ровно now + 5 мин', () => {
+    expect(sanitizeFullSweepAt(0, NOW)).toBe(0);
+    expect(sanitizeFullSweepAt(NOW + SKEW, NOW)).toBe(NOW + SKEW);
+  });
+
+  it('валидная свежая метка возвращается как есть', () => {
+    expect(sanitizeFullSweepAt(NOW - 1000, NOW)).toBe(NOW - 1000);
   });
 });
