@@ -1036,6 +1036,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // PinUnlock) can have probes in flight at once, and a slow older one must
   // not overwrite a newer verdict.
   const quickUnlockCapabilityGenerationRef = useRef(0);
+  // What a real ceremony proved, once it has. Outranks every probe for the
+  // rest of the session — see publishQuickUnlockCapability.
+  const quickUnlockCeremonyVerdictRef = useRef<QuickUnlockCapability | null>(null);
   useEffect(() => {
     // Set on SETUP, not only cleared on cleanup. React StrictMode mounts,
     // cleans up and mounts again in development: without this line the trial
@@ -3406,17 +3409,32 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }
 
   function quickUnlockCapabilityMessage(capability: QuickUnlockCapability): string {
-    if (capability === 'no-api') return 'Этот браузер не поддерживает быстрый вход.';
-    if (capability === 'no-platform') return 'На этом устройстве нет встроенной проверки (Windows Hello, Touch ID, Face ID или код устройства).';
-    return 'Это устройство не выдаёт PRF — быстрый вход здесь недоступен.';
+    const fallback = ' Вход по PIN-коду и seed-фразе работает как обычно.';
+    if (capability === 'no-api') return 'Этот браузер не поддерживает быстрый вход.' + fallback;
+    if (capability === 'no-platform') {
+      return 'На этом устройстве нет встроенной проверки — отпечатка, лица или кода устройства.' + fallback;
+    }
+    return 'Это устройство не поддерживает быстрый вход.' + fallback;
   }
 
-  /** Publish a capability verdict under BOTH guards: still mounted, and still
-   *  the newest probe. */
+  /** Publish a PROBE verdict under three guards: still mounted, still the
+   *  newest probe, and no ceremony has already settled the question. */
   function publishQuickUnlockCapability(capability: QuickUnlockCapability, myProbe: number): void {
     if (!mountedRef.current) return;
     if (quickUnlockCapabilityGenerationRef.current !== myProbe) return;
+    // A real ceremony outranks every probe (§6): the probes only guess, and on
+    // this platform they guessed wrong — which is how a credential got created
+    // that turned out to be useless. Letting a later probe overwrite that with
+    // an optimistic 'unknown' would put the setup button back and mint another.
+    if (quickUnlockCeremonyVerdictRef.current !== null) return;
     setQuickUnlockCapability(capability);
+  }
+
+  /** Record what the CEREMONY proved, and make it stick for this session. */
+  function publishQuickUnlockCeremonyVerdict(verdict: QuickUnlockCapability): void {
+    quickUnlockCeremonyVerdictRef.current = verdict;
+    quickUnlockCapabilityGenerationRef.current++; // outrun any probe in flight
+    if (mountedRef.current) setQuickUnlockCapability(verdict);
   }
 
   const refreshQuickUnlockCapability = useCallback(() => {
@@ -3533,6 +3551,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       postVaultMessage('config');
     } catch (err) {
       if (err instanceof QuickUnlockCancelledError) return; // our own abort — silent
+      // The ceremony settled a capability question the probes had guessed
+      // wrong. Record it: the block must stop offering a setup that creates
+      // another credential this device cannot use.
+      if (err instanceof QuickUnlockUnavailableError && err.verdict) {
+        publishQuickUnlockCeremonyVerdict(err.verdict);
+      }
       throw err;
     } finally {
       endQuickUnlockOp(abort);

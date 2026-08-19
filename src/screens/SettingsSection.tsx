@@ -829,12 +829,17 @@ function QuickUnlockSection({
   //    the weaker fallback («biometrics as a latch») was rejected outright.
   if (capability === 'no-api' || capability === 'no-platform' || capability === 'no-prf') {
     return (
+      // No jargon, and every line ends with what the reader can DO. «PRF» is
+      // meaningless to a person, and the only actionable facts are «nothing is
+      // broken» and «the PIN still works».
       <p className="settings-hint">
         {capability === 'no-api'
-          ? 'Этот браузер не поддерживает быстрый вход.'
+          ? 'Этот браузер не поддерживает быстрый вход. Вход по PIN-коду и seed-фразе работает как обычно.'
           : capability === 'no-platform'
-            ? 'На этом устройстве нет встроенной проверки — Windows Hello, Touch ID, Face ID или кода устройства.'
-            : 'Это устройство не выдаёт нужный криптографический ответ (PRF), поэтому быстрый вход здесь недоступен.'}
+            ? 'На этом устройстве нет встроенной проверки — отпечатка, лица или кода устройства. '
+              + 'Вход по PIN-коду и seed-фразе работает как обычно.'
+            : 'Это устройство не поддерживает быстрый вход: система не выдаёт ключ, которым он открывается. '
+              + 'Это не поломка — вход по PIN-коду и seed-фразе работает как обычно.'}
       </p>
     );
   }

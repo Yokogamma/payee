@@ -161,7 +161,7 @@ describe('блок «Быстрый вход» в настройках', () => {
     for (const [capability, phrase] of [
       ['no-api', 'браузер не поддерживает'],
       ['no-platform', 'нет встроенной проверки'],
-      ['no-prf', 'не выдаёт нужный криптографический ответ'],
+      ['no-prf', 'не поддерживает быстрый вход'],
     ] as const) {
       cleanup();
       h.store = { ...baseStore(), quickUnlockCapability: capability };
@@ -169,6 +169,11 @@ describe('блок «Быстрый вход» в настройках', () => {
       openQuickUnlockBlock();
       expect(document.body.textContent).toContain(phrase);
       expect(screen.queryByRole('button', { name: 'Настроить быстрый вход' })).toBeNull();
+      // Every dead end says what STILL works — a screen that only reports a
+      // failure leaves the reader with nothing to do.
+      expect(document.body.textContent).toContain('по PIN-коду и seed-фразе работает как обычно');
+      // …and none of them uses jargon the reader cannot act on.
+      expect(document.body.textContent).not.toContain('PRF');
     }
   });
 

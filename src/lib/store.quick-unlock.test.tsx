@@ -1046,6 +1046,70 @@ describe('capability probe', () => {
     expect(store.hasQuickUnlock).toBe(true);
   });
 
+  it('a ceremony that proves no-PRF STICKS — no second orphaned credential', async () => {
+    // The failure the operator hit on Android: the probes said «go ahead», the
+    // credential got created, and the platform then refused the PRF output.
+    // If the block went back to offering setup, every retry would mint another
+    // platform credential the user cannot use — and, on residentKey
+    // 'discouraged', may not even be able to see in order to delete.
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setupPin('123456'); });
+
+    vi.mocked(detectQuickUnlockCapability).mockResolvedValue('ready'); // the probe lies
+    vi.mocked(createPrfCredential).mockRejectedValueOnce(
+      new QuickUnlockUnavailableError('устройство не выдало нужный ключ', 'no-prf'),
+    );
+
+    await act(async () => {
+      await expect(store.setupQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+    expect(store.quickUnlockCapability).toBe('no-prf');
+
+    // A later probe — the settings block remounting, PinUnlock mounting —
+    // must NOT put the button back by reporting an optimistic verdict.
+    await act(async () => { store.refreshQuickUnlockCapability(); });
+    await act(async () => {});
+    expect(store.quickUnlockCapability).toBe('no-prf');
+  });
+
+  it('a ceremony verdict beats a probe that is ALREADY in flight', async () => {
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setupPin('123456'); });
+
+    const slow = deferred<'ready'>();
+    vi.mocked(detectQuickUnlockCapability).mockImplementationOnce(() => slow.promise);
+    act(() => { store.refreshQuickUnlockCapability(); });
+
+    vi.mocked(detectQuickUnlockCapability).mockResolvedValue('ready');
+    vi.mocked(createPrfCredential).mockRejectedValueOnce(
+      new QuickUnlockUnavailableError('нет ключа', 'no-prf'),
+    );
+    await act(async () => { await store.setupQuickUnlock().catch(() => {}); });
+    expect(store.quickUnlockCapability).toBe('no-prf');
+
+    await act(async () => { slow.resolve('ready'); });
+    expect(store.quickUnlockCapability).toBe('no-prf'); // the stale probe lost
+  });
+
+  it('an unavailable WITHOUT a verdict leaves the capability alone', async () => {
+    // A transient environment failure proves nothing about the device.
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setupPin('123456'); });
+    vi.mocked(detectQuickUnlockCapability).mockResolvedValue('ready');
+    vi.mocked(createPrfCredential).mockRejectedValueOnce(
+      new QuickUnlockUnavailableError('WebCrypto икнул'),
+    );
+
+    await act(async () => { await store.setupQuickUnlock().catch(() => {}); });
+    expect(store.quickUnlockCapability).toBe('ready');
+  });
+
   it('a negative verdict refuses BEFORE the ceremony', async () => {
     renderStore();
     await untilReady();
