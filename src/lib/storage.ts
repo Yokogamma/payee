@@ -15,6 +15,15 @@
 import { openDB, deleteDB, type IDBPDatabase } from 'idb';
 import type { EncryptedNote, EncryptedSafeboxEntry, PinEncryptedSeed } from './crypto';
 import { SafeboxPinUnavailableError, assertValidPinBlob } from './crypto';
+import {
+  QUICK_UNLOCK_META_KEY,
+  judgeQuickUnlock,
+  parseQuickUnlockRecord,
+  quickUnlockBelongsToVault,
+  quickUnlockRecordEquals,
+  type QuickUnlockRecord,
+  type QuickUnlockVerdict,
+} from './quick-unlock';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -922,6 +931,12 @@ async function wipePinConfigInto(meta: MetaStoreWriter): Promise<void> {
   await meta.delete('pin-seed');
   await meta.delete('pin-attempts');
   await meta.delete('pin-locked-until');
+  // Quick unlock is a SECOND KEY TO THE SAME SEED, gated on the PIN existing.
+  // It therefore dies in the SAME transaction as the PIN — manual removal and
+  // the 10-strike wipe alike. Doing it here rather than at the call sites is
+  // what makes «PIN gone ⇒ quick unlock gone» atomic instead of a two-step
+  // sequence with a window in the middle.
+  await meta.delete(QUICK_UNLOCK_META_KEY);
   await meta.put(null, 'auto-lock-timeout');
 }
 
@@ -1166,6 +1181,180 @@ export async function commitPinSeedRewrap(
     await meta.put(newBlob, 'pin-seed');
     return 'committed' as const;
   });
+}
+
+// ─── Quick unlock: atomic reader + conditional commits ───────────────
+
+/** One CONSISTENT snapshot of the whole client configuration: FOUR keys read
+ *  inside a single readonly transaction, plus the verdict on the quick-unlock
+ *  record.
+ *
+ *  Why four and not «two here, two there»: `getPinConfigMeta()` + a separate
+ *  record read are two DIFFERENT transactions, and a single reconcile token
+ *  does not fuse them — it orders publications, it does not make two snapshots
+ *  one. Bootstrap and the cross-tab config reconcile could otherwise publish a
+ *  combination of PIN + threshold + record that never existed at any instant.
+ *  The fourth key costs nothing (same transaction) and removes the class.
+ *
+ *  NOT for the auto-lock verdict: that path runs under VERDICT_DEADLINE_MS and
+ *  keeps its two-key `getPinConfigMeta()`. Widening the reader on a deadline
+ *  path is forbidden, and a third reader is not to be introduced. */
+export interface ClientConfigSnapshot {
+  pinSeed: unknown;
+  autoLockTimeout: unknown;
+  vaultPublicKey: unknown;
+  quickUnlock: QuickUnlockVerdict;
+}
+
+export async function readClientConfigSnapshot(): Promise<ClientConfigSnapshot> {
+  const tx = getDB().transaction('meta', 'readonly');
+  const meta = tx.objectStore('meta');
+  const [pinSeed, autoLockTimeout, rawQuickUnlock, vaultPublicKey] = await Promise.all([
+    meta.get('pin-seed'),
+    meta.get('auto-lock-timeout'),
+    meta.get(QUICK_UNLOCK_META_KEY),
+    meta.get('vault-public-key'),
+  ]);
+  await tx.done;
+  return {
+    pinSeed,
+    autoLockTimeout,
+    vaultPublicKey,
+    quickUnlock: judgeQuickUnlock(rawQuickUnlock, pinSeed, vaultPublicKey),
+  };
+}
+
+/**
+ * `'written'` — this tab created the record.
+ * `'already-configured'` — a racing tab got there first; its record is LEFT
+ *   ALONE (first-writer-wins, the same choice `commitPinSeedIfAbsent` makes).
+ *   Last-writer-wins would let two tabs create DIFFERENT credentials and
+ *   silently clobber each other's working record while both report success —
+ *   which breaks the product invariant that orphaning a platform credential is
+ *   always a deliberate act.
+ * `'no-pin'` / `'foreign-vault'` — the preconditions failed between the
+ *   caller's snapshot and this transaction. Reported separately rather than
+ *   folded into `'already-configured'`: they need different, honest messages
+ *   («Сначала установите PIN» is not «уже настроен»).
+ *
+ * All three preconditions are re-checked INSIDE this transaction, because
+ * React state (and any snapshot the caller read before the ~2 system prompts
+ * of the ceremony) can lag behind another tab by an arbitrary amount.
+ */
+export type QuickUnlockWriteOutcome = 'written' | 'already-configured' | 'no-pin' | 'foreign-vault';
+
+export async function commitQuickUnlockSeedWrite(
+  record: QuickUnlockRecord,
+  expectedDbGeneration: number,
+): Promise<QuickUnlockWriteOutcome> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const [pinSeed, vaultPublicKey, existing] = await Promise.all([
+      meta.get('pin-seed'),
+      meta.get('vault-public-key'),
+      meta.get(QUICK_UNLOCK_META_KEY),
+    ]);
+
+    let outcome: QuickUnlockWriteOutcome = 'written';
+    if (pinSeed === undefined) outcome = 'no-pin';
+    else if (!quickUnlockBelongsToVault(record, vaultPublicKey)) outcome = 'foreign-vault';
+    else if (judgeQuickUnlock(existing, pinSeed, vaultPublicKey).kind === 'valid') outcome = 'already-configured';
+
+    // A record that is present but VOID (unparseable, or bound to another
+    // vault) does not block the write — it is not somebody's working setup.
+    if (outcome === 'written') await meta.put(record, QUICK_UNLOCK_META_KEY);
+    await tx.done;
+    return outcome;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/** UNCONDITIONAL removal — for the manual «Удалить быстрый вход» only. The
+ *  user is looking at the button; they mean this record, whatever it is. */
+export async function commitQuickUnlockSeedDelete(expectedDbGeneration: number): Promise<void> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    await tx.objectStore('meta').delete(QUICK_UNLOCK_META_KEY);
+    await tx.done;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/**
+ * CONDITIONAL removal — for the automatic paths (a GCM mismatch, a foreign
+ * `pk`). While tab A waited on the system sheet, tab B could have removed the
+ * record and configured a NEW one; `dbGeneration` does not move for that, so a
+ * mismatch computed against A's stale snapshot has no right to delete B's
+ * working record. The full record is compared inside the transaction.
+ */
+export type QuickUnlockConditionalDeleteOutcome = 'deleted' | 'changed' | 'absent';
+
+export async function commitQuickUnlockSeedDeleteIfMatches(
+  expected: QuickUnlockRecord,
+  expectedDbGeneration: number,
+): Promise<QuickUnlockConditionalDeleteOutcome> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const raw: unknown = await meta.get(QUICK_UNLOCK_META_KEY);
+    let outcome: QuickUnlockConditionalDeleteOutcome;
+    if (raw === undefined) {
+      outcome = 'absent';
+    } else if (!quickUnlockRecordEquals(parseQuickUnlockRecord(raw), expected)) {
+      // Includes «the current record no longer parses»: either way it is not
+      // the one whose unwrap failed, so it is not ours to delete here.
+      outcome = 'changed';
+    } else {
+      await meta.delete(QUICK_UNLOCK_META_KEY);
+      outcome = 'deleted';
+    }
+    await tx.done;
+    return outcome;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/** Housekeeping for an orphaned/invalid record. RE-EVALUATES the verdict
+ *  inside its own readwrite transaction: the readonly snapshot that prompted
+ *  the cleanup may be stale by now — a `pin-seed` that reappeared between the
+ *  two makes the record valid again, and deleting it then would destroy a
+ *  working setup. */
+export type QuickUnlockCleanupOutcome = 'deleted' | 'kept';
+
+export async function commitQuickUnlockSeedCleanup(
+  expectedDbGeneration: number,
+): Promise<QuickUnlockCleanupOutcome> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const [pinSeed, vaultPublicKey, raw] = await Promise.all([
+      meta.get('pin-seed'),
+      meta.get('vault-public-key'),
+      meta.get(QUICK_UNLOCK_META_KEY),
+    ]);
+    const stale = judgeQuickUnlock(raw, pinSeed, vaultPublicKey).kind === 'stale';
+    if (stale) await meta.delete(QUICK_UNLOCK_META_KEY);
+    await tx.done;
+    return stale ? 'deleted' : 'kept';
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
 }
 
 // ─── Migration from localStorage ────────────────────────────────────
