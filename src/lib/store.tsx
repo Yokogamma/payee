@@ -1581,6 +1581,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * setMeta('init') would be writable into a database that was cleared or
    * re-bound in between, leaving a phantom-initialized empty vault.
    *
+   * `expectedDbGeneration` lets a caller that captured its reset-exclusivity
+   * token EARLIER hand it over instead of letting this function capture a
+   * fresh one. The PIN path needs it: it takes its token before ~1 s of
+   * Argon2id, and a reset landing anywhere in that window (including AFTER
+   * the metering/re-wrap commits, which have their own guard) must not let
+   * this open re-bind the old seed into the freshly wiped database and
+   * publish a vault the user just deleted. Omitted ⇒ captured here, the
+   * previous behaviour for every caller whose token is already current.
+   *
    * ORDER MATTERS (review round 4): every storage-side refusal happens BEFORE
    * commitVaultSnapshot() and the session write, so a rejected open cannot
    * leave a decrypted vault or the seed behind in this tab. What this does NOT
@@ -1603,10 +1612,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    */
   async function openVault(
     mn: string,
-    opts: { initialize?: boolean } = {},
+    opts: { initialize?: boolean; expectedDbGeneration?: number } = {},
   ): Promise<{ epoch: number; pkB64: string } | null> {
+    const myDbGen = opts.expectedDbGeneration ?? getDbGeneration();
+    // Stand down BEFORE touching the shared abort ref: a caller arriving with
+    // a token that a reset has already invalidated must not cancel somebody
+    // else's in-flight operation on its way out. Synchronous ⇒ no TOCTOU
+    // window, the same discipline as assertDbGeneration in storage.ts.
+    if (myDbGen !== getDbGeneration()) return null;
+
     const myEpoch = vaultEpochRef.current;
-    const myDbGen = getDbGeneration();
     const abort = new AbortController();
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = abort;
@@ -3164,7 +3179,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     }
 
-    const opened = await openVault(mn);
+    // The token captured at the top, NOT a fresh one: a reset that landed
+    // after the commits above (each of which refused to write) must not be
+    // rewarded with a vault re-bound into the wiped database.
+    const opened = await openVault(mn, { expectedDbGeneration: myDbGen });
     if (!opened) return;
     const epoch = opened.epoch;
     // An explicit unlock — a user action the persistence request belongs to.

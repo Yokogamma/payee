@@ -101,7 +101,7 @@ import {
 import {
   initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords,
   clearPinConfigMeta, saveNote, getAllNotes as getStoredNotes,
-  commitPinUnlockFailure,
+  commitPinUnlockFailure, commitPinUnlockSuccess, commitPinSeedRewrap,
 } from './storage';
 import { isArweaveOnline, uploadViaProxy, type UploadResult } from './arweave';
 import { decryptWithPin, WrongPinError, deriveKey, encryptEnvelopeV3, type EncryptedNote } from './crypto';
@@ -1937,6 +1937,73 @@ describe('PIN unlock against a configuration that changed mid-derivation', () =>
     expect(await getMeta('pin-seed')).toBeUndefined();
     expect(await getMeta('pin-attempts')).toBeUndefined();
     expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  // A blob whose kdf is already Argon2id — no legacy re-wrap on the success
+  // path, so the reset below lands in the window this describe is about.
+  const ARGON2_PIN_BLOB = {
+    ciphertext: 'ct', iv: 'iv', salt: 's',
+    kdf: 'argon2id' as const, v: 1,
+    argon2: { iterations: 3, memorySize: 65_536, parallelism: 1, hashLength: 32 },
+  };
+
+  it('a reset AFTER the success commit, before openVault: nothing is re-bound', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', ARGON2_PIN_BLOB);
+    renderStore();
+    await untilReady();
+
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => MN);
+    // The commit itself succeeds — «Удалить всё» lands immediately after it,
+    // in the window between the last guarded write and openVault.
+    const realSuccess = vi.mocked(commitPinUnlockSuccess).getMockImplementation()!;
+    vi.mocked(commitPinUnlockSuccess).mockImplementationOnce(async (blob, gen) => {
+      const outcome = await realSuccess(blob, gen);
+      await resetAll();
+      return outcome;
+    });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    await act(async () => {
+      await expect(store.unlockWithPin('000000')).resolves.toBeUndefined();
+    });
+
+    // openVault carries the token captured before the KDF: it stands down
+    // BEFORE the identity transaction, so nothing is bound into the wiped DB.
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(await getMeta('vault-public-key')).toBeUndefined();
+    expect(store.mnemonic).toBeNull();
+    expect(store.notes).toEqual([]);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).not.toBe('main');
+  });
+
+  it('a reset AFTER the legacy re-wrap, before openVault: nothing is re-bound', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB); // legacy → the re-wrap branch runs
+    renderStore();
+    await untilReady();
+
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => MN);
+    vi.mocked(encryptWithPin).mockResolvedValueOnce(ARGON2_PIN_BLOB); // skip a real Argon2
+    const realRewrap = vi.mocked(commitPinSeedRewrap).getMockImplementation()!;
+    vi.mocked(commitPinSeedRewrap).mockImplementationOnce(async (blob, next, gen) => {
+      const outcome = await realRewrap(blob, next, gen);
+      await resetAll(); // the re-wrap committed; THEN the database is wiped
+      return outcome;
+    });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    await act(async () => {
+      await expect(store.unlockWithPin('000000')).resolves.toBeUndefined();
+    });
+
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(await getMeta('vault-public-key')).toBeUndefined();
+    expect(await getMeta('pin-seed')).toBeUndefined(); // the wipe stands
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).not.toBe('main');
   });
 
   it('a SUCCESSFUL unlock still opens the vault, but leaves foreign counters alone', async () => {
