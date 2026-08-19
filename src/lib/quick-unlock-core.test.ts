@@ -325,7 +325,12 @@ describe('createPrfCredential', () => {
     await createPrfCredential({ prfSalt });
     const sel = publicKeyOf(createCalls[0]).authenticatorSelection as Record<string, unknown>;
     expect(sel.authenticatorAttachment).toBe('platform');
-    expect(sel.residentKey).toBe('discouraged');
+    // 'preferred', not 'discouraged': the providers that implement hmac-secret
+    // are the ones storing DISCOVERABLE passkeys, and a non-discoverable
+    // credential is what an Android device handed back with no PRF at all.
+    // Not 'required' either — a platform that can only do non-discoverable
+    // should still get its chance instead of a flat refusal.
+    expect(sel.residentKey).toBe('preferred');
     expect(publicKeyOf(createCalls[0]).attestation).toBe('none');
   });
 
