@@ -579,23 +579,40 @@ What ships:
 - Undetectable damage (a safebox row corrupted while the section stays locked)
   waits for the daily full sweep — detection requires decryption, which never
   ran.
-- A record whose ON-CHAIN copy is itself undecryptable (corruption that
-  happened BEFORE the upload, so the bad bytes were paid onto Arweave) stays in
-  the repair set forever: an id leaves it only through a successful merge, and
-  a candidate that fails `buildRestoredNote` is an intentional skip that
-  produces no merge. Consequence: one payload fetch per such record per check,
-  indefinitely — bounded, no data loss, no false error. Repair is genuinely
-  impossible for these; giving up after a failed attempt would change repair
-  semantics and belongs in its own review, not in this release.
+- **Any on-chain candidate that never decrypts is permanently unknown** and is
+  re-fetched on EVERY check. `known` is built from LOCAL sync records, and a
+  candidate that fails `buildRestoredNote` is an intentional skip that produces
+  no merge — so no sync record is ever written and the txId can never enter
+  `known`. This covers both a record whose on-chain copy is corrupt (bad bytes
+  paid onto Arweave before the upload) and, more commonly, **a transaction that
+  simply is not decryptable by this vault** even though it carries this
+  Owner-Hash. No data loss, no false error, cost bounded by the count of such
+  transactions.
+
+  **MEASURED IN PRODUCTION 2026-08-19** on the operator's own vault: 9
+  transactions carry this Owner-Hash, 6 are held locally, and the remaining
+  **3 are re-fetched on every check** — `Ry0Nhrrzh…`, `ku07BASgrlY3…`,
+  `8bldiJx5cfEo…`. Two of those are the permanent paid SMOKE-TEST records this
+  runbook documents above; they are not, and never will be, decryptable by a
+  user vault. Steady state on this account is therefore 3 payload fetches per
+  check (a few hundred bytes each), not zero.
+
+  This is the evidence the plan asked for before building the deferred
+  `sync-seen-tx` meta set (a persisted «fetched and rejected» txId set, which
+  would take the residual to zero). It is a NEW persisted schema and needs its
+  own plan + review round — deliberately not hot-patched onto this release.
 
 Acceptance on the live site (DevTools → Network, filter `arweave.net`; there
 are no new user-facing strings, so «grep the bundle» does NOT prove this
 release — the network profile does):
 
-1. first `↻` press — `/graphql` plus `/raw/…` requests;
-2. second press — `/graphql` present, **zero `/raw/…`** (on a clean state:
-   a repair candidate or redrop duplicate produces legitimate single `/raw`
-   fetches — that is not a failed acceptance);
+1. first `↻` press — `/graphql` plus one `/raw/…` per transaction (the first
+   check after the update is FULL: there is no `sweep-full-at` mark yet);
+2. second press — every LOCALLY-HELD txId is gone from the log. What may remain
+   is one `/raw` per never-decryptable candidate (see the third trade-off
+   above), a repair candidate, or a redrop duplicate — none of those is a
+   failed acceptance. The pass condition is «no locally-held transaction is
+   re-fetched», not a literal zero;
 3. create a note on the second device, press `↻` — exactly one
    `/raw/<new txId>`, and the status line reads «Проверено в HH:MM · …» with
    the note counted (the «Получено с других устройств» TOAST was removed by
@@ -612,6 +629,21 @@ deployment URL. Live bundle `index-D0_-tE-x.js`; CSP and
 `sweep-full-at` — direct evidence the incremental code is in the artifact, not
 merely in the source (this release adds no user-facing string, so the usual
 «grep the bundle for new copy» check does not apply).
+
+**ACCEPTANCE PASSED 2026-08-19** (operator's desktop Chrome, live site, driven
+through the browser extension with the vault unlocked by the operator):
+
+- running bundle confirmed `index-D0_-tE-x.js`, service worker `activated`
+  with nothing `waiting`/`installing` — the update really is applied, not
+  merely published;
+- **1st press: 9 `/raw` fetches** (full — no mark yet); the sweep then wrote
+  `sweep-full-at = 2026-08-19T11:02:02Z`;
+- **2nd press: 3 `/raw` fetches**; **3rd press: the same 3** — steady state.
+  IndexedDB shows exactly 6 sync records with a txId (3 notes + 3 safebox) and
+  all 6 rows present, and those 6 txIds are precisely the ones that stopped
+  being fetched. **Every locally-held transaction is skipped; the 3 repeats are
+  the never-decryptable ones** described in the third trade-off above;
+- status line reads «Проверено в 14:03 · новых записей нет»; no console errors.
 
 Tag `client-sync1` after acceptance. **Floors do not move**: client `client-r4`,
 worker `worker-r3`. This release is NOT a floor — no IndexedDB version change,
