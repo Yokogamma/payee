@@ -593,6 +593,20 @@ interface RestoreCandidate {
   txId: string;
   version: string;
   noteId: string;
+  /** Sentinel: the payload is already held locally (decrypted once through the
+   *  full pipeline), so it is not fetched — but the candidate STAYS in the
+   *  ordered list and claims its Note-Id at its position, keeping duplicate
+   *  resolution bit-identical to a full sweep. */
+  known: boolean;
+}
+
+/** What the caller knows about an already-held transaction. The sweep treats a
+ *  txId as known ONLY when the edge's Note-Id tag and version class match this
+ *  record too — a corrupted sync record must not be able to declare someone
+ *  else's TX known. */
+export interface KnownTxRecord {
+  noteId: string;
+  kind: 'note' | 'safebox';
 }
 
 /**
@@ -600,21 +614,30 @@ interface RestoreCandidate {
  * Pagination is sequential (cursors), payload download + decryption runs in a
  * bounded-parallel pool. Deduplicated by Note-Id, version-gated.
  * `onProgress(done, total)` fires as each candidate settles — the UI shows
- * «Восстановлено N/M».
+ * «Восстановлено N/M». With `opts.known` the sweep is incremental: known txIds
+ * become sentinels (not fetched, but still claiming their Note-Id in block
+ * order), the progress denominator counts only real downloads, and a fully
+ * known selection produces NO progress events at all.
  */
 export async function fetchAllNotes(
   ownerHash: string,
   keys: RestoreKeyring,
   onProgress?: (done: number, total: number) => void,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; known?: ReadonlyMap<string, KnownTxRecord> } = {},
 ): Promise<FetchAllNotesResult> {
   assertTrustedOwners(); // fail-closed: never trust arbitrary on-chain TX
-  const { signal } = opts;
+  const { signal, known } = opts;
 
   let incomplete = false;
 
   // Phase 1: sequential cursor pagination — collect candidate TXs.
   const candidates: RestoreCandidate[] = [];
+  // Note-Ids already claimed by a collected sentinel. Anything with the same id
+  // BELOW a sentinel (pages arrive HEIGHT_DESC) would lose the phase-3 claim to
+  // it with certainty — the sentinel is known-good — so it is dropped here and
+  // never fetched. Ids above a sentinel are unaffected: they are collected
+  // before the sentinel is seen.
+  const sentinelIds = new Set<string>();
   let cursor: string | null = null;
   while (true) {
     let edges: ArweaveEdge[];
@@ -647,8 +670,22 @@ export async function fetchAllNotes(
       if (!noteIdTag) continue;
       // NOTE: duplicates by Note-Id are NOT dropped here — the id is CLAIMED
       // only after a successful decrypt (truth after decryption), so a
-      // replay/garbage candidate can't shadow the real note.
-      candidates.push({ txId: edge.node.id, version: versionTag.value, noteId: noteIdTag.value });
+      // replay/garbage candidate can't shadow the real note. The ONE exception
+      // is a candidate below a sentinel (see sentinelIds above): the sentinel
+      // already decrypted once through the full pipeline, so the claim outcome
+      // is certain and the fetch would be pure waste.
+      if (sentinelIds.has(noteIdTag.value)) continue;
+      // A txId counts as known only when the whole identity lines up: the tag
+      // must repeat the sync record's noteId and the version class must match
+      // its kind. Anything else is treated as unknown and goes through the
+      // full fetch+decrypt pipeline (fail open towards MORE work, never less).
+      const knownRec = known?.get(edge.node.id);
+      const candidateKind: KnownTxRecord['kind'] = versionTag.value === '4' ? 'safebox' : 'note';
+      const isKnown = knownRec !== undefined
+        && knownRec.noteId === noteIdTag.value
+        && knownRec.kind === candidateKind;
+      if (isKnown) sentinelIds.add(noteIdTag.value);
+      candidates.push({ txId: edge.node.id, version: versionTag.value, noteId: noteIdTag.value, known: isKnown });
     }
 
     if (!hasNextPage) break;
@@ -657,7 +694,10 @@ export async function fetchAllNotes(
 
   // Phase 2: bounded-parallel payload fetch + decrypt. Results keep the
   // original slot so claiming stays deterministic (HEIGHT_DESC order).
+  // Sentinels are not fetched; the progress denominator counts only the
+  // candidates that actually cost a download.
   const results: (RestoredNote | RestoredSafeboxEntry | null)[] = new Array(candidates.length).fill(null);
+  const fetchTotal = candidates.reduce((n, c) => n + (c.known ? 0 : 1), 0);
   let nextIndex = 0;
   let done = 0;
   const runWorker = async () => {
@@ -671,6 +711,7 @@ export async function fetchAllNotes(
       const i = nextIndex++;
       if (i >= candidates.length) return;
       const cand = candidates[i];
+      if (cand.known) continue; // sentinel: no fetch, no decrypt, no progress event
 
       let dataResponse: Response | null = null;
       try {
@@ -695,7 +736,7 @@ export async function fetchAllNotes(
         }
       }
       done++;
-      onProgress?.(done, candidates.length);
+      onProgress?.(done, fetchTotal);
     }
   };
   await Promise.all(
@@ -711,7 +752,16 @@ export async function fetchAllNotes(
   // ONE id space: v3 notes and v4 entries share the UUIDv8 namespace, so an id
   // claimed by one kind must not be re-claimed by the other.
   const seenIds = new Set<string>();
-  for (const built of results) {
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i].known) {
+      // Sentinel claims its Note-Id at its position — no merge, no counters.
+      // A newer unknown duplicate above has already claimed by now and wins,
+      // exactly as in a full sweep; an older one below was dropped at
+      // collection. The add is idempotent either way.
+      seenIds.add(candidates[i].noteId);
+      continue;
+    }
+    const built = results[i];
     if (!built) continue;
     if (isSafeboxResult(built)) {
       if (seenIds.has(built.encrypted.entryId)) continue;

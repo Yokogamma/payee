@@ -308,6 +308,14 @@ export async function getAllNotes(): Promise<EncryptedNote[]> {
   return all.reverse() as EncryptedNote[];
 }
 
+/** Cheap key-only listing for the incremental sweep: a sync record counts as
+ *  «known» only when its note PHYSICALLY exists in its own store — a record
+ *  whose row was lost to DB damage must fall out of the known set and be
+ *  re-downloaded. Payloads are not read. */
+export async function getAllNoteIds(): Promise<string[]> {
+  return getDB().getAllKeys('notes') as Promise<string[]>;
+}
+
 export async function getNoteById(noteId: string): Promise<EncryptedNote | undefined> {
   return getDB().get('notes', noteId) as Promise<EncryptedNote | undefined>;
 }
@@ -323,6 +331,11 @@ export async function getAllSafeboxEntries(): Promise<EncryptedSafeboxEntry[]> {
 
 export async function getSafeboxEntryById(entryId: string): Promise<EncryptedSafeboxEntry | undefined> {
   return getDB().get('safebox', entryId) as Promise<EncryptedSafeboxEntry | undefined>;
+}
+
+/** Key-only listing, mirror of getAllNoteIds — see the comment there. */
+export async function getAllSafeboxEntryIds(): Promise<string[]> {
+  return getDB().getAllKeys('safebox') as Promise<string[]>;
 }
 
 /** Cheap count for hydration + reset-safety — works with the safebox LOCKED
@@ -675,6 +688,21 @@ export async function getAllSyncRecords(): Promise<SyncRecord[]> {
 
 export async function getMeta<T = unknown>(key: string): Promise<T | undefined> {
   return getDB().get('meta', key) as Promise<T | undefined>;
+}
+
+/**
+ * Runtime-validate the «last full sweep» meta value (`sweep-full-at`).
+ * `getMeta<number>` is a type ASSERTION, not a check: a string, NaN, Infinity
+ * or a far-future timestamp landing in meta through DB corruption would make
+ * `now − lastFull > MAX_AGE` permanently false — silently disabling the very
+ * safety net that exists to repair corruption. Anything but a finite integer
+ * in [0, now + 5 min] reads as «no mark» (0): a data error must cause EXTRA
+ * work, never a skip.
+ */
+export function sanitizeFullSweepAt(raw: unknown, now: number): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) return 0; // string/NaN/Infinity/fractional
+  if (raw < 0 || raw > now + 5 * 60 * 1000) return 0;
+  return raw;
 }
 
 // ─── v3 upload pause (worker kill switch, client side) ──────────────
