@@ -9,7 +9,7 @@ export function Landing() {
       <div className="card landing-card">
         <div className="landing-hero">
           <div className="logo-icon landing-logo"><InfinityMark /></div>
-          <h1>Eternal Notes</h1>
+          <h1>Matamata Notes</h1>
           <p className="subtitle">
             Зашифрованы на устройстве. По желанию — навсегда в блокчейне.
           </p>

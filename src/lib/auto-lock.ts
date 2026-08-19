@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — pure auto-lock decision logic.
+ * Matamata Notes — pure auto-lock decision logic.
  *
  * No DOM, no React: everything here is a total function over explicit inputs so
  * the lock/no-lock matrix stays unit-testable. The store wires these decisions
@@ -28,7 +28,7 @@ export function isValidAutoLockTimeout(v: unknown): v is AutoLockTimeout {
 
 // ─── Hidden-at marker ────────────────────────────────────────────────
 
-export const HIDDEN_AT_KEY = 'eternal-notes-hidden-at';
+export const HIDDEN_AT_KEY = 'matamata-notes-hidden-at';
 
 /** The subset of the Storage interface the marker helpers need — tests pass a
  *  Map-backed fake, the app passes sessionStorage. */

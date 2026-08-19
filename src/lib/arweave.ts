@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — Arweave Transport Module
+ * Matamata Notes — Arweave Transport Module
  *
  * All uploads go through a Cloudflare Worker proxy (server pays AR).
  * Downloads use Arweave GraphQL API directly.
@@ -36,7 +36,7 @@ const PROXY_URL = (() => {
     return ''; // unusable value → behaves as "proxy not configured"
   }
 })();
-export const APP_NAME = 'EternalNotes';
+export const APP_NAME = 'MatamataNotes';
 export const APP_VERSION = '1';
 
 // Supported data format versions for READING (reader-before-writer): v4

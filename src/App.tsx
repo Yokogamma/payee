@@ -30,7 +30,7 @@ function AppRouter({ theme, onThemeChange }: RouterProps) {
               <h1>Закройте другие вкладки</h1>
               <p className="subtitle">
                 Приложение обновляет локальное хранилище, но оно открыто в
-                другой вкладке Eternal Notes. Закройте остальные вкладки и
+                другой вкладке Matamata Notes. Закройте остальные вкладки и
                 обновите страницу — обновление продолжится автоматически.
               </p>
               <button className="btn btn-primary" onClick={() => window.location.reload()}>

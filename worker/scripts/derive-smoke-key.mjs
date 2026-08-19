@@ -4,7 +4,7 @@
  * клиент (deriveSigningKeypair в src/lib/crypto.ts):
  *
  *   BIP-39 seed → первые 32 байта → HKDF-SHA256
- *   (salt "eternal-notes-v1", info "ed25519-signing-v1") → 32 байта
+ *   (salt "matamata-notes-v1", info "ed25519-signing-v1") → 32 байта
  *
  * Смысл: смоук должен ходить от ЗАРЕГИСТРИРОВАННОГО ключа, а регистрация в
  * этом приложении привязана к seed-фразе. Поэтому ключ не «где-то лежит» —
@@ -48,7 +48,7 @@ export async function deriveSmokeKey(mnemonic) {
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: new TextEncoder().encode('eternal-notes-v1'),
+      salt: new TextEncoder().encode('matamata-notes-v1'),
       info: new TextEncoder().encode('ed25519-signing-v1'),
     },
     keyMaterial,

@@ -12,7 +12,7 @@ vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLE
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({
   useNotes: () => h.store,
-  DRAFT_STORAGE_KEY: 'eternal-notes-draft',
+  DRAFT_STORAGE_KEY: 'matamata-notes-draft',
   // Main (and the modals) `instanceof` these — the mock must export REAL classes.
   OperationInFlightError: class OperationInFlightError extends Error {},
   WriterDisabledError: class WriterDisabledError extends Error {},

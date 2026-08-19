@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — encrypted-at-rest composer draft (§2 auto-lock plan).
+ * Matamata Notes — encrypted-at-rest composer draft (§2 auto-lock plan).
  *
  * The draft used to be PLAINTEXT in sessionStorage — an auto-lock that wipes
  * the vault but leaves the draft readable would leak exactly the text the user
@@ -21,7 +21,7 @@
 
 import { bufferToBase64, base64ToBuffer } from './crypto';
 
-export const DRAFT_STORAGE_KEY = 'eternal-notes-draft';
+export const DRAFT_STORAGE_KEY = 'matamata-notes-draft';
 
 /** Minimal Storage surface — the app passes sessionStorage, tests a Map fake. */
 export interface DraftStorage {

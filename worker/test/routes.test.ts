@@ -63,7 +63,7 @@ describe('CORS allowlist', () => {
 
   it('does NOT allow arbitrary *.pages.dev preview origins', async () => {
     const preview = await SELF.fetch('https://proxy.example.com/health', {
-      headers: { Origin: 'https://random-preview.eternal-notes.pages.dev' },
+      headers: { Origin: 'https://random-preview.matamata-notes.pages.dev' },
     });
     expect(preview.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });

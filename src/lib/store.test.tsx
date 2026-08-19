@@ -142,7 +142,7 @@ afterAll(() => {
 // ─── Harness ─────────────────────────────────────────────────────────
 
 const MN = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
-const SESSION_KEY = 'eternal-notes-session';
+const SESSION_KEY = 'matamata-notes-session';
 const FAKE_PIN_BLOB = { ciphertext: 'ct', iv: 'iv', salt: 's' };
 
 let store: ReturnType<typeof useNotes>;
@@ -172,7 +172,7 @@ async function openMain() {
 /** Attach a listener tab to the vault channel (created AFTER renderStore so
  *  the store's own channel exists too). */
 function listenOnChannel() {
-  const channel = new FakeBroadcastChannel('eternal-notes-vault');
+  const channel = new FakeBroadcastChannel('matamata-notes-vault');
   const received: Array<Record<string, unknown>> = [];
   channel.onmessage = e => received.push(e.data as Record<string, unknown>);
   return { channel, received };

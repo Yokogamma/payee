@@ -35,7 +35,7 @@ import type { EncryptedSafeboxEntry } from './crypto';
 // helpers, the `kind` normalization at the read boundary and the INDEPENDENT
 // v4 pause marker.
 
-const DB_NAME = 'eternal-notes';
+const DB_NAME = 'matamata-notes';
 
 function entry(id: string, over: Partial<EncryptedSafeboxEntry> = {}): EncryptedSafeboxEntry {
   return {

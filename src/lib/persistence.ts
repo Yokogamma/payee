@@ -23,7 +23,7 @@
 export type PersistenceState = 'persisted' | 'denied' | 'unsupported';
 
 /** Per-TAB refusal marker: survives reloads, dies with the tab. */
-const DENIED_KEY = 'eternal-notes-persist-denied';
+const DENIED_KEY = 'matamata-notes-persist-denied';
 
 /** Single-flight for one page load: concurrent callers share one attempt. */
 let attempt: Promise<PersistenceState> | null = null;

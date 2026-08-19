@@ -1,4 +1,4 @@
-# Security guidance — Eternal Notes
+# Security guidance — Matamata Notes
 
 Threat model: an **E2E-encrypted, invite-gated** notes app. A Cloudflare Worker
 proxy pays for Arweave uploads, so the two crown jewels are **user plaintext /

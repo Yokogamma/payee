@@ -152,7 +152,7 @@ afterAll(() => { globalWithBC.BroadcastChannel = savedBC; });
 const MN = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const OTHER_MN = 'zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong';
 const PIN = '135790';
-const SESSION_KEY = 'eternal-notes-session';
+const SESSION_KEY = 'matamata-notes-session';
 
 let store: ReturnType<typeof useNotes>;
 
@@ -427,7 +427,7 @@ describe('configId recheck before publishing a secret (§2)', () => {
 
     // A second "tab" on the same channel announces a config change.
     await foreignTabReplacesConfig();
-    const other = new FakeBroadcastChannel('eternal-notes-vault');
+    const other = new FakeBroadcastChannel('matamata-notes-vault');
     await act(async () => {
       other.postMessage({ type: 'config', originId: 'other-tab', messageId: crypto.randomUUID() });
       await new Promise(r => setTimeout(r, 0));

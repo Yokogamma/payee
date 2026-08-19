@@ -80,7 +80,7 @@ describe('canonical public-key enforcement', () => {
     const r = await signedFetch('/upload', nonCanonical, priv, {
       data: JSON.stringify({ id: noteId, c: 'AAAA', iv: 'AAAAAAAAAAAAAAAA' }),
       tags: [
-        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Name', value: 'MatamataNotes' },
         { name: 'App-Version', value: '2' },
         { name: 'Content-Type', value: 'application/json' },
         { name: 'Owner-Hash', value: ownerHash },

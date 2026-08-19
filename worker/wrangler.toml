@@ -1,4 +1,4 @@
-name = "eternal-notes-proxy"
+name = "matamata-notes-proxy"
 main = "src/index.ts"
 compatibility_date = "2026-03-31"
 
@@ -81,7 +81,7 @@ V4_UPLOADS_ENABLED = "true"
 # CORS check needs a staging CLIENT page whose origin is what belongs in
 # ALLOWED_ORIGINS here.
 [env.staging]
-name = "eternal-notes-proxy-staging"
+name = "matamata-notes-proxy-staging"
 
 [env.staging.durable_objects]
 bindings = [

@@ -1,10 +1,10 @@
 /**
- * Eternal Notes — IndexedDB Persistence Module
+ * Matamata Notes — IndexedDB Persistence Module
  *
  * Single source of truth for all persistent data.
  * Replaces localStorage for notes/sync/meta.
  *
- * Schema: DB "eternal-notes", version 2
+ * Schema: DB "matamata-notes", version 2
  *   - notes:   { noteId (PK), ciphertext, iv, createdAt } + index by-timestamp
  *   - sync:    { noteId (PK), kind, txId?, status, transport, lastError?, updatedAt } + index by-status
  *   - meta:    { key (PK), value }
@@ -91,7 +91,7 @@ function normalizeSyncRecord(raw: SyncRecord | undefined): SyncRecord | undefine
 
 // ─── Database ────────────────────────────────────────────────────────
 
-const DB_NAME = 'eternal-notes';
+const DB_NAME = 'matamata-notes';
 /** v2 adds the `safebox` store. The bump happens on the FIRST launch of R4,
  *  independently of the writer flag — which is exactly why R4 is an
  *  irreversible client floor (docs/ROLLBACK.md). */
@@ -977,7 +977,7 @@ async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesM
   if (migrated) return { notesMigrated: 0 };
 
   // 2. Read from localStorage
-  const raw = localStorage.getItem('eternal-notes-encrypted');
+  const raw = localStorage.getItem('matamata-notes-encrypted');
   if (!raw) {
     await database.put('meta', true, 'migration-v1-done');
     return { notesMigrated: 0 };
@@ -1031,10 +1031,10 @@ async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesM
   }
 
   // 4. Migrate meta flags
-  if (localStorage.getItem('eternal-notes-init') === 'true') {
+  if (localStorage.getItem('matamata-notes-init') === 'true') {
     await tx.objectStore('meta').put(true, 'init');
   }
-  if (localStorage.getItem('eternal-notes-ar-enabled') === 'true') {
+  if (localStorage.getItem('matamata-notes-ar-enabled') === 'true') {
     await tx.objectStore('meta').put(true, 'ar-enabled');
   }
 
@@ -1045,7 +1045,7 @@ async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesM
   //    Leaving without SyncRecord = implicitly pending → will be re-uploaded via proxy.
   //    Cost: ~$0.001 per note. Old chain copies are harmless orphaned data.
   try {
-    localStorage.removeItem('eternal-notes-ar-synced');
+    localStorage.removeItem('matamata-notes-ar-synced');
   } catch { /* skip */ }
 
   // 6. Write migration marker (same transaction)
@@ -1053,10 +1053,10 @@ async function migrateFromLocalStorage(database: IDBPDatabase): Promise<{ notesM
   await tx.done;
 
   // 7. Clear localStorage ONLY after successful commit
-  localStorage.removeItem('eternal-notes-encrypted');
-  localStorage.removeItem('eternal-notes-init');
-  localStorage.removeItem('eternal-notes-ar-enabled');
-  localStorage.removeItem('eternal-notes-ar-synced');
+  localStorage.removeItem('matamata-notes-encrypted');
+  localStorage.removeItem('matamata-notes-init');
+  localStorage.removeItem('matamata-notes-ar-enabled');
+  localStorage.removeItem('matamata-notes-ar-synced');
 
   return { notesMigrated: count };
 }

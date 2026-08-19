@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — Core Crypto Module
+ * Matamata Notes — Core Crypto Module
  *
  * Pure cryptographic operations. No storage/persistence.
  *
@@ -118,7 +118,7 @@ export async function deriveKey(mnemonic: string): Promise<CryptoKey> {
 }
 
 /** Shared HKDF→AES-256-GCM derivation. The SALT is fixed forever
- *  ('eternal-notes-v1'); only `info` separates the domains. Changing either
+ *  ('matamata-notes-v1'); only `info` separates the domains. Changing either
  *  constant orphans every existing record — treat as a breaking migration. */
 async function deriveAesKey(mnemonic: string, info: string): Promise<CryptoKey> {
   const seed = mnemonicToSeedSync(mnemonic);
@@ -131,7 +131,7 @@ async function deriveAesKey(mnemonic: string, info: string): Promise<CryptoKey> 
     ['deriveKey']
   );
 
-  const salt = new TextEncoder().encode('eternal-notes-v1');
+  const salt = new TextEncoder().encode('matamata-notes-v1');
 
   return crypto.subtle.deriveKey(
     { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode(info) },
@@ -187,7 +187,7 @@ export async function deriveSigningKeypair(mnemonic: string): Promise<{
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: new TextEncoder().encode('eternal-notes-v1'),
+      salt: new TextEncoder().encode('matamata-notes-v1'),
       info: new TextEncoder().encode('ed25519-signing-v1'),
     },
     keyMaterial,

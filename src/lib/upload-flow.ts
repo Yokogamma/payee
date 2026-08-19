@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — single upload attempt state-machine (§7 auto-lock plan).
+ * Matamata Notes — single upload attempt state-machine (§7 auto-lock plan).
  *
  * The invariant this module exists for (round-5 blocker): ONE epoch check,
  * placed BEFORE the `toUploading` write, is the upload's point of no return.

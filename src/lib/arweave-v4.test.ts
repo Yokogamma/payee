@@ -31,7 +31,7 @@ function stubGateway(
     if (url.includes('/graphql')) {
       return new Response(JSON.stringify({ data: { transactions: {
         edges: edges.map(e => ({ cursor: e.txId, node: { id: e.txId, tags: [
-          { name: 'App-Name', value: 'EternalNotes' },
+          { name: 'App-Name', value: 'MatamataNotes' },
           { name: 'App-Version', value: e.version },
           { name: 'Note-Id', value: e.noteId },
         ] } })),

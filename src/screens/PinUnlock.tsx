@@ -118,7 +118,7 @@ export function PinUnlock() {
     <div className="screen-center">
       <div className="card onboarding">
         <div className="logo-icon"><InfinityMark /></div>
-        <h1>Eternal Notes</h1>
+        <h1>Matamata Notes</h1>
         <p className="subtitle">Введите PIN для разблокировки</p>
 
         <input

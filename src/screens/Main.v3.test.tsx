@@ -11,7 +11,7 @@ vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({
   useNotes: () => h.store,
-  DRAFT_STORAGE_KEY: 'eternal-notes-draft',
+  DRAFT_STORAGE_KEY: 'matamata-notes-draft',
   OperationInFlightError: class OperationInFlightError extends Error {},
   WriterDisabledError: class WriterDisabledError extends Error {},
 }));

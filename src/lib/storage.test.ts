@@ -151,7 +151,7 @@ describe('recoverStorage', () => {
 
   it('waits out a blocking tab (onBlocked fires) and completes once it closes — never pretends cancelled', async () => {
     // Simulate another tab: an independent connection that ignores versionchange.
-    const otherTab = await openDB('eternal-notes', 2);
+    const otherTab = await openDB('matamata-notes', 2);
 
     let blockedSignalled = false;
     const recovery = recoverStorage({ onBlocked: () => { blockedSignalled = true; } });
@@ -227,10 +227,10 @@ describe('getPinConfigMeta (round 5 — one consistent snapshot)', () => {
 
 describe('localStorage migration validation', () => {
   it('migrates well-formed legacy notes and clears localStorage', async () => {
-    localStorage.setItem('eternal-notes-encrypted', JSON.stringify([
+    localStorage.setItem('matamata-notes-encrypted', JSON.stringify([
       { ciphertext: 'ct', iv: 'iv', createdAt: 123 },
     ]));
-    localStorage.setItem('eternal-notes-init', 'true');
+    localStorage.setItem('matamata-notes-init', 'true');
 
     await recoverStorage(); // fresh DB → migration runs
 
@@ -239,7 +239,7 @@ describe('localStorage migration validation', () => {
     expect(notes[0].ciphertext).toBe('ct');
     expect(await getMeta('migration-v1-done')).toBe(true);
     expect(await getMeta('init')).toBe(true);
-    expect(localStorage.getItem('eternal-notes-encrypted')).toBeNull();
+    expect(localStorage.getItem('matamata-notes-encrypted')).toBeNull();
   });
 
   it('rejects records with invalid shape: no marker, localStorage preserved', async () => {
@@ -247,26 +247,26 @@ describe('localStorage migration validation', () => {
       { ciphertext: 'ct', iv: 'iv', createdAt: 123 },
       { ciphertext: 42, iv: 'iv' }, // corrupted record
     ]);
-    localStorage.setItem('eternal-notes-encrypted', raw);
+    localStorage.setItem('matamata-notes-encrypted', raw);
 
     await recoverStorage();
 
     expect(await getAllNotes()).toHaveLength(0); // nothing partially migrated
     expect(await getMeta('migration-v1-done')).toBeUndefined();
-    expect(localStorage.getItem('eternal-notes-encrypted')).toBe(raw); // kept for recovery
-    localStorage.removeItem('eternal-notes-encrypted');
+    expect(localStorage.getItem('matamata-notes-encrypted')).toBe(raw); // kept for recovery
+    localStorage.removeItem('matamata-notes-encrypted');
   });
 
   it('rejects a non-array payload: no marker, localStorage preserved', async () => {
     const raw = JSON.stringify({ not: 'an array' });
-    localStorage.setItem('eternal-notes-encrypted', raw);
+    localStorage.setItem('matamata-notes-encrypted', raw);
 
     await recoverStorage();
 
     expect(await getAllNotes()).toHaveLength(0);
     expect(await getMeta('migration-v1-done')).toBeUndefined();
-    expect(localStorage.getItem('eternal-notes-encrypted')).toBe(raw);
-    localStorage.removeItem('eternal-notes-encrypted');
+    expect(localStorage.getItem('matamata-notes-encrypted')).toBe(raw);
+    localStorage.removeItem('matamata-notes-encrypted');
   });
 });
 

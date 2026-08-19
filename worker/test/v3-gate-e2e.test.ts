@@ -43,7 +43,7 @@ async function v3Request(
   version: '1' | '2' | '3' = '3',
 ): Promise<Request> {
   const tags = [
-    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Name', value: 'MatamataNotes' },
     { name: 'App-Version', value: version },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: id.ownerHash },

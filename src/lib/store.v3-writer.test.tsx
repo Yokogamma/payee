@@ -357,7 +357,7 @@ describe('W3: v3 upload pause (kill switch, client side)', () => {
 
     // Remount (reload analogue): the mirror must come back from the marker.
     cleanup();
-    sessionStorage.setItem('eternal-notes-session', MN);
+    sessionStorage.setItem('matamata-notes-session', MN);
     renderStore();
     await waitFor(() => expect(store.isReady).toBe(true));
     await waitFor(() => expect(store.screen).toBe('main'));

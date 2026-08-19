@@ -66,7 +66,7 @@ export function AppNav({ safeboxDimmed }: Props) {
           context and a second title would just eat a row. */}
       <div className="app-nav-brand" aria-hidden="true">
         <InfinityMark className="app-nav-mark" />
-        <span>Eternal Notes</span>
+        <span>Matamata Notes</span>
       </div>
       {(Object.keys(LABELS) as Section[]).map(id => {
         const active = section === id;

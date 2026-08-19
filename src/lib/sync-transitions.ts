@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — pure SyncRecord transition logic.
+ * Matamata Notes — pure SyncRecord transition logic.
  *
  * The upload/poll orchestration in store.tsx delegates every SyncRecord
  * mutation here so the recovery-protocol invariants are unit-testable without

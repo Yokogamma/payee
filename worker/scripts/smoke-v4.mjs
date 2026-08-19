@@ -8,7 +8,7 @@
  * alone only proves configuration.
  *
  * Usage (CLI — sends no Origin header, CORS is NOT exercised here):
- *   SMOKE_URL=https://eternal-notes-proxy-staging.<acct>.workers.dev \
+ *   SMOKE_URL=https://matamata-notes-proxy-staging.<acct>.workers.dev \
  *   SMOKE_PRIVATE_KEY=<base64 32-byte Ed25519 seed of a REGISTERED staging key> \
  *   npm run smoke:v4
  *
@@ -49,7 +49,7 @@ if (!url || !privB64) {
   smoke is an escape hatch that needs its own explicit operator decision — and
   must be recorded in the runbook when used.
 
-  Staging target?  use the eternal-notes-proxy-staging URL.
+  Staging target?  use the matamata-notes-proxy-staging URL.
   Really production? re-run with ALLOW_PRODUCTION_SMOKE=true and write down why.
 `);
     process.exit(2);
@@ -103,7 +103,7 @@ async function signedUpload(tags, dataObj) {
 }
 
 const v4Tags = (noteId) => [
-  { name: 'App-Name', value: 'EternalNotes' },
+  { name: 'App-Name', value: 'MatamataNotes' },
   { name: 'App-Version', value: '4' },
   { name: 'Content-Type', value: 'application/json' },
   { name: 'Owner-Hash', value: ownerHash },
@@ -150,7 +150,7 @@ check('v4 upload with v2/v3 data keys rejected (400)', r4.status === 400,
 // ── 5. v3 is untouched by the v4 acceptor (regression guard) ────────
 const v3Id = randomUuidV8();
 const r5 = await signedUpload([
-  { name: 'App-Name', value: 'EternalNotes' },
+  { name: 'App-Name', value: 'MatamataNotes' },
   { name: 'App-Version', value: '3' },
   { name: 'Content-Type', value: 'application/json' },
   { name: 'Owner-Hash', value: ownerHash },

@@ -1,5 +1,5 @@
 /**
- * Eternal Notes — Cloudflare Worker Proxy
+ * Matamata Notes — Cloudflare Worker Proxy
  *
  * Handles Arweave uploads (server pays AR), invite registration,
  * and registration checks. Auth via Ed25519 signature + server-side allowlist.
@@ -499,7 +499,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const isSplitEnvelope = declaredVersion === '4';
 
   const REQUIRED_TAGS = new Map<string, string>([
-    ['App-Name', 'EternalNotes'],
+    ['App-Name', 'MatamataNotes'],
     ['App-Version', declaredVersion],
     ['Content-Type', 'application/json'],
   ]);

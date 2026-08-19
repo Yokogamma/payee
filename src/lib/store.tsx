@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 /**
- * Eternal Notes — App Store (React Context)
+ * Matamata Notes — App Store (React Context)
  *
  * Manages: encryption key, notes, Arweave sync, registration, upload queue,
  * auto-lock. All persistence through IndexedDB (storage.ts). No localStorage.
@@ -157,7 +157,7 @@ export { SafeboxConfigChangedError } from './storage';
 
 export type AppScreen = 'loading' | 'landing' | 'onboarding' | 'restore' | 'pin' | 'main' | 'error';
 
-const SESSION_STORAGE_KEY = 'eternal-notes-session';
+const SESSION_STORAGE_KEY = 'matamata-notes-session';
 
 /** Per-note sync state for the card indicator: SyncRecord.status, or 'queued'
  *  when the note has no record yet (never attempted). */
@@ -1219,7 +1219,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // ─── Multi-tab vault channel (§8) ──────────────────────────────────
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return; // older Safari — per-tab only
-    const channel = new BroadcastChannel('eternal-notes-vault');
+    const channel = new BroadcastChannel('matamata-notes-vault');
     channelRef.current = channel;
     channel.onmessage = (e: MessageEvent) => {
       const msg = e.data as { type?: unknown; originId?: unknown; messageId?: unknown } | null;

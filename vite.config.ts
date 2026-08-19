@@ -37,8 +37,8 @@ export default defineConfig(({ command, mode }) => {
         // workbox globPatterns below; listing them twice duplicated precache
         // manifest entries (round-15 LOW).
         manifest: {
-          name: "Eternal Notes",
-          short_name: "EternalNotes",
+          name: "Matamata Notes",
+          short_name: "Matamata",
           description: "Вечные зашифрованные заметки в блокчейне",
           // start_url/scope default to the Vite base — correct for both targets.
           display: "standalone",

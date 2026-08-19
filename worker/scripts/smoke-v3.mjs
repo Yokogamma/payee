@@ -7,7 +7,7 @@
  * path and idempotency — /health alone only proves configuration.
  *
  * Usage (CLI — sends no Origin header, CORS is NOT exercised here):
- *   SMOKE_URL=https://eternal-notes-proxy-staging.<acct>.workers.dev \
+ *   SMOKE_URL=https://matamata-notes-proxy-staging.<acct>.workers.dev \
  *   SMOKE_PRIVATE_KEY=<base64 32-byte Ed25519 seed of a REGISTERED staging key> \
  *   npm run smoke:v3
  *
@@ -79,7 +79,7 @@ const noteId = randomUuidV8();
 const iv = b64(crypto.getRandomValues(new Uint8Array(12)));
 const c = b64(crypto.getRandomValues(new Uint8Array(64)));
 const v3Tags = [
-  { name: 'App-Name', value: 'EternalNotes' },
+  { name: 'App-Name', value: 'MatamataNotes' },
   { name: 'App-Version', value: '3' },
   { name: 'Content-Type', value: 'application/json' },
   { name: 'Owner-Hash', value: ownerHash },
@@ -99,7 +99,7 @@ check('v3 repeat is idempotent (same txId)',
 
 // ── 3. Namespace barrier: v1 tags with a v8 Note-Id must be rejected ──
 const v1Tags = [
-  { name: 'App-Name', value: 'EternalNotes' },
+  { name: 'App-Name', value: 'MatamataNotes' },
   { name: 'App-Version', value: '1' },
   { name: 'Content-Type', value: 'application/json' },
   { name: 'Owner-Hash', value: ownerHash },

@@ -61,7 +61,7 @@ const IV = 'AAAAAAAAAAAAAAAA';    // valid base64, exactly 12 bytes
 
 function v1Tags(): Tag[] {
   return [
-    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Name', value: 'MatamataNotes' },
     { name: 'App-Version', value: '1' },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: 'PLACEHOLDER' },
@@ -71,7 +71,7 @@ function v1Tags(): Tag[] {
 }
 function v2Tags(): Tag[] {
   return [
-    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Name', value: 'MatamataNotes' },
     { name: 'App-Version', value: '2' },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: 'PLACEHOLDER' },
@@ -80,7 +80,7 @@ function v2Tags(): Tag[] {
 }
 function v3Tags(noteId: string = NOTE_ID_V8): Tag[] {
   return [
-    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Name', value: 'MatamataNotes' },
     { name: 'App-Version', value: '3' },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: 'PLACEHOLDER' },

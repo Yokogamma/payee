@@ -166,7 +166,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: note.noteId },
           ] } }],
@@ -212,7 +212,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: foreign.noteId },
           ] } }],
@@ -251,7 +251,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: ['TXOLD', 'TXNEW'].map(txId => ({ cursor: txId, node: { id: txId, tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: byId[txId].id },
           ] } })),
@@ -323,7 +323,7 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [...byTx.entries()].map(([txId, n]) => ({ cursor: txId, node: { id: txId, tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: n.noteId },
           ] } })),
@@ -363,7 +363,7 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [...byTx.entries()].map(([txId, n]) => ({ cursor: txId, node: { id: txId, tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: n.noteId },
           ] } })),
@@ -404,7 +404,7 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
         if (gqlCalls > 1) return new Response('gateway down', { status: 502 });
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: note.noteId },
           ] } }],
@@ -457,7 +457,7 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: 'nid' },
           ] } }],
@@ -616,7 +616,7 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [{ cursor: 'c1', node: { id: 'TXV3', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '3' },
             { name: 'Note-Id', value: note.noteId },
           ] } }],
@@ -657,7 +657,7 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
           edges: [{ cursor: 'c1', node: { id: 'TXBAD', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Name', value: 'MatamataNotes' },
             { name: 'App-Version', value: '3' },
             { name: 'Note-Id', value: id },
           ] } }],

@@ -65,7 +65,7 @@ const nextIp = () => `v4v-${crypto.randomUUID().slice(0, 6)}-${ipCounter++}`;
 
 function v4Tags(noteId: string = ID_V8): Tag[] {
   return [
-    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Name', value: 'MatamataNotes' },
     { name: 'App-Version', value: '4' },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: 'PLACEHOLDER' },
@@ -157,7 +157,7 @@ describe('upload validation: App-Version=4 (safebox split envelope)', () => {
   // Regression: the v4 acceptor must not disturb the older versions.
   it('leaves v3 uploads working (502 at Arweave stage)', async () => {
     const tags: Tag[] = [
-      { name: 'App-Name', value: 'EternalNotes' },
+      { name: 'App-Name', value: 'MatamataNotes' },
       { name: 'App-Version', value: '3' },
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Owner-Hash', value: 'PLACEHOLDER' },
@@ -169,7 +169,7 @@ describe('upload validation: App-Version=4 (safebox split envelope)', () => {
 
   it('leaves v1 uploads working, still on the UUIDv4 namespace', async () => {
     const tags: Tag[] = [
-      { name: 'App-Name', value: 'EternalNotes' },
+      { name: 'App-Name', value: 'MatamataNotes' },
       { name: 'App-Version', value: '1' },
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Owner-Hash', value: 'PLACEHOLDER' },

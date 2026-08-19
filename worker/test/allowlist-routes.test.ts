@@ -32,7 +32,7 @@ async function makeUpload(ip: string) {
   const pkB64 = b64(pub);
   const ownerHash = b64(await sha256(pub));
   const tags = [
-    { name: 'App-Name', value: 'EternalNotes' },
+    { name: 'App-Name', value: 'MatamataNotes' },
     { name: 'App-Version', value: '2' },
     { name: 'Content-Type', value: 'application/json' },
     { name: 'Owner-Hash', value: ownerHash },

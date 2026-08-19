@@ -3,7 +3,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 // Фаза 1 инкрементального sweep'а: sentinel-модель известных кандидатов.
 // Известный txId не скачивается, но ОСТАЁТСЯ в упорядоченном списке и занимает
 // свой Note-Id в порядке блоков — семантика выбора дубликатов обязана быть
-// побитово равна полному sweep'у (план eternal-notes-incremental-sweep-phase1,
+// побитово равна полному sweep'у (план matamata-notes-incremental-sweep-phase1,
 // §6.1б; тесты 1–9).
 // config.ts читает VITE_TRUSTED_OWNERS при загрузке модуля, поэтому каждый тест
 // стабит env и импортирует arweave.ts заново (resetModules).
@@ -44,7 +44,7 @@ function stubGateway(
     if (url.includes('/graphql')) {
       return new Response(JSON.stringify({ data: { transactions: {
         edges: edges.map(e => ({ cursor: e.txId, node: { id: e.txId, tags: [
-          { name: 'App-Name', value: 'EternalNotes' },
+          { name: 'App-Name', value: 'MatamataNotes' },
           { name: 'App-Version', value: e.version },
           { name: 'Note-Id', value: e.noteId },
         ] } })),

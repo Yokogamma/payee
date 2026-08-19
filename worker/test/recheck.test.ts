@@ -62,7 +62,7 @@ async function recheckUpload(id: { priv: Uint8Array; pkB64: string; ownerHash: s
   const body = JSON.stringify({
     data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
     tags: [
-      { name: 'App-Name', value: 'EternalNotes' },
+      { name: 'App-Name', value: 'MatamataNotes' },
       { name: 'App-Version', value: '2' },
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Owner-Hash', value: id.ownerHash },
@@ -110,7 +110,7 @@ async function recoveryUpload(id: { priv: Uint8Array; pkB64: string; ownerHash: 
   const body = JSON.stringify({
     data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
     tags: [
-      { name: 'App-Name', value: 'EternalNotes' },
+      { name: 'App-Name', value: 'MatamataNotes' },
       { name: 'App-Version', value: '2' },
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Owner-Hash', value: id.ownerHash },
@@ -216,7 +216,7 @@ describe('recovery token (triple-failure reconciliation)', () => {
     const body = JSON.stringify({
       data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
       tags: [
-        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Name', value: 'MatamataNotes' },
         { name: 'App-Version', value: '2' },
         { name: 'Content-Type', value: 'application/json' },
         { name: 'Owner-Hash', value: id.ownerHash },
