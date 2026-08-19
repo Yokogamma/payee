@@ -1172,6 +1172,45 @@ the failure instead of the operator meeting it on a preview build. Rollback is
 a redeploy of `client-qu1` — the feature disappears from the UI, and any record
 already written stays readable (an older client ignores the key).
 
+### Acceptance so far — Android, and what it cost
+
+**OnePlus 12 (Android), 2026-08-19 — SETUP FAILED: the credential was created,
+the platform then returned no PRF.** The capability probes had said «go
+ahead» — which is exactly the case §3 predicts and the reason the design treats
+a real ceremony, not a probe, as the only authority.
+
+Two defects surfaced with it, and the second was the serious one:
+
+1. The message was jargon («это устройство не выдаёт PRF») and its instruction
+   was wrong twice over: with `residentKey: 'discouraged'` the leftover
+   credential may not be VISIBLE in the manager at all, and leaving it is
+   harmless — it opens nothing. Nothing told the reader the one thing that
+   mattered: nothing is broken, the PIN still works.
+2. The block stayed in «не настроен» WITH the setup button. So the only obvious
+   next action — press it again — minted another unusable platform credential,
+   every time. A dead end that punishes the user for trying to fix it.
+
+Fixed in `b9d3722` (PR #63): `QuickUnlockUnavailableError` now carries the
+verdict a ceremony PROVED, the store publishes it and makes it sticky for the
+session, so a later probe cannot put the button back with an optimistic
+`'unknown'`. A transient environment failure carries no verdict and leaves the
+capability alone — it proves nothing about the device. All refusal copy was
+rewritten without jargon, each line ending in what the reader can DO.
+
+**KNOWN LIMIT of that fix:** the verdict does not survive a reload. After a
+restart the button returns and one more orphaned credential can be created.
+Persisting it needs a new meta key and was not added silently.
+
+**Cause on this device: NOT ESTABLISHED.** «OnePlus 12» alone does not settle
+it — on Android, PRF depends on which provider actually created the passkey and
+on the browser build, not on the handset. Two checks settle it in a minute:
+the Chrome version (`chrome://version`; `getClientCapabilities` needs 133+, and
+below that the probe answers `'unknown'` rather than lying), and which passkey
+provider is selected (Settings → Passwords & accounts → the passkey/autofill
+provider — Google Password Manager implements hmac-secret, a third-party or
+vendor provider may not). Until one of those is known, record this as «this
+combination does not deliver PRF», NOT as «Android does not».
+
 **Still outstanding after this deploy:** the §13 device matrix has NOT been run
 — iPhone (Safari and the installed PWA separately), Android (Chrome and PWA),
 a Windows Hello laptop in Chrome AND Edge, and separately a machine WITHOUT
