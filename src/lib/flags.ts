@@ -44,3 +44,20 @@ export const V3_WRITER_ENABLED: boolean = true;
  * branch into unreachable dead code under TS narrowing.
  */
 export const SAFEBOX_WRITER_ENABLED: boolean = true;
+
+/**
+ * «Быстрый вход» — unlocking the vault with a WebAuthn PRF key instead of
+ * typing the PIN (release `client-qu2` flips this in a dedicated commit/tag).
+ *
+ * Contract PER OPERATION, not per screen:
+ * - `setupQuickUnlock` / `unlockWithQuickUnlock` are GATED: with the flag off
+ *   they refuse (QuickUnlockUnavailableError) instead of running a ceremony.
+ * - Reading the record and REMOVING it are NEVER gated. The settings block is
+ *   visible when `QUICK_UNLOCK_ENABLED || hasQuickUnlock`, and with the flag
+ *   off over a live record it offers removal ONLY: rolling the flag back must
+ *   never strand a user with a working record and no control for it.
+ *
+ * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
+ * branch into unreachable dead code under TS narrowing.
+ */
+export const QUICK_UNLOCK_ENABLED: boolean = false;
