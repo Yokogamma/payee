@@ -61,8 +61,9 @@ Byzantine-модель фиксируется в ADR и, где уместно, 
 - **D4. Доступ к метрикам: `/admin/metrics` (bearer `ADMIN_SECRET`) + прямой
   Cloudflare Analytics Engine SQL API.**
 - **D5. Телеметрия — только серверная.**
-- **D6. `restore.html` хранится на Arweave**, txId в README и приложении —
-  **при условии решённой trust-модели (§4.PR-5, critical-1).**
+- **D6. `restore.html` хранится на Arweave и распространяется как СКАЧИВАЕМЫЙ
+  ФАЙЛ** с проверкой SHA-256 (реш. 1 §7) — не как исполняемая gateway-страница.
+  txId в README и приложении. Это снимает critical-1.
 - **D7. Конкретные адреса шлюзов утверждаются ДО production-wiring** (не «в PR
   по ходу»): реальные URL, операторы, CORS, GraphQL schema/pagination, limits,
   status-поведение, sandbox-redirect для HTML. См. §4.PR-3a и открытые вопросы.
@@ -279,16 +280,16 @@ single-index (union из одного источника == текущее по�
 (worker в корне получает корневой scope). ar.io для этого вводит
 tx-specific sandbox subdomains.
 
-**Требование trust-модели (одно из, зафиксировать в PR-1 ADR):**
+**Trust-модель — ВЫБРАН вариант B (реш. 1 §7): скачиваемый файл.** HTML
+распространяется как файл с независимой проверкой SHA-256, НЕ как исполняемая
+страница по gateway-URL. Пользователь скачивает, сверяет контрольную сумму (в
+README и приложении публикуется эталонный SHA-256 + txId), затем открывает
+локально. Браузер исполняет байты только после сверки — нечестный шлюз не
+может подсунуть исполняемый код, крадущий seed. PR-5 разблокирован.
 
-- (A) Страница НЕ принимает seed до runtime-проверки собственных байтов через
-  отдельно доверенный verifier/подпись/verifying router; И все D7-шлюзы для
-  запуска HTML гарантированно редиректят на уникальный **sandbox origin**
-  (tx-specific subdomain), что проверяется acceptance-тестом; ИЛИ
-- (B) HTML распространяется как **скачиваемый файл** с независимой проверкой
-  SHA-256/подписи, а НЕ как напрямую исполняемая страница по gateway-URL.
-
-Пока (A) или (B) не выбрано и не проверено — PR-5 **заблокирован**.
+Вариант A (sandbox-origin + runtime-самопроверка) остаётся возможным будущим
+UX-улучшением; sandbox-поведение шлюзов исследуется (реш. 6 §7), но НЕ на
+критическом пути.
 
 **Прочее (по ревью, medium):**
 
@@ -354,18 +355,37 @@ malicious HTML/script/formula payload безопасно рендерится; B
    (PR-5).
 8. Обновить rollback/rotation runbooks; fault-injection + staging smoke.
 
-## 7. Открытые вопросы к ревью (нужны ответы ДО реализации)
+## 7. Решения по семи вопросам ревью (утверждены владельцем 2026-08-19)
 
-1. Каким отдельно доверенным механизмом браузер проверит байты restore.html
-   до ввода seed? (выбор A/B из §4.PR-5)
-2. Подтверждаем: upload failover — только тот же signed tx/txId, и P0-persist
-   signed tx возвращается в объём (§3)?
-3. `dead` — N-of-N или 2-of-3 при недоступном третьем? (§4.PR-3a)
-4. Индексы — полные публичные GraphQL URL (D8), или Goldsky исключается?
-5. Политика `block=null` и конфликтующей metadata одного txId? (§4.PR-4)
-6. Какие конкретно D7-шлюзы дают tx-specific browser sandboxing?
-7. Точный порядок публикации restore при wallet rotation и добавлении
-   App-Version 5? (§4.PR-5)
+1. **restore.html — распространяется как СКАЧИВАЕМЫЙ ФАЙЛ** (вариант B §4.PR-5)
+   с независимой проверкой SHA-256, НЕ как исполняемая страница по gateway-URL.
+   Это снимает critical-1: браузер исполняет байты только после того, как
+   пользователь сверил контрольную сумму. PR-5 разблокирован в этой модели.
+2. **Upload failover — только тот же signed tx/txId** (critical-2 закрыт).
+   Persist подписанной транзакции до первого POST **возвращён в объём** (§3,
+   предусловие PR-3b).
+3. **`dead` = N-of-N** (все настроенные status-источники согласованно `404`).
+   Недоступный источник не голосует «за».
+4. **Индексы — полные публичные GraphQL URL** (D8). Goldsky остаётся
+   кандидатом; клиентский bearer не используем (только публичные endpoints).
+5. **Конфликт metadata / `block=null` — осторожная политика:** конфликтующий
+   txId помечает sweep `incomplete=true` (не разрешается порядком Promise);
+   `block=null` упорядочивается детерминированно в конец (tie-break txId ASC).
+6. **Sandbox-шлюзы — research-задача (владелец: «исследуй»).** Известно из
+   документации ar.io: gateway отдаёт HTML-контент не с корневого origin, а
+   редиректит (301/302) на **sandbox-поддомен** вида
+   `https://<base32(txId)>.<gateway>/`, изолируя каждую транзакцию в свой
+   origin (чужие cookie/localStorage/SW недоступны). Точный список D7-шлюзов
+   с таким поведением и формат редиректа ПОДЛЕЖАТ проверке на среде с сетевым
+   доступом (здесь egress к ar.io закрыт) и закрепляются acceptance-тестом.
+   Полезно и для основного приложения. НЕ на критическом пути restore, раз
+   выбран скачиваемый файл (реш. 1).
+7. **Wallet rotation — «сначала новый restore», отдельный release-кошелёк.**
+   Порядок (runbook в `docs/ROLLBACK.md`): опубликовать новый restore со
+   старым+новым owner отдельным release-кошельком → обновить ссылки/verifier
+   → выкатить клиент → переключить `ARWEAVE_JWK` Worker-а. То же для новой
+   App-Version (restore знает формат до появления таких записей on-chain).
+   Боевой upload-кошелёк на локальную машину не выносится.
 
 ## 8. Карта соответствия (статус по ревью)
 
@@ -374,7 +394,7 @@ malicious HTML/script/formula payload безопасно рендерится; B
 | PR-1 ADR | needs clarification | trust-модель restore, same-tx инвариант, остаточная полнота |
 | PR-2 метрики | needs clarification | transport adapter, AE schema+sampling, auth 401/503/no-store |
 | PR-3a read | ready после D7/quorum | unique-origin кворум, изменённая empty-env семантика, payload-validation fallback |
-| PR-3b write | blocked | same signed txId, persist-before-POST, 208, ambiguous POST |
-| PR-4 union | risky | metadata-конфликт, nullable height, детерминизм, abort-during-backoff |
-| PR-5 restore | blocked | runtime-authenticity, sandbox origin, pre-existing SW, safe render |
+| PR-3b write | ready после persist-tx | same signed txId (реш.2), persist-before-POST, 208, ambiguous POST |
+| PR-4 union | risky | metadata-конфликт→incomplete (реш.5), nullable height, детерминизм, abort-during-backoff |
+| PR-5 restore | unblocked (файл, реш.1) | скачиваемый файл + SHA-256, safe render, rotation runbook (реш.7) |
 | PR-6 CI/deploy | обязателен в каждом | env/bindings везде, prod fail-closed, rollback/rotation |
