@@ -967,15 +967,34 @@ not apply, exactly as with `client-sync1`. `smoke-headers.mjs` run against
 `https://notes.matamata.dev` reports CSP, `X-Frame-Options`, `nosniff` and
 `Referrer-Policy` present on the custom domain.
 
-**NOT verified in production:** the races themselves. All four are timing
-windows — a reset landing inside a 1-second KDF, two tabs changing a PIN at the
-same moment, a lock arriving during an IndexedDB transaction. They are proven
-by deterministic tests (each new guard test was additionally confirmed to FAIL
-with its fix reverted), not by a production run. The operator's manual check is
-the ordinary PIN path: a correct PIN opens the vault and clears the counter, a
-wrong one counts exactly once, the 4th arms the 30 s lockout, the 10th still
-wipes the configuration to the seed screen, and unlocking after «Сразу»
-auto-lock works.
+**ACCEPTED 2026-08-19** — the operator ran the manual check on the live origin
+and reported the PIN path working. That is what this release needed to
+establish: it changes no user-facing behaviour, so acceptance is the absence of
+a regression on the ordinary path (a correct PIN opens the vault, a wrong one
+is refused and counted, the app unlocks again after an auto-lock), not a new
+capability to demonstrate.
+
+**NOT established by that acceptance — read before trusting this section:**
+
+- **The four races themselves.** All are timing windows: a reset landing inside
+  a ~1 s KDF, two tabs changing a PIN at the same moment, a lock arriving
+  during an IndexedDB transaction, a reset between the last guarded commit and
+  `openVault`. None is reachable by hand on purpose. They are proven by
+  deterministic tests — and each new guard test was additionally confirmed to
+  FAIL with its own fix reverted, so the tests are known to discriminate rather
+  than merely pass. A production run neither confirms nor refutes them.
+- **The 10-strike wipe.** It destroys a working PIN configuration, so it is not
+  something an operator re-runs on a live vault, and it should NOT be assumed
+  covered by the acceptance above. Its guarantee stays where it has always
+  been: `commitPinUnlockFailure` wipes inside the SAME transaction that meters
+  the 10th attempt (storage tests), and the store publishes the cleared state
+  and the cross-tab notice afterwards (store tests). If it is ever exercised
+  deliberately on a throwaway vault, record the result here.
+
+If a PIN-path complaint arrives later, this ordering is the useful one: an
+attempt counted twice or not at all points at the metering commit; a lockout
+that outlives its window points at `pin-locked-until`; a vault that opens right
+after «Удалить всё» points at the generation handover into `openVault`.
 
 ⚠️ Prompt-gated as always: an already-loaded tab keeps the old build until
 «Обновить».
