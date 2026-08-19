@@ -71,6 +71,13 @@ export function PinUnlock() {
   }, [lockedSeconds]);
 
   async function handleUnlock() {
+    // The guard lives HERE, not only on the button's `disabled`: Enter reaches
+    // this function directly, so a disabled button alone would let a PIN
+    // derivation start alongside a running quick-unlock ceremony. Two
+    // concurrent unlocks would then race for openVault, the registration check
+    // and the queue kick. The two contours' COUNTERS stay independent — this
+    // is a UI interlock, not a shared limiter.
+    if (loading || quickBusy) return;
     if (pin.length < 4) {
       setError('Минимум 4 цифры');
       return;
@@ -160,7 +167,10 @@ export function PinUnlock() {
           maxLength={8}
           onChange={e => { setPin(e.target.value.replace(/\D/g, '')); setError(''); }}
           onKeyDown={handleKeyDown}
-          disabled={isLocked}
+          // Also disabled while EITHER attempt runs: an editable field next to
+          // an inert button reads as «type here», and Enter must not start a
+          // second unlock.
+          disabled={isLocked || loading || quickBusy}
           // Back-applied anti-autofill set: a manager that silently saves the
           // master PIN to a third-party cloud breaks the E2E model.
           {...SECRET_PASSWORD_FIELD_PROPS}

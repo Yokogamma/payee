@@ -708,6 +708,208 @@ describe('races on the unlock path', () => {
   });
 });
 
+// ─── Cross-tab REVOCATION during the ceremony (review round 11) ──────
+//
+// The window these close is up to 60 seconds long — the whole system sheet —
+// and NOTHING the flow holds can see into it: `dbGeneration` moves only on a
+// reset, the epoch only on a lock, and the `config` broadcast only schedules a
+// reconcile. Only a fresh authoritative read before publication catches this.
+
+describe('access revoked in another tab DURING the ceremony', () => {
+  it('the record REMOVED mid-sheet does not open the vault one more time', async () => {
+    renderStore();
+    await untilReady();
+    await configureQuickUnlock();
+    act(() => { store.lockApp(); });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    vi.mocked(evalPrf).mockImplementationOnce(async () => {
+      const db = await import('./storage');
+      await db.deleteMeta(QUICK_UNLOCK_META_KEY); // another tab removes it
+      return PRF;
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).toBe('pin');
+    await waitFor(() => expect(store.hasQuickUnlock).toBe(false));
+  });
+
+  it('the PIN removed mid-sheet voids the record — the «no pin-seed» rule holds', async () => {
+    // Exactly the OLDER-CLIENT case: a build without this feature clears the
+    // PIN and leaves the record orphaned. It must not still open the vault.
+    renderStore();
+    await untilReady();
+    await configureQuickUnlock();
+    act(() => { store.lockApp(); });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    vi.mocked(evalPrf).mockImplementationOnce(async () => {
+      const db = await import('./storage');
+      await db.deleteMeta('pin-seed'); // an old client's clearPinConfigMeta
+      return PRF;
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(store.mnemonic).toBeNull();
+    // …and the orphan is cleaned up, per the rule.
+    await waitFor(async () => expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined());
+  });
+
+  it('the record REPLACED mid-sheet does not publish under the old one', async () => {
+    renderStore();
+    await untilReady();
+    await configureQuickUnlock();
+    act(() => { store.lockApp(); });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    vi.mocked(evalPrf).mockImplementationOnce(async () => {
+      const stored = parseQuickUnlockRecord(await getMeta(QUICK_UNLOCK_META_KEY))!;
+      // A different credential — the same vault, a new setup elsewhere.
+      await setMeta(QUICK_UNLOCK_META_KEY, { ...stored, createdAt: stored.createdAt + 5000 });
+      return PRF;
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(store.mnemonic).toBeNull();
+  });
+
+  it('works WITHOUT BroadcastChannel — the guard is a storage read, not a message', async () => {
+    // Older Safari has no BroadcastChannel at all, so nothing tells this tab
+    // anything. The re-read is what makes the guard work there too.
+    const saved = globalWithBC.BroadcastChannel;
+    globalWithBC.BroadcastChannel = undefined;
+    try {
+      cleanup();
+      renderStore();
+      await untilReady();
+      await configureQuickUnlock();
+      act(() => { store.lockApp(); });
+      vi.mocked(bindVaultIdentity).mockClear();
+
+      vi.mocked(evalPrf).mockImplementationOnce(async () => {
+        const db = await import('./storage');
+        await db.deleteMeta(QUICK_UNLOCK_META_KEY);
+        return PRF;
+      });
+
+      await act(async () => {
+        await expect(store.unlockWithQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+      });
+      expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+      expect(store.mnemonic).toBeNull();
+    } finally {
+      globalWithBC.BroadcastChannel = saved;
+    }
+  });
+});
+
+// ─── Setup: the record must pass OUR OWN validator ───────────────────
+
+describe('a credential the authenticator returns is not trusted blindly', () => {
+  it('an out-of-range rawId is refused instead of being stored and later purged', async () => {
+    // Silently writing it would report success and then delete the record on
+    // the next read — the worst of the three outcomes, because it looks like
+    // it worked.
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setupPin('123456'); });
+
+    vi.mocked(createPrfCredential).mockResolvedValueOnce({
+      credentialId: new Uint8Array(8).fill(3), // below the 16-byte floor
+      prfOutput: PRF,
+    });
+
+    await act(async () => {
+      await expect(store.setupQuickUnlock()).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    });
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+    expect(store.hasQuickUnlock).toBe(false);
+  });
+
+  it('accepts the documented bounds', async () => {
+    renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setupPin('123456'); });
+
+    vi.mocked(createPrfCredential).mockResolvedValueOnce({
+      credentialId: new Uint8Array(16).fill(3), // exactly the floor
+      prfOutput: PRF,
+    });
+    await act(async () => { await store.setupQuickUnlock(); });
+    expect(store.hasQuickUnlock).toBe(true);
+  });
+});
+
+// ─── Capability probe lifecycle ──────────────────────────────────────
+
+describe('capability probe guards', () => {
+  it('a SLOW older probe cannot overwrite a newer verdict', async () => {
+    renderStore();
+    await untilReady();
+
+    const slow = deferred<'no-prf'>();
+    vi.mocked(detectQuickUnlockCapability).mockImplementationOnce(() => slow.promise);
+    act(() => { store.refreshQuickUnlockCapability(); });
+
+    vi.mocked(detectQuickUnlockCapability).mockResolvedValueOnce('ready');
+    await act(async () => { store.refreshQuickUnlockCapability(); });
+    await waitFor(() => expect(store.quickUnlockCapability).toBe('ready'));
+
+    await act(async () => { slow.resolve('no-prf'); });
+    expect(store.quickUnlockCapability).toBe('ready'); // the stale one lost
+  });
+
+  it('publishes after a StrictMode-style remount — the mounted flag is re-armed', async () => {
+    // React StrictMode mounts, runs the cleanup, and mounts again. A flag that
+    // is only ever CLEARED would stay false forever after that trial cleanup,
+    // and the verdict would never reach the screen in development.
+    const { unmount } = renderStore();
+    await untilReady();
+    unmount();
+
+    cleanup();
+    renderStore();
+    await untilReady();
+    vi.mocked(detectQuickUnlockCapability).mockResolvedValueOnce('no-platform');
+    act(() => { store.refreshQuickUnlockCapability(); });
+    await waitFor(() => expect(store.quickUnlockCapability).toBe('no-platform'));
+  });
+
+  it('an UNMOUNT aborts an in-flight ceremony instead of letting it commit', async () => {
+    const view = renderStore();
+    await untilReady();
+    await openMain();
+    await act(async () => { await store.setupPin('123456'); });
+
+    const gate = deferred<{ credentialId: Uint8Array; prfOutput: Uint8Array }>();
+    vi.mocked(createPrfCredential).mockImplementationOnce(() => gate.promise);
+
+    let pending!: Promise<void>;
+    act(() => { pending = store.setupQuickUnlock(); });
+    await waitFor(() => expect(vi.mocked(createPrfCredential)).toHaveBeenCalled());
+
+    act(() => { view.unmount(); });
+    await act(async () => { gate.resolve({ credentialId: CRED_ID, prfOutput: PRF }); await pending; });
+
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+});
+
 // ─── Cross-tab state ─────────────────────────────────────────────────
 
 describe('cross-tab reconcile', () => {

@@ -224,14 +224,28 @@ function assertNotAborted(signal: AbortSignal | undefined): void {
  *    outcome may not delete anything or claim to know which happened;
  * 3. anything else ⇒ Unavailable.
  */
+function errorName(e: unknown): string {
+  // Structurally, not `instanceof Error` — a WebAuthn/WebCrypto rejection from
+  // another realm (Node's webcrypto under jsdom, an iframe) is not an instance
+  // of THIS realm's Error, and the whole point of matching on the name is to
+  // survive that. Same reasoning as isOperationError in crypto.ts.
+  const name = (e as { name?: unknown } | null | undefined)?.name;
+  return typeof name === 'string' ? name : '';
+}
+
 function classifyCeremonyError(e: unknown, signal: AbortSignal | undefined): Error {
+  // «Cancelled» means OUR abort, and nothing else. An AbortError raised while
+  // our signal is NOT aborted came from somewhere we do not control (a
+  // platform-internal cancel, a competing controller) — calling that a silent
+  // user cancel would hide a real failure behind a screen that says nothing.
   if (signal?.aborted) return new QuickUnlockCancelledError();
-  // Name, not class — WebAuthn errors can arrive from another realm, exactly
-  // like the OperationError case above.
-  if (e instanceof Error && e.name === 'AbortError') return new QuickUnlockCancelledError();
-  if (e instanceof Error && e.name === 'NotAllowedError') return new QuickUnlockNotCompletedError();
+  // A catch-all BY DESIGN of the spec: cancel, timeout and «no such
+  // credential» are indistinguishable, so this may not delete or claim
+  // anything.
+  if (errorName(e) === 'NotAllowedError') return new QuickUnlockNotCompletedError();
+  const message = (e as { message?: unknown } | null | undefined)?.message;
   return new QuickUnlockUnavailableError(
-    `Быстрый вход недоступен: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
+    `Быстрый вход недоступен: ${errorName(e) || String(e)}${typeof message === 'string' ? `: ${message}` : ''}`,
   );
 }
 

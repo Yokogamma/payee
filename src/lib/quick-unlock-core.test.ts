@@ -373,6 +373,21 @@ describe('createPrfCredential', () => {
     await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
   });
 
+  it('a BARE AbortError (not ours) is Unavailable, NOT a silent cancel', async () => {
+    // «Cancelled» is the one outcome that shows the user nothing. Claiming it
+    // for an abort we did not issue would hide a real failure behind a screen
+    // that says nothing at all.
+    stubCredentials({ createRejects: named('AbortError') });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+  });
+
+  it('classifies a CROSS-REALM rejection by name, not by instanceof', async () => {
+    // A WebAuthn error arriving from another realm is not an instance of THIS
+    // realm's Error — matching on the class would misfile it as Unavailable.
+    stubCredentials({ createRejects: { name: 'NotAllowedError', message: 'denied' } as unknown as Error });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockNotCompletedError);
+  });
+
   it('a null credential is Unavailable, not a crash', async () => {
     stubCredentials({ createReturnsNull: true });
     await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);

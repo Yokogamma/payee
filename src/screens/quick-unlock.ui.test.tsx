@@ -263,6 +263,46 @@ describe('кнопка «Быстрый вход» на экране входа'
     expect((screen.getByRole('button', { name: 'Разблокировать' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('Enter в поле PIN НЕ запускает второй вход во время быстрого', async () => {
+    // The disabled button is not the interlock: Enter reaches handleUnlock
+    // directly, and two concurrent unlocks would race for openVault, the
+    // registration check and the queue kick.
+    let release!: () => void;
+    const unlockWithQuickUnlock = vi.fn(() => new Promise<void>(res => { release = res; }));
+    const unlockWithPin = vi.fn(async () => {});
+    h.store = { ...baseStore(), hasQuickUnlock: true, unlockWithQuickUnlock, unlockWithPin };
+    render(<PinUnlock />);
+
+    const input = document.querySelector('.pin-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '123456' } });
+    act(() => { fireEvent.click(screen.getByRole('button', { name: 'Быстрый вход' })); });
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(unlockWithPin).not.toHaveBeenCalled();
+    // …and the field itself is inert while an attempt runs.
+    expect(input.disabled).toBe(true);
+
+    await act(async () => { release(); });
+    expect(input.disabled).toBe(false);
+  });
+
+  it('Enter не запускает второй PIN-вход поверх уже идущего', async () => {
+    let release!: () => void;
+    const unlockWithPin = vi.fn(() => new Promise<void>(res => { release = res; }));
+    h.store = { ...baseStore(), unlockWithPin };
+    render(<PinUnlock />);
+
+    const input = document.querySelector('.pin-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '123456' } });
+    act(() => { fireEvent.keyDown(input, { key: 'Enter' }); });
+    expect(unlockWithPin).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(unlockWithPin).toHaveBeenCalledTimes(1);
+
+    await act(async () => { release(); });
+  });
+
   it('ошибка быстрого входа показывается как alert и возвращает фокус в поле PIN', async () => {
     const unlockWithQuickUnlock = vi.fn(async () => { throw new QuickUnlockKeyMismatchError(); });
     h.store = { ...baseStore(), hasQuickUnlock: true, unlockWithQuickUnlock };

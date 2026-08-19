@@ -74,6 +74,8 @@ import {
 import {
   bytesToBase64Url,
   base64UrlToBytes,
+  parseQuickUnlockRecord,
+  quickUnlockRecordEquals,
   type QuickUnlockRecord,
 } from './quick-unlock';
 import {
@@ -1014,7 +1016,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // moves — only this signal can end it.
   const quickUnlockAbortRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  // Last-caller-wins for the capability probe: two mounts (settings block and
+  // PinUnlock) can have probes in flight at once, and a slow older one must
+  // not overwrite a newer verdict.
+  const quickUnlockCapabilityGenerationRef = useRef(0);
+  useEffect(() => {
+    // Set on SETUP, not only cleared on cleanup. React StrictMode mounts,
+    // cleans up and mounts again in development: without this line the trial
+    // cleanup would leave the ref false forever and the capability verdict
+    // would never publish there.
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // An in-flight ceremony belongs to a screen that no longer exists. It
+      // cannot publish anything useful, and its commit would land against a
+      // torn-down tree — stand it down like a lock.
+      quickUnlockAbortRef.current?.abort();
+      quickUnlockAbortRef.current = null;
+    };
+  }, []);
 
   // Encrypted-at-rest draft (§2) + multi-tab identity (§8)
   const draftStoreRef = useRef<DraftStore | null>(null);
@@ -3358,9 +3378,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return 'Это устройство не выдаёт PRF — быстрый вход здесь недоступен.';
   }
 
+  /** Publish a capability verdict under BOTH guards: still mounted, and still
+   *  the newest probe. */
+  function publishQuickUnlockCapability(capability: QuickUnlockCapability, myProbe: number): void {
+    if (!mountedRef.current) return;
+    if (quickUnlockCapabilityGenerationRef.current !== myProbe) return;
+    setQuickUnlockCapability(capability);
+  }
+
   const refreshQuickUnlockCapability = useCallback(() => {
+    const myProbe = ++quickUnlockCapabilityGenerationRef.current;
     void detectQuickUnlockCapability().then(capability => {
-      if (mountedRef.current) setQuickUnlockCapability(capability);
+      publishQuickUnlockCapability(capability, myProbe);
     });
     // detectQuickUnlockCapability never rejects — see its contract.
   }, []);
@@ -3396,9 +3425,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
       // 2. Capability probe, then the ceremony. A lock during the PROBE must
       // not let `create()` start.
+      const myProbe = ++quickUnlockCapabilityGenerationRef.current;
       const capability = await detectQuickUnlockCapability();
       if (abort.signal.aborted) return;
-      if (mountedRef.current) setQuickUnlockCapability(capability);
+      publishQuickUnlockCapability(capability, myProbe);
       if (capability === 'no-api' || capability === 'no-platform' || capability === 'no-prf') {
         throw new QuickUnlockUnavailableError(quickUnlockCapabilityMessage(capability));
       }
@@ -3426,6 +3456,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         pk: pkB64,
         createdAt: Date.now(),
       };
+
+      // The credential id comes from the AUTHENTICATOR, so its length is not
+      // ours to assume. Run the record through the very validator every later
+      // READ will use: without this, a rawId outside 16…1024 bytes would be
+      // written, reported as a successful setup, and then silently deleted as
+      // invalid by this same client on the next read — the worst outcome of
+      // the three, because it looks like it worked.
+      if (!parseQuickUnlockRecord(record)) {
+        throw new QuickUnlockUnavailableError(
+          'Устройство вернуло ключ в неподдерживаемом формате — быстрый вход не настроен.',
+        );
+      }
 
       // 4. Final synchronous triple, then THE POINT OF NO RETURN: an
       // AbortSignal cannot cancel a readwrite transaction once created — and
@@ -3520,6 +3562,35 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (!isValidMnemonic(mn)) {
         throw new QuickUnlockRecordInvalidError(
           'Быстрый вход вернул повреждённые данные. Войдите по PIN и настройте быстрый вход заново.',
+        );
+      }
+
+      // FINAL AUTHORITY, re-read from storage (round 11 of review). The
+      // snapshot above is up to 60 seconds old — the whole length of the system
+      // sheet — and NOTHING this flow holds can notice a cross-tab removal in
+      // that window: `dbGeneration` moves only on a reset, the epoch only on a
+      // lock, and the `config` broadcast merely triggers a reconcile. Without
+      // this read, a quick entry the user had just deleted in another tab — or
+      // one orphaned by an OLDER client removing the PIN, which is exactly the
+      // case the «no pin-seed ⇒ void» rule exists for — would still open the
+      // vault one more time.
+      //
+      // What remains after this check is the interval between it and
+      // `commitVaultSnapshot`, i.e. the key derivation inside
+      // prepareVaultSnapshot. That residual is the SAME one the PIN path has
+      // always had (its ~1 s of Argon2id sits in exactly this position), and
+      // closing it would mean re-verifying inside the bind transaction — a
+      // change to the shared open path that belongs to its own review.
+      const fresh = await readClientConfigSnapshot();
+      if (superseded()) return;
+      if (fresh.quickUnlock.kind !== 'valid'
+          || !quickUnlockRecordEquals(fresh.quickUnlock.record, record)) {
+        applyQuickUnlockMeta(
+          fresh.quickUnlock.kind === 'valid' ? { createdAt: fresh.quickUnlock.record.createdAt } : null,
+        );
+        if (fresh.quickUnlock.kind === 'stale') void cleanupStaleQuickUnlock();
+        throw new QuickUnlockUnavailableError(
+          'Быстрый вход был изменён или удалён — войдите по PIN.',
         );
       }
 
