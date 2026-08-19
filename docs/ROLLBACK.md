@@ -1146,12 +1146,53 @@ closed in `client-pin1` (timing windows, proven by tests). What IS verified is
 that the app still boots, the PIN path is unchanged, and no quick-unlock UI
 appears for a user who has no record.
 
+### `client-qu2` — DEPLOYED 2026-08-19, THE FEATURE IS LIVE
+
+main `4a2c798` (PR #61), tag `client-qu2`, run 32294225175. One line:
+`QUICK_UNLOCK_ENABLED = false → true`. Nothing else in production code changed.
+All gates green; bundle **191.9 / 195 KB gz**; `smoke-headers` passed against
+the deployment URL and re-run against the custom domain.
+
+Verified on the live origin: bundle `index-Ul18PfRV.js` contains
+`eternal-notes-quick-unlock-v1`, `already-configured`, «Настроить быстрый вход»
+and the WebAuthn `publicKey` options — i.e. the ceremony bodies the flag-off
+build had eliminated are now genuinely shipped.
+
+**THE RELEASE ORDER WAS INVERTED, deliberately, by the operator.** §14 puts the
+§13 hardware acceptance BEFORE the flag; here the flag went first and the
+acceptance runs on production. The reasoning, recorded so a future reader does
+not mistake it for an oversight: the feature is fail-safe by construction — no
+PRF, a GCM mismatch, a cancelled sheet, a deleted passkey all end in an honest
+refusal with PIN entry intact, and NO outcome touches `pin-attempts` /
+`pin-locked-until`. The worst case is «the accelerator does not work here»,
+which is the same case the support matrix predicts anyway.
+
+What that costs: if PRF turns out broken on a given platform, a real user meets
+the failure instead of the operator meeting it on a preview build. Rollback is
+a redeploy of `client-qu1` — the feature disappears from the UI, and any record
+already written stays readable (an older client ignores the key).
+
+**Still outstanding after this deploy:** the §13 device matrix has NOT been run
+— iPhone (Safari and the installed PWA separately), Android (Chrome and PWA),
+a Windows Hello laptop in Chrome AND Edge, and separately a machine WITHOUT
+KB5077181 where the honest «не поддерживается» must appear rather than a silent
+failure. Until it is, «it works» is known only for whatever device the operator
+happened to try.
+
+### Bundle budget — worth watching now
+
+With the flag on, the client sits at **191.9 KB gz against a 195 KB ceiling**:
+**3.1 KB of headroom**, down from 5.7 with the flag off. The next feature of any
+size will hit it. Raising the ceiling is a decision, not a formality — the
+number exists because this is a PWA people install on phones.
+
 ### Rollback
 
-Redeploy **`client-pin1`**. Data is unaffected: `quick-unlock-seed` is an
-unknown meta key to that build, which ignores it. The one trace is that
-removing the PIN there leaves the record orphaned — and the next newer client
-deletes it on its first read, by the rule above.
+Redeploy **`client-pin1`** to undo the whole feature, or **`client-qu1`** to
+keep the code and only hide it (the flag). Data is unaffected either way:
+`quick-unlock-seed` is an unknown meta key to `client-pin1`, which ignores it.
+The one trace is that removing the PIN there leaves the record orphaned — and
+the next newer client deletes it on its first read, by the rule above.
 
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
