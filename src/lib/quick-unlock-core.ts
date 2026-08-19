@@ -174,6 +174,197 @@ export async function deriveQuickUnlockKek(
   }
 }
 
+// ─── WebAuthn ceremonies ─────────────────────────────────────────────
+//
+// WE DO NOT USE WEBAUTHN AS AUTHENTICATION — only as a key source. Nobody
+// verifies the assertion signature or the challenge, and nobody could: there is
+// no server in this product. Forging an assertion buys an attacker nothing,
+// because the PRF output does not follow from one. The challenge is therefore
+// local randomness, and that is a deliberate, documented choice.
+
+/** Goes into the platform credential manager (iCloud / Google) and is visible
+ *  to the user there. A CONSTANT: neither the vault public key nor anything
+ *  derived from the seed may ever appear in it. */
+const RP_NAME = 'Matamata Notes';
+
+const CEREMONY_TIMEOUT_MS = 60_000;
+
+/** Both ceremonies carry `'required'`, forever. On the CTAP level hmac-secret
+ *  keeps two independent secrets — one behind UV and one without — and while
+ *  WebAuthn L3 ties PRF to the UV-gated key, the spec does NOT guarantee the
+ *  output stays stable if the policy changes; that is platform-dependent. The
+ *  invariant is a product one either way: unwrapping the seed is ALWAYS behind
+ *  a system check. Changing this ⇒ a new record `v`. */
+const USER_VERIFICATION = 'required' as const;
+
+interface PrfExtensionResults {
+  enabled?: boolean;
+  results?: { first?: ArrayBuffer | Uint8Array };
+}
+
+function randomBytes(n: number): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(n));
+}
+
+function toBytes(value: ArrayBuffer | Uint8Array): Uint8Array {
+  return value instanceof Uint8Array ? new Uint8Array(value) : new Uint8Array(value);
+}
+
+/** OUR abort is the only silent outcome — see QuickUnlockCancelledError. */
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new QuickUnlockCancelledError();
+}
+
+/**
+ * Map a ceremony rejection onto our classes. The order is the contract:
+ *
+ * 1. our own signal fired ⇒ Cancelled (silent);
+ * 2. `NotAllowedError` ⇒ NotCompleted — a CATCH-ALL: cancel, timeout and
+ *    «no such credential» are indistinguishable BY DESIGN of the spec, so this
+ *    outcome may not delete anything or claim to know which happened;
+ * 3. anything else ⇒ Unavailable.
+ */
+function classifyCeremonyError(e: unknown, signal: AbortSignal | undefined): Error {
+  if (signal?.aborted) return new QuickUnlockCancelledError();
+  // Name, not class — WebAuthn errors can arrive from another realm, exactly
+  // like the OperationError case above.
+  if (e instanceof Error && e.name === 'AbortError') return new QuickUnlockCancelledError();
+  if (e instanceof Error && e.name === 'NotAllowedError') return new QuickUnlockNotCompletedError();
+  return new QuickUnlockUnavailableError(
+    `Быстрый вход недоступен: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
+  );
+}
+
+function readPrfOutput(credential: PublicKeyCredential): Uint8Array | null {
+  const prf = (credential.getClientExtensionResults() as { prf?: PrfExtensionResults }).prf;
+  const first = prf?.results?.first;
+  return first ? toBytes(first) : null;
+}
+
+export interface CreatedPrfCredential {
+  /** Raw credential id bytes — encoding is the consumer's policy, not ours. */
+  credentialId: Uint8Array;
+  /** The output of the CONTROL `get()`, already proven usable. */
+  prfOutput: Uint8Array;
+}
+
+/**
+ * Create a platform credential and return a PRF output that is KNOWN to work.
+ *
+ * «We never store a blob we have not opened» is the whole point of the second
+ * ceremony: `prf.enabled === true` is a promise, not a fact; not every platform
+ * returns `results` on create at all; and known WebKit bugs (311099, 314934)
+ * have returned garbage and null there. So the seed is wrapped with the output
+ * of the CONTROL `get()` — the very path every future unlock will take — which
+ * also removes any need to compare two outputs.
+ *
+ * The price is TWO system prompts during setup (one at unlock). That is a
+ * deliberate trade: a blob that cannot be opened is worse than no feature.
+ */
+export async function createPrfCredential(opts: {
+  prfSalt: Uint8Array;
+  signal?: AbortSignal;
+}): Promise<CreatedPrfCredential> {
+  const { prfSalt, signal } = opts;
+  assertNotAborted(signal);
+  if (typeof navigator === 'undefined' || !navigator.credentials) {
+    throw new QuickUnlockUnavailableError('WebAuthn недоступен в этом браузере.');
+  }
+
+  let created: PublicKeyCredential | null;
+  try {
+    created = await navigator.credentials.create({
+      signal,
+      publicKey: {
+        challenge: randomBytes(32) as BufferSource,
+        rp: { id: location.hostname, name: RP_NAME },
+        // 32 random bytes, used nowhere else. name/displayName are CONSTANTS:
+        // they sync to the credential manager and are visible to the user.
+        user: { id: randomBytes(32) as BufferSource, name: RP_NAME, displayName: RP_NAME },
+        pubKeyCredParams: [
+          { type: 'public-key', alg: -7 },   // ES256
+          { type: 'public-key', alg: -257 }, // RS256
+        ],
+        authenticatorSelection: {
+          authenticatorAttachment: 'platform',
+          userVerification: USER_VERIFICATION,
+          // Do not clutter the passkey list, and lower the chance of an
+          // accidental deletion. Apple creates a discoverable one anyway —
+          // expected, not an error.
+          residentKey: 'discouraged',
+        },
+        attestation: 'none',
+        timeout: CEREMONY_TIMEOUT_MS,
+        extensions: { prf: { eval: { first: prfSalt as BufferSource } } },
+      } as PublicKeyCredentialCreationOptions,
+    } as CredentialCreationOptions) as PublicKeyCredential | null;
+  } catch (e) {
+    throw classifyCeremonyError(e, signal);
+  }
+  assertNotAborted(signal);
+  if (!created) throw new QuickUnlockUnavailableError('Аутентификатор не создал ключ.');
+
+  // Early diagnosis ONLY — cheap enough to spare the user a second prompt on a
+  // platform that has already said no.
+  const prf = (created.getClientExtensionResults() as { prf?: PrfExtensionResults }).prf;
+  if (prf?.enabled !== true && !prf?.results?.first) {
+    throw new QuickUnlockUnavailableError(
+      'Ключ создан, но это устройство не выдаёт PRF. Удалите ключ «Matamata Notes» в системном менеджере паролей.',
+    );
+  }
+
+  const credentialId = toBytes(created.rawId);
+  const prfOutput = await evalPrf({ credentialId, prfSalt, signal });
+  return { credentialId, prfOutput };
+}
+
+/**
+ * The unlock ceremony: one credential id, one salt, one PRF output.
+ *
+ * `allowCredentials` is always non-empty and `transports: ['internal']` is
+ * HARD-CODED rather than remembered from the record — part of the local-only
+ * contract. A synced passkey may also be reachable over `hybrid` (the QR /
+ * phone flow), and this hint steers the sheet away from it. It is a UX hint,
+ * not a security boundary: a client may ignore it, and nothing rests on it —
+ * the PRF output requires UV regardless, and the BLOB is local.
+ */
+export async function evalPrf(opts: {
+  credentialId: Uint8Array;
+  prfSalt: Uint8Array;
+  signal?: AbortSignal;
+}): Promise<Uint8Array> {
+  const { credentialId, prfSalt, signal } = opts;
+  assertNotAborted(signal);
+  if (typeof navigator === 'undefined' || !navigator.credentials) {
+    throw new QuickUnlockUnavailableError('WebAuthn недоступен в этом браузере.');
+  }
+
+  let assertion: PublicKeyCredential | null;
+  try {
+    assertion = await navigator.credentials.get({
+      signal,
+      publicKey: {
+        challenge: randomBytes(32) as BufferSource,
+        allowCredentials: [{ type: 'public-key', id: credentialId as BufferSource, transports: ['internal'] }],
+        userVerification: USER_VERIFICATION,
+        timeout: CEREMONY_TIMEOUT_MS,
+        extensions: { prf: { eval: { first: prfSalt as BufferSource } } },
+      } as PublicKeyCredentialRequestOptions,
+    } as CredentialRequestOptions) as PublicKeyCredential | null;
+  } catch (e) {
+    throw classifyCeremonyError(e, signal);
+  }
+  assertNotAborted(signal);
+  if (!assertion) throw new QuickUnlockUnavailableError('Аутентификатор не вернул ответ.');
+
+  const prfOutput = readPrfOutput(assertion);
+  // No output ⇒ UNAVAILABLE, never a key mismatch: nothing was decrypted, so
+  // there is nothing to conclude about the stored record — and a record must
+  // never be dropped over a platform that simply did not answer.
+  if (!prfOutput) throw new QuickUnlockUnavailableError('Устройство не выдало PRF-значение.');
+  return prfOutput;
+}
+
 // ─── Envelope ────────────────────────────────────────────────────────
 
 /** AES-GCM over the mnemonic. Environment failures only — there is no «wrong

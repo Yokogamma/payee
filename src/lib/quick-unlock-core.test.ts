@@ -4,8 +4,12 @@ import {
   deriveQuickUnlockKek,
   wrapWithKek,
   unwrapWithKek,
+  createPrfCredential,
+  evalPrf,
   QuickUnlockUnavailableError,
   QuickUnlockKeyMismatchError,
+  QuickUnlockCancelledError,
+  QuickUnlockNotCompletedError,
   QUICK_UNLOCK_VAULT_INFO,
 } from './quick-unlock-core';
 
@@ -214,5 +218,216 @@ describe('detectQuickUnlockCapability', () => {
       getClientCapabilities: async () => { throw new Error('boom'); },
     });
     await expect(detectQuickUnlockCapability()).resolves.toBe('unknown');
+  });
+});
+
+// ─── Ceremonies (fake navigator.credentials) ─────────────────────────
+//
+// jsdom has no `navigator.credentials` at all, so the whole surface is stubbed.
+// The fake returns DIFFERENT bytes on create and on get — that is what proves
+// WHICH output actually ends up wrapping the seed.
+
+const CREATE_PRF = new Uint8Array(32).fill(0xc1);
+const GET_PRF = new Uint8Array(32).fill(0x67);
+const CRED_ID = new Uint8Array(32).fill(0x1d);
+
+type ExtResults = { prf?: { enabled?: boolean; results?: { first?: Uint8Array } } };
+
+interface FakeOptions {
+  createExt?: ExtResults;
+  getExt?: ExtResults;
+  createRejects?: Error;
+  getRejects?: Error;
+  createReturnsNull?: boolean;
+  getReturnsNull?: boolean;
+}
+
+const globalWithNav = globalThis as { navigator?: unknown; location?: unknown };
+
+function stubCredentials(opts: FakeOptions = {}) {
+  const createCalls: unknown[] = [];
+  const getCalls: unknown[] = [];
+  const credential = (ext: ExtResults) => ({
+    rawId: CRED_ID.slice().buffer,
+    getClientExtensionResults: () => ext,
+  });
+
+  globalWithNav.location = { hostname: 'notes.matamata.dev' };
+  globalWithNav.navigator = {
+    credentials: {
+      create: async (o: unknown) => {
+        createCalls.push(o);
+        if (opts.createRejects) throw opts.createRejects;
+        if (opts.createReturnsNull) return null;
+        return credential(opts.createExt ?? { prf: { enabled: true, results: { first: CREATE_PRF } } });
+      },
+      get: async (o: unknown) => {
+        getCalls.push(o);
+        if (opts.getRejects) throw opts.getRejects;
+        if (opts.getReturnsNull) return null;
+        return credential(opts.getExt ?? { prf: { enabled: true, results: { first: GET_PRF } } });
+      },
+    },
+  };
+  return { createCalls, getCalls };
+}
+
+function publicKeyOf(call: unknown): Record<string, unknown> {
+  return (call as { publicKey: Record<string, unknown> }).publicKey;
+}
+
+const named = (name: string) => Object.assign(new Error(name), { name });
+
+afterEach(() => {
+  delete globalWithNav.navigator;
+  delete globalWithNav.location;
+});
+
+describe('createPrfCredential', () => {
+  const prfSalt = bytes(32, 2);
+
+  it('wraps with the CONTROL get() output, not the create() one', async () => {
+    stubCredentials();
+    const result = await createPrfCredential({ prfSalt });
+    // The blob must be openable by the very path every unlock will take.
+    expect(Array.from(result.prfOutput)).toEqual(Array.from(GET_PRF));
+    expect(Array.from(result.prfOutput)).not.toEqual(Array.from(CREATE_PRF));
+    expect(Array.from(result.credentialId)).toEqual(Array.from(CRED_ID));
+  });
+
+  it('ALWAYS performs the control get()', async () => {
+    const { getCalls } = stubCredentials();
+    await createPrfCredential({ prfSalt });
+    expect(getCalls).toHaveLength(1);
+  });
+
+  it('both ceremonies carry userVerification: required (v1 invariant)', async () => {
+    const { createCalls, getCalls } = stubCredentials();
+    await createPrfCredential({ prfSalt });
+    expect((publicKeyOf(createCalls[0]).authenticatorSelection as Record<string, unknown>).userVerification)
+      .toBe('required');
+    expect(publicKeyOf(getCalls[0]).userVerification).toBe('required');
+  });
+
+  it('sends a CONSTANT user name — no mnemonic, no pk, nothing derived from them', async () => {
+    const { createCalls } = stubCredentials();
+    await createPrfCredential({ prfSalt });
+    const user = publicKeyOf(createCalls[0]).user as Record<string, unknown>;
+    expect(user.name).toBe('Matamata Notes');
+    expect(user.displayName).toBe('Matamata Notes');
+    const serialized = JSON.stringify(createCalls[0], (_k, v) =>
+      v instanceof Uint8Array ? Array.from(v) : v);
+    for (const word of MN.split(' ')) expect(serialized).not.toContain(word);
+  });
+
+  it('asks for a platform authenticator and a discouraged resident key', async () => {
+    const { createCalls } = stubCredentials();
+    await createPrfCredential({ prfSalt });
+    const sel = publicKeyOf(createCalls[0]).authenticatorSelection as Record<string, unknown>;
+    expect(sel.authenticatorAttachment).toBe('platform');
+    expect(sel.residentKey).toBe('discouraged');
+    expect(publicKeyOf(createCalls[0]).attestation).toBe('none');
+  });
+
+  it('refuses BEFORE the second prompt when create reports no PRF at all', async () => {
+    const { getCalls } = stubCredentials({ createExt: { prf: { enabled: false } } });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+    expect(getCalls).toHaveLength(0); // the user is not shown a pointless sheet
+  });
+
+  it('accepts enabled:true even when create returns no results — get decides', async () => {
+    stubCredentials({ createExt: { prf: { enabled: true } } });
+    const result = await createPrfCredential({ prfSalt });
+    expect(Array.from(result.prfOutput)).toEqual(Array.from(GET_PRF));
+  });
+
+  it('enabled:true but the control get() returns NOTHING → unavailable, no blob', async () => {
+    stubCredentials({ createExt: { prf: { enabled: true } }, getExt: { prf: { enabled: true } } });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+  });
+
+  it('NotAllowedError becomes NotCompleted (cancel / timeout / gone are one outcome)', async () => {
+    stubCredentials({ createRejects: named('NotAllowedError') });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockNotCompletedError);
+  });
+
+  it('OUR abort becomes Cancelled — the only silent outcome', async () => {
+    stubCredentials({ createRejects: named('AbortError') });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(createPrfCredential({ prfSalt, signal: controller.signal }))
+      .rejects.toBeInstanceOf(QuickUnlockCancelledError);
+  });
+
+  it('an already-aborted signal never opens a sheet at all', async () => {
+    const { createCalls } = stubCredentials();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(createPrfCredential({ prfSalt, signal: controller.signal }))
+      .rejects.toBeInstanceOf(QuickUnlockCancelledError);
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it('any other DOM error becomes Unavailable', async () => {
+    stubCredentials({ createRejects: named('NotSupportedError') });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+  });
+
+  it('a null credential is Unavailable, not a crash', async () => {
+    stubCredentials({ createReturnsNull: true });
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+  });
+
+  it('no WebAuthn API at all is Unavailable', async () => {
+    globalWithNav.navigator = {};
+    await expect(createPrfCredential({ prfSalt })).rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+  });
+});
+
+describe('evalPrf', () => {
+  const prfSalt = bytes(32, 2);
+
+  it('returns the PRF output and pins transports to internal', async () => {
+    const { getCalls } = stubCredentials();
+    const out = await evalPrf({ credentialId: CRED_ID, prfSalt });
+    expect(Array.from(out)).toEqual(Array.from(GET_PRF));
+    const allow = publicKeyOf(getCalls[0]).allowCredentials as Array<Record<string, unknown>>;
+    expect(allow).toHaveLength(1);
+    expect(allow[0].transports).toEqual(['internal']);
+    expect(Array.from(allow[0].id as Uint8Array)).toEqual(Array.from(CRED_ID));
+  });
+
+  it('passes the salt through the prf extension', async () => {
+    const { getCalls } = stubCredentials();
+    await evalPrf({ credentialId: CRED_ID, prfSalt });
+    const ext = publicKeyOf(getCalls[0]).extensions as { prf: { eval: { first: Uint8Array } } };
+    expect(Array.from(ext.prf.eval.first)).toEqual(Array.from(prfSalt));
+  });
+
+  it('a missing PRF output is UNAVAILABLE — never a key mismatch', async () => {
+    // Nothing was decrypted, so nothing may be concluded about the record.
+    stubCredentials({ getExt: { prf: { enabled: true } } });
+    await expect(evalPrf({ credentialId: CRED_ID, prfSalt }))
+      .rejects.toBeInstanceOf(QuickUnlockUnavailableError);
+  });
+
+  it('NotAllowedError becomes NotCompleted', async () => {
+    stubCredentials({ getRejects: named('NotAllowedError') });
+    await expect(evalPrf({ credentialId: CRED_ID, prfSalt }))
+      .rejects.toBeInstanceOf(QuickUnlockNotCompletedError);
+  });
+
+  it('our abort wins the classification over whatever the platform raised', async () => {
+    const controller = new AbortController();
+    stubCredentials({ getRejects: named('NotAllowedError') });
+    controller.abort();
+    await expect(evalPrf({ credentialId: CRED_ID, prfSalt, signal: controller.signal }))
+      .rejects.toBeInstanceOf(QuickUnlockCancelledError);
+  });
+
+  it('a null assertion is Unavailable', async () => {
+    stubCredentials({ getReturnsNull: true });
+    await expect(evalPrf({ credentialId: CRED_ID, prfSalt }))
+      .rejects.toBeInstanceOf(QuickUnlockUnavailableError);
   });
 });
