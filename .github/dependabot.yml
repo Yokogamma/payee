@@ -1,12 +1,33 @@
 version: 2
+
+# ПОЧЕМУ ЗДЕСЬ ГРУППЫ. Без них каждое обновление приезжает отдельным PR: три
+# экосистемы × еженедельная проверка = очередь, которую никто не разбирает.
+# К 20.08.2026 накопилось 15 открытых PR, самому старому месяц, и часть из них
+# старше файла ci.yml — то есть на них НИ РАЗУ не запускались гейты. Очередь,
+# которую не разбирают, не защищает от CVE: она их прячет.
+#
+# Правило разделения: patch/minor собираются в ОДИН PR на экосистему (их можно
+# смержить одним зелёным прогоном), major всегда приезжает ОТДЕЛЬНО — его
+# нельзя мержить, не прочитав changelog.
 updates:
   # Actions are pinned to immutable commit SHAs; without this they would never
   # receive security fixes. Dependabot bumps the SHA and rewrites the trailing
   # version comment.
+  #
+  # Мажоры экшенов НЕ группируются намеренно: там меняется рантайм (node20 →
+  # node24) и поведение, а SHA-пиннинг требует ручной сверки, что новый хеш
+  # действительно принадлежит заявленному тегу.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
 
   # Dev-toolchain CVEs (Vite/Wrangler/Miniflare chains) reached us via manual
   # audits twice — keep both manifests watched.
@@ -14,8 +35,22 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      client-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: npm
     directory: /worker
     schedule:
       interval: weekly
+    groups:
+      worker-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
