@@ -74,3 +74,15 @@ export function computeSyncCounters(
  */
 export const QUARANTINE_EXPLANATION =
   'эта версия приложения не может обработать такие записи; повтор не поможет';
+
+/**
+ * The 'recovery_invalidated' reason gets its OWN sentence: unlike the two
+ * above, the record itself is intact — the SERVER rejected its signed
+ * publication proof (e.g. after an emergency key rotation). The honest advice
+ * is different too: a seed restore brings the note back if the transaction
+ * actually landed on-chain, while «повторить» is a guaranteed no-op and the
+ * quarantine deliberately survives it.
+ */
+export const RECOVERY_INVALIDATED_EXPLANATION =
+  'сервер отклонил подтверждение публикации; повтор не поможет — ' +
+  'восстановление по seed-фразе вернёт запись, если транзакция прошла';

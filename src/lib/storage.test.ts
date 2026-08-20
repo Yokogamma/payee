@@ -287,7 +287,7 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
       noteId: 'p1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 5,
       lastError: 'v3_uploads_disabled',
     };
-    await commitV3PausedFailure(record, 12345);
+    await commitV3PausedFailure('p1', () => record, 12345);
     expect(await getSyncRecord('p1')).toEqual(record);
     expect(await readV3PauseMeta()).toEqual({ pausedAt: 12345 });
   });
@@ -298,17 +298,45 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
       updatedAt: 5, needsRecheck: true,
       recovery: { txId: 'TX-KEEP', postedAt: 1, token: 'tok' },
     };
-    await commitV3PausedFailure(record, 1);
+    await commitV3PausedFailure('p2', () => record, 1);
     const stored = await getSyncRecord('p2');
     expect(stored?.txId).toBe('TX-KEEP');
     expect(stored?.needsRecheck).toBe(true);
     expect(stored?.recovery).toEqual(record.recovery);
   });
 
+  it('the builder receives the FRESH row from inside the transaction', async () => {
+    const prior: SyncRecord = {
+      noteId: 'p2f', kind: 'note', txId: 'TX-FRESH', status: 'accepted',
+      transport: 'proxy', updatedAt: 5,
+    };
+    await setSyncRecord(prior);
+    await commitV3PausedFailure('p2f', fresh => ({
+      noteId: 'p2f', kind: 'note', txId: fresh?.txId, status: 'error',
+      transport: 'proxy', updatedAt: 6,
+    }), 2);
+    expect((await getSyncRecord('p2f'))?.txId).toBe('TX-FRESH');
+  });
+
+  it('a quarantined row is NOT overwritten — but the pause marker IS set', async () => {
+    const quarantined: SyncRecord = {
+      noteId: 'p2q', kind: 'note', txId: 'TX-Q', status: 'error', transport: 'proxy',
+      updatedAt: 5, terminalError: 'recovery_invalidated',
+    };
+    await setSyncRecord(quarantined);
+    await commitV3PausedFailure('p2q', () => ({
+      noteId: 'p2q', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 9,
+    }), 42);
+    // The record half is terminal-preserving (monotone quarantine)…
+    expect(await getSyncRecord('p2q')).toEqual(quarantined);
+    // …but the pause is version-global state about the WORKER, and it stands.
+    expect(await readV3PauseMeta()).toEqual({ pausedAt: 42 });
+  });
+
   it('aborts BOTH writes when the record is invalid (rollback, no half-commit)', async () => {
     // sync store keyPath is noteId — a record without it fails the first put.
     const bad = { kind: 'note', status: 'error', transport: 'proxy', updatedAt: 5 } as unknown as SyncRecord;
-    await expect(commitV3PausedFailure(bad, 777)).rejects.toBeDefined();
+    await expect(commitV3PausedFailure('missing-key', () => bad, 777)).rejects.toBeDefined();
     expect(await readV3PauseMeta()).toBeNull(); // pause marker NOT written
   });
 });

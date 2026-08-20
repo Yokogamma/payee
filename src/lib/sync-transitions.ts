@@ -128,6 +128,34 @@ export function afterFailure(
   };
 }
 
+/** The server REJECTED the signed recovery proof (400 {code:'recovery_invalid'}:
+ *  forged, corrupt, or signed under a rotated key after a compromise).
+ *  PERMANENT quarantine — retrying reproduces the same rejection, and without
+ *  this state the record would recheck a guaranteed failure forever. txId and
+ *  the (now-invalid) recovery hint are PRESERVED as evidence: the terminal row
+ *  must keep everything a later seed-restore or operator reconciliation needs.
+ *  Cleared ONLY by proof-bearing paths (see storage.ts save*WithSync). */
+export function toRecoveryInvalidated(
+  noteId: string,
+  kind: SyncKind,
+  prev: SyncRecord | undefined,
+  errText: string | undefined,
+  now: number,
+): SyncRecord {
+  return {
+    noteId,
+    kind,
+    txId: prev?.txId ?? prev?.recovery?.txId,
+    status: 'error',
+    transport: 'proxy',
+    lastError: errText,
+    updatedAt: now,
+    needsRecheck: false,
+    recovery: prev?.recovery,
+    terminalError: 'recovery_invalidated',
+  };
+}
+
 /** Restore-UI decision: should this restored note be ADDED to the visible list
  *  (and counted in «Восстановлено N»)? Claims the id in `visibleIds` on true,
  *  so a repair of an already-visible note — or a second occurrence of the same

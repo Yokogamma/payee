@@ -26,7 +26,12 @@
 import { buildUploadPayload, buildSafeboxUploadPayload, type UploadResult } from './arweave';
 import { bufferToBase64, base64ToBuffer, type EncryptedNote, type EncryptedSafeboxEntry } from './crypto';
 import type { SyncRecord } from './storage';
-import { toUploading, toAccepted, afterInProgress, afterFailure } from './sync-transitions';
+import {
+  toAccepted,
+  afterInProgress,
+  afterFailure,
+  toRecoveryInvalidated,
+} from './sync-transitions';
 
 /** Vault keys captured ONCE by the caller before the attempt — refs are never
  *  re-read mid-flight (post-lock they are null; the captured locals stay
@@ -54,17 +59,41 @@ export interface UploadAttemptDeps {
   /** Live read of vaultEpochRef — compared against the caller's captured epoch. */
   currentEpoch(): number;
   getSyncRecord(noteId: string): Promise<SyncRecord | undefined>;
-  setSyncRecord(record: SyncRecord): Promise<void>;
+  /** ATOMIC begin (storage.beginUploadUnlessTerminal + the reset guard): in ONE
+   *  transaction re-read the current row, REFUSE if quarantined, else write
+   *  'uploading' built from the FRESH row. On false the attempt is BLOCKED —
+   *  the caller dispatches NO HTTP. Direct setSyncRecord is banned on this
+   *  path: between the queue's `prev` read and this write another tab may have
+   *  quarantined the record, and a plain put would erase that. */
+  beginUpload(noteId: string, kind: SyncKind, now: number): Promise<boolean>;
+  /** Terminal-preserving result persist (storage.commitSyncUnlessTerminal +
+   *  the reset guard): applies build(fresh) in one transaction unless the row
+   *  is quarantined — a late result must never erase an established
+   *  quarantine, whatever the request's outcome was. */
+  commitResult(
+    noteId: string,
+    build: (fresh: SyncRecord | undefined) => SyncRecord | null,
+  ): Promise<void>;
   /** ATOMIC sync+meta write for a vN_disabled result: persists the failure
-   *  record AND that version's uploads-paused marker in one IndexedDB
-   *  transaction. Called INSTEAD of setSyncRecord for that branch — sequential
-   *  writes would reopen the crash window (error saved, pause lost → burst
-   *  after unlock). */
-  commitV3PausedFailure(record: SyncRecord, pausedAt: number): Promise<void>;
-  commitV4PausedFailure(record: SyncRecord, pausedAt: number): Promise<void>;
+   *  record (terminal-preserving, like commitResult) AND that version's
+   *  uploads-paused marker in one IndexedDB transaction. Called INSTEAD of
+   *  commitResult for that branch — sequential writes would reopen the crash
+   *  window (error saved, pause lost → burst after unlock). */
+  commitV3PausedFailure(
+    noteId: string,
+    build: (fresh: SyncRecord | undefined) => SyncRecord,
+    pausedAt: number,
+  ): Promise<void>;
+  commitV4PausedFailure(
+    noteId: string,
+    build: (fresh: SyncRecord | undefined) => SyncRecord,
+    pausedAt: number,
+  ): Promise<void>;
   signPayload(privateKey: Uint8Array, payload: string): Promise<string>;
   uploadViaProxy(bodyText: string, publicKeyB64: string, signature: string): Promise<UploadResult>;
 }
+
+type SyncKind = SyncRecord['kind'];
 
 /** The stored row failed runtime validation right before serialization.
  *  PERMANENT quarantine (terminalError:'malformed_record') — no HTTP is made
@@ -125,6 +154,9 @@ export function assertUploadableItem(item: UploadItem): void {
 export type UploadAttemptOutcome =
   /** Lock happened before the point of no return: no HTTP, no writes. */
   | { kind: 'cancelled' }
+  /** The record was quarantined (terminalError) between enqueue and the atomic
+   *  begin — e.g. by another tab. No HTTP was dispatched, nothing written. */
+  | { kind: 'blocked' }
   /** Past the point of no return: dispatched and the result persisted. */
   | { kind: 'committed'; result: UploadResult };
 
@@ -155,24 +187,32 @@ export async function runUploadAttempt(
   const signature = await deps.signPayload(keys.signingKey, bodyText);
   const publicKeyB64 = bufferToBase64(keys.publicKey);
 
-  // 2) ── POINT OF NO RETURN: the ONLY epoch check, BEFORE toUploading ──
+  // 2) ── POINT OF NO RETURN: the ONLY epoch check, BEFORE the begin write ──
   if (deps.currentEpoch() !== myEpoch) return { kind: 'cancelled' };
 
-  // 3) Committed: uploading + dispatch + persist run unconditionally from here.
-  await deps.setSyncRecord(toUploading(id, kind, prev, deps.now()));
+  // 3) Atomic begin: re-read + refuse-if-terminal + 'uploading' in ONE
+  //    transaction. A refusal means another writer quarantined the record
+  //    between enqueue and here — the attempt stops with NO HTTP dispatched.
+  //    Past a successful begin the upload is committed: dispatch + persist run
+  //    unconditionally, with no further epoch checks.
+  const began = await deps.beginUpload(id, kind, deps.now());
+  if (!began) return { kind: 'blocked' };
   const result = await deps.uploadViaProxy(bodyText, publicKeyB64, signature);
 
-  // 4) EVERY processed result branch persists — none leaves 'uploading'.
+  // 4) EVERY processed result branch persists through the terminal-preserving
+  //    commit — none leaves 'uploading', and none can erase a quarantine set
+  //    while the request was in flight. Builders receive the FRESH row (the
+  //    re-read happens inside the commit's transaction), so late results
+  //    cannot resurrect stale state either.
   if (result.kind === 'accepted') {
-    await deps.setSyncRecord(toAccepted(id, kind, prev, result, deps.now()));
+    await deps.commitResult(id, fresh => toAccepted(id, kind, fresh, result, deps.now()));
   } else if (result.kind === 'in_progress') {
     // 409 with a prior accepted TX → restore it; WITHOUT one there is nothing
     // to restore — record a RETRYABLE failure, never a stranded 'uploading'
     // (round-5 #1).
-    await deps.setSyncRecord(
-      afterInProgress(id, kind, prev, deps.now())
-        ?? afterFailure(id, kind, prev, recheck, 'in_progress', deps.now()),
-    );
+    await deps.commitResult(id, fresh =>
+      afterInProgress(id, kind, fresh, deps.now())
+        ?? afterFailure(id, kind, fresh, recheck, 'in_progress', deps.now()));
   } else if (result.kind === 'v3_disabled' || result.kind === 'v4_disabled') {
     // Worker kill switch: a PAUSE, not an error. The failure record (which
     // preserves txId/recovery/needsRecheck via afterFailure) and the pause
@@ -182,12 +222,20 @@ export async function runUploadAttempt(
     // SERVER refused, never the item's kind (they always agree, but the
     // server's answer is the authority).
     const now = deps.now();
-    const failure = afterFailure(id, kind, prev, recheck, result.error, now);
-    if (result.kind === 'v3_disabled') await deps.commitV3PausedFailure(failure, now);
-    else await deps.commitV4PausedFailure(failure, now);
+    if (result.kind === 'v3_disabled') {
+      await deps.commitV3PausedFailure(id, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
+    } else {
+      await deps.commitV4PausedFailure(id, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
+    }
+  } else if (result.kind === 'recovery_invalid') {
+    // The server rejected the signed recovery proof (rotated key / forged
+    // hint): PERMANENT quarantine instead of an endless recheck of a
+    // guaranteed failure. txId + the hint are preserved as evidence; only
+    // proof-bearing paths (seed restore) may clear this state.
+    await deps.commitResult(id, fresh => toRecoveryInvalidated(id, kind, fresh, result.error, deps.now()));
   } else {
     const errText = 'error' in result ? result.error : undefined;
-    await deps.setSyncRecord(afterFailure(id, kind, prev, recheck, errText, deps.now()));
+    await deps.commitResult(id, fresh => afterFailure(id, kind, fresh, recheck, errText, deps.now()));
   }
 
   return { kind: 'committed', result };

@@ -14,7 +14,7 @@ function baseStore() {
     arweave: {
       enabled: true, online: true, syncing: false, registered: true,
       countsReady: true, confirmedCount: 0, acceptedCount: 0, unsyncedCount: 0,
-      errorCount: 0, quarantinedCount: 0, lastError: null,
+      errorCount: 0, quarantinedCount: 0, recoveryInvalidatedCount: 0, lastError: null,
     },
     restoring: false, restoreProgress: null, restoreError: null,
     restoredCount: null, restoredUpdatedCount: null,
@@ -211,6 +211,30 @@ describe('StatusLine — карантин объясняется верно', ()
     render(<StatusLine />);
     fireEvent.click(screen.getByLabelText('Показать подробности'));
     expect(screen.queryByText(/Отложено/)).toBeNull();
+  });
+
+  it('recovery_invalidated — ОТДЕЛЬНАЯ причина и отдельный честный совет (§1.9)', () => {
+    // Общий текст «версия не может обработать» для этой причины — ложь:
+    // запись цела, сервер отклонил подтверждение публикации. Совет тоже
+    // другой: восстановление по seed, а не обновление приложения.
+    s().arweave.quarantinedCount = 3;
+    s().arweave.recoveryInvalidatedCount = 1;
+    render(<StatusLine />);
+    fireEvent.click(screen.getByLabelText('Показать подробности'));
+    const generic = screen.getByText(/Отложено: 2/); // 3 − 1: причины не смешаны
+    expect(generic.textContent).toMatch(/не может обработать/);
+    const recovery = screen.getByText(/Отложено: 1/);
+    expect(recovery.textContent).toMatch(/восстановление по seed/i);
+    expect(recovery.textContent).toMatch(/повтор не поможет/);
+  });
+
+  it('только recovery_invalidated: общий текст карантина не рисуется вовсе', () => {
+    s().arweave.quarantinedCount = 1;
+    s().arweave.recoveryInvalidatedCount = 1;
+    render(<StatusLine />);
+    fireEvent.click(screen.getByLabelText('Показать подробности'));
+    expect(screen.queryByText(/не может обработать/)).toBeNull();
+    expect(screen.getByText(/восстановление по seed/i)).toBeTruthy();
   });
 });
 

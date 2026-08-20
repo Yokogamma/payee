@@ -187,6 +187,13 @@ export type UploadResult =
   /** 503 {code:'v4_uploads_disabled'} — the worker's SAFEBOX kill switch is on.
    *  Same contract as v3_disabled, on its own independent pause marker. */
   | { kind: 'v4_disabled'; error: string }
+  /** 400 {code:'recovery_invalid'} — the server REJECTED the signed recovery
+   *  proof (forged, corrupt, or signed under a rotated key). PERMANENT for
+   *  this record: a retry reproduces the same rejection, so the caller
+   *  quarantines it (terminalError:'recovery_invalidated') instead of
+   *  rechecking a guaranteed failure forever. NO duplicate paid TX happened —
+   *  the server released the reservation before answering. */
+  | { kind: 'recovery_invalid'; error: string }
   | { kind: 'error'; error: string };
 
 export type RegistrationStatus = 'allowed' | 'denied' | 'unavailable' | 'invalid_request';
@@ -389,6 +396,17 @@ export async function uploadViaProxy(
         }
       } catch { /* not JSON → generic 503 */ }
       return { kind: 'unavailable', error: text }; // retryable
+    }
+    if (response.status === 400) {
+      // Both worker branches of «Invalid recovery token» answer 400 with a
+      // machine code; any other 400 stays the generic (retryable-by-user) error.
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (typeof parsed === 'object' && parsed !== null
+            && (parsed as { code?: unknown }).code === 'recovery_invalid') {
+          return { kind: 'recovery_invalid', error: text };
+        }
+      } catch { /* not JSON → generic 400 */ }
     }
     return { kind: 'error', error: `HTTP ${response.status}: ${text}` };
   } catch (e) {
