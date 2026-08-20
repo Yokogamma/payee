@@ -529,6 +529,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
             <p>Ничего не найдено по «{searchQuery}»</p>
           </div>
         ) : (
+          // `chain.current` is the HEAD OF A NOTE VERSION CHAIN, not a React
+          // ref — react-hooks/refs (eslint-plugin-react-hooks >= 7.1) flags any
+          // `.current` access during render by property name alone. On the
+          // current 7.0.x the unused directive is only a warning, so lint
+          // stays green on both sides of the plugin upgrade.
+          // eslint-disable-next-line react-hooks/refs
           filteredChains.map(chain => {
             const note = chain.current;
             // Sync info is derived UNCONDITIONALLY — a confirmed TX stays
