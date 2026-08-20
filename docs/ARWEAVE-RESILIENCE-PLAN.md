@@ -1,13 +1,15 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v6 — четвёртый раунд ревью учтён** (ревью 4 по v5: 2 high + 3
-medium — все приняты; главное: точная формула dead-кворума, bounded lifecycle
-`signed`, логическая топология индексов, cold-download контракт, CORS-замеры
-`/raw`). История: v5 — решения владельца + живые пробы, D7 утверждён (§2.1);
-v4 — три раунда ревью (ревью 1: 2 critical + 6 high + 4 medium; ревью 2: 8;
-ревью 3: 3). Дата: 2026-08-20. Строится поверх задеплоенного инкрементального
-sweep (PR #53). Остаточные блокеры полной реализации — конец §8. Принцип:
-каждое спорное место — ОДНО нормативное решение без альтернатив.
+Статус: **v7 — пятый раунд ревью учтён** (ревью 5 по v6: 1 high + 2 medium +
+1 low — все приняты; главное: single-alarm scheduler с CAS для `signed`,
+нормативная verdict-таблица alarm-прогона, программный hash-барьер cold-flow,
+поправка лимита SQLite-backed DO). История: v6 — формула dead-кворума,
+bounded `signed`, логические индексы, cold-flow, CORS `/raw`; v5 — решения
+владельца + живые пробы, D7 утверждён (§2.1); v4 — три раунда ревью (ревью 1:
+2 critical + 6 high + 4 medium; ревью 2: 8; ревью 3: 3). Дата: 2026-08-20.
+Строится поверх задеплоенного инкрементального sweep (PR #53). Остаточные
+блокеры полной реализации — конец §8. Принцип: каждое спорное место — ОДНО
+нормативное решение без альтернатив.
 
 Документ адресован ревьюеру: фиксирует решения, объём, разбиение на PR,
 инварианты, тестовые сценарии и границы. Ключевое изменение v2: **PR-3
@@ -362,10 +364,14 @@ anchor+price запросы внутри SDK — из вызовов тольк�
   вариант `|ref` из v5 УПРАЗДНЁН (внешняя ссылка = атомарность и потеря
   reference, которые пришлось бы доказывать). Запись
   `note:{noteId} = {status:'signed', txId, signedTx, anchorHeight, token,
-  gen, signedAt}` — ОДИН атомарный `storage.put`. Влезает по построению:
-  `MAX_BODY_BYTES = 51200` (`wrangler.toml:34`) → сериализованный tx-JSON
-  (data + owner ~0.7 KB + signature ~0.7 KB + tags) ≤ ~75 KB < лимита
-  128 KiB на DO-значение. Тест фиксирует худший случай.
+  gen, signedAt, dueAt, attempts}` — ОДИН атомарный `storage.put`. Влезает по
+  построению (поправка v7, ревью 5 low): `RateLimiter` — **SQLite-backed DO**
+  (`worker/wrangler.toml:14`, `new_sqlite_classes`), лимит key+value —
+  **2 MB** (128 KiB из v6 — лимит legacy KV-backed DO, к нам не относится);
+  наш собственный worst case при `MAX_BODY_BYTES = 51200` — сериализованный
+  tx-JSON (data + owner ~0.7 KB + signature ~0.7 KB + tags) ≤ ~75 KB — запас
+  более чем 25×. Тест фиксирует худший случай против ВНУТРЕННЕГО предела
+  ~75 KB, не против платформенного.
 - **Порча/потеря `signedTx` — fail closed:** запись `signed` есть, а байты
   не парсятся/не сходятся с txId → resend невозможен, слот НЕ освобождается
   автоматически; допустима только reconciliation по кворуму статуса (alive →
@@ -403,12 +409,61 @@ reconciliation по кворуму статуса. Это снимает нео�
   достижении cap новый upload отклоняется **ДО подписания** (`503`,
   retryable) — подписей сверх границы не существует по построению.
 - **Reconciliation — сервер-инициированная, два триггера (ревью 4 H2):**
-  (а) как сегодня — любой `/upload`/recheck этого noteId; (б) **DO alarm**:
-  ставится при создании `signed` (первый — через ~5 мин, далее экспоненциальный
-  backoff с потолком), alarm делает resend ТОГО ЖЕ `signedTx` + кворум
-  статуса: alive → `posted` (дальше обычный путь), не-alive → следующий alarm.
-  Alarm снимается при переходе вперёд. Клиент, который никогда не повторит
-  запрос, больше не оставляет `signed` навечно — DO добивает сам.
+  (а) как сегодня — любой `/upload`/recheck этого noteId; (б) DO alarm через
+  scheduler ниже. Клиент, который никогда не повторит запрос, больше не
+  оставляет `signed` навечно — DO добивает сам.
+
+**Single-alarm scheduler (ревью 5 H1 — нормативно, без альтернатив):**
+
+У Durable Object есть РОВНО ОДИН alarm (`setAlarm` перезаписывает предыдущий).
+Формулировка v6 «alarm ставится при создании каждой записи и снимается при
+переходе вперёд» при нескольких `signed` перезаписывала бы расписание чужой
+записи, а завершение одной ноты отменяло бы reconciliation остальных.
+Нормативная модель — один persistent scheduler на DO:
+
+- **`dueAt` живёт В САМОЙ signed-записи** (поле, см. storage-контракт) вместе
+  с `attempts`; отдельной очереди-структуры нет — источником расписания
+  являются сами записи. Backlog ограничен `MAX_SIGNED_INFLIGHT`, поэтому
+  выбор min(dueAt) перебором `signed`-записей — O(cap), приемлемо.
+- **Глобальный alarm всегда = min(dueAt) по всем записям `status='signed'`.**
+  ЛЮБАЯ мутация множества signed-записей (создание, переход вперёд, redrop,
+  изменение dueAt после прогона) завершается пересчётом min(dueAt) и
+  `setAlarm(min)` — либо `deleteAlarm()`, когда signed-записей не осталось.
+  Продвижение одной записи по построению НЕ отменяет reconciliation других.
+- **Атомарность (ревью 5):** создание `signed` = ОДНА атомарная группа:
+  запись `note:*` + `signedCount` + `dueAt` + `setAlarm`. `setAlarm` — тоже
+  storage-операция и входит в ту же группу (`storage.transaction` /
+  сериализация через `blockConcurrencyWhile`, как принято в InviteManager).
+  Crash «между» шагами невозможен по построению — тест с искусственным
+  разрывом обязан показать «всё или ничего».
+- **Alarm-обработчик:** выбирает записи с `dueAt <= now`, обрабатывает
+  ПОСЛЕДОВАТЕЛЬНО (никаких параллельных resend), максимум **`ALARM_BATCH = 5`**
+  записей за прогон — бюджет subrequests: ≤5 записей × (resend + ≤5
+  status-хостов) в лимите Cloudflare; необработанные due-записи получают
+  немедленный re-alarm. Прогон завершается обязательным пересчётом
+  min(dueAt) + `setAlarm`, пока существует хоть одна signed-запись.
+- **CAS после КАЖДОГО внешнего await (ревью 5):** перед применением перехода
+  запись перечитывается; переход применяется ТОЛЬКО при совпадении
+  `{status:'signed', token, txId}` с тем, что было прочитано до сетевого
+  вызова. Не совпало (запись продвинул конкурентный recheck или другой
+  прогон) — результат ОТБРАСЫВАЕТСЯ без записи. Redrop-ветка — под тем же
+  CAS внутри атомарной группы.
+- **Вердикты alarm-прогона (ревью 5 M1) — нормативная таблица («не-alive»
+  из v6 упразднено как смешение трёх исходов):**
+
+  | Кворум-статус (формула PR-3a) | Действие |
+  |---|---|
+  | `confirmed` (alive) | CAS → `posted`, дальше обычный путь |
+  | `pending` | reschedule (экспоненциальный backoff с потолком) |
+  | `unavailable` | reschedule (backoff) |
+  | `dead`, age guard НЕ пройден | reschedule |
+  | `dead` + age guard пройден | атомарная redrop-ветка под CAS — ЕДИНСТВЕННОЕ место новой подписи |
+
+- **Reader-релиз (floor) обязан нести ВЕСЬ scheduler-контракт** — dueAt,
+  signedCount, alarm-обработчик, CAS, verdict-таблицу — а не только чтение
+  `signedTx`; иначе откат writer→reader оставил бы запланированные signed
+  без reconciliation. Reader отличается от writer ровно одним: НЕ создаёт
+  `signed`.
 - **Истечение anchor:** подписанная tx с протухшим anchor (~50 блоков) на
   chain не попадёт. Пересоздание — только после подтверждения кворумом, что
   старый txId не alive. Это частный случай «доказанного окончательного
@@ -425,9 +480,10 @@ reconciliation по кворуму статуса. Это снимает нео�
 текущий Worker потерял бы `signed` или дал дубль. Поэтому:
 
 1. **Reader-релиз:** Worker умеет безопасно ЧИТАТЬ/резюмировать `signed`
-   (реконсиляция, resend), но ещё НЕ создаёт его. Совместим со старыми
-   клиентами (новых обязательных полей запроса нет — resume полностью
-   server-side).
+   (реконсиляция, resend) И несёт ПОЛНЫЙ scheduler-контракт (dueAt,
+   signedCount, alarm-обработчик, CAS, verdict-таблица — ревью 5), но ещё НЕ
+   создаёт `signed`. Совместим со старыми клиентами (новых обязательных
+   полей запроса нет — resume полностью server-side).
 2. **Writer-релиз:** начинает создавать `signed`. После него — **hard
    rollback floor** (`worker-rN`): откат ниже reader-релиза запрещён.
 3. Внешний `/upload`-контракт остаётся совместим со старыми клиентами.
@@ -449,9 +505,21 @@ reconciliation по кворуму статуса. Это снимает нео�
 - **порча `signedTx`** (байты не парсятся / не сходятся с txId) → fail
   closed: ни resend мусора, ни новой подписи, ни авто-release; выход только
   через кворум (alive→posted / dead+age→redrop);
-- **DO alarm** повторяет ТОЛЬКО тот же txId (никогда не подписывает) и
-  снимается при переходе вперёд; худший размер `signedTx` при
-  `MAX_BODY_BYTES=51200` влезает в DO-значение;
+- **DO alarm** повторяет ТОЛЬКО тот же txId (никогда не подписывает);
+  худший размер `signedTx` при `MAX_BODY_BYTES=51200` ≤ внутреннего предела
+  ~75 KB;
+- **scheduler (ревью 5):** две и более signed-записи с разными `dueAt` —
+  обе реконсилируются; продвижение одной НЕ снимает alarm остальных
+  (alarm исчезает только с последней signed-записью); искусственный crash
+  между записью `note:*`, `signedCount` и `setAlarm` → «всё или ничего»;
+  alarm и обычный recheck конкурируют за один txId → ровно один переход
+  (CAS); CAS отклоняет stale-результат alarm-прогона после
+  `posted`/`committed`/redrop; отдельные тесты исходов `pending`,
+  `unavailable`, `dead` ДО age guard (все → reschedule) и `dead` ПОСЛЕ age
+  guard (→ redrop); due-записей больше `ALARM_BATCH` → остаток получает
+  немедленный re-alarm;
+- **откат writer→reader-floor при НЕСКОЛЬКИХ запланированных signed** —
+  reader продолжает scheduler-обработку всех;
 - reservation/recovery/quota-инварианты не регрессируют.
 
 ### PR-4 «Multi-index restore union»
@@ -567,12 +635,35 @@ tx-specific sandbox subdomains.
   навигации на gateway-URL нет ни на одном шаге:
   1. `curl --fail --location --output restore.download
      "https://<gateway>/raw/<txId>"` (curl штатен в Windows 10+/macOS/Linux);
-  2. `certutil -hashfile restore.download SHA256` (Windows) /
-     `shasum -a 256 restore.download` (macOS/Linux);
-  3. сверка с эталонным SHA-256; ТОЛЬКО при совпадении — переименовать в
-     `restore.html` и открыть локально (file://).
-  Отдельный скачиваемый verifier-артефакт НЕ вводится — он воспроизвёл бы ту
-  же проблему доверия к своим байтам; используются ТОЛЬКО штатные системные
+  2. **программная сверка + rename ОДНИМ копируемым блоком (ревью 5 M2):**
+     человек НЕ сравнивает hex-строки глазами — сравнение и переименование
+     выполняет команда, rename недостижим без совпадения. Windows
+     (PowerShell):
+
+     ```powershell
+     $E='<ЭТАЛОННЫЙ_SHA256>'
+     if ((Get-FileHash restore.download -Algorithm SHA256).Hash -eq $E) {
+       Rename-Item restore.download restore.html; 'OK: открывайте restore.html'
+     } else { Remove-Item restore.download; Write-Error 'HASH MISMATCH' }
+     ```
+
+     macOS/Linux (sh):
+
+     ```sh
+     E='<ЭТАЛОННЫЙ_SHA256>'
+     echo "$E  restore.download" | shasum -a 256 -c - \
+       && mv restore.download restore.html \
+       || { rm -f restore.download; echo 'HASH MISMATCH' >&2; }
+     ```
+
+  3. открыть `restore.html` локально (file://). При mismatch файл УДАЛЁН
+     (а до rename носит неисполняемое расширение `.download`) — «открыть
+     несмотря на mismatch» требует сознательных ручных действий вне
+     инструкции.
+  Блоки генерируются скриптом публикации релиза с УЖЕ подставленным эталоном
+  (не заполняются руками) и живут в доверенных местах ниже. Отдельный
+  скачиваемый verifier-артефакт НЕ вводится — он воспроизвёл бы ту же
+  проблему доверия к своим байтам; используются ТОЛЬКО штатные системные
   утилиты. **Канал доверия к инструкции и эталонному хешу:** README в
   GitHub-репозитории, экран настроек приложения и `docs/ROLLBACK.md` — те же
   доверенные места, где живёт txId; шлюз не участвует. **Мобильное холодное
@@ -624,8 +715,11 @@ tx-specific sandbox subdomains.
 
 **Acceptance:** восстановление при полном отключении Matamata/Cloudflare/Solana;
 gateway-код НЕ исполняется до checksum verification (file-mode); **полный
-terminal-only cold-flow: curl-download → hash → открытие ТОЛЬКО после
-совпадения** (ревью 4 M2); hash mismatch блокирует процедуру; GraphQL и
+terminal-only cold-flow: curl-download → ПРОГРАММНАЯ сверка → rename/open
+только через `&&`/`if`** (ревью 4 M2 + ревью 5 M2); **hash mismatch
+программно запрещает rename/open — автотест прогоняет оба командных блока
+(PowerShell и sh) на подменённом файле и убеждается, что `restore.html` не
+возник, а `.download` удалён**; GraphQL и
 `/raw` работают из `file:///` `Origin: null` на поддерживаемых браузерах —
 **с per-gateway фиксацией `Access-Control-Allow-Origin` на 200-ответах
 каждого `PAYLOAD_GATEWAYS`** (ревью 4 M3; предварительные замеры — §2.1);
@@ -643,6 +737,10 @@ BFCache-lifecycle; форматы v1–v4.
   в т.ч. **`MIN_STATUS_ORIGINS = 2`** (бывш. H4; в v6 это ЕДИНСТВЕННЫЙ порог —
   runtime-порога «ответивших» больше нет, §4.PR-3a), — иначе прод незаметно
   останется на одном `arweave.net` или dead будет недостижим;
+- **идентичность списков клиент/Worker (ревью 5):** формула dead одна на
+  двоих, значит `STATUS_GATEWAYS` клиента и Worker ОБЯЗАНЫ совпадать —
+  deploy/staging config checker сверяет нормализованные (канонизация+дедуп
+  PR-3a) списки из Vite env и Worker vars и падает при расхождении;
 - **Worker rollback floor (H3):** PR-3b выкатывается reader-релизом ПЕРЕД
   writer-релизом; после writer фиксируется hard floor `worker-rN` в
   `docs/ROLLBACK.md`. DO-схема `signed` де-факто требует reader-before-writer
@@ -669,8 +767,8 @@ BFCache-lifecycle; форматы v1–v4.
 рискованный кусок (state machine DO, два последовательных Worker-релиза с
 floor, платные staging-испытания) и не должен задерживать автотриггеры.
 
-1. PR-1: ADR + этот план v6 (D7 утверждён — §2.1; формула кворума, bounded
-   `signed`, логические источники — v6).
+1. PR-1: ADR + этот план v7 (D7 утверждён — §2.1; формула кворума и
+   логические источники — v6; scheduler `signed` и hash-барьер — v7).
 2. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
 3. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
 4. Multi-index union с conflict/null-height политикой (PR-4).
@@ -721,27 +819,30 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v6)
+## 8. Карта соответствия (статус v7)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready** после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
 | PR-3a read | ready (D7 §2.1 + формула кворума v6) | строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | blocked до своей очереди (§6 п.6) | inline `signedTx` + `signedCount` cap + DO alarm (H2 ревью 4), `signed` не подлежит release/TTL (ревью 3), reader-before-writer floor (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | спецификация ЗАВЕРШЕНА v7; ждёт своей очереди (§6 п.6) | single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + `signedCount` cap (H2 ревью 4), `signed` не подлежит release/TTL (ревью 3), reader-floor несёт scheduler (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky | логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
-| PR-5 restore | ready (cold-flow специфицирован v6) | терминальный download→hash→open (M2 ревью 4), per-gateway `/raw` CORS-фиксация (M3), safe render, release-кошелёк (§4.PR-5) |
+| PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
 
-**Остаточные блокеры к полной реализации:** (1) PR-3b — реализация bounded
-lifecycle `signed` (inline bytes, cap, alarm) + reader-before-writer floor;
-(2) PR-3a/4 — реализация формулы кворума и логических источников по v6;
-(3) PR-5 — исполнение cold-flow контракта + фиксация CORS в acceptance.
-Спецификационных блокеров НЕ осталось; открытым в D7 остаётся только
-`UPLOAD_GATEWAYS` — утверждается по staging-испытаниям в PR-3b. **PR-1 и
-PR-2 можно начинать** (вердикт ревью 4).
+**Остаточные блокеры к полной реализации:** только реализационные — (1)
+PR-3b: scheduler+CAS+cap по v7 и reader-before-writer floor; (2) PR-3a/4:
+формула кворума и логические источники по v6; (3) PR-5: исполнение
+cold-flow контракта (генерация команд-блоков скриптом публикации) + CORS в
+acceptance. Спецификационных блокеров НЕ осталось; открытым в D7 остаётся
+только `UPLOAD_GATEWAYS` — утверждается по staging-испытаниям в PR-3b.
+**PR-1 и PR-2 можно начинать** (вердикт ревью 4, подтверждён ревью 5);
+спецификации PR-3a и PR-4 признаны готовыми ревью 5.
 
 Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 — все 3;
 из ревью 4 (по v5) — все 5 (2 high: формула dead-кворума, bounded lifecycle
 `signed`; 3 medium: логическая топология индексов, терминальный cold-flow,
-CORS-замеры `/raw`).
+CORS-замеры `/raw`); из ревью 5 (по v6) — все 4 (high: single-alarm
+scheduler + CAS; medium: verdict-таблица alarm-прогона, программный
+hash-барьер; low: лимит SQLite-backed DO = 2 MB, не 128 KiB).
