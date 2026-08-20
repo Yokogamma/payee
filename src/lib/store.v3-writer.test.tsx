@@ -29,6 +29,11 @@ vi.mock('./storage', async importOriginal => {
   return {
     ...actual,
     saveNote: vi.fn(actual.saveNote),
+    // Spy only — the real write still runs. A sweep that RESURRECTS a
+    // permanently quarantined row is invisible over HTTP (the payload builder
+    // fails closed before any request is built), so the re-write of its sync
+    // record is the only observable proof that it was touched at all.
+    setSyncRecord: vi.fn(actual.setSyncRecord),
   };
 });
 
@@ -57,11 +62,11 @@ import { NotesProvider, useNotes, OperationInFlightError } from './store';
 import { noteSearchText } from './note-search-text';
 import {
   initStorage, resetAll, setMeta, saveNote, getAllNotes as getStoredNotes,
-  getAllSyncRecords, readV3PauseMeta, getSyncRecord,
+  getAllSyncRecords, readV3PauseMeta, getSyncRecord, setSyncRecord,
 } from './storage';
 import { isArweaveOnline, uploadViaProxy, fetchAllNotes } from './arweave';
 import { deriveKey, decryptNote, encryptEnvelopeV3, type EncryptedNote } from './crypto';
-import type { RestoredNote } from './arweave';
+import type { RestoredNote, UploadResult } from './arweave';
 
 // jsdom has no BroadcastChannel — minimal stand-in (no cross-tab needs here).
 class FakeBroadcastChannel {
@@ -108,6 +113,68 @@ beforeEach(async () => {
 afterEach(() => cleanup());
 
 const UUID_V8 = /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// ─── Driving the upload queue deterministically ──────────────────────
+//
+// The queue processor is fire-and-forget (`kickQueue` never returns a promise),
+// so a test's only handle on its progress is the HTTP boundary. Waiting on
+// downstream effects instead — «poll until the sync record turns accepted» —
+// puts a whole round trip plus the 200ms inter-upload throttle inside a
+// `waitFor` budget, and makes the result depend on how loaded the machine is.
+// The helpers below replace that: PARK each dispatch until the test answers it,
+// then use the processor's own completion as the happens-after barrier.
+
+/** One dispatch parked at the proxy boundary. */
+interface ParkedUpload {
+  /** App-Version tag of the signed body: '1' for a legacy note, '3' for v3. */
+  version: string | undefined;
+  body: string;
+  /** Answer this attempt; the processor resumes from here. */
+  reply: (result: UploadResult) => void;
+}
+
+function appVersionTag(body: string): string | undefined {
+  return (JSON.parse(body) as { tags: Array<{ name: string; value: string }> })
+    .tags.find(t => t.name === 'App-Version')?.value;
+}
+
+/** Installs an `uploadViaProxy` that never answers on its own. */
+function parkUploads() {
+  const arrived: ParkedUpload[] = [];                   // dispatched, not taken
+  const takers: Array<(u: ParkedUpload) => void> = [];  // taken before dispatch
+  const all: ParkedUpload[] = [];
+
+  vi.mocked(uploadViaProxy).mockImplementation(
+    (body: string) => new Promise<UploadResult>(reply => {
+      const upload: ParkedUpload = { version: appVersionTag(body), body, reply };
+      all.push(upload);
+      const taker = takers.shift();
+      if (taker) taker(upload);
+      else arrived.push(upload);
+    }),
+  );
+
+  return {
+    /** Every dispatch so far, in order. */
+    all,
+    /** The next dispatch. Deliberately without a deadline of its own: a queue
+     *  that never gets there fails on the test timeout, not on a poll budget
+     *  that a slow machine can exhaust while the queue is still working. */
+    next(): Promise<ParkedUpload> {
+      const ready = arrived.shift();
+      return ready ? Promise.resolve(ready) : new Promise(take => { takers.push(take); });
+    },
+  };
+}
+
+/** Barrier for a queue that is KNOWN to be running (a dispatch was just
+ *  answered): `syncing` flips back in processQueue's `finally`, i.e. after the
+ *  last item's sync record, its counters, the pause marker and the
+ *  registration flag are all published. Every assertion made after this
+ *  happens-after the state it reads — no assertion may race a later write. */
+async function queueDrained() {
+  await waitFor(() => expect(store.arweave.syncing).toBe(false));
+}
 
 describe('W3: addNote writes v3', () => {
   it('creates a rev-1 md chain root with a UUIDv8 id and RAW (untrimmed) text', async () => {
@@ -293,7 +360,6 @@ describe('W3: v3 upload pause (kill switch, client side)', () => {
   const V3_DISABLED = { kind: 'v3_disabled' as const, error: '{"code":"v3_uploads_disabled"}' };
 
   it('queue [v3, v3, v1]: ONE v3 HTTP attempt, the v1 still uploads, pause persisted', async () => {
-    vi.mocked(isArweaveOnline).mockResolvedValue(true);
     await setMeta('ar-enabled', true);
 
     renderStore();
@@ -305,43 +371,57 @@ describe('W3: v3 upload pause (kill switch, client side)', () => {
     const v1note = await encrypt(key, 'старая v1');
     await saveNote(v1note);
 
-    vi.mocked(uploadViaProxy).mockImplementation(async (body: string) => {
-      const version = (JSON.parse(body) as { tags: Array<{ name: string; value: string }> })
-        .tags.find(t => t.name === 'App-Version')?.value;
-      return version === '3' ? V3_DISABLED : { kind: 'accepted', txId: `TX-${version}`, committed: true };
-    });
+    const http = parkUploads();
 
+    // Fill the queue while the store is still OFFLINE (beforeEach default):
+    // enqueueing is gated on `enabled` alone, dispatching on `online` too, so
+    // the [v3, v3, v1] order this test is named after becomes a fact instead
+    // of a race against the background online probe.
     await act(async () => { await store.addNote('первая v3'); });
     await act(async () => { await store.addNote('вторая v3'); });
-    await act(async () => { await store.retrySync(); });
+    expect(http.all).toHaveLength(0);
 
-    await waitFor(async () => {
-      expect(await readV3PauseMeta()).not.toBeNull();
+    // Online: retrySync publishes `online` BEFORE it resolves, and its sweep
+    // appends the v1 behind the two queued v3s — one processor, one order.
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+    let first!: ParkedUpload;
+    await act(async () => {
+      await store.retrySync();
+      first = await http.next();
     });
-    await waitFor(() => expect(store.v3Paused).toBe(true));
+    expect(first.version).toBe('3');
 
-    // The v1 note went through despite the paused v3 backlog.
-    await waitFor(async () => {
-      const rec = await getSyncRecord(v1note.noteId);
-      expect(rec?.status).toBe('accepted');
+    // The kill switch answers the first v3 …
+    let second!: ParkedUpload;
+    await act(async () => {
+      first.reply(V3_DISABLED);
+      second = await http.next();
     });
+    // … and the very next request on the wire is the v1: the second v3 was
+    // dropped by the pre-dispatch marker check (ONE v3 HTTP attempt) and the
+    // queue moved ON instead of stalling on the paused backlog.
+    expect(second.version).toBe('1');
 
-    // At most ONE v3 HTTP attempt (the first 503 set the marker; the second
-    // v3 note was skipped by the pre-dispatch marker check).
-    const v3Calls = vi.mocked(uploadViaProxy).mock.calls.filter(([body]) =>
-      (JSON.parse(body) as { tags: Array<{ name: string; value: string }> })
-        .tags.some(t => t.name === 'App-Version' && t.value === '3'));
-    expect(v3Calls).toHaveLength(1);
+    await act(async () => {
+      second.reply({ kind: 'accepted', txId: 'TX-1', committed: true });
+    });
+    await queueDrained();
+
+    expect(http.all.filter(u => u.version === '3')).toHaveLength(1);
+    expect(await readV3PauseMeta()).not.toBeNull();
+    expect(store.v3Paused).toBe(true);
+    expect((await getSyncRecord(v1note.noteId))?.status).toBe('accepted');
 
     // recovery-critical: v3_disabled must never markUnregistered — the v1
     // upload's accepted auto-discovery set registered=true and it must stay.
     //
-    // `waitFor`, not a bare expect: the flag is set by the SAME auto-discovery
-    // that the accepted record above comes from, but it reaches the store one
-    // render later. A synchronous assertion here won the race on every local
-    // run and lost it on a loaded CI runner — flaky in the direction that
-    // reads as a real recovery regression, which is the worst kind.
-    await waitFor(() => expect(store.arweave.registered).toBe(true));
+    // A BARE expect, deliberately — 12e7b45 had to wrap this one in `waitFor`
+    // because the flag reached the store a render after the accepted record it
+    // comes from, and a loaded CI runner lost that race. `queueDrained()` above
+    // closes the gap structurally: it returns on the processor's own `finally`,
+    // and setArweave publishes ONE state object (store.tsx), so the render that
+    // shows syncing=false is the render that shows registered=true.
+    expect(store.arweave.registered).toBe(true);
   });
 
   it('the pause survives a remount (lock/reload): banner state re-derived from the marker', async () => {
@@ -398,41 +478,59 @@ describe('W3: v3 upload pause (kill switch, client side)', () => {
 
 describe('W3: unsupported-version quarantine in the queue', () => {
   it('a v:4 record is quarantined without HTTP; the queue moves on to valid notes', async () => {
-    vi.mocked(isArweaveOnline).mockResolvedValue(true);
     await setMeta('ar-enabled', true);
     renderStore();
     await openMain();
 
-    // A record from a FUTURE client version sits in storage.
     const key = await deriveKey(MN);
-    const future = { ...(await encryptEnvelopeV3(key, 'из будущего', { fmt: 'md', rev: 1 })), v: 4 };
+    // A record from a FUTURE client version sits in storage AHEAD of a valid
+    // note: syncPendingRecords enqueues newest-first, so the explicit
+    // createdAt values are what make «moves on» a fact about ONE queue pass
+    // instead of a coin flip on IndexedDB order.
+    const valid = { ...(await encryptEnvelopeV3(key, 'нормальная', { fmt: 'md', rev: 1 })), createdAt: 1_000 };
+    const future = { ...(await encryptEnvelopeV3(key, 'из будущего', { fmt: 'md', rev: 1 })), v: 4, createdAt: 2_000 };
+    await saveNote(valid);
     await saveNote(future as unknown as EncryptedNote);
 
-    vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'accepted', txId: 'TX-OK', committed: true });
-    await act(async () => { await store.addNote('нормальная'); });
-    await act(async () => { await store.retrySync(); });
+    const http = parkUploads();
 
-    await waitFor(async () => {
-      const rec = await getSyncRecord(future.noteId);
-      expect(rec?.terminalError).toBe('unsupported_version');
+    // One sweep enqueues [v:4, valid]. The v:4 row fails closed on its way to
+    // the payload builder, so the FIRST request on the wire is the valid note.
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+    let first!: ParkedUpload;
+    await act(async () => {
+      await store.retrySync();
+      first = await http.next();
     });
-    // No HTTP was made for the quarantined record…
-    for (const [body] of vi.mocked(uploadViaProxy).mock.calls) {
-      expect(body).not.toContain(future.noteId);
-    }
-    // …and the valid note still uploaded.
-    await waitFor(async () => {
-      const records = await getAllSyncRecords();
-      expect(records.some(r => r.status === 'accepted')).toBe(true);
-    });
+    expect(first.body).toContain(valid.noteId);
 
-    // reload/poll/manual retry never resurrect it: another full retry pass
-    // must not produce an HTTP call for the quarantined id.
-    vi.mocked(uploadViaProxy).mockClear();
-    await act(async () => { await store.retrySync(); });
-    for (const [body] of vi.mocked(uploadViaProxy).mock.calls) {
-      expect(body).not.toContain(future.noteId);
-    }
+    await act(async () => { first.reply({ kind: 'accepted', txId: 'TX-OK', committed: true }); });
+    await queueDrained();
+
+    expect((await getSyncRecord(future.noteId))?.terminalError).toBe('unsupported_version');
+    expect((await getSyncRecord(valid.noteId))?.status).toBe('accepted');
+    expect(http.all).toHaveLength(1); // the quarantined row cost no HTTP at all
+
+    // reload/poll/manual retry never resurrect it. A re-processed quarantine
+    // makes no HTTP either (fail-closed again), so its sync record write is
+    // what has to be watched — and a third, still-pending note gives the
+    // second sweep visible work: without it «no calls» would pass whether the
+    // sweep ran or not.
+    const pending = await encryptEnvelopeV3(key, 'ещё не отправленная', { fmt: 'md', rev: 1 });
+    await saveNote(pending);
+    vi.mocked(setSyncRecord).mockClear();
+
+    let second!: ParkedUpload;
+    await act(async () => {
+      await store.retrySync();
+      second = await http.next();
+    });
+    expect(second.body).toContain(pending.noteId); // the sweep really ran
+    await act(async () => { second.reply({ kind: 'accepted', txId: 'TX-OK-2', committed: true }); });
+    await queueDrained();
+
+    expect(http.all.some(u => u.body.includes(future.noteId))).toBe(false);
+    expect(vi.mocked(setSyncRecord).mock.calls.some(([r]) => r.noteId === future.noteId)).toBe(false);
   });
 });
 
