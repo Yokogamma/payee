@@ -3,6 +3,18 @@
 Both deploys are **manual** (`workflow_dispatch`) so nothing auto-publishes on
 merge. Reader-before-writer ordering is operator-driven.
 
+> **Contour reclassified 2026-08-20 (operator decision).**
+> `notes.matamata.dev` is the **working (dev) contour**, not production. The
+> real production will be provisioned **from scratch** on a `.app` domain when
+> v1 is declared ready; nothing from the current contour — data, wallets,
+> secrets, floor tags — is carried over. The deploy workflows are named
+> `… — dev` accordingly; future production workflows will be `… — production`.
+>
+> Historical entries below that say "production"/"PRODUCTION" are left
+> untouched on purpose: at the time of writing this contour *was* the
+> production, and rewriting the records would destroy the audit trail. Read
+> them as history. Active instructions in this runbook operate the dev contour.
+
 > **Legacy GitHub Pages target retired 2026-08-20 (operator decision).**
 > `.github/workflows/deploy.yml` («Deploy to GitHub Pages (legacy)») is deleted.
 > The cutover to Cloudflare Pages is complete, and GitHub Pages could never

@@ -1,11 +1,12 @@
-name: Deploy Worker (proxy)
+name: Deploy Worker (proxy) — dev
 
+# Deploys the WORKING (dev) contour worker (contour reclassified 2026-08-20;
+# the future production gets its own `… — production` workflow, never this one).
 # Manual trigger, intentionally decoupled from the client deploys so the
 # operator controls the sequence (authoritative order: docs/ROLLBACK.md).
-#   FIRST rollout of the recovery protocol:  recovery-aware CLIENT on the legacy
-#   GitHub Pages origin → THEN this Worker → smoke → Cloudflare Pages. Running
-#   this Worker against pre-recovery clients opens the duplicate-paid-TX window.
-#   Subsequent compatible releases: Worker → smoke → Pages (reader-before-writer).
+#   Release order: Worker → smoke → Pages (reader-before-writer). The first
+#   recovery-protocol rollout used a special order — recorded in ROLLBACK.md
+#   as history; the legacy GitHub Pages origin is retired.
 # NOTE: a workflow_dispatch workflow must already exist on the default branch
 # before it can be run from the Actions UI, so land this file in main FIRST
 # (both deploys here are manual, so merging does not auto-publish anything).

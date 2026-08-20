@@ -1,16 +1,16 @@
-name: Deploy to Cloudflare Pages
+name: Deploy to Cloudflare Pages — dev
 
-# Migration target (Phase 3 runbook). Unlike GitHub Pages, Cloudflare Pages
-# parses dist/_headers, so the generated CSP + security headers are actually
-# applied to responses. Builds at root base (VITE_BASE=/).
+# Deploys the client of the WORKING (dev) contour to Cloudflare Pages (contour
+# reclassified 2026-08-20; the future production gets its own `… — production`
+# workflow, never this one). Cloudflare Pages parses dist/_headers, so the
+# generated CSP + security headers are actually applied to responses. Builds at
+# root base (VITE_BASE=/).
 #
 # Manual trigger; ordering is operator-driven (authoritative: docs/ROLLBACK.md).
-#   FIRST rollout of the recovery protocol:
-#     1. deploy the recovery-aware client to the LEGACY GitHub Pages origin,
-#     2. run "Deploy Worker (proxy)" and smoke-test it,
-#     3. then run THIS workflow to publish the client on Cloudflare Pages
-#        (ALLOWED_ORIGINS must already contain the Pages origin).
-#   Subsequent compatible releases: Worker → smoke → THIS workflow.
+#   Release order: "Deploy Worker (proxy) — dev" → smoke → THIS workflow
+#   (reader-before-writer). The first recovery-protocol rollout used a special
+#   order — recorded in ROLLBACK.md as history; the legacy GitHub Pages origin
+#   is retired.
 #   The header smoke-test (scripts/smoke-headers.mjs) runs against the URL after.
 #
 # Requires repo secrets:

@@ -24,13 +24,16 @@ new_sqlite_classes = ["IpRateLimiter"]
 binding = "ALLOWLIST"
 id = "8d9e7ee08bff44f793933d69718600ef"
 
-# Production origin: https://notes.matamata.dev (Cloudflare Pages custom
-# domain). The github.io origin stays until the legacy deployment is retired
-# (the FIRST recovery rollout deploys the client there first — see
-# docs/ROLLBACK.md). Do NOT wildcard preview domains (*.pages.dev change per
-# deploy) — they must not reach the prod CORS allowlist.
+# Client origin of the WORKING (dev) contour: https://notes.matamata.dev
+# (Cloudflare Pages custom domain). Reclassified from "production" to dev on
+# 2026-08-20 — the real production will be provisioned from scratch on a .app
+# domain later, as a separate contour with its own worker and allowlist.
+# The legacy github.io origin was retired AND unpublished on 2026-08-20
+# (PR #73 + Pages depublication, serves 404) — it must not return here.
+# Do NOT wildcard preview domains (*.pages.dev change per deploy) — they must
+# not reach the CORS allowlist.
 [vars]
-ALLOWED_ORIGINS = "https://notes.matamata.dev,https://yokogamma.github.io,http://localhost:5173"
+ALLOWED_ORIGINS = "https://notes.matamata.dev,http://localhost:5173"
 MAX_BODY_BYTES = "51200"
 RATE_LIMIT_PER_HOUR = "20"
 # v3 upload kill switch. STRICTLY "true" enables; anything else fails CLOSED
