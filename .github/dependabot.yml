@@ -29,9 +29,10 @@ version: 2
 # относятся только к version-updates (applies-to: version-updates), и это здесь
 # осознанно — фикс CVE не должен ждать своей еженедельной пачки.
 #
-# open-pull-requests-limit поднят с дефолтных 5: на момент правки все три
-# экосистемы упёрлись в лимит (5/5/5), и сгруппированному PR просто некуда
-# приехать, пока слоты не освободятся.
+# open-pull-requests-limit поднят с дефолтных 5 ВРЕМЕННО: на момент правки все
+# три экосистемы упёрлись в лимит (5/5/5), и сгруппированному PR просто некуда
+# приехать, пока слоты не освободятся. После разбора очереди (сгруппированные
+# PR приехали, старые закрыты) лимит возвращается к 5 отдельным PR.
 updates:
   # ── GitHub Actions ────────────────────────────────────────────────────
   # Actions are pinned to immutable commit SHAs; without this they would never
@@ -51,6 +52,13 @@ updates:
       actions-minor:
         patterns:
           - "*"
+        # wrangler-action — вне группы: checkout и setup-node прогоняет ci.yml
+        # на самом же PR Dependabot'а, а wrangler-action живёт только в
+        # workflow_dispatch-деплоях, которые CI не запускает — его бампы никто
+        # не проверяет автоматически. Отдельный PR = ручная сверка SHA↔тега
+        # и репетиция деплоя до мержа.
+        exclude-patterns:
+          - cloudflare/wrangler-action
         update-types:
           - minor
           - patch
@@ -113,6 +121,21 @@ updates:
         update-types:
           - minor
           - patch
+    # ПАРКОВКА МАЖОРНЫХ ЛИНИЙ — решение владельца от 2026-08-20, диапазоном,
+    # а не одним мажором (иначе выход TS 8 / Node 27 молча вернул бы PR):
+    #   typescript >=7   — typescript-eslint поддерживает TS <6.1, совместного
+    #                      переезда нет; обе половины репозитория обязаны
+    #                      переехать одновременно;
+    #   @types/node >=25 — типы обязаны совпадать с engines ^24 (.nvmrc).
+    # ВНИМАНИЕ: ignore глушит и security-обновления этих линий. Alert придёт,
+    # но автоматического fix-PR НЕ будет — увидеть alert, решить и обновить
+    # руками. Компенсирующий контроль — Dependabot alerts, которые обязаны
+    # быть включены ДО мержа этого файла.
+    ignore:
+      - dependency-name: typescript
+        versions: [">=7"]
+      - dependency-name: "@types/node"
+        versions: [">=25"]
 
   # ── Worker ────────────────────────────────────────────────────────────
   - package-ecosystem: npm
@@ -136,3 +159,11 @@ updates:
           - patch
     # @noble/ed25519 и arweave в worker'е не группируются: это проверка подписей
     # и протокол публикации — каждый своим PR.
+    #
+    # Та же парковка TS-мажора, что и у клиента: worker не должен уезжать на
+    # TS 7 в одиночку (для этого закрывается PR #8); выравнивание на ~5.9.x
+    # приедет через worker-tooling. Про заглушенные security-обновления линии —
+    # см. комментарий у корневого ignore.
+    ignore:
+      - dependency-name: typescript
+        versions: [">=7"]
