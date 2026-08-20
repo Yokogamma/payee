@@ -1172,12 +1172,19 @@ the failure instead of the operator meeting it on a preview build. Rollback is
 a redeploy of `client-qu1` — the feature disappears from the UI, and any record
 already written stays readable (an older client ignores the key).
 
-### Acceptance so far — Android, and what it cost
+### Acceptance — Android, the cause, and what it cost
 
-**OnePlus 12 (Android), 2026-08-19 — SETUP FAILED: the credential was created,
-the platform then returned no PRF.** The capability probes had said «go
-ahead» — which is exactly the case §3 predicts and the reason the design treats
-a real ceremony, not a probe, as the only authority.
+**RESOLVED 2026-08-20 (tag `client-qu2-hotfix1`): quick unlock works on the
+OnePlus 12 and on a Windows PC with a fingerprint reader.** The cause was
+`residentKey`. Read the rest of this section before touching that setting
+again — it is the only thing standing between this feature and «works
+everywhere except Android».
+
+**How it started. OnePlus 12 / Android 16 / installed PWA, 2026-08-19 — SETUP
+FAILED: the credential was created, the platform then returned no PRF.** The
+capability probes had said «go ahead» — which is exactly the case §3 predicts
+and the reason the design treats a real ceremony, not a probe, as the only
+authority.
 
 Two defects surfaced with it, and the second was the serious one:
 
@@ -1201,22 +1208,58 @@ rewritten without jargon, each line ending in what the reader can DO.
 restart the button returns and one more orphaned credential can be created.
 Persisting it needs a new meta key and was not added silently.
 
-**Cause on this device: NOT ESTABLISHED.** «OnePlus 12» alone does not settle
-it — on Android, PRF depends on which provider actually created the passkey and
-on the browser build, not on the handset. Two checks settle it in a minute:
-the Chrome version (`chrome://version`; `getClientCapabilities` needs 133+, and
-below that the probe answers `'unknown'` rather than lying), and which passkey
-provider is selected (Settings → Passwords & accounts → the passkey/autofill
-provider — Google Password Manager implements hmac-secret, a third-party or
-vendor provider may not). Until one of those is known, record this as «this
-combination does not deliver PRF», NOT as «Android does not».
+**THE CAUSE: `residentKey: 'discouraged'`.** Changed to `'preferred'` in
+`1a90c13` (PR #65); the retry on the same device succeeded. One variable
+changed, the symptom went away — that is as close to proof as a single device
+gets, and it is enough to treat the setting as the cause.
 
-**Still outstanding after this deploy:** the §13 device matrix has NOT been run
-— iPhone (Safari and the installed PWA separately), Android (Chrome and PWA),
-a Windows Hello laptop in Chrome AND Edge, and separately a machine WITHOUT
-KB5077181 where the honest «не поддерживается» must appear rather than a silent
-failure. Until it is, «it works» is known only for whatever device the operator
-happened to try.
+**The MECHANISM is still inference, and the distinction matters.** An earlier
+version of this section claimed a missing PRF is «the signature» of a
+non-discoverable credential. It is not: CTAP requires `hmac-secret` support for
+discoverable and non-discoverable credentials alike, and `'preferred'` may
+still yield a plain server-side credential. What is likely happening is
+ROUTING — on Android the request goes to different credential providers, and
+what you ask for influences which one takes it; `'discouraged'` can steer away
+from the provider that implements `hmac-secret`. We did NOT read
+`credProps.rk` on the successful run, so «it is now discoverable» is an
+assumption, not an observation. `credProps: true` is requested and logged on
+both no-PRF paths (`33c874f`), so the next failure anywhere will say more.
+
+**The price, accepted knowingly:** the key is now visible in the system
+password manager and, on a syncing provider, synced. It can therefore be
+deleted by hand — which §2 already covers: losing it costs only the
+accelerator, never the data.
+
+**Do not «tidy» this back to `'discouraged'`.** The original rationale («do not
+clutter the passkey list, lower the chance of an accidental deletion») reads
+perfectly sensible and was written on the assumption that the choice was free.
+It is not. That assumption cost one failed acceptance, two UI defects and three
+releases to unwind.
+
+### §13 device matrix — where it actually stands (2026-08-20)
+
+| Platform | Result |
+|---|---|
+| Android — OnePlus 12 / Android 16 / installed PWA | **PASS**, after `residentKey: 'preferred'` |
+| Windows PC, fingerprint | **PASS** |
+| iPhone — Safari | not run |
+| iPhone — installed PWA (its own IndexedDB; configure again there) | not run |
+| Windows Hello laptop — Edge specifically | not run |
+| A machine WITHOUT KB5077181 — must say «не поддерживается», not fail silently | not run |
+| macOS Safari (optional second Keychain) | not run |
+
+The two passes are real and they cover the platform that was broken. What they
+do NOT cover is the whole point of the remaining rows: iOS is a different
+WebKit/Keychain path entirely, Edge is a different WebAuthn client from Chrome
+on the same OS, and the no-KB5077181 machine is the only way to see whether the
+HONEST refusal appears rather than a silent failure — the one behaviour the
+support matrix cannot predict and the tests cannot exercise.
+
+Scenario coverage on the two passing devices is also partial: the end-to-end
+list (setup at «Сразу» shows the explanation and no button; two tabs reconcile;
+removing the PIN removes quick unlock; 10 wrong PINs remove both; reset removes
+the record; refusing an «another device» offer leaves the record intact;
+airplane mode) has not been walked through and reported.
 
 ### Bundle budget — worth watching now
 
