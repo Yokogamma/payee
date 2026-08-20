@@ -13,7 +13,8 @@
 - Cryptography: Web Crypto AES-256-GCM, BIP-39 via `@scure/bip39`, Ed25519 via `@noble/ed25519`, PIN wrapping with Argon2id via `hash-wasm`.
 - Remote persistence: Arweave through a Cloudflare Worker proxy.
 - Worker: Cloudflare Workers, TypeScript 5.8, Wrangler 4, Vitest 4 with `@cloudflare/vitest-pool-workers`.
-- Supported Node.js: 22.13.0 or >=24; `.nvmrc` pins 22.13.0.
+- Supported Node.js: the 24 LTS line only (`engines: ^24.19.0`, enforced by `engine-strict=true` in both `.npmrc` files — a wrong Node fails `npm ci` instead of printing a warning); `.nvmrc` pins 24.19.0.
+- Install scripts (npm ≥11 `allowScripts`): only `esbuild` and `workerd` may run postinstall, approved UNPINNED in the respective `package.json` — exact versions are already pinned by the lockfiles, and pinned approvals would break CI on every routine bump. Any OTHER package's install script stays blocked until explicitly approved via `npm approve-scripts`.
 
 ## Architecture And Security Review Focus
 

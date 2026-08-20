@@ -6,7 +6,10 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // `.claude/worktrees/` holds session git-worktree COPIES of this repo:
+  // linting them double-reports every finding against stale snapshots and
+  // breaks a clean local `npm run lint` (CI never has them).
+  globalIgnores(['dist', '.claude']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [
