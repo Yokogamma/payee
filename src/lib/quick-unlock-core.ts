@@ -318,9 +318,10 @@ export async function createPrfCredential(opts: {
           //
           // What is FACT: a OnePlus 12 / Android 16 installed PWA created the
           // credential happily and then returned no PRF; after this change the
-          // same device works. What that does NOT establish is the mechanism —
-          // and note the successful run carried BOTH this change and the
-          // `credProps` request below, so it was not a single-variable test.
+          // same device works. What that does NOT establish is the mechanism:
+          // it was ONE success, on ONE device, with neither the browser build
+          // nor the selected credential provider recorded — and those are the
+          // two things that actually decide PRF availability on Android.
           //
           // What is NOT fact, and what an earlier version of this comment
           // wrongly asserted: that a missing PRF is «the signature» of a
@@ -354,11 +355,13 @@ export async function createPrfCredential(opts: {
         timeout: CEREMONY_TIMEOUT_MS,
         extensions: {
           prf: { eval: { first: prfSalt as BufferSource } },
-          // Diagnostic only — never a decision input. `credProps.rk` is the
-          // one honest way to learn whether the credential we just created is
-          // actually discoverable, which is exactly the question the
-          // residentKey hypothesis above turns on. It is OPTIONAL by spec:
-          // absent means «the client did not say», not «no».
+          // Diagnostic only — never a decision input, and it cannot influence
+          // the ceremony even in principle: `credProps` is a CLIENT extension
+          // with no authenticator extension input and no authenticator
+          // processing (WebAuthn L3 §10.4), so it never reaches the
+          // authenticator. All it does is report `rk` back from the client —
+          // which is exactly the question the residentKey note above turns on.
+          // OPTIONAL by spec: absent means «the client did not say», not «no».
           credProps: true,
         },
       } as PublicKeyCredentialCreationOptions,

@@ -1172,7 +1172,7 @@ the failure instead of the operator meeting it on a preview build. Rollback is
 a redeploy of `client-qu1` — the feature disappears from the UI, and any record
 already written stays readable (an older client ignores the key).
 
-### Acceptance — Android, the cause, and what it cost
+### Acceptance — Android, the workaround, and what it cost
 
 **UNBLOCKED 2026-08-20 (tag `client-qu2-hotfix1`): quick unlock works on the
 OnePlus 12 (installed PWA) and on one Windows PC with a fingerprint reader.**
@@ -1213,12 +1213,17 @@ Persisting it needs a new meta key and was not added silently.
 succeeded. That is a working hypothesis confirmed on THIS combination, and the
 wording matters, because two things stop it short of a diagnosis:
 
-1. **The successful run was not a single-variable experiment.** By the time it
-   happened, the deployed build carried BOTH the `residentKey` change AND
-   `credProps: true` (`33c874f`, PR #66). `credProps` is itself a request
-   extension, so it cannot be ruled out as an influence on which provider took
-   the request. Nobody re-tested with one change at a time, and nobody needs
-   to — but the record should not pretend otherwise.
+1. **One success, on one unrecorded configuration.** A single retry on a single
+   device, and neither the browser build nor the selected credential provider
+   was written down — the two things that actually decide whether PRF is
+   available on Android. Repeatable ≠ explained.
+
+   (An earlier version of this list also called `credProps: true` a second
+   variable that might have influenced provider routing. That was wrong:
+   `credProps` is a CLIENT registration extension — it has no authenticator
+   extension input and no authenticator processing at all, so it cannot reach
+   the authenticator, let alone steer which provider takes the request. It
+   only reports `rk` back from the client. See WebAuthn L3 §10.4.)
 2. **The mechanism was never observed.** An earlier version of this section
    claimed a missing PRF is «the signature» of a non-discoverable credential.
    It is not: CTAP requires `hmac-secret` support for discoverable and
