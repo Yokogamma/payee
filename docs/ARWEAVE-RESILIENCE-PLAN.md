@@ -1,14 +1,15 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v7 — пятый раунд ревью учтён** (ревью 5 по v6: 1 high + 2 medium +
-1 low — все приняты; главное: single-alarm scheduler с CAS для `signed`,
-нормативная verdict-таблица alarm-прогона, программный hash-барьер cold-flow,
-поправка лимита SQLite-backed DO). История: v6 — формула dead-кворума,
-bounded `signed`, логические индексы, cold-flow, CORS `/raw`; v5 — решения
-владельца + живые пробы, D7 утверждён (§2.1); v4 — три раунда ревью (ревью 1:
-2 critical + 6 high + 4 medium; ревью 2: 8; ревью 3: 3). Дата: 2026-08-20.
-Строится поверх задеплоенного инкрементального sweep (PR #53). Остаточные
-блокеры полной реализации — конец §8. Принцип: каждое спорное место — ОДНО
+Статус: **v8 — шестой раунд ревью учтён (план признан готовым целиком после
+двух уточнений)** (ревью 6 по v7: 1 high + 1 medium — оба приняты:
+`storage.transaction` как ЕДИНСТВЕННЫЙ механизм атомарности scheduler-мутаций
+и гарантированное alarm-reschedule при исключениях). История: v7 —
+single-alarm scheduler + CAS, verdict-таблица, программный hash-барьер, лимит
+SQLite-DO; v6 — формула dead-кворума, bounded `signed`, логические индексы,
+cold-flow, CORS `/raw`; v5 — решения владельца + живые пробы, D7 утверждён
+(§2.1); v4 — три раунда ревью (ревью 1: 2 critical + 6 high + 4 medium;
+ревью 2: 8; ревью 3: 3). Дата: 2026-08-20. Строится поверх задеплоенного
+инкрементального sweep (PR #53). Принцип: каждое спорное место — ОДНО
 нормативное решение без альтернатив.
 
 Документ адресован ревьюеру: фиксирует решения, объём, разбиение на PR,
@@ -430,24 +431,58 @@ reconciliation по кворуму статуса. Это снимает нео�
   изменение dueAt после прогона) завершается пересчётом min(dueAt) и
   `setAlarm(min)` — либо `deleteAlarm()`, когда signed-записей не осталось.
   Продвижение одной записи по построению НЕ отменяет reconciliation других.
-- **Атомарность (ревью 5):** создание `signed` = ОДНА атомарная группа:
-  запись `note:*` + `signedCount` + `dueAt` + `setAlarm`. `setAlarm` — тоже
-  storage-операция и входит в ту же группу (`storage.transaction` /
-  сериализация через `blockConcurrencyWhile`, как принято в InviteManager).
-  Crash «между» шагами невозможен по построению — тест с искусственным
-  разрывом обязан показать «всё или ничего».
+- **Атомарность (ревью 5, уточнено ревью 6 H1 — нормативно, БЕЗ
+  альтернатив):** ЕДИНСТВЕННЫЙ механизм crash-атомарности —
+  **`storage.transaction()`** SQLite-backed DO. Формулировка v7
+  «transaction / blockConcurrencyWhile» была ошибкой: `blockConcurrencyWhile`
+  лишь запрещает interleaving других событий, но несколько `await put()`
+  внутри него фиксируются ПО ОТДЕЛЬНОСТИ и crash между ними оставит частичное
+  состояние (в InviteManager он используется именно для сериализации, не для
+  атомарного коммита). Нормативно: КАЖДАЯ scheduler-мутация — создание
+  `signed`, переход вперёд, фаза-1 redrop — это один `storage.transaction`,
+  внутри которого через транзакционный контекст выполняются ВСЕ связанные
+  операции: `note:*`, `signedCount`, пересчёт min(dueAt) и
+  `setAlarm`/`deleteAlarm`. `blockConcurrencyWhile` как средство атомарности
+  из плана УДАЛЁН (для сериализации он остаётся допустим, но атомарность
+  доказывается только транзакцией). Тест с искусственным crash после каждого
+  storage-вызова обязан показать полный rollback («всё или ничего»).
 - **Alarm-обработчик:** выбирает записи с `dueAt <= now`, обрабатывает
   ПОСЛЕДОВАТЕЛЬНО (никаких параллельных resend), максимум **`ALARM_BATCH = 5`**
   записей за прогон — бюджет subrequests: ≤5 записей × (resend + ≤5
   status-хостов) в лимите Cloudflare; необработанные due-записи получают
-  немедленный re-alarm. Прогон завершается обязательным пересчётом
-  min(dueAt) + `setAlarm`, пока существует хоть одна signed-запись.
+  немедленный re-alarm.
+- **Отказоустойчивость обработчика (ревью 6 M1 — нормативно):**
+  - каждая due-запись обрабатывается в СОБСТВЕННОМ `try/catch` — исключение
+    одного gateway-запроса/записи логируется, запись получает reschedule с
+    backoff, обработка остальных записей batch-а ПРОДОЛЖАЕТСЯ;
+  - весь прогон обёрнут во внешний **`try/finally`**: `finally` ВСЕГДА
+    перечитывает backlog и ставит следующий alarm (`setAlarm(min(dueAt))` /
+    `deleteAlarm` при пустом) — даже если прогон упал до этой точки. Cloudflare
+    авто-ретраит упавший alarm-хендлер ограниченное число раз (~6 с
+    backoff), полагаться на это НЕЛЬЗЯ: перепланирование — обязанность
+    самого хендлера ДО возврата;
+  - сбой самого финального `setAlarm` не должен осиротить backlog:
+    ограниченный retry в `finally` + **self-healing инвариант** — на входе
+    КАЖДОГО DO-запроса (`/check-and-reserve`, `/upload`-recheck и т.д.):
+    если `signedCount > 0`, а alarm не установлен (`getAlarm() === null`) —
+    восстановить `setAlarm(min(dueAt))`. Триггер (а) reconciliation тем
+    самым чинит расписание даже после исчерпания всех platform retry.
 - **CAS после КАЖДОГО внешнего await (ревью 5):** перед применением перехода
   запись перечитывается; переход применяется ТОЛЬКО при совпадении
   `{status:'signed', token, txId}` с тем, что было прочитано до сетевого
   вызова. Не совпало (запись продвинул конкурентный recheck или другой
-  прогон) — результат ОТБРАСЫВАЕТСЯ без записи. Redrop-ветка — под тем же
-  CAS внутри атомарной группы.
+  прогон) — результат ОТБРАСЫВАЕТСЯ без записи.
+- **Redrop — ЯВНО двухфазный (ревью 6):** подпись и сеть НИКОГДА не
+  выполняются внутри storage transaction. Фаза 1 — атомарный
+  `storage.transaction`: CAS-проверка `{status:'signed', token, txId}` +
+  кворум-вердикт dead + age guard уже получены → запись переводится в
+  redrop-состояние (новый `gen`/token, слот signed освобождён:
+  `signedCount--`, пересчёт alarm). Фаза 2 — ВНЕ транзакции: создание и
+  подписание новой транзакции, которая входит в жизненный цикл штатным путём
+  «создание `signed`» (своя транзакция фазы 1 нового цикла). Crash между
+  фазами безопасен: состояние уже redrop, повторный проход просто выполнит
+  фазу 2 заново — вторая подпись легальна ТОЛЬКО здесь, после доказанного
+  dead.
 - **Вердикты alarm-прогона (ревью 5 M1) — нормативная таблица («не-alive»
   из v6 упразднено как смешение трёх исходов):**
 
@@ -457,7 +492,7 @@ reconciliation по кворуму статуса. Это снимает нео�
   | `pending` | reschedule (экспоненциальный backoff с потолком) |
   | `unavailable` | reschedule (backoff) |
   | `dead`, age guard НЕ пройден | reschedule |
-  | `dead` + age guard пройден | атомарная redrop-ветка под CAS — ЕДИНСТВЕННОЕ место новой подписи |
+  | `dead` + age guard пройден | двухфазный redrop (см. выше): фаза 1 — CAS-переход в транзакции; фаза 2 — новая подпись ВНЕ транзакции. ЕДИНСТВЕННОЕ место новой подписи |
 
 - **Reader-релиз (floor) обязан нести ВЕСЬ scheduler-контракт** — dueAt,
   signedCount, alarm-обработчик, CAS, verdict-таблицу — а не только чтение
@@ -481,7 +516,8 @@ reconciliation по кворуму статуса. Это снимает нео�
 
 1. **Reader-релиз:** Worker умеет безопасно ЧИТАТЬ/резюмировать `signed`
    (реконсиляция, resend) И несёт ПОЛНЫЙ scheduler-контракт (dueAt,
-   signedCount, alarm-обработчик, CAS, verdict-таблица — ревью 5), но ещё НЕ
+   signedCount, alarm-обработчик, CAS, verdict-таблица — ревью 5; включая
+   транзакционную схему и self-healing alarm — ревью 6), но ещё НЕ
    создаёт `signed`. Совместим со старыми клиентами (новых обязательных
    полей запроса нет — resume полностью server-side).
 2. **Writer-релиз:** начинает создавать `signed`. После него — **hard
@@ -518,6 +554,15 @@ reconciliation по кворуму статуса. Это снимает нео�
   `unavailable`, `dead` ДО age guard (все → reschedule) и `dead` ПОСЛЕ age
   guard (→ redrop); due-записей больше `ALARM_BATCH` → остаток получает
   немедленный re-alarm;
+- **атомарность/отказоустойчивость (ревью 6):** искусственный crash после
+  КАЖДОГО storage-вызова внутри транзакции → полный rollback;
+  статический/ревью-гейт: `blockConcurrencyWhile` нигде не используется как
+  замена транзакции; исключение на ПЕРВОЙ записи batch-а не мешает обработке
+  остальных и перепланированию; серия ошибок длиннее шести platform retry —
+  будущий alarm сохраняется (finally + self-healing на входе запросов);
+  ошибка финального `setAlarm` → backlog не сирота (ретрай + восстановление
+  при следующем DO-запросе); двухфазный redrop НЕ держит storage transaction
+  во время подписи или сетевых вызовов;
 - **откат writer→reader-floor при НЕСКОЛЬКИХ запланированных signed** —
   reader продолжает scheduler-обработку всех;
 - reservation/recovery/quota-инварианты не регрессируют.
@@ -767,8 +812,9 @@ BFCache-lifecycle; форматы v1–v4.
 рискованный кусок (state machine DO, два последовательных Worker-релиза с
 floor, платные staging-испытания) и не должен задерживать автотриггеры.
 
-1. PR-1: ADR + этот план v7 (D7 утверждён — §2.1; формула кворума и
-   логические источники — v6; scheduler `signed` и hash-барьер — v7).
+1. PR-1: ADR + этот план v8 (D7 утверждён — §2.1; формула кворума и
+   логические источники — v6; scheduler `signed` и hash-барьер — v7;
+   transaction-атомарность и alarm-fault-tolerance — v8).
 2. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
 3. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
 4. Multi-index union с conflict/null-height политикой (PR-4).
@@ -819,30 +865,34 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v7)
+## 8. Карта соответствия (статус v8)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready** после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
 | PR-3a read | ready (D7 §2.1 + формула кворума v6) | строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | спецификация ЗАВЕРШЕНА v7; ждёт своей очереди (§6 п.6) | single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + `signedCount` cap (H2 ревью 4), `signed` не подлежит release/TTL (ревью 3), reader-floor несёт scheduler (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | **спецификация ЗАВЕРШЕНА v8** (ревью 6: план готов целиком); ждёт своей очереди (§6 п.6) | `storage.transaction`-атомарность + try/finally + self-healing alarm + двухфазный redrop (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed` не подлежит release/TTL (ревью 3), reader-floor несёт scheduler (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky | логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
 | PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
 
-**Остаточные блокеры к полной реализации:** только реализационные — (1)
-PR-3b: scheduler+CAS+cap по v7 и reader-before-writer floor; (2) PR-3a/4:
-формула кворума и логические источники по v6; (3) PR-5: исполнение
-cold-flow контракта (генерация команд-блоков скриптом публикации) + CORS в
-acceptance. Спецификационных блокеров НЕ осталось; открытым в D7 остаётся
-только `UPLOAD_GATEWAYS` — утверждается по staging-испытаниям в PR-3b.
-**PR-1 и PR-2 можно начинать** (вердикт ревью 4, подтверждён ревью 5);
-спецификации PR-3a и PR-4 признаны готовыми ревью 5.
+**Спецификационных блокеров НЕ осталось — по вердикту ревью 6 план готов
+целиком.** Все оставшиеся пункты реализационные: (1) PR-3b: transaction-
+scheduler по v8 и reader-before-writer floor; (2) PR-3a/4: формула кворума и
+логические источники по v6; (3) PR-5: исполнение cold-flow контракта
+(генерация команд-блоков скриптом публикации) + CORS в acceptance. Открытым
+в D7 остаётся только `UPLOAD_GATEWAYS` — утверждается по staging-испытаниям
+в PR-3b. **PR-1 и PR-2 можно начинать**; спецификации PR-3a, PR-4 и PR-5
+признаны готовыми ревью 5–6.
 
 Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 — все 3;
 из ревью 4 (по v5) — все 5 (2 high: формула dead-кворума, bounded lifecycle
 `signed`; 3 medium: логическая топология индексов, терминальный cold-flow,
 CORS-замеры `/raw`); из ревью 5 (по v6) — все 4 (high: single-alarm
 scheduler + CAS; medium: verdict-таблица alarm-прогона, программный
-hash-барьер; low: лимит SQLite-backed DO = 2 MB, не 128 KiB).
+hash-барьер; low: лимит SQLite-backed DO = 2 MB, не 128 KiB); из ревью 6
+(по v7) — оба (high: `storage.transaction` — единственный механизм
+атомарности, `blockConcurrencyWhile` удалён как альтернатива; medium:
+try/finally + self-healing alarm-reschedule; плюс два уточнения из
+вопросов: изоляция исключений по записи, двухфазный redrop).
