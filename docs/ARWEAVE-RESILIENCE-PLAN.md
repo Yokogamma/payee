@@ -1,8 +1,13 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v9 — седьмой раунд ревью учтён** (ревью 7 по v8: 1 high — принят:
-durable-состояние `redrop_pending` scheduler-visible и в общем cap
-(`recoveryCount`); reader-floor возобновляет и его). История: v8 —
+Статус: **v10 — восьмой раунд ревью учтён** (ревью 8 по v9: 2 medium —
+приняты: «alarm никогда не подписывает» ограничено состоянием `signed`
+(фаза 2 `redrop_pending` — единственная alarm-driven подпись, CAS-победитель);
+durable-контракт фазы 2 — data/tags берутся из СОХРАНЁННОГО старого
+`signedTx`, сверенного с `deadTxId`; плюс уточнение из вопросов: «подпись
+ровно один раз» — на generation). История: v9 — durable `redrop_pending`
+scheduler-visible и в общем cap (`recoveryCount`), reader-floor возобновляет
+фазу 2 (ревью 7); v8 —
 `storage.transaction` как ЕДИНСТВЕННЫЙ механизм атомарности scheduler-мутаций
 и гарантированное alarm-reschedule при исключениях (ревью 6); v7 —
 single-alarm scheduler + CAS, verdict-таблица, программный hash-барьер, лимит
@@ -348,7 +353,11 @@ anchor+price запросы внутри SDK — из вызовов тольк�
 **Протокол (нормативный):**
 
 1. anchor и price можно переключать между шлюзами ДО подписания.
-2. Подпись создаётся РОВНО ОДИН раз → ровно один txId.
+2. Подпись создаётся РОВНО ОДИН раз **на generation** (уточнение v10, ревью
+   8): ровно один txId на весь период, пока кворум НЕ доказал dead этого
+   txId. Новая generation открывается ЕДИНСТВЕННЫМ путём — переходом
+   `signed → redrop_pending` (фаза 1, dead + age guard доказаны), и внутри
+   неё подпись снова ровно одна (CAS-победитель фазы 2).
 3. **Предусловие:** подписанная транзакция и её txId сохраняются в DO ДО
    первого POST. Потерянный ответ реконсилируем, а не повод для второй подписи.
 4. Failover POST = повторная отправка ТОГО ЖЕ сериализованного transaction с
@@ -498,20 +507,36 @@ reconciliation по кворуму статуса. Это снимает нео�
   1. **Фаза 1** — атомарный `storage.transaction`: CAS-проверка
      `{status:'signed', token, txId}` (кворум dead + age guard уже получены
      ВНЕ транзакции) → `signed → redrop_pending` (новый `gen`/token, поле
-     `deadTxId` для аудита, СВОЙ `dueAt` + backoff-`attempts`).
-     **Capacity НЕ освобождается** — `recoveryCount` не меняется; запись
-     остаётся scheduler-visible и в cap.
-  2. **Фаза 2** — ВНЕ транзакции: создание и подписание новой транзакции.
-     Затем атомарный CAS-переход `redrop_pending → signed` с НОВЫМ txId и
-     `signedTx` (транзакция «создание signed» штатного цикла;
-     `recoveryCount` не меняется — слот тот же). **POST нового tx разрешён
+     `deadTxId := txId` мёртвой транзакции, СВОЙ `dueAt` + backoff-`attempts`).
+     **Durable-источник для фазы 2 (ревью 8 M2 — нормативно): поле
+     `signedTx` при переходе СОХРАНЯЕТСЯ в записи** — старая подписанная
+     транзакция остаётся ЕДИНСТВЕННЫМ durable-источником encrypted payload
+     и тегов; ничего внешнего фазе 2 не нужно. **Capacity НЕ
+     освобождается** — `recoveryCount` не меняется; запись остаётся
+     scheduler-visible и в cap.
+  2. **Фаза 2** — ВНЕ транзакции, автономно (клиент не требуется):
+     (а) валидация сохранённого `signedTx`: парсится И его txId ===
+     `deadTxId` — иначе fail closed (ниже); (б) **data и tags извлекаются из
+     сохранённого `signedTx` и переносятся в новую транзакцию БЕЗ
+     изменений** (тот же конверт, тот же Note-Id/App-Version — envelope
+     не пересобирается); новые только anchor и reward (transport adapter
+     PR-2); (в) подпись; (г) атомарный CAS-переход `redrop_pending → signed`
+     с НОВЫМ txId и НОВЫМ `signedTx` (транзакция «создание signed» штатного
+     цикла; `recoveryCount` не меняется — слот тот же; старый `signedTx`
+     замещается, `deadTxId` остаётся для аудита). **POST нового tx разрешён
      ТОЛЬКО ПОСЛЕ durable-коммита нового `signed`** (инвариант «сначала
      запись, потом сеть» сохраняется и здесь).
-  3. Ошибка/crash фазы 2 → запись остаётся `redrop_pending`, получает
-     backoff-`dueAt` и новый alarm (finally/self-healing её видят через
-     `recoveryCount`); повторный прогон повторяет фазу 2. Конкурентные
-     попытки фазы 2 разрешаются CAS-ом — сохраняется и отправляется только
-     победитель.
+  3. Ошибка/crash фазы 2 → запись остаётся `redrop_pending` с НЕТРОНУТЫМ
+     старым `signedTx`, получает backoff-`dueAt` и новый alarm
+     (finally/self-healing её видят через `recoveryCount`); повторный прогон
+     повторяет фазу 2 из тех же durable-данных. Конкурентные попытки фазы 2
+     разрешаются CAS-ом — сохраняется и отправляется только победитель.
+  4. **Порча сохранённого `signedTx` в `redrop_pending`** (не парсится /
+     txId ≠ `deadTxId`) → автономная фаза 2 НЕВОЗМОЖНА, fail closed: слот
+     не освобождается, подпись из мусора не создаётся; лог + метрика.
+     Восстановление — только клиентский триггер (а): повторный `/upload`
+     этого noteId несёт data в теле запроса и реконсилируется под тем же
+     CAS/generation-правилом.
   Вторая подпись легальна ТОЛЬКО в фазе 2, после доказанного dead в фазе 1.
 - **Вердикты alarm-прогона (ревью 5 M1) — нормативная таблица («не-alive»
   из v6 упразднено как смешение трёх исходов):**
@@ -574,7 +599,10 @@ reconciliation по кворуму статуса. Это снимает нео�
 - **порча `signedTx`** (байты не парсятся / не сходятся с txId) → fail
   closed: ни resend мусора, ни новой подписи, ни авто-release; выход только
   через кворум (alive→posted / dead+age→redrop);
-- **DO alarm** повторяет ТОЛЬКО тот же txId (никогда не подписывает);
+- **DO alarm**: в состоянии `signed` — повторяет ТОЛЬКО тот же txId и
+  НИКОГДА не подписывает (поправка v10, ревью 8: формулировка v9 «никогда»
+  противоречила scheduler-driven фазе 2); подпись из alarm-прогона возможна
+  ЕДИНСТВЕННО в фазе 2 `redrop_pending` — и только у CAS-победителя;
   худший размер `signedTx` при `MAX_BODY_BYTES=51200` ≤ внутреннего предела
   ~75 KB;
 - **scheduler (ревью 5):** две и более signed-записи с разными `dueAt` —
@@ -605,6 +633,13 @@ reconciliation по кворуму статуса. Это снимает нео�
   `MAX_RECOVERY_INFLIGHT` получает `503`; конкурентные попытки фазы 2 →
   сохраняется и отправляется только CAS-победитель; POST нового tx
   невозможен до durable-коммита нового `signed`;
+- **источник данных фазы 2 (ревью 8):** alarm-driven подпись происходит
+  ИСКЛЮЧИТЕЛЬНО из `redrop_pending` (негативный тест: из `signed` — никогда);
+  crash-resume фазы 2 собирает новую tx из ОДНИХ durable-данных записи
+  (сохранённый `signedTx`) без участия клиента — data и tags новой tx
+  байт-в-байт совпадают со старой; сохранённый `signedTx` с txId ≠
+  `deadTxId` или непарсящийся → fail closed, автономной подписи нет,
+  клиентский `/upload` с телом реконсилирует;
 - **откат writer→reader-floor при НЕСКОЛЬКИХ запланированных signed** —
   reader продолжает scheduler-обработку всех;
 - reservation/recovery/quota-инварианты не регрессируют.
@@ -854,10 +889,11 @@ BFCache-lifecycle; форматы v1–v4.
 рискованный кусок (state machine DO, два последовательных Worker-релиза с
 floor, платные staging-испытания) и не должен задерживать автотриггеры.
 
-1. PR-1: ADR + этот план v9 (D7 утверждён — §2.1; формула кворума и
+1. PR-1: ADR + этот план v10 (D7 утверждён — §2.1; формула кворума и
    логические источники — v6; scheduler и hash-барьер — v7;
    transaction-атомарность и alarm-fault-tolerance — v8; durable
-   `redrop_pending` + `recoveryCount` — v9).
+   `redrop_pending` + `recoveryCount` — v9; generation-правило подписи и
+   durable-источник фазы 2 — v10).
 2. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
 3. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
 4. Multi-index union с conflict/null-height политикой (PR-4).
@@ -908,14 +944,14 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v9)
+## 8. Карта соответствия (статус v10)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready** после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
 | PR-3a read | ready (D7 §2.1 + формула кворума v6) | строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | **спецификация ЗАВЕРШЕНА v9**; ждёт своей очереди (§6 п.6) | durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | **спецификация ЗАВЕРШЕНА v10**; ждёт своей очереди (§6 п.6) | generation-правило подписи + durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky | логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
 | PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
@@ -943,4 +979,8 @@ try/finally + self-healing alarm-reschedule; плюс два уточнения 
 (по v8) — high принят целиком (durable `redrop_pending`: scheduler-visible,
 свой dueAt, в общем `recoveryCount`-cap, capacity не освобождается в фазе 1,
 POST только после durable-коммита нового `signed`, backoff при ошибке
-фазы 2; reader-floor возобновляет фазу 2).
+фазы 2; reader-floor возобновляет фазу 2); из ревью 8 (по v9) — оба medium
+(«alarm не подписывает» ограничено `signed` — фаза 2 `redrop_pending`
+единственная alarm-driven подпись; durable-источник фазы 2 — сохранённый
+старый `signedTx`, сверенный с `deadTxId`, data/tags переносятся без
+изменений) плюс gap-уточнение «подпись ровно один раз на generation».
