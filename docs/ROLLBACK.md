@@ -3,6 +3,23 @@
 Both deploys are **manual** (`workflow_dispatch`) so nothing auto-publishes on
 merge. Reader-before-writer ordering is operator-driven.
 
+> **Legacy GitHub Pages target retired 2026-08-20 (operator decision).**
+> `.github/workflows/deploy.yml` («Deploy to GitHub Pages (legacy)») is deleted.
+> The cutover to Cloudflare Pages is complete, and GitHub Pages could never
+> carry the security headers anyway: it ignores `_headers`, so the generated CSP
+> was **not** applied there. The only client deploy is now
+> `deploy-pages-cf.yml`; the only worker deploy is `deploy-worker.yml`.
+>
+> Historical entries below that mention `yokogamma.github.io` are left untouched
+> on purpose — they record what was true during those rollouts, and rewriting
+> them would destroy the audit trail. Read them as history, not as instructions.
+>
+> Open follow-up: `VITE_BASE` still defaults to `/payee/` (`vite.config.ts`,
+> `scripts/postbuild.mjs`) — the base of the retired target. Both deploy paths
+> pass `VITE_BASE=/` explicitly, so nothing is broken today, but a build run
+> without the variable now produces artefacts for a target that no longer
+> exists. Flipping the default is a separate decision.
+
 ## FIRST rollout of the recovery protocol — CLIENT BEFORE WORKER
 
 > **Operator override (decided 2026-07-22, executed 2026-07-23): WORKER-FIRST for
