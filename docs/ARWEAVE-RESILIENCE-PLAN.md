@@ -1,9 +1,10 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v8 — шестой раунд ревью учтён (план признан готовым целиком после
-двух уточнений)** (ревью 6 по v7: 1 high + 1 medium — оба приняты:
+Статус: **v9 — седьмой раунд ревью учтён** (ревью 7 по v8: 1 high — принят:
+durable-состояние `redrop_pending` scheduler-visible и в общем cap
+(`recoveryCount`); reader-floor возобновляет и его). История: v8 —
 `storage.transaction` как ЕДИНСТВЕННЫЙ механизм атомарности scheduler-мутаций
-и гарантированное alarm-reschedule при исключениях). История: v7 —
+и гарантированное alarm-reschedule при исключениях (ревью 6); v7 —
 single-alarm scheduler + CAS, verdict-таблица, программный hash-барьер, лимит
 SQLite-DO; v6 — формула dead-кворума, bounded `signed`, логические индексы,
 cold-flow, CORS `/raw`; v5 — решения владельца + живые пробы, D7 утверждён
@@ -357,7 +358,9 @@ anchor+price запросы внутри SDK — из вызовов тольк�
 **Нормативная state machine DO (ревью 2 H2, ревью 3):**
 
 Текущий lifecycle `reserved → posted → committed` (reserved TTL 10 мин)
-расширяется до `reserved → signed → posted → committed`.
+расширяется до `reserved → signed → posted → committed`, плюс durable
+side-состояние **`redrop_pending`** (v9): петля `signed → redrop_pending →
+signed(новый txId)` — единственный путь второй подписи (детали ниже).
 
 **Storage-контракт `signed` (ревью 4 H2 — нормативно, без альтернатив):**
 
@@ -393,6 +396,7 @@ reconciliation по кворуму статуса. Это снимает нео�
 |---|---|
 | `reserved`, подписи ещё нет | обычный TTL-expire → свободный слот, дубля нет |
 | `signed` (любой под-случай) | **release/TTL ЗАПРЕЩЕНЫ**; только resend того же txId + reconciliation по кворуму → при alive записать `posted` |
+| `redrop_pending` (v9: фаза 2 не завершена — crash/ошибка между фазами) | **release/TTL ЗАПРЕЩЕНЫ**; scheduler-visible, backoff + alarm → повторить фазу 2 (новая подпись легальна: dead старого txId уже доказан в фазе 1) |
 | `posted` | как сегодня: кворум alive→commit, dead→redrop (новая подпись только тут) |
 | `committed` | идемпотентный happy-path |
 
@@ -404,11 +408,16 @@ reconciliation по кворуму статуса. Это снимает нео�
   storage/cost DoS. Часовое окно для этого НЕ годится: `count/inFlight/attempts`
   обнуляются при смене окна (`rate-limiter.ts:65–71`, проверено) — заброшенные
   `signed` пережили бы сброс неучтёнными. Поэтому отдельный persistent-счётчик
-  `signedCount` в DO (инвариант: равен числу `note:*` со `status='signed'`;
-  меняется в тех же атомарных транзакциях, что и записи). Cap нормативно:
-  **`MAX_SIGNED_INFLIGHT = quotaLimit`** (часовая квота пользователя). При
-  достижении cap новый upload отклоняется **ДО подписания** (`503`,
-  retryable) — подписей сверх границы не существует по построению.
+  **`recoveryCount`** в DO (поправка v9, ревью 7: НОРМАТИВНО ОДИН счётчик на
+  ОБА recovery-состояния — инвариант: равен числу `note:*` со `status ∈
+  {'signed','redrop_pending'}`; меняется в тех же атомарных транзакциях, что
+  и записи; `signedCount` из v6–v8 переименован и расширен — иначе
+  `signedCount--` в фазе 1 redrop открывал бы новые upload-ы при
+  накоплении зависших redrop-записей, возвращая storage/cost DoS). Cap
+  нормативно: **`MAX_RECOVERY_INFLIGHT = quotaLimit`** (часовая квота
+  пользователя). При достижении cap новый upload отклоняется **ДО
+  подписания** (`503`, retryable) — подписей сверх границы не существует по
+  построению.
 - **Reconciliation — сервер-инициированная, два триггера (ревью 4 H2):**
   (а) как сегодня — любой `/upload`/recheck этого noteId; (б) DO alarm через
   scheduler ниже. Клиент, который никогда не повторит запрос, больше не
@@ -422,14 +431,18 @@ reconciliation по кворуму статуса. Это снимает нео�
 записи, а завершение одной ноты отменяло бы reconciliation остальных.
 Нормативная модель — один persistent scheduler на DO:
 
-- **`dueAt` живёт В САМОЙ signed-записи** (поле, см. storage-контракт) вместе
-  с `attempts`; отдельной очереди-структуры нет — источником расписания
-  являются сами записи. Backlog ограничен `MAX_SIGNED_INFLIGHT`, поэтому
-  выбор min(dueAt) перебором `signed`-записей — O(cap), приемлемо.
-- **Глобальный alarm всегда = min(dueAt) по всем записям `status='signed'`.**
-  ЛЮБАЯ мутация множества signed-записей (создание, переход вперёд, redrop,
+- **Scheduler-visible множество (поправка v9, ревью 7) = записи со
+  `status ∈ {'signed','redrop_pending'}`** («recovery-записи»). Везде ниже,
+  где v7–v8 говорили «signed-записи», нормативно читается это множество —
+  промежуточное redrop-состояние НЕ выпадает из расписания.
+- **`dueAt` живёт В САМОЙ recovery-записи** (поле, см. storage-контракт)
+  вместе с `attempts`; отдельной очереди-структуры нет — источником
+  расписания являются сами записи. Backlog ограничен `MAX_RECOVERY_INFLIGHT`,
+  поэтому выбор min(dueAt) перебором recovery-записей — O(cap), приемлемо.
+- **Глобальный alarm всегда = min(dueAt) по всем recovery-записям.**
+  ЛЮБАЯ мутация их множества (создание, переход вперёд, обе фазы redrop,
   изменение dueAt после прогона) завершается пересчётом min(dueAt) и
-  `setAlarm(min)` — либо `deleteAlarm()`, когда signed-записей не осталось.
+  `setAlarm(min)` — либо `deleteAlarm()`, когда recovery-записей не осталось.
   Продвижение одной записи по построению НЕ отменяет reconciliation других.
 - **Атомарность (ревью 5, уточнено ревью 6 H1 — нормативно, БЕЗ
   альтернатив):** ЕДИНСТВЕННЫЙ механизм crash-атомарности —
@@ -439,10 +452,10 @@ reconciliation по кворуму статуса. Это снимает нео�
   внутри него фиксируются ПО ОТДЕЛЬНОСТИ и crash между ними оставит частичное
   состояние (в InviteManager он используется именно для сериализации, не для
   атомарного коммита). Нормативно: КАЖДАЯ scheduler-мутация — создание
-  `signed`, переход вперёд, фаза-1 redrop — это один `storage.transaction`,
-  внутри которого через транзакционный контекст выполняются ВСЕ связанные
-  операции: `note:*`, `signedCount`, пересчёт min(dueAt) и
-  `setAlarm`/`deleteAlarm`. `blockConcurrencyWhile` как средство атомарности
+  `signed`, переход вперёд, обе фазовые границы redrop — это один
+  `storage.transaction`, внутри которого через транзакционный контекст
+  выполняются ВСЕ связанные операции: `note:*`, `recoveryCount`, пересчёт
+  min(dueAt) и `setAlarm`/`deleteAlarm`. `blockConcurrencyWhile` как средство атомарности
   из плана УДАЛЁН (для сериализации он остаётся допустим, но атомарность
   доказывается только транзакцией). Тест с искусственным crash после каждого
   storage-вызова обязан показать полный rollback («всё или ничего»).
@@ -464,25 +477,42 @@ reconciliation по кворуму статуса. Это снимает нео�
   - сбой самого финального `setAlarm` не должен осиротить backlog:
     ограниченный retry в `finally` + **self-healing инвариант** — на входе
     КАЖДОГО DO-запроса (`/check-and-reserve`, `/upload`-recheck и т.д.):
-    если `signedCount > 0`, а alarm не установлен (`getAlarm() === null`) —
-    восстановить `setAlarm(min(dueAt))`. Триггер (а) reconciliation тем
-    самым чинит расписание даже после исчерпания всех platform retry.
+    если `recoveryCount > 0`, а alarm не установлен (`getAlarm() === null`) —
+    восстановить `setAlarm(min(dueAt))`. Счётчик покрывает и
+    `redrop_pending` (v9), поэтому зависшая фаза 2 тоже чинится. Триггер (а)
+    reconciliation тем самым восстанавливает расписание даже после
+    исчерпания всех platform retry.
 - **CAS после КАЖДОГО внешнего await (ревью 5):** перед применением перехода
   запись перечитывается; переход применяется ТОЛЬКО при совпадении
   `{status:'signed', token, txId}` с тем, что было прочитано до сетевого
   вызова. Не совпало (запись продвинул конкурентный recheck или другой
   прогон) — результат ОТБРАСЫВАЕТСЯ без записи.
-- **Redrop — ЯВНО двухфазный (ревью 6):** подпись и сеть НИКОГДА не
-  выполняются внутри storage transaction. Фаза 1 — атомарный
-  `storage.transaction`: CAS-проверка `{status:'signed', token, txId}` +
-  кворум-вердикт dead + age guard уже получены → запись переводится в
-  redrop-состояние (новый `gen`/token, слот signed освобождён:
-  `signedCount--`, пересчёт alarm). Фаза 2 — ВНЕ транзакции: создание и
-  подписание новой транзакции, которая входит в жизненный цикл штатным путём
-  «создание `signed`» (своя транзакция фазы 1 нового цикла). Crash между
-  фазами безопасен: состояние уже redrop, повторный проход просто выполнит
-  фазу 2 заново — вторая подпись легальна ТОЛЬКО здесь, после доказанного
-  dead.
+- **Redrop — ЯВНО двухфазный, через durable `redrop_pending` (ревью 6,
+  переписано в v9 по ревью 7 H1):** подпись и сеть НИКОГДА не выполняются
+  внутри storage transaction. Ошибка v8: фаза 1 освобождала слот
+  (`signedCount--`) и выводила запись из scheduler-видимости — crash или
+  падение фазы 2 оставляли «повторный проход» ничем не запланированным
+  (последняя запись могла снести alarm), а cap переставал считать зависшие
+  redrop-записи (вопрос ревью 7 про `recoveryCount` — да, нормативно один
+  счётчик, см. bounded backlog выше). Нормативно v9:
+  1. **Фаза 1** — атомарный `storage.transaction`: CAS-проверка
+     `{status:'signed', token, txId}` (кворум dead + age guard уже получены
+     ВНЕ транзакции) → `signed → redrop_pending` (новый `gen`/token, поле
+     `deadTxId` для аудита, СВОЙ `dueAt` + backoff-`attempts`).
+     **Capacity НЕ освобождается** — `recoveryCount` не меняется; запись
+     остаётся scheduler-visible и в cap.
+  2. **Фаза 2** — ВНЕ транзакции: создание и подписание новой транзакции.
+     Затем атомарный CAS-переход `redrop_pending → signed` с НОВЫМ txId и
+     `signedTx` (транзакция «создание signed» штатного цикла;
+     `recoveryCount` не меняется — слот тот же). **POST нового tx разрешён
+     ТОЛЬКО ПОСЛЕ durable-коммита нового `signed`** (инвариант «сначала
+     запись, потом сеть» сохраняется и здесь).
+  3. Ошибка/crash фазы 2 → запись остаётся `redrop_pending`, получает
+     backoff-`dueAt` и новый alarm (finally/self-healing её видят через
+     `recoveryCount`); повторный прогон повторяет фазу 2. Конкурентные
+     попытки фазы 2 разрешаются CAS-ом — сохраняется и отправляется только
+     победитель.
+  Вторая подпись легальна ТОЛЬКО в фазе 2, после доказанного dead в фазе 1.
 - **Вердикты alarm-прогона (ревью 5 M1) — нормативная таблица («не-alive»
   из v6 упразднено как смешение трёх исходов):**
 
@@ -492,13 +522,15 @@ reconciliation по кворуму статуса. Это снимает нео�
   | `pending` | reschedule (экспоненциальный backoff с потолком) |
   | `unavailable` | reschedule (backoff) |
   | `dead`, age guard НЕ пройден | reschedule |
-  | `dead` + age guard пройден | двухфазный redrop (см. выше): фаза 1 — CAS-переход в транзакции; фаза 2 — новая подпись ВНЕ транзакции. ЕДИНСТВЕННОЕ место новой подписи |
+  | `dead` + age guard пройден | двухфазный redrop (см. выше): фаза 1 — CAS `signed → redrop_pending` в транзакции (capacity не освобождается); фаза 2 — новая подпись ВНЕ транзакции → CAS `redrop_pending → signed`. ЕДИНСТВЕННОЕ место новой подписи |
 
 - **Reader-релиз (floor) обязан нести ВЕСЬ scheduler-контракт** — dueAt,
-  signedCount, alarm-обработчик, CAS, verdict-таблицу — а не только чтение
-  `signedTx`; иначе откат writer→reader оставил бы запланированные signed
-  без reconciliation. Reader отличается от writer ровно одним: НЕ создаёт
-  `signed`.
+  `recoveryCount`, alarm-обработчик, CAS, verdict-таблицу, **включая
+  возобновление `redrop_pending` (фаза 2, ревью 7)** — а не только чтение
+  `signedTx`; иначе откат writer→reader оставил бы запланированные
+  recovery-записи без reconciliation. Reader отличается от writer ровно
+  одним: НЕ создаёт НОВЫЙ `signed` для нового upload-а (возобновлять
+  существующие recovery-записи, включая фазу 2, он обязан).
 - **Истечение anchor:** подписанная tx с протухшим anchor (~50 блоков) на
   chain не попадёт. Пересоздание — только после подтверждения кворумом, что
   старый txId не alive. Это частный случай «доказанного окончательного
@@ -514,12 +546,13 @@ reconciliation по кворуму статуса. Это снимает нео�
 неизвестный, `release` умеет удалять только `reserved`. Прямой откат writer на
 текущий Worker потерял бы `signed` или дал дубль. Поэтому:
 
-1. **Reader-релиз:** Worker умеет безопасно ЧИТАТЬ/резюмировать `signed`
-   (реконсиляция, resend) И несёт ПОЛНЫЙ scheduler-контракт (dueAt,
-   signedCount, alarm-обработчик, CAS, verdict-таблица — ревью 5; включая
-   транзакционную схему и self-healing alarm — ревью 6), но ещё НЕ
-   создаёт `signed`. Совместим со старыми клиентами (новых обязательных
-   полей запроса нет — resume полностью server-side).
+1. **Reader-релиз:** Worker умеет безопасно ЧИТАТЬ/резюмировать `signed` И
+   `redrop_pending` (реконсиляция, resend, фаза 2 redrop — ревью 7) И несёт
+   ПОЛНЫЙ scheduler-контракт (dueAt, recoveryCount, alarm-обработчик, CAS,
+   verdict-таблица — ревью 5; транзакционная схема и self-healing alarm —
+   ревью 6), но ещё НЕ создаёт `signed` для новых upload-ов. Совместим со
+   старыми клиентами (новых обязательных полей запроса нет — resume
+   полностью server-side).
 2. **Writer-релиз:** начинает создавать `signed`. После него — **hard
    rollback floor** (`worker-rN`): откат ниже reader-релиза запрещён.
 3. Внешний `/upload`-контракт остаётся совместим со старыми клиентами.
@@ -534,9 +567,9 @@ reconciliation по кворуму статуса. Это снимает нео�
 - истёкший anchor → пересоздание только после кворума dead;
 - откат writer→reader-floor и старый клиент→новый Worker;
 - невозможность resend → fail closed ДО POST, ноль вторых транзакций;
-- **`signed` переживает quota-window reset** (счётчики окна обнулились —
-  запись и `signedCount` целы);
-- **cap:** `MAX_SIGNED_INFLIGHT` заброшенных `signed` → следующий upload
+- **`signed`/`redrop_pending` переживают quota-window reset** (счётчики окна
+  обнулились — записи и `recoveryCount` целы);
+- **cap:** `MAX_RECOVERY_INFLIGHT` заброшенных recovery-записей → следующий upload
   получает `503` ДО подписания; после reconciliation слоты освобождаются;
 - **порча `signedTx`** (байты не парсятся / не сходятся с txId) → fail
   closed: ни resend мусора, ни новой подписи, ни авто-release; выход только
@@ -546,8 +579,8 @@ reconciliation по кворуму статуса. Это снимает нео�
   ~75 KB;
 - **scheduler (ревью 5):** две и более signed-записи с разными `dueAt` —
   обе реконсилируются; продвижение одной НЕ снимает alarm остальных
-  (alarm исчезает только с последней signed-записью); искусственный crash
-  между записью `note:*`, `signedCount` и `setAlarm` → «всё или ничего»;
+  (alarm исчезает только с последней recovery-записью); искусственный crash
+  между записью `note:*`, `recoveryCount` и `setAlarm` → «всё или ничего»;
   alarm и обычный recheck конкурируют за один txId → ровно один переход
   (CAS); CAS отклоняет stale-результат alarm-прогона после
   `posted`/`committed`/redrop; отдельные тесты исходов `pending`,
@@ -563,6 +596,15 @@ reconciliation по кворуму статуса. Это снимает нео�
   ошибка финального `setAlarm` → backlog не сирота (ретрай + восстановление
   при следующем DO-запросе); двухфазный redrop НЕ держит storage transaction
   во время подписи или сетевых вызовов;
+- **`redrop_pending` (ревью 7):** crash сразу после `signed → redrop_pending`
+  (до подписи) → запись scheduler-visible, alarm стоит, фаза 2 выполняется
+  на следующем прогоне; ПОСЛЕДНЯЯ запись DO в `redrop_pending` НЕ сносит
+  alarm; ошибки фазы 2 дольше шести platform retry без входящих запросов →
+  reconciliation продолжается (self-healing по `recoveryCount`);
+  `redrop_pending` НЕ освобождает cap — upload сверх
+  `MAX_RECOVERY_INFLIGHT` получает `503`; конкурентные попытки фазы 2 →
+  сохраняется и отправляется только CAS-победитель; POST нового tx
+  невозможен до durable-коммита нового `signed`;
 - **откат writer→reader-floor при НЕСКОЛЬКИХ запланированных signed** —
   reader продолжает scheduler-обработку всех;
 - reservation/recovery/quota-инварианты не регрессируют.
@@ -812,9 +854,10 @@ BFCache-lifecycle; форматы v1–v4.
 рискованный кусок (state machine DO, два последовательных Worker-релиза с
 floor, платные staging-испытания) и не должен задерживать автотриггеры.
 
-1. PR-1: ADR + этот план v8 (D7 утверждён — §2.1; формула кворума и
-   логические источники — v6; scheduler `signed` и hash-барьер — v7;
-   transaction-атомарность и alarm-fault-tolerance — v8).
+1. PR-1: ADR + этот план v9 (D7 утверждён — §2.1; формула кворума и
+   логические источники — v6; scheduler и hash-барьер — v7;
+   transaction-атомарность и alarm-fault-tolerance — v8; durable
+   `redrop_pending` + `recoveryCount` — v9).
 2. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
 3. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
 4. Multi-index union с conflict/null-height политикой (PR-4).
@@ -865,26 +908,27 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v8)
+## 8. Карта соответствия (статус v9)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready** после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
 | PR-3a read | ready (D7 §2.1 + формула кворума v6) | строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | **спецификация ЗАВЕРШЕНА v8** (ревью 6: план готов целиком); ждёт своей очереди (§6 п.6) | `storage.transaction`-атомарность + try/finally + self-healing alarm + двухфазный redrop (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed` не подлежит release/TTL (ревью 3), reader-floor несёт scheduler (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | **спецификация ЗАВЕРШЕНА v9**; ждёт своей очереди (§6 п.6) | durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky | логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
 | PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
 
-**Спецификационных блокеров НЕ осталось — по вердикту ревью 6 план готов
-целиком.** Все оставшиеся пункты реализационные: (1) PR-3b: transaction-
-scheduler по v8 и reader-before-writer floor; (2) PR-3a/4: формула кворума и
-логические источники по v6; (3) PR-5: исполнение cold-flow контракта
-(генерация команд-блоков скриптом публикации) + CORS в acceptance. Открытым
-в D7 остаётся только `UPLOAD_GATEWAYS` — утверждается по staging-испытаниям
-в PR-3b. **PR-1 и PR-2 можно начинать**; спецификации PR-3a, PR-4 и PR-5
-признаны готовыми ревью 5–6.
+**Спецификационных блокеров НЕ осталось** (единственный HIGH ревью 7 —
+scheduler-невидимый redrop — закрыт durable-состоянием `redrop_pending` и
+единым `recoveryCount`-cap в v9). Все оставшиеся пункты реализационные:
+(1) PR-3b: transaction-scheduler по v8/v9 и reader-before-writer floor;
+(2) PR-3a/4: формула кворума и логические источники по v6; (3) PR-5:
+исполнение cold-flow контракта (генерация команд-блоков скриптом публикации)
++ CORS в acceptance. Открытым в D7 остаётся только `UPLOAD_GATEWAYS` —
+утверждается по staging-испытаниям в PR-3b. **PR-1 и PR-2 можно начинать**;
+спецификации PR-3a, PR-4 и PR-5 признаны готовыми ревью 5–6.
 
 Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 — все 3;
 из ревью 4 (по v5) — все 5 (2 high: формула dead-кворума, bounded lifecycle
@@ -895,4 +939,8 @@ hash-барьер; low: лимит SQLite-backed DO = 2 MB, не 128 KiB); из 
 (по v7) — оба (high: `storage.transaction` — единственный механизм
 атомарности, `blockConcurrencyWhile` удалён как альтернатива; medium:
 try/finally + self-healing alarm-reschedule; плюс два уточнения из
-вопросов: изоляция исключений по записи, двухфазный redrop).
+вопросов: изоляция исключений по записи, двухфазный redrop); из ревью 7
+(по v8) — high принят целиком (durable `redrop_pending`: scheduler-visible,
+свой dueAt, в общем `recoveryCount`-cap, capacity не освобождается в фазе 1,
+POST только после durable-коммита нового `signed`, backoff при ошибке
+фазы 2; reader-floor возобновляет фазу 2).
