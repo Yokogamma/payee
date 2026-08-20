@@ -31,6 +31,17 @@ interface Env {
    *  Deliberately NOT derived from ARWEAVE_JWK: wallet rotation must not
    *  invalidate outstanding tokens (they'd fail closed, blocking recovery). */
   RECOVERY_HMAC_SECRET: string;
+  /** GLOBAL upload kill switch — the incident lever (§1.9). Strictly "true"
+   *  enables; ANY other value (missing, garbage) fails CLOSED: EVERY /upload
+   *  (v1–v4, including rechecks and recovery reconciliation) gets
+   *  503 {code:'uploads_disabled'} right after the IP limiter, before the body
+   *  is even read. Unlike V3/V4 switches this stops the WHOLE flow: those gate
+   *  only their declared version, while v1/v2 traffic (legacy re-sends included)
+   *  would still reach the paid POST path. An emergency lever must be named
+   *  what it is — not be a side effect of the rate-limit parser rejecting "0".
+   *  Source of truth: wrangler.toml (dashboard overrides are emergency-only
+   *  and must be synced back to the repo immediately). */
+  UPLOADS_ENABLED?: string;
   /** Upload kill switch for App-Version=3 (versioned notes). Strictly "true"
    *  enables; ANY other value (missing, garbage) fails CLOSED — v3 uploads get
    *  503 {code:'v3_uploads_disabled'} after the IP limiter but BEFORE any
@@ -85,7 +96,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   // Capability surface: lets clients (and the operator runbook) verify what the
   // deployed worker accepts WITHOUT a paid probe. `versions` = accepted
-  // App-Versions; `v3Uploads`/`v4Uploads` mirror the kill switches. Clients
+  // App-Versions; `v3Uploads`/`v4Uploads` mirror the kill switches, `uploads`
+  // mirrors the GLOBAL incident lever (false = every version paused). Clients
   // resume a paused version only on ok===true AND that version's flag===true
   // AND versions includes it (the list describes the ACCEPTOR and still
   // contains the version while its gate is off).
@@ -93,6 +105,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return json({
       ok: true,
       versions: ['1', '2', '3', '4'],
+      uploads: uploadsEnabled(env),
       v3Uploads: v3UploadsEnabled(env),
       v4Uploads: v4UploadsEnabled(env),
     });
@@ -391,6 +404,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const ipBlock = await enforceIpLimit(request, env);
   if (ipBlock) return ipBlock;
 
+  // 0a. GLOBAL kill switch — the incident lever, checked before ANYTHING else
+  // (even body read): during e.g. a RECOVERY_HMAC_SECRET compromise the whole
+  // v1–v4 flow must stop, and the stop must not depend on the validity of any
+  // other config value. Deliberately 503, never 403 (the client reads 403 as
+  // "not registered" and drops its registration marker).
+  if (!uploadsEnabled(env)) {
+    return new Response(JSON.stringify({ code: 'uploads_disabled' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
   // 0. Strict config — fail CLOSED (503) rather than disabling a limit on NaN.
   const maxBytes = parsePositiveInt(env.MAX_BODY_BYTES);
   const quotaLimit = parsePositiveInt(env.RATE_LIMIT_PER_HOUR);
@@ -446,7 +471,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // one sent outside a recheck) must never silently degrade into a fresh paid
   // post — the referenced TX may be alive on-chain (duplicate + quota burn).
   if (hasRecoveryField && (!recoveryHint || !wantsRecheck)) {
-    return error('Invalid recovery token', 400);
+    // Structured {code} + human text, HTTP 400 preserved. Same pattern as
+    // v3_uploads_disabled: an old client sees a plain error, a new one can
+    // react to the code (terminal quarantine instead of endless recheck).
+    // The shared error() helper stays plain-text — changing it would change
+    // the shape of EVERY API error.
+    return recoveryInvalid();
   }
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
@@ -718,7 +748,9 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       const recoveryValid = await verifyRecovery(env, noteId, recoveryHint.txId, recoveryHint.postedAt, recoveryHint.token);
       if (!recoveryValid) {
         await safeRelease(reserveToken);
-        return error('Invalid recovery token', 400);
+        // Same structured body as the malformed-hint branch above: both
+        // "Invalid recovery token" responses must carry the SAME code.
+        return recoveryInvalid();
       }
       const live = await getTxStatusWorker(recoveryHint.txId);
       if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
@@ -847,9 +879,27 @@ function error(message: string, status: number): Response {
   return new Response(message, { status });
 }
 
+/** Both `Invalid recovery token` branches answer with THIS response: HTTP 400
+ *  plus a machine-readable {code} so a new client can distinguish an
+ *  invalidated recovery proof (→ terminal quarantine, §1.9) from a generic
+ *  error, while an old client still sees a 400 with readable text. */
+function recoveryInvalid(): Response {
+  return new Response(
+    JSON.stringify({ code: 'recovery_invalid', error: 'Invalid recovery token' }),
+    { status: 400, headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
 /** Anti-replay freshness: a real number within ±5 min (rejects NaN/non-number). */
 function isFreshTimestamp(ts: unknown): boolean {
   return typeof ts === 'number' && Number.isFinite(ts) && Math.abs(Date.now() - ts) <= 300_000;
+}
+
+/** GLOBAL upload kill switch (incident lever). STRICTLY "true" enables — a
+ *  missing, empty, or garbage value fails CLOSED (all uploads disabled).
+ *  See Env.UPLOADS_ENABLED. */
+function uploadsEnabled(env: Env): boolean {
+  return env.UPLOADS_ENABLED === 'true';
 }
 
 /** v3 upload kill switch. STRICTLY "true" enables — a missing, empty, or
