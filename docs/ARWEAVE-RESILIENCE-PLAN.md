@@ -1,12 +1,13 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v5 — вторая серия решений владельца (2026-08-19) + живые пробы
-шлюзов из среды с сетевым доступом; D7 УТВЕРЖДЁН** (§2.1). История: v4 — три
-раунда ревью (ревью 1: 2 critical + 6 high + 4 medium; ревью 2: 8; ревью 3:
-3 — все приняты). Дата: 2026-08-19. Строится поверх задеплоенного
-инкрементального sweep (PR #53). Остаточные блокеры полной реализации — конец
-§8. Принцип v4 сохранён: каждое спорное место — ОДНО нормативное решение без
-альтернатив.
+Статус: **v6 — четвёртый раунд ревью учтён** (ревью 4 по v5: 2 high + 3
+medium — все приняты; главное: точная формула dead-кворума, bounded lifecycle
+`signed`, логическая топология индексов, cold-download контракт, CORS-замеры
+`/raw`). История: v5 — решения владельца + живые пробы, D7 утверждён (§2.1);
+v4 — три раунда ревью (ревью 1: 2 critical + 6 high + 4 medium; ревью 2: 8;
+ревью 3: 3). Дата: 2026-08-20. Строится поверх задеплоенного инкрементального
+sweep (PR #53). Остаточные блокеры полной реализации — конец §8. Принцип:
+каждое спорное место — ОДНО нормативное решение без альтернатив.
 
 Документ адресован ревьюеру: фиксирует решения, объём, разбиение на PR,
 инварианты, тестовые сценарии и границы. Ключевое изменение v2: **PR-3
@@ -49,9 +50,10 @@ read-path.
 **Граница защиты (уточнение по ревью).** Инварианты выше и multi-index
 защищают от подмены и от умалчивания ОДНОГО индекса. Они НЕ доказывают
 глобальную полноту: все настроенные индексы могут отставать или согласованно
-умалчивать. `incomplete=false` означает строго «все настроенные endpoint
-дочитаны до конца», а не «на chain больше ничего нет». Остаточная
-Byzantine-модель фиксируется в ADR и, где уместно, в UI.
+умалчивать. `incomplete=false` означает строго «все настроенные ЛОГИЧЕСКИЕ
+источники дочитаны до конца» (v6: через какой-либо свой transport, §4.PR-4),
+а не «на chain больше ничего нет». Остаточная Byzantine-модель фиксируется в
+ADR и, где уместно, в UI.
 
 ## 2. Зафиксированные решения
 
@@ -74,14 +76,17 @@ Byzantine-модель фиксируется в ADR и, где уместно, 
   2026-08-19 по результатам живых проб — состав в §2.1.** Открытым остаётся
   только `UPLOAD_GATEWAYS` (утверждается по staging-испытаниям в PR-3b).
 - **D8. Типы endpoint РАЗЛИЧАЮТСЯ + дедуп по РАЗНЫМ ключам (ревью 2, H5).**
-  Индексы — ПОЛНЫЕ публичные HTTPS URL (`INDEX_ENDPOINTS`), т.к. индексный
-  endpoint в общем случае несёт путь. Поправка v5: утверждённый публичный
-  Goldsky-поиск — `https://arweave-search.goldsky.com/graphql` (проверен вживую
-  2026-08-19, форма `origin+/graphql`); Goldsky-subgraph-endpoints вида
+  Индексы — ПОЛНЫЕ публичные HTTPS URL, сгруппированные в ЛОГИЧЕСКИЕ
+  источники `INDEX_SOURCES` (поправка v6, ревью 4 M1: primary +
+  transport-fallbacks в группе; completeness — по группам, §2.1 и §4.PR-4),
+  т.к. индексный endpoint в общем случае несёт путь. Поправка v5:
+  утверждённый публичный Goldsky-поиск —
+  `https://arweave-search.goldsky.com/graphql` (проверен вживую 2026-08-19,
+  форма `origin+/graphql`); Goldsky-subgraph-endpoints вида
   `/api/public/.../gn` существуют как отдельный продукт — обоснование v4
   опиралось на них. Решение «полный URL» остаётся верным для обоих случаев:
-  два разных endpoint на одном хосте имеют ОДИН origin, поэтому
-  `INDEX_ENDPOINTS` канонизируются и дедуплицируются по **полному URL**.
+  два разных endpoint на одном хосте имеют ОДИН origin, поэтому URL индексов
+  канонизируются и дедуплицируются по **полному URL**.
   `STATUS/PAYLOAD/UPLOAD_GATEWAYS` — bare origins, дедуп по **origin**. CSP
   `connect-src` строится ТОЛЬКО по извлечённым origin. Клиентский bearer для
   приватных индексов НЕ используется. (Ошибка v2 «дедуп всех списков по
@@ -99,28 +104,44 @@ v4): 13 кандидатов, реальная 10-дневная транзак�
   `frostor.xyz`, `permagate.io` — у всех пяти согласованная семантика
   (несуществующий txId → `404`, существующий → `200`), требование ≥2
   status-origin (H4) выполнено с запасом.
-- `INDEX_ENDPOINTS`: `https://arweave.net/graphql`,
-  `https://arweave-search.goldsky.com/graphql` (два НЕЗАВИСИМЫХ индекса) +
-  `https://vilenarios.com/graphql` как transport-fallback (см. оговорку ниже).
+- Индексы — **ЛОГИЧЕСКИЕ источники** (`INDEX_SOURCES`, поправка v6 по ревью 4
+  M1): completeness считается по логическим источникам, transport-fallback —
+  ВНУТРИ группы. Два логических источника:
+  - `arweave-index` = [`https://arweave.net/graphql`,
+    `https://vilenarios.com/graphql` (transport-fallback того же индекса)];
+  - `goldsky-index` = [`https://arweave-search.goldsky.com/graphql`].
+  Ошибка v5: vilenarios был записан третьим РАВНОПРАВНЫМ endpoint — при
+  строгой семантике `incomplete=false ⟺ все дочитаны` его отказ помечал бы
+  sweep неполным при живых обоих независимых индексах, т.е. fallback СНИЖАЛ бы
+  доступность. Исправлено: см. §4.PR-4.
 - `PAYLOAD_GATEWAYS`: `arweave.net` (первый), `vilenarios.com`, `ar-io.dev`,
-  `frostor.xyz`. **`permagate.io` в PAYLOAD НЕ входит** — его `/raw` стабильно
-  таймаутит (при рабочих status/graphql).
+  `frostor.xyz`. **`permagate.io` в PAYLOAD НЕ входит** — его холодный `/raw`
+  в пробах 19.08 стабильно таймаутил (25s+); 20.08 отдал 200 из кэша —
+  нестабильность холодного пути дисквалифицирует из PAYLOAD, в STATUS остаётся.
 - `UPLOAD_GATEWAYS`: НЕ утверждён — определяется staging-испытаниями в PR-3b;
   владелец разрешил платные транзакции для этих испытаний (staging JWK).
 
-**Факты проб:**
+**Факты проб (19–20.08.2026; колонка `/raw` дополнена CORS-замерами по
+ревью 4 M3 — заголовок снят с фактических 200-ответов при `Origin: null`):**
 
-| Кандидат | status | graphql (CORS для `Origin: null`) | `/raw` (реальная нота) |
+| Кандидат | status | graphql (CORS для `Origin: null`) | `/raw` при `Origin: null` |
 |---|---|---|---|
-| arweave.net | ok | ok, `ACAO: *` | 200 за ~0.5s |
-| vilenarios.com | ok | ok, `ACAO: *` | холодный ~13s → из кэша ~0.4s |
-| ar-io.dev | ok | ok, `ACAO: *` | холодный 10–15s (первый раз может 504) |
-| frostor.xyz | ok | ok, `ACAO: *` | холодный ~12–16s |
-| permagate.io | ok | ok, отражает `null` | СЛОМАН (таймаут 25s+) |
+| arweave.net | ok | ok, `ACAO: *` | 200 + `ACAO: *`, ~0.5s |
+| vilenarios.com | ok | ok, `ACAO: *` | 200 + `ACAO: *`; холодный ~13s → из кэша ~0.4s |
+| ar-io.dev | ok | ok, `ACAO: *` | 200 + `ACAO: *` после прогрева; холодный может 504 (504 — БЕЗ ACAO: для file:// это network error, перебор продолжается) |
+| frostor.xyz | ok | ok, `ACAO: *` | 200 + `ACAO: *`; холодный ~12–16s |
+| permagate.io | ok | ok, отражает `null` | 19.08 холодный таймаутил (25s+); 20.08 из кэша 200 + `ACAO: *` — нестабилен, вне PAYLOAD |
 | arweave-search.goldsky.com | — | ok, отражает `null` | — |
 | ar-io.net | DNS не резолвится — исключён | | |
 | love4src.com, g8way.io, adaconna.top | не отвечают — исключены | | |
 | ariospeedwagon.com, arweave.fllstck.dev, aoweave.tech | нестабильны (5xx/частичные отказы) — исключены | | |
+
+Acceptance-правило (нормативно): каждый шлюз в `PAYLOAD_GATEWAYS` обязан
+отдавать `Access-Control-Allow-Origin: *` (или допускать `null`) на
+**200-ответах** и graphql, и `/raw`, проверено из реального `file:///`
+контекста; не проходит — исключается из PAYLOAD. К STATUS-шлюзам
+file://-требование не применяется (restore не делает status-проверок);
+им достаточно CORS с origin приложения — все пять отдают `*`.
 
 - Холодный `/raw` вторичных шлюзов (10–16s) укладывается в текущий
   `PAYLOAD_TIMEOUT_MS = 20s` (`arweave.ts:590`); после первого запроса ответ
@@ -134,12 +155,18 @@ v4): 13 кандидатов, реальная 10-дневная транзак�
   → 401) УЖЕ реализована для существующих `/admin/*`
   (`worker/src/index.ts:174–186`) — PR-2 переиспользует её.
 
-**Оговорка независимости (в ADR):** GraphQL ar.io-шлюзов — прокси к тому же
-индексу arweave.net (дефолт ar.io-node), т.е. третий `INDEX_ENDPOINT` даёт
-транспортную избыточность, НЕ независимое мнение; независимых индексов два —
-arweave.net и Goldsky. Отдельно: четыре из пяти status-шлюзов (включая сам
-arweave.net) работают на ar.io-стеке — программная монокультура: общий баг
-затронет всех одновременно. Byzantine-граница §1 остаётся в силе.
+**Оговорка независимости / failure domains (в ADR, уточнено ревью 4):**
+GraphQL ar.io-шлюзов — прокси к индексу, который проиндексировал сам gateway
+(ar.io-node отдаёт только свои данные), для наших целей это ОДИН логический
+индекс arweave-семейства; vilenarios в `INDEX_SOURCES` — transport-fallback,
+НЕ независимое мнение. Независимых индексных РЕАЛИЗАЦИЙ две — arweave.net и
+Goldsky. По status-шлюзам: ОПЕРАТОРЫ различны (ar.io core team — ar-io.dev;
+сообщество — vilenarios, frostor, permagate; arweave.net — своя команда), но
+ПРОГРАММНАЯ реализация у всех пяти — ar.io-стек, т.е. один software failure
+domain: общий баг (например, ложный `404`) затронет всех одновременно.
+Именно поэтому dead-формула v6 — строгий N-of-N по ВСЕМ настроенным (§4.PR-3a)
+плюс age guard, а не K-of-N по «числу голосов». Byzantine-граница §1 остаётся
+в силе.
 
 **Прочие решения владельца (2026-08-19, вторая серия):**
 
@@ -228,11 +255,13 @@ anchor+price запросы внутри SDK — из вызовов тольк�
 
 **Конфигурация (D8):**
 
-- `src/lib/gateways.ts`: `INDEX_ENDPOINTS` (полные HTTPS URL),
-  `PAYLOAD_GATEWAYS`, `STATUS_GATEWAYS` (bare origins). Валидация как у
-  `PROXY_URL` (`arweave.ts:30–38`).
-- **Канонизация и дедуп по РАЗНЫМ ключам (D8, H5):** `INDEX_ENDPOINTS` — по
-  полному URL (два Goldsky-endpoint одного origin остаются оба);
+- `src/lib/gateways.ts`: `INDEX_SOURCES` (список ЛОГИЧЕСКИХ источников,
+  каждый — упорядоченный массив полных HTTPS URL: primary + transport-fallbacks,
+  см. §2.1 и ревью 4 M1), `PAYLOAD_GATEWAYS`, `STATUS_GATEWAYS` (bare
+  origins). Валидация как у `PROXY_URL` (`arweave.ts:30–38`).
+- **Канонизация и дедуп по РАЗНЫМ ключам (D8, H5):** URL внутри
+  `INDEX_SOURCES` — по полному URL глобально (один URL не может входить в
+  две группы; два endpoint одного origin остаются оба);
   `STATUS/PAYLOAD` — по origin (дублированный origin в CSV не создаёт ложный
   «кворум»).
 - `postbuild.mjs:39`: `connect-src` = union origin(ов) ВСЕХ списков (для
@@ -243,31 +272,44 @@ anchor+price запросы внутри SDK — из вызовов тольк�
   `dropped`). Это осознанное изменение поведения, а не no-op; фиксируется
   тестом и в ROLLBACK.
 
-**Статус — кворум с полной таблицей (по ревью):**
+**Статус — кворум с точной формулой (ревью 4 H1 — нормативно, без
+альтернатив):**
 
-- считаются только уникальные canonical origin; локально валидируется
-  43-символьный base64url txId (иначе `invalid`, без сети);
+Формула v5 «404 от всех ответивших, ответивших ≥2» была двусмысленна и
+допускала dead при `2×404 + 3×timeout` — два голоса из одной программной
+монокультуры при трёх молчащих. Нормативная формула v6:
+
+- считаются только уникальные canonical origin ПОСЛЕ дедупа
+  (`configuredOrigins`); локально валидируется 43-символьный base64url txId
+  (иначе `invalid`, без сети);
+- **`dead` ⟺ `deadVotes === configuredOrigins.length` И
+  `configuredOrigins.length >= 2`** — КАЖДЫЙ настроенный origin ответил `404`.
+  ЛЮБОЙ не-404-исход хотя бы одного origin (timeout, `429`, `5xx`, `400`,
+  malformed `200`, сетевая ошибка, неответивший) делает dead НЕДОСТИЖИМЫМ в
+  этом раунде → verdict `unavailable` (при отсутствии `200`/`202`).
+  Константа `MIN_DEAD_WITNESSES` из v4/v5 УПРАЗДНЕНА — порога «ответивших»
+  в runtime больше нет; остаётся build-time `MIN_STATUS_ORIGINS = 2`
+  (production build fail-closed, PR-6);
 - таблица verdict (нормативная, одна для клиента и Worker):
 
   | Наблюдение | Verdict |
   |---|---|
   | ≥1 источник `200` (валидное тело) | `confirmed` |
   | ≥1 источник `202`, нет `200` | `pending` |
-  | `200` с malformed телом | не засчитывается как alive → как `unavailable` от этого источника |
-  | `404` от ВСЕХ источников, ответивших ≥ `MIN_DEAD_WITNESSES` уникальных | кандидат в `dead` (+ 30-мин age guard Worker-а) |
-  | `404`, но ответивших уникальных источников < `MIN_DEAD_WITNESSES` | `unavailable` |
-  | `400`, `429`, `503`, timeout | `unavailable` (НИКОГДА не `dead`) |
+  | `200` с malformed телом | не засчитывается как alive; для dead-формулы = не-404-исход |
+  | ВСЕ настроенные origin ответили `404` (настроено ≥2) | кандидат в `dead` (+ 30-мин age guard Worker-а) |
+  | `404` у части, у остальных — любой не-404-исход | `unavailable` |
+  | `400`, `429`, `5xx`, timeout | `unavailable` (НИКОГДА не `dead`) |
+  | Нормативный пример: `2×404 + 3×timeout` при 5 настроенных | **`unavailable`** (тест) |
 
-- **Политика dead (ревью 2, H4): `MIN_DEAD_WITNESSES = 2`.** `dead` требует
-  N-of-N (все настроенные согласованно `404`) **И минимум ДВА уникальных
-  ответивших источника**. При ЕДИНСТВЕННОМ настроенном источнике N-of-N
-  вырождается в 1-of-1 — это ловушка «одиночный 404 снова dead», поэтому один
-  источник + `404` → всегда `unavailable`. **Production build fail-closed
-  требует ≥2 status-origin** (иначе dead недостижим — безопасная сторона).
-  Ослабление до 2-of-3 при большем числе источников — только явным решением с
-  независимостью операторов в ADR. Недоступный источник не голосует «за».
-- Worker `getTxStatusWorker`: `400` больше НИКОГДА не `dead`; тот же кворум и
-  тот же `MIN_DEAD_WITNESSES`. Бюджет subrequests ≤ (хостов × проверок) в
+- Цена решения осознана: один флапающий шлюз из пяти откладывает dead —
+  это безопасная сторона (dead лишь открывает платный redrop; застрявший
+  `unavailable` = «повторить позже», денег не тратит). Ослабление до K-of-N —
+  только отдельным ADR, где голоса группируются по НЕЗАВИСИМЫМ failure
+  domains (софт + оператор), а не по числу origin (§2.1: все пять — один
+  ar.io-софт-домен, поэтому счёт origin-голосов не даёт независимости).
+- Worker `getTxStatusWorker`: `400` больше НИКОГДА не `dead`; та же формула
+  и та же таблица, что у клиента. Бюджет subrequests ≤ (хостов × проверок) в
   лимите Cloudflare.
 
 **Payload fallback (по ревью, high):**
@@ -280,8 +322,11 @@ anchor+price запросы внутри SDK — из вызовов тольк�
 
 **Тесты PR-3a:**
 
-- `404`+`202` → pending; `404` от всех при неполном ответе → unavailable;
-  `400` → unavailable, redrop не запускается;
+- `404`+`202` → pending; **`2×404 + 3×timeout` (5 настроенных) → unavailable,
+  НЕ dead** (нормативный пример формулы); `404` от всех настроенных → dead
+  только после age guard; `400` → unavailable, redrop не запускается;
+- два `404` от шлюзов одной failure-domain группы + один здоровый origin
+  без ответа → unavailable;
 - `/raw` `200` с повреждённым телом на первом, валидный на втором → нота
   восстановлена, ошибка первого нейтрализована;
 - дублированный origin в CSV не даёт кворум;
@@ -309,8 +354,23 @@ anchor+price запросы внутри SDK — из вызовов тольк�
 **Нормативная state machine DO (ревью 2 H2, ревью 3):**
 
 Текущий lifecycle `reserved → posted → committed` (reserved TTL 10 мин)
-расширяется до `reserved → signed → posted → committed`. Поля `signed`:
-`{noteId, txId, signedTxBytes|ref, anchorHeight, reserveToken, signedAt}`.
+расширяется до `reserved → signed → posted → committed`.
+
+**Storage-контракт `signed` (ревью 4 H2 — нормативно, без альтернатив):**
+
+- Сериализованная подписанная транзакция хранится **INLINE в DO storage** —
+  вариант `|ref` из v5 УПРАЗДНЁН (внешняя ссылка = атомарность и потеря
+  reference, которые пришлось бы доказывать). Запись
+  `note:{noteId} = {status:'signed', txId, signedTx, anchorHeight, token,
+  gen, signedAt}` — ОДИН атомарный `storage.put`. Влезает по построению:
+  `MAX_BODY_BYTES = 51200` (`wrangler.toml:34`) → сериализованный tx-JSON
+  (data + owner ~0.7 KB + signature ~0.7 KB + tags) ≤ ~75 KB < лимита
+  128 KiB на DO-значение. Тест фиксирует худший случай.
+- **Порча/потеря `signedTx` — fail closed:** запись `signed` есть, а байты
+  не парсятся/не сходятся с txId → resend невозможен, слот НЕ освобождается
+  автоматически; допустима только reconciliation по кворуму статуса (alive →
+  `posted`; кворум dead + age guard → redrop-ветка, где новая подпись
+  легальна). noteId разблокируется ТОЛЬКО этими двумя путями.
 
 **Проблема ревью 3: одно `signed` покрывало ДВА случая (до и после диспатча
 POST), и после crash нельзя доказать, какой именно → нельзя доказать,
@@ -333,6 +393,22 @@ reconciliation по кворуму статуса. Это снимает нео�
   вперёд (`posted`/`committed`) либо после доказанного окончательного отказа
   (кворум dead + age guard) — это единственный путь, где создаётся новая
   подпись.
+- **Bounded backlog (ревью 4 H2):** «неудаляемый `signed`» без границы —
+  storage/cost DoS. Часовое окно для этого НЕ годится: `count/inFlight/attempts`
+  обнуляются при смене окна (`rate-limiter.ts:65–71`, проверено) — заброшенные
+  `signed` пережили бы сброс неучтёнными. Поэтому отдельный persistent-счётчик
+  `signedCount` в DO (инвариант: равен числу `note:*` со `status='signed'`;
+  меняется в тех же атомарных транзакциях, что и записи). Cap нормативно:
+  **`MAX_SIGNED_INFLIGHT = quotaLimit`** (часовая квота пользователя). При
+  достижении cap новый upload отклоняется **ДО подписания** (`503`,
+  retryable) — подписей сверх границы не существует по построению.
+- **Reconciliation — сервер-инициированная, два триггера (ревью 4 H2):**
+  (а) как сегодня — любой `/upload`/recheck этого noteId; (б) **DO alarm**:
+  ставится при создании `signed` (первый — через ~5 мин, далее экспоненциальный
+  backoff с потолком), alarm делает resend ТОГО ЖЕ `signedTx` + кворум
+  статуса: alive → `posted` (дальше обычный путь), не-alive → следующий alarm.
+  Alarm снимается при переходе вперёд. Клиент, который никогда не повторит
+  запрос, больше не оставляет `signed` навечно — DO добивает сам.
 - **Истечение anchor:** подписанная tx с протухшим anchor (~50 блоков) на
   chain не попадёт. Пересоздание — только после подтверждения кворумом, что
   старый txId не alive. Это частный случай «доказанного окончательного
@@ -366,6 +442,16 @@ reconciliation по кворуму статуса. Это снимает нео�
 - истёкший anchor → пересоздание только после кворума dead;
 - откат writer→reader-floor и старый клиент→новый Worker;
 - невозможность resend → fail closed ДО POST, ноль вторых транзакций;
+- **`signed` переживает quota-window reset** (счётчики окна обнулились —
+  запись и `signedCount` целы);
+- **cap:** `MAX_SIGNED_INFLIGHT` заброшенных `signed` → следующий upload
+  получает `503` ДО подписания; после reconciliation слоты освобождаются;
+- **порча `signedTx`** (байты не парсятся / не сходятся с txId) → fail
+  closed: ни resend мусора, ни новой подписи, ни авто-release; выход только
+  через кворум (alive→posted / dead+age→redrop);
+- **DO alarm** повторяет ТОЛЬКО тот же txId (никогда не подписывает) и
+  снимается при переходе вперёд; худший размер `signedTx` при
+  `MAX_BODY_BYTES=51200` влезает в DO-значение;
 - reservation/recovery/quota-инварианты не регрессируют.
 
 ### PR-4 «Multi-index restore union»
@@ -373,9 +459,19 @@ reconciliation по кворуму статуса. Это снимает нео�
 Строится поверх sentinel-модели (§1). Компоновка union и sentinel — самая
 тонкая часть; ниже специфицирована явно.
 
-- `fetchPage` параметризуется endpoint-ом; пагинация ВНУТРИ индекса
-  последовательна (курсор `after` opaque, непереносим), индексы — параллельно
-  с backoff (ниже).
+- **Логическая топология (ревью 4 M1 — нормативно):** единица sweep-а —
+  ЛОГИЧЕСКИЙ источник из `INDEX_SOURCES` (§2.1), не URL. Внутри источника —
+  transport-fallback: страницы читаются с primary; при отказе primary (в
+  пределах backoff-бюджета) источник ПЕРЕЗАПУСКАЕТСЯ с первой страницы на
+  fallback-URL (курсор `after` opaque и непереносим между transport!),
+  прочитанные с primary кандидаты этого источника отбрасываются — источник
+  либо дочитан целиком через ОДИН transport, либо неполон. Логические
+  источники — параллельно.
+- `fetchPage` параметризуется URL-ом; пагинация ВНУТРИ transport
+  последовательна.
+- Честная оговорка (в ADR): «источник дочитан через fallback» = дочитан
+  ВЫБРАННЫЙ transport; отставание fallback-транспорта от primary — то же
+  остаточное умалчивание §1, новых гарантий полноты fallback не даёт.
 - **Схема `block` (по ревью, high):** GraphQL `block` сейчас не запрашивается
   и по контракту nullable (`block: {height} | null`). PR-4 добавляет `block`
   в запрос и определяет runtime-схему + политику null-height (немайненные /
@@ -396,10 +492,16 @@ reconciliation по кворуму статуса. Это снимает нео�
   стать будущим улучшением, но НЕ в этом PR.)
 - `opts.known` (sentinel) работает по txId → компонуется с union без изменений
   в карте: та же `KnownTxRecord`-проверка (Note-Id тег + класс версии).
-- `incomplete`-семантика строгая: `incomplete=false` только если ВСЕ индексы
-  дочитаны. Держит продвижение `sweep-full-at` (§1) честным.
+- `incomplete`-семантика строгая, но по ЛОГИЧЕСКИМ источникам (ревью 4 M1):
+  `incomplete=false` ⟺ каждый источник из `INDEX_SOURCES` дочитан через
+  какой-либо СВОЙ transport. Отказ fallback-URL при дочитанном primary (и
+  наоборот) sweep НЕ портит — fallback не может снижать доступность. Держит
+  продвижение `sweep-full-at` (§1) честным.
+- Правило metadata-конфликта выше применяется к расхождению между ЛЮБЫМИ
+  двумя endpoint, вернувшими один txId (в т.ч. внутри одной группы — там
+  расхождение теоретически невозможно и тем подозрительнее).
 - `ArweaveIndexUnavailableError` — только когда ПЕРВАЯ страница упала у ВСЕХ
-  индексов (не по abort).
+  transport ВСЕХ источников (не по abort).
 
 **Backoff (по ревью, medium):**
 
@@ -420,7 +522,11 @@ HEIGHT_DESC, а для одинакового Note-Id порядок влияе�
 (HEIGHT_DESC) без пересортировки** — 12 тестов `arweave.incremental.test.ts`
 (поправка v5: пересчитано, в v4 стояло «16») проходят бит-в-бит. Новая детерминированная сортировка применяется ТОЛЬКО при
 union ≥2 индексов, где единого потока и так нет. Новые тесты: equal-height,
-mixed null-height, перестановки ответов индексов не меняют победителя.
+mixed null-height, перестановки ответов индексов не меняют победителя;
+**primary transport упал, fallback дочитал → источник complete,
+`incomplete=false`; fallback упал, primary дочитал → тоже complete;
+рестарт на fallback не смешивает страницы двух transport (курсор
+непереносим).**
 
 ### PR-5 «restore.html на Arweave»
 
@@ -454,13 +560,26 @@ tx-specific sandbox subdomains.
   неисполняющая проверочная утилита** (downloader/verifier), которая
   скачивает файл, считает SHA-256 и лишь при совпадении отдаёт его.
   Прямой клик по gateway-URL НЕ является поддерживаемым способом запуска.
-- **Verifier — только ПК (решение владельца 2026-08-19).** Основной путь —
-  проверка внутри PWA (пункт (а) выше); холодный путь — десктоп: Windows
-  `certutil -hashfile`, macOS/Linux `shasum -a 256` как ручной запасной.
-  **Мобильное холодное восстановление БЕЗ приложения объявляется
-  неподдерживаемым** (фиксируется в ADR и README); отдельный мобильный
-  проверочный инструмент — отложенная задача в бэклог, НЕ в PR-5. Hash
-  mismatch ОБЯЗАН блокировать (тест).
+- **Verifier — только ПК (решение владельца 2026-08-19); полный cold-flow
+  нормативен (ревью 4 M2).** Основной путь — проверка внутри PWA (пункт (а)
+  выше; PWA качает **строго `/raw/<txId>`**, НЕ корневой `/{txId}` с
+  sandbox-redirect). Холодный ПК-путь — ЦЕЛИКОМ терминальный, браузерной
+  навигации на gateway-URL нет ни на одном шаге:
+  1. `curl --fail --location --output restore.download
+     "https://<gateway>/raw/<txId>"` (curl штатен в Windows 10+/macOS/Linux);
+  2. `certutil -hashfile restore.download SHA256` (Windows) /
+     `shasum -a 256 restore.download` (macOS/Linux);
+  3. сверка с эталонным SHA-256; ТОЛЬКО при совпадении — переименовать в
+     `restore.html` и открыть локально (file://).
+  Отдельный скачиваемый verifier-артефакт НЕ вводится — он воспроизвёл бы ту
+  же проблему доверия к своим байтам; используются ТОЛЬКО штатные системные
+  утилиты. **Канал доверия к инструкции и эталонному хешу:** README в
+  GitHub-репозитории, экран настроек приложения и `docs/ROLLBACK.md` — те же
+  доверенные места, где живёт txId; шлюз не участвует. **Мобильное холодное
+  восстановление БЕЗ приложения объявляется неподдерживаемым** (фиксируется
+  в ADR и README); отдельный мобильный проверочный инструмент — отложенная
+  задача в бэклог, НЕ в PR-5. Hash mismatch ОБЯЗАН блокировать (тест);
+  полный terminal-only сценарий download → hash → open — в acceptance.
 - **Заголовки шлюза — вспомогательны, не барьер.** Публиковать с
   `application/octet-stream` / `Content-Disposition: attachment` полезно, но
   это НЕ считается защитой (шлюз волен игнорировать). Защита — только
@@ -504,10 +623,14 @@ tx-specific sandbox subdomains.
   `docs/ROLLBACK.md`.
 
 **Acceptance:** восстановление при полном отключении Matamata/Cloudflare/Solana;
-gateway-код НЕ исполняется до checksum verification (file-mode); hash mismatch
-блокирует процедуру; GraphQL и `/raw` работают из `file:///` `Origin: null` на
-поддерживаемых браузерах; malicious HTML/script/formula payload безопасно
-рендерится (`textContent`); BFCache-lifecycle; форматы v1–v4.
+gateway-код НЕ исполняется до checksum verification (file-mode); **полный
+terminal-only cold-flow: curl-download → hash → открытие ТОЛЬКО после
+совпадения** (ревью 4 M2); hash mismatch блокирует процедуру; GraphQL и
+`/raw` работают из `file:///` `Origin: null` на поддерживаемых браузерах —
+**с per-gateway фиксацией `Access-Control-Allow-Origin` на 200-ответах
+каждого `PAYLOAD_GATEWAYS`** (ревью 4 M3; предварительные замеры — §2.1);
+malicious HTML/script/formula payload безопасно рендерится (`textContent`);
+BFCache-lifecycle; форматы v1–v4.
 
 ### PR-6 «CI / deploy / rollback wiring» (по ревью, high — пронизывает все PR)
 
@@ -517,8 +640,9 @@ gateway-код НЕ исполняется до checksum verification (file-mode
   GitHub Pages, Cloudflare Pages, Worker **production И staging**, staging
   config checker;
 - **production build fail-closed**: требует утверждённый multi-gateway набор,
-  в т.ч. **≥2 status-origin** (H4), — иначе прод незаметно останется на одном
-  `arweave.net` или dead будет недостижим;
+  в т.ч. **`MIN_STATUS_ORIGINS = 2`** (бывш. H4; в v6 это ЕДИНСТВЕННЫЙ порог —
+  runtime-порога «ответивших» больше нет, §4.PR-3a), — иначе прод незаметно
+  останется на одном `arweave.net` или dead будет недостижим;
 - **Worker rollback floor (H3):** PR-3b выкатывается reader-релизом ПЕРЕД
   writer-релизом; после writer фиксируется hard floor `worker-rN` в
   `docs/ROLLBACK.md`. DO-схема `signed` де-факто требует reader-before-writer
@@ -545,7 +669,8 @@ gateway-код НЕ исполняется до checksum verification (file-mode
 рискованный кусок (state machine DO, два последовательных Worker-релиза с
 floor, платные staging-испытания) и не должен задерживать автотриггеры.
 
-1. PR-1: ADR + этот план v5 (D7 утверждён — §2.1, правки фактов v5).
+1. PR-1: ADR + этот план v6 (D7 утверждён — §2.1; формула кворума, bounded
+   `signed`, логические источники — v6).
 2. Transport adapter + метрики со staging/CI (PR-2 + PR-6).
 3. Read-only multi-gateway: status + validated payload fallback (PR-3a + PR-6).
 4. Multi-index union с conflict/null-height политикой (PR-4).
@@ -570,8 +695,12 @@ floor, платные staging-испытания) и не должен заде�
 2. **Upload failover — только тот же signed tx/txId** (critical-2 закрыт).
    Persist подписанной транзакции до первого POST **возвращён в объём** (§3,
    предусловие PR-3b).
-3. **`dead` = N-of-N** (все настроенные status-источники согласованно `404`).
-   Недоступный источник не голосует «за».
+3. **`dead` = строгий N-of-N** — уточнено ревью 4 (H1) до формулы:
+   `deadVotes === configuredOrigins.length && configuredOrigins.length >= 2`.
+   КАЖДЫЙ настроенный origin должен ответить `404`; любой timeout/`429`/`5xx`/
+   неответивший делает вердикт `unavailable` (пример: `2×404 + 3×timeout` →
+   `unavailable`). Недоступный источник не просто «не голосует за» — он
+   блокирует dead целиком.
 4. **Индексы — полные публичные GraphQL URL** (D8). Goldsky остаётся
    кандидатом; клиентский bearer не используем (только публичные endpoints).
 5. **Конфликт metadata / `block=null` — осторожная политика:** конфликтующий
@@ -592,26 +721,27 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v5)
+## 8. Карта соответствия (статус v6)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
-| PR-1 ADR | **ready** (все clarifications сняты v5) | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, оговорка монокультуры (§2.1) |
-| PR-2 метрики | ready после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
-| PR-3a read | **ready** (D7 утверждён §2.1) | MIN_DEAD_WITNESSES=2 (H4), dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | blocked до своей очереди (§6 п.6) | `signed` не подлежит release/TTL (ревью 3), reader-before-writer floor (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
-| PR-4 union | risky | single-index edge-order сохранён (M2), metadata-конфликт→incomplete (нормативно), nullable height, abort-backoff |
-| PR-5 restore | ready (file-mechanics + PC-only verifier решены) | доверенный агент сверяет SHA-256 (ревью 3), `Origin:null` CORS, safe render, release-кошелёк (§4.PR-5) |
-| PR-6 CI/deploy | обязателен в каждом | ≥2 status-origin, **Worker rollback floor (H3)**, env/bindings везде |
+| PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
+| PR-2 метрики | **ready** после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
+| PR-3a read | ready (D7 §2.1 + формула кворума v6) | строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
+| PR-3b write | blocked до своей очереди (§6 п.6) | inline `signedTx` + `signedCount` cap + DO alarm (H2 ревью 4), `signed` не подлежит release/TTL (ревью 3), reader-before-writer floor (H3), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-4 union | risky | логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
+| PR-5 restore | ready (cold-flow специфицирован v6) | терминальный download→hash→open (M2 ревью 4), per-gateway `/raw` CORS-фиксация (M3), safe render, release-кошелёк (§4.PR-5) |
+| PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
 
-**Остаточные блокеры к полной реализации:** (1) `signed` неудаляем — только
-resend+reconcile, плюс reader-before-writer floor (PR-3b); (2)
-`MIN_DEAD_WITNESSES=2` и ≥2 status-origin в prod (PR-3a — состав утверждён);
-(3) restore.html проверяется доверенным агентом до исполнения (не
-gateway-MIME), включая `Origin:null` CORS (PR-5). Бывший блокер (4)
-«утверждение D7» ЗАКРЫТ в v5 (§2.1); открытым в D7 остаётся только
-`UPLOAD_GATEWAYS` — утверждается по staging-испытаниям в PR-3b.
+**Остаточные блокеры к полной реализации:** (1) PR-3b — реализация bounded
+lifecycle `signed` (inline bytes, cap, alarm) + reader-before-writer floor;
+(2) PR-3a/4 — реализация формулы кворума и логических источников по v6;
+(3) PR-5 — исполнение cold-flow контракта + фиксация CORS в acceptance.
+Спецификационных блокеров НЕ осталось; открытым в D7 остаётся только
+`UPLOAD_GATEWAYS` — утверждается по staging-испытаниям в PR-3b. **PR-1 и
+PR-2 можно начинать** (вердикт ревью 4).
 
-Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 приняты все
-3 (два — снятие противоречий: `signed`-неоднозначность и «sandbox не нужен для
-file-mode»).
+Из ревью 1 закрыты 9 из 12; из ревью 2 приняты все 8; из ревью 3 — все 3;
+из ревью 4 (по v5) — все 5 (2 high: формула dead-кворума, bounded lifecycle
+`signed`; 3 medium: логическая топология индексов, терминальный cold-flow,
+CORS-замеры `/raw`).
