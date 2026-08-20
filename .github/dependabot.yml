@@ -1,26 +1,52 @@
 version: 2
 
 # ПОЧЕМУ ЗДЕСЬ ГРУППЫ. Без них каждое обновление приезжает отдельным PR: три
-# экосистемы × еженедельная проверка = очередь, которую никто не разбирает.
-# К 20.08.2026 накопилось 15 открытых PR, самому старому месяц, и часть из них
-# старше файла ci.yml — то есть на них НИ РАЗУ не запускались гейты. Очередь,
-# которую не разбирают, не защищает от CVE: она их прячет.
+# экосистемы × еженедельная проверка. К 20.08.2026 накопилось 15 открытых PR,
+# самому старому месяц, часть из них старше файла ci.yml — то есть гейты на них
+# не запускались НИ РАЗУ. Очередь, которую не разбирают, от CVE не защищает.
 #
-# Правило разделения: patch/minor собираются в ОДИН PR на экосистему (их можно
-# смержить одним зелёным прогоном), major всегда приезжает ОТДЕЛЬНО — его
-# нельзя мержить, не прочитав changelog.
+# Хуже: без групп Dependabot разрезает пакеты, обязанные двигаться вместе. Так
+# появились PR #12 (react) и #17 (react-dom): каждый по отдельности роняет ВСЕ
+# .tsx-тесты с «Incompatible React versions: react 19.2.8 / react-dom 19.2.4».
+#
+# ГРАНИЦЫ ГРУПП — ПО ДОМЕНАМ, А НЕ «ВСЁ В ОДИН PR». Один зелёный прогон
+# доказывает, что сборка не развалилась, но НЕ доказывает сохранность
+# криптографических, sync- и restore-инвариантов. Поэтому пакеты, от которых
+# зависят ключи, подписи, хранилище и офлайн, обновляются ПООДИНОЧКЕ даже в
+# minor — их PR должен быть маленьким и читаемым, а откат — точечным.
+#
+# Что НЕ группируется (умышленно, каждый своим PR):
+#   @noble/ed25519, @noble/hashes  — подписи и хеши
+#   @scure/bip39                   — мнемоника: цена ошибки = потеря сейфа
+#   hash-wasm                      — Argon2id, обёртка PIN
+#   arweave                        — протокол публикации
+#   idb                            — IndexedDB, весь локальный слой
+#   vite-plugin-pwa                — service worker, офлайн и обновления
+#   @types/node                    — версия типов обязана соответствовать .nvmrc
+#
+# Мажоры не группируются нигде: группы объявлены с update-types [minor, patch].
+# Security-обновления тоже приезжают ОТДЕЛЬНЫМИ PR: группы по умолчанию
+# относятся только к version-updates (applies-to: version-updates), и это здесь
+# осознанно — фикс CVE не должен ждать своей еженедельной пачки.
+#
+# open-pull-requests-limit поднят с дефолтных 5: на момент правки все три
+# экосистемы упёрлись в лимит (5/5/5), и сгруппированному PR просто некуда
+# приехать, пока слоты не освободятся.
 updates:
+  # ── GitHub Actions ────────────────────────────────────────────────────
   # Actions are pinned to immutable commit SHAs; without this they would never
   # receive security fixes. Dependabot bumps the SHA and rewrites the trailing
   # version comment.
   #
-  # Мажоры экшенов НЕ группируются намеренно: там меняется рантайм (node20 →
-  # node24) и поведение, а SHA-пиннинг требует ручной сверки, что новый хеш
-  # действительно принадлежит заявленному тегу.
+  # Мажоры сюда не попадают намеренно: у экшенов мажор — это смена рантайма
+  # (node20 → node24) и входных параметров, плюс ручная сверка, что новый SHA
+  # принадлежит заявленному тегу. И отдельно: три из четырёх воркфлоу —
+  # деплойные и `workflow_dispatch`-only, то есть CI их НЕ проверяет.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     groups:
       actions-minor:
         patterns:
@@ -29,28 +55,84 @@ updates:
           - minor
           - patch
 
+  # ── Клиент ────────────────────────────────────────────────────────────
   # Dev-toolchain CVEs (Vite/Wrangler/Miniflare chains) reached us via manual
   # audits twice — keep both manifests watched.
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     groups:
-      client-minor:
+      # Связанная четвёрка: react и react-dom обязаны совпадать до патча,
+      # типы ходят с ними. Ровно та пара, расщепление которой дало #12/#17.
+      react:
         patterns:
-          - "*"
+          - react
+          - react-dom
+          - "@types/react"
+          - "@types/react-dom"
+        update-types:
+          - minor
+          - patch
+      # Рендер markdown: отдельно от остального, потому что регрессия здесь
+      # видна как «поехала карточка заметки», и откатывать надо точечно.
+      markdown:
+        patterns:
+          - react-markdown
+          - remark-*
+          - unified
+          - "@types/mdast"
+        update-types:
+          - minor
+          - patch
+      # Инструменты: не попадают в рантайм пользователя.
+      tooling:
+        patterns:
+          - eslint
+          - eslint-*
+          - "@eslint/*"
+          - typescript-eslint
+          - globals
+          - typescript
+          - vite
+          - "@vitejs/*"
+          - vitest
+          - jsdom
+          - fake-indexeddb
+          - "@testing-library/*"
+        update-types:
+          - minor
+          - patch
+      # Шрифты прекешируются service worker'ом и считаются в бюджет бандла —
+      # держим отдельно, чтобы `check-no-inlined-fonts` и бюджет были читаемы.
+      fonts:
+        patterns:
+          - "@fontsource/*"
+          - "@fontsource-variable/*"
         update-types:
           - minor
           - patch
 
+  # ── Worker ────────────────────────────────────────────────────────────
   - package-ecosystem: npm
     directory: /worker
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     groups:
-      worker-minor:
+      # Тестовый стек worker'а движется как одно целое: vitest и
+      # vitest-pool-workers связаны версиями, wrangler и workers-types — средой.
+      # В 0.x минор ведёт себя как мажор, поэтому гейт здесь — worker-тесты,
+      # а не сам факт зелёного ярлыка.
+      worker-tooling:
         patterns:
-          - "*"
+          - vitest
+          - "@cloudflare/*"
+          - wrangler
+          - typescript
         update-types:
           - minor
           - patch
+    # @noble/ed25519 и arweave в worker'е не группируются: это проверка подписей
+    # и протокол публикации — каждый своим PR.
