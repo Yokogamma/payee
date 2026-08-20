@@ -313,28 +313,49 @@ export async function createPrfCredential(opts: {
         authenticatorSelection: {
           authenticatorAttachment: 'platform',
           userVerification: USER_VERIFICATION,
-          // 'preferred', NOT 'discouraged' (changed 2026-08-19 after the first
-          // device acceptance). The original choice was «do not clutter the
-          // passkey list, lower the chance of an accidental deletion», taken
-          // on the assumption that it was free. On Android it is not: a
-          // OnePlus 12 / Android 16 installed PWA created the credential
-          // happily and then returned NO PRF, which is the signature of a
-          // NON-DISCOVERABLE, device-bound credential — the providers that
-          // implement hmac-secret (Google Password Manager and friends) are
-          // the ones that store DISCOVERABLE passkeys.
+          // 'preferred', NOT 'discouraged' (changed 2026-08-19). AN UNPROVEN
+          // HYPOTHESIS, deliberately labelled as one.
           //
-          // 'preferred' asks for discoverable without hard-requiring it, so a
-          // platform that only offers non-discoverable still gets its chance
-          // rather than a refusal. The cost is the one the original comment
-          // was avoiding — the key becomes visible in the system manager, and
-          // therefore deletable by hand. That is the better half of the trade:
-          // a visible key that WORKS beats an invisible one that does not, and
-          // §2 already promises that losing it costs only the accelerator.
+          // What is FACT: a OnePlus 12 / Android 16 installed PWA created the
+          // credential happily and then returned no PRF.
+          //
+          // What is NOT fact, and what an earlier version of this comment
+          // wrongly asserted: that a missing PRF is «the signature» of a
+          // non-discoverable credential. CTAP requires `hmac-secret` support
+          // for discoverable and non-discoverable credentials alike, so the
+          // spec draws no such line, and `residentKey: 'preferred'` may still
+          // yield a plain server-side credential.
+          //
+          // What makes the change worth trying anyway is a ROUTING effect, not
+          // a spec one: on Android the request can be handled by different
+          // credential providers, and which one takes it is influenced by what
+          // is asked for. `'discouraged'` can steer away from the provider
+          // that does implement `hmac-secret`. `'preferred'` asks for a
+          // discoverable credential without hard-requiring it, so a platform
+          // that only offers non-discoverable still gets its chance.
+          //
+          // The price is real and was accepted knowingly: the key becomes
+          // visible in the system manager — and, on a syncing provider,
+          // synced — so it can also be deleted by hand. §2 already promises
+          // that losing it costs only the accelerator, and a visible key that
+          // works beats an invisible one that does not.
+          //
+          // `credProps` below is what will actually settle this: if the retry
+          // reports `rk: true` and PRF is STILL missing, this hypothesis is
+          // dead and the cause lies with the provider or the browser build.
           residentKey: 'preferred',
         },
         attestation: 'none',
         timeout: CEREMONY_TIMEOUT_MS,
-        extensions: { prf: { eval: { first: prfSalt as BufferSource } } },
+        extensions: {
+          prf: { eval: { first: prfSalt as BufferSource } },
+          // Diagnostic only — never a decision input. `credProps.rk` is the
+          // one honest way to learn whether the credential we just created is
+          // actually discoverable, which is exactly the question the
+          // residentKey hypothesis above turns on. It is OPTIONAL by spec:
+          // absent means «the client did not say», not «no».
+          credProps: true,
+        },
       } as PublicKeyCredentialCreationOptions,
     } as CredentialCreationOptions) as PublicKeyCredential | null;
   } catch (e) {
@@ -345,8 +366,19 @@ export async function createPrfCredential(opts: {
 
   // Early diagnosis ONLY — cheap enough to spare the user a second prompt on a
   // platform that has already said no.
-  const prf = (created.getClientExtensionResults() as { prf?: PrfExtensionResults }).prf;
+  const extensions = created.getClientExtensionResults() as {
+    prf?: PrfExtensionResults;
+    credProps?: { rk?: boolean };
+  };
+  const prf = extensions.prf;
   if (prf?.enabled !== true && !prf?.results?.first) {
+    // The one line that can settle the residentKey question from a real
+    // device. `undefined` means the client declined to say — not «no».
+    console.error(
+      'quick unlock: no PRF from create();',
+      'credProps.rk =', extensions.credProps?.rk,
+      '| prf.enabled =', prf?.enabled,
+    );
     throw new QuickUnlockUnavailableError(
       // NO JARGON, and no instruction the reader cannot act on. «PRF» means
       // nothing to a person, and a bare «удалите ключ» would be wrong twice
@@ -360,8 +392,18 @@ export async function createPrfCredential(opts: {
   }
 
   const credentialId = toBytes(created.rawId);
-  const prfOutput = await evalPrf({ credentialId, prfSalt, signal });
-  return { credentialId, prfOutput };
+  try {
+    const prfOutput = await evalPrf({ credentialId, prfSalt, signal });
+    return { credentialId, prfOutput };
+  } catch (e) {
+    // The other way a setup dies without PRF: create promised it, the control
+    // get() did not deliver. Same diagnostic, because the same question
+    // decides it.
+    if (e instanceof QuickUnlockUnavailableError && e.verdict === 'no-prf') {
+      console.error('quick unlock: no PRF from the control get(); credProps.rk =', extensions.credProps?.rk);
+    }
+    throw e;
+  }
 }
 
 /**

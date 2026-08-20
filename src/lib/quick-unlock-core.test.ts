@@ -320,18 +320,34 @@ describe('createPrfCredential', () => {
     for (const word of MN.split(' ')) expect(serialized).not.toContain(word);
   });
 
-  it('asks for a platform authenticator and a discouraged resident key', async () => {
+  it('asks for a platform authenticator and a PREFERRED resident key', async () => {
     const { createCalls } = stubCredentials();
     await createPrfCredential({ prfSalt });
     const sel = publicKeyOf(createCalls[0]).authenticatorSelection as Record<string, unknown>;
     expect(sel.authenticatorAttachment).toBe('platform');
-    // 'preferred', not 'discouraged': the providers that implement hmac-secret
-    // are the ones storing DISCOVERABLE passkeys, and a non-discoverable
-    // credential is what an Android device handed back with no PRF at all.
-    // Not 'required' either — a platform that can only do non-discoverable
-    // should still get its chance instead of a flat refusal.
+    // 'preferred', not 'discouraged' — an UNPROVEN routing hypothesis about
+    // Android providers, not a spec requirement (CTAP mandates hmac-secret
+    // for discoverable and non-discoverable alike). Not 'required' either: a
+    // platform that can only do non-discoverable should still get its chance.
     expect(sel.residentKey).toBe('preferred');
     expect(publicKeyOf(createCalls[0]).attestation).toBe('none');
+  });
+
+  it('requests credProps — the only honest way to learn what was created', async () => {
+    // Diagnostic ONLY: nothing branches on it. It is what will settle the
+    // residentKey hypothesis from a real device — rk:true with PRF still
+    // missing kills it.
+    const { createCalls } = stubCredentials();
+    await createPrfCredential({ prfSalt });
+    const ext = publicKeyOf(createCalls[0]).extensions as Record<string, unknown>;
+    expect(ext.credProps).toBe(true);
+  });
+
+  it('a missing credProps result does not break the flow — it is optional by spec', async () => {
+    // «Absent» means the client declined to say, not «not discoverable».
+    stubCredentials(); // the fake returns no credProps at all
+    const result = await createPrfCredential({ prfSalt });
+    expect(Array.from(result.prfOutput)).toEqual(Array.from(GET_PRF));
   });
 
   it('refuses BEFORE the second prompt when create reports no PRF at all', async () => {
