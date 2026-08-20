@@ -146,10 +146,9 @@ Compromise procedure (levers that exist in the code today):
    binding to the signed client envelope — never trust a client-supplied
    txId;
 4. **client side**: the `{code:'recovery_invalid'}` responses feed the
-   terminal quarantine (`terminalError: 'recovery_invalidated'`) so affected
-   records stop rechecking forever instead of polling a guaranteed failure.
-   Until the client half ships, the invalidated records recheck endlessly —
-   noisy but safe (no duplicate spend);
+   terminal quarantine (`terminalError: 'recovery_invalidated'`) — affected
+   records stop rechecking, keep their txId + hint as evidence, and only the
+   proof-bearing seed-restore path may clear the state;
 5. re-enable uploads (`UPLOADS_ENABLED = "true"` + deploy) once the new key
    is live.
 
