@@ -15,6 +15,8 @@
 import { openDB, deleteDB, type IDBPDatabase } from 'idb';
 import type { EncryptedNote, EncryptedSafeboxEntry, PinEncryptedSeed } from './crypto';
 import { SafeboxPinUnavailableError, assertValidPinBlob } from './crypto';
+// Runtime import is cycle-safe: sync-transitions imports ONLY types from here.
+import { toUploading } from './sync-transitions';
 import {
   QUICK_UNLOCK_META_KEY,
   judgeQuickUnlock,
@@ -67,9 +69,23 @@ export interface SyncRecord {
    * 'malformed_record': the stored row failed runtime validation right before
    * serialization (IndexedDB is an untrusted boundary) — retrying can only
    * ever produce the same rejection.
+   * 'recovery_invalidated': the SERVER rejected the signed recovery proof
+   * (400 {code:'recovery_invalid'} — e.g. the HMAC secret was rotated after a
+   * compromise). The local row is intact — txId and the recovery hint are
+   * preserved as evidence — but every future recheck is a guaranteed failure,
+   * so the record is quarantined instead of polling forever.
+   *
+   * MONOTONE at the record boundary: no ordinary writer may CLEAR an
+   * established terminalError (see beginUploadUnlessTerminal /
+   * commitSyncUnlessTerminal). The only proof-bearing exception is the
+   * seed-restore path (saveNoteWithSync / saveSafeboxEntryWithSync), which
+   * clears 'recovery_invalidated' ONLY — by the time it writes, the restore
+   * pipeline has established a trusted owner, an authenticated envelope and
+   * an on-chain transaction, which is exactly the publication proof the
+   * quarantine was waiting for. Other reasons survive even restore.
    * Still counted by reset-safety (a newer build might read it).
    */
-  terminalError?: 'unsupported_version' | 'malformed_record';
+  terminalError?: 'unsupported_version' | 'malformed_record' | 'recovery_invalidated';
 }
 
 /**
@@ -257,6 +273,22 @@ export async function saveNote(note: EncryptedNote): Promise<void> {
  * CONTRACT: the transaction is created SYNCHRONOUSLY on entry. Callers that
  * guard against a concurrent reset rely on it — an await added before the
  * `transaction(...)` line would silently reopen the resurrection window.
+ *
+ * QUARANTINE RULE (per reason, decided on the row re-read INSIDE this
+ * transaction — the caller's earlier getSyncRecord is a suspension point and
+ * must not be trusted):
+ *  - no terminalError → write `record` as given (the normal restore path);
+ *  - 'recovery_invalidated' → CLEARED. This is the authorized cryptographic
+ *    reconciliation path: by the time restore writes, the pipeline has
+ *    established a TRUSTED OWNER (owners: TRUSTED_OWNERS filter), an
+ *    AUTHENTICATED envelope (it just decrypted under the vault key) and an
+ *    on-chain transaction — exactly the publication proof the quarantine was
+ *    waiting for. Clearing here is the model's designed completion, not a
+ *    bypass;
+ *  - 'unsupported_version' / 'malformed_record' → PRESERVED. The local row is
+ *    unusable for a different reason; whether replacing it with the on-chain
+ *    copy is safe is a separate decision, not a restore side effect. The
+ *    payload is still written (upsert-repair), the quarantine flag stays.
  */
 export async function saveNoteWithSync(
   note: EncryptedNote,
@@ -265,7 +297,8 @@ export async function saveNoteWithSync(
   const tx = getDB().transaction(['notes', 'sync'], 'readwrite');
   try {
     await tx.objectStore('notes').put(note);
-    await tx.objectStore('sync').put(record);
+    const syncStore = tx.objectStore('sync');
+    await syncStore.put(await applyRestoreQuarantineRule(syncStore, record));
     await tx.done;
   } catch (e) {
     // Explicitly roll back so a failure on the SECOND put can't leave the first
@@ -275,6 +308,23 @@ export async function saveNoteWithSync(
     try { tx.abort(); } catch { /* already aborting/aborted */ }
     throw e;
   }
+}
+
+/** The per-reason quarantine decision shared by both restore writers. Runs on
+ *  the row re-read INSIDE the caller's transaction (TOCTOU-safe: a quarantine
+ *  set after the caller's preliminary read still wins/clears correctly). */
+async function applyRestoreQuarantineRule(
+  syncStore: { get(key: string): Promise<unknown> },
+  record: SyncRecord,
+): Promise<SyncRecord> {
+  const fresh = normalizeSyncRecord(await syncStore.get(record.noteId) as SyncRecord | undefined);
+  if (fresh?.terminalError === undefined) return record;
+  if (fresh.terminalError === 'recovery_invalidated') {
+    const cleared = { ...record };
+    delete cleared.terminalError;
+    return cleared;
+  }
+  return { ...record, terminalError: fresh.terminalError };
 }
 
 /**
@@ -355,7 +405,9 @@ export async function countSafeboxEntries(): Promise<number> {
 
 /** Persist an entry and its sync record together in a SINGLE transaction —
  *  same contract as saveNoteWithSync, including the synchronous creation of the
- *  transaction on entry. Used by the restore merge, which records the
+ *  transaction on entry AND the per-reason quarantine rule (in-transaction
+ *  re-read; 'recovery_invalidated' cleared by this proof-bearing path, other
+ *  reasons preserved). Used by the restore merge, which records the
  *  already-on-chain TX as `confirmed`. */
 export async function saveSafeboxEntryWithSync(
   entry: EncryptedSafeboxEntry,
@@ -364,7 +416,8 @@ export async function saveSafeboxEntryWithSync(
   const tx = getDB().transaction(['safebox', 'sync'], 'readwrite');
   try {
     await tx.objectStore('safebox').put(entry);
-    await tx.objectStore('sync').put(record);
+    const syncStore = tx.objectStore('sync');
+    await syncStore.put(await applyRestoreQuarantineRule(syncStore, record));
     await tx.done;
   } catch (e) {
     tx.done.catch(() => {});
@@ -688,6 +741,72 @@ export async function setSyncRecord(record: SyncRecord): Promise<void> {
   await getDB().put('sync', record);
 }
 
+/**
+ * ATOMIC begin of an upload attempt: ONE readwrite transaction re-reads the
+ * CURRENT row, REFUSES if it is quarantined, otherwise writes the 'uploading'
+ * transition built from the FRESH row. Returns false on refusal — the caller
+ * must then NOT dispatch any HTTP.
+ *
+ * Closes the enqueue/quarantine race: between the queue reading `prev` and
+ * writing `toUploading`, another tab may have set `terminalError` — a plain
+ * setSyncRecord would erase it before the request even started.
+ */
+export async function beginUploadUnlessTerminal(
+  noteId: string,
+  kind: SyncRecord['kind'],
+  now: number,
+): Promise<boolean> {
+  const tx = getDB().transaction('sync', 'readwrite');
+  const store = tx.objectStore('sync');
+  const fresh = normalizeSyncRecord(await store.get(noteId) as SyncRecord | undefined);
+  if (fresh?.terminalError !== undefined) {
+    await tx.done;
+    return false;
+  }
+  await store.put(toUploading(noteId, kind, fresh, now));
+  await tx.done;
+  return true;
+}
+
+/**
+ * Terminal-preserving writer for EVERY ordinary sync-record result (upload
+ * response, late poll, BFCache resurrection): ONE readwrite transaction
+ * re-reads the CURRENT row and applies `build(fresh)` only if the row is not
+ * quarantined. `terminalError` is MONOTONE at the record boundary — an
+ * in-flight result finishing after a quarantine was set must never erase it,
+ * whatever the request's outcome was. The quarantined row already preserves
+ * txId and the recovery hint, so dropping the stale result loses nothing.
+ *
+ * `build` runs INSIDE the transaction and must be synchronous/pure (the
+ * sync-transitions builders are). It MAY itself set terminalError — the
+ * quarantine SETTERS go through here too, which also guarantees a second
+ * reason never overwrites the first. Returning null = deliberate no-op.
+ *
+ * The only writers allowed to bypass this monotonicity are the proof-bearing
+ * restore writers (saveNoteWithSync / saveSafeboxEntryWithSync — see their
+ * per-reason rules) and resetAll(), which is a deliberate user wipe.
+ */
+export async function commitSyncUnlessTerminal(
+  noteId: string,
+  build: (fresh: SyncRecord | undefined) => SyncRecord | null,
+): Promise<'applied' | 'blocked' | 'noop'> {
+  const tx = getDB().transaction('sync', 'readwrite');
+  const store = tx.objectStore('sync');
+  const fresh = normalizeSyncRecord(await store.get(noteId) as SyncRecord | undefined);
+  if (fresh?.terminalError !== undefined) {
+    await tx.done;
+    return 'blocked';
+  }
+  const next = build(fresh);
+  if (next === null) {
+    await tx.done;
+    return 'noop';
+  }
+  await store.put(next);
+  await tx.done;
+  return 'applied';
+}
+
 export async function getRecordsByStatus(status: SyncRecord['status']): Promise<SyncRecord[]> {
   const all = await getDB().getAllFromIndex('sync', 'by-status', status) as SyncRecord[];
   return all.map(r => normalizeSyncRecord(r)!);
@@ -761,17 +880,28 @@ export function readV4PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
 /**
  * Persist a vN_disabled upload failure AND the pause marker in ONE transaction
  * over sync+meta. Called from the committed part of runUploadAttempt INSTEAD
- * of the final setSyncRecord (never in addition — two writes reopen the crash
- * window this exists to close).
+ * of the terminal-preserving result commit (never in addition — two writes
+ * reopen the crash window this exists to close).
+ *
+ * Terminal-preserving for the RECORD half (same monotonicity contract as
+ * commitSyncUnlessTerminal — a quarantined row is never overwritten), but the
+ * PAUSE MARKER is written unconditionally: the pause is version-global state
+ * about the WORKER, not about this record, and the server did just answer
+ * vN_disabled regardless of what happened to the row.
  */
 async function commitPausedFailure(
   key: string,
-  record: SyncRecord,
+  noteId: string,
+  buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
   const tx = getDB().transaction(['sync', 'meta'], 'readwrite');
   try {
-    await tx.objectStore('sync').put(record);
+    const syncStore = tx.objectStore('sync');
+    const fresh = normalizeSyncRecord(await syncStore.get(noteId) as SyncRecord | undefined);
+    if (fresh?.terminalError === undefined) {
+      await syncStore.put(buildRecord(fresh));
+    }
     await tx.objectStore('meta').put({ pausedAt } satisfies PauseMeta, key);
     await tx.done;
   } catch (e) {
@@ -783,11 +913,19 @@ async function commitPausedFailure(
   }
 }
 
-export function commitV3PausedFailure(record: SyncRecord, pausedAt: number): Promise<void> {
-  return commitPausedFailure(V3_PAUSE_META_KEY, record, pausedAt);
+export function commitV3PausedFailure(
+  noteId: string,
+  buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
+  pausedAt: number,
+): Promise<void> {
+  return commitPausedFailure(V3_PAUSE_META_KEY, noteId, buildRecord, pausedAt);
 }
-export function commitV4PausedFailure(record: SyncRecord, pausedAt: number): Promise<void> {
-  return commitPausedFailure(V4_PAUSE_META_KEY, record, pausedAt);
+export function commitV4PausedFailure(
+  noteId: string,
+  buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
+  pausedAt: number,
+): Promise<void> {
+  return commitPausedFailure(V4_PAUSE_META_KEY, noteId, buildRecord, pausedAt);
 }
 
 /**

@@ -128,7 +128,8 @@ import {
   getAllSyncRecords,
   getRecordsByStatus,
   getSyncRecord,
-  setSyncRecord,
+  beginUploadUnlessTerminal,
+  commitSyncUnlessTerminal,
   commitV3PausedFailure,
   commitV4PausedFailure,
   readV3PauseMeta,
@@ -157,7 +158,6 @@ import {
   noteExternalReset,
   isDbVersionError,
   type PinUnlockFailureOutcome,
-  type SyncRecord,
   type VaultBindResult,
 } from './storage';
 import { ensurePersistentStorage } from './persistence';
@@ -219,6 +219,11 @@ export interface ArweaveState {
    *  app version). Settings shows a dedicated explainer instead of a lying
    *  «Ошибки: N — Повторить». */
   quarantinedCount: number;
+  /** Subset of quarantinedCount with reason 'recovery_invalidated' — shown
+   *  with its OWN explainer: unlike the other reasons («эта версия не может
+   *  обработать»), here the record is intact and a seed restore can bring it
+   *  back if the transaction landed on-chain. */
+  recoveryInvalidatedCount: number;
   /** STORAGE-BACKED reset risk, SPLIT BY KIND: every stored record minus the
    *  confirmed ones. The reset dialog must use THIS, not the visible `notes` —
    *  an invisible quarantined/undecryptable record (or the whole safebox, which
@@ -234,6 +239,7 @@ export interface ArweaveState {
     confirmedCount: number;
     errorCount: number;
     quarantinedCount: number;
+    recoveryInvalidatedCount: number;
   };
   lastSync: number | null;
   lastError: string | null;
@@ -250,6 +256,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   acceptedCount: 0,
   confirmedCount: 0,
   quarantinedCount: 0,
+  recoveryInvalidatedCount: 0,
   resetRisk: { notes: 0, safebox: 0 },
   safebox: {
     unsyncedCount: 0,
@@ -257,6 +264,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
     confirmedCount: 0,
     errorCount: 0,
     quarantinedCount: 0,
+    recoveryInvalidatedCount: 0,
   },
   lastSync: null,
   lastError: null,
@@ -2023,7 +2031,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     //    dangerous: an orphan `confirmed` row cancels out a real unsynced note
     //    in `resetRisk` and makes the reset dialog claim everything is safely
     //    on chain right before wiping it.
-    const zero = () => ({ accepted: 0, confirmed: 0, errors: 0, quarantined: 0 });
+    const zero = () => ({ accepted: 0, confirmed: 0, errors: 0, quarantined: 0, recoveryInvalidated: 0 });
     const tallyFor = (ids: string[]) => {
       const t = zero();
       for (const id of ids) {
@@ -2033,7 +2041,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // outranks `accepted`: a record that can never be re-dispatched must
         // not sit in «ожидают подтверждения» forever pretending progress.
         if (r.status === 'confirmed') t.confirmed++;
-        else if (r.terminalError !== undefined) t.quarantined++;
+        else if (r.terminalError !== undefined) {
+          t.quarantined++;
+          // Sub-split by reason: 'recovery_invalidated' gets its OWN explainer
+          // (the record is intact; seed restore can bring it back) — the
+          // generic «версия не может обработать» text would be a lie for it.
+          if (r.terminalError === 'recovery_invalidated') t.recoveryInvalidated++;
+        }
         else if (r.status === 'accepted') t.accepted++;
         else if (r.status === 'error') t.errors++;
       }
@@ -2060,6 +2074,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       countsReady: true,
       errorCount: tally.note.errors,
       quarantinedCount: tally.note.quarantined,
+      recoveryInvalidatedCount: tally.note.recoveryInvalidated,
       // Storage-backed: EVERY stored record that is not confirmed is at risk on
       // a reset — including versions invisible in the UI (historical,
       // quarantined, undecryptable, or locked away in the safebox).
@@ -2073,6 +2088,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         unsyncedCount: allSafebox.length - tally.safebox.accepted - tally.safebox.confirmed,
         errorCount: tally.safebox.errors,
         quarantinedCount: tally.safebox.quarantined,
+        recoveryInvalidatedCount: tally.safebox.recoveryInvalidated,
       },
     }));
   }
@@ -2257,17 +2273,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           now: () => Date.now(),
           currentEpoch: () => vaultEpochRef.current,
           getSyncRecord,
-          setSyncRecord: async record => {
-            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
-            await setSyncRecord(record);
+          beginUpload: async (noteId, kind, now) => {
+            // Reset counts as a refusal: 'false' means NO HTTP is dispatched,
+            // which is exactly right when the DB was just wiped.
+            if (getDbGeneration() !== myDbGen) return false; // reset won — refuse
+            return beginUploadUnlessTerminal(noteId, kind, now);
           },
-          commitV3PausedFailure: async (record, pausedAt) => {
+          commitResult: async (noteId, build) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
-            await commitV3PausedFailure(record, pausedAt);
+            await commitSyncUnlessTerminal(noteId, build);
           },
-          commitV4PausedFailure: async (record, pausedAt) => {
+          commitV3PausedFailure: async (noteId, build, pausedAt) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
-            await commitV4PausedFailure(record, pausedAt);
+            await commitV3PausedFailure(noteId, build, pausedAt);
+          },
+          commitV4PausedFailure: async (noteId, build, pausedAt) => {
+            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
+            await commitV4PausedFailure(noteId, build, pausedAt);
           },
           signPayload,
           uploadViaProxy,
@@ -2285,27 +2307,32 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // serialize (written by a newer client), or it failed runtime shape
         // validation. PERMANENT local quarantine: terminalError keeps it out of
         // every future queue pass (a plain 'error' would retry forever), no
-        // HTTP was made, and the reset risk still counts it.
-        const prev = await getSyncRecord(id);
-        const quarantined: SyncRecord = {
+        // HTTP was made, and the reset risk still counts it. The setter goes
+        // through the terminal-preserving commit too: if another tab already
+        // quarantined the row, the FIRST reason stands (monotone, never
+        // re-labelled by a racing writer).
+        if (getDbGeneration() !== myDbGen) return 'quarantined'; // reset won
+        await commitSyncUnlessTerminal(id, fresh => ({
           noteId: id,
           kind: item.kind,
-          txId: prev?.txId,
+          txId: fresh?.txId,
           status: 'error',
           transport: 'proxy',
           lastError: terminal,
           updatedAt: Date.now(),
-          recovery: prev?.recovery,
+          recovery: fresh?.recovery,
           terminalError: terminal,
-        };
-        if (getDbGeneration() !== myDbGen) return 'quarantined'; // reset won
-        await setSyncRecord(quarantined);
+        }));
         if (vaultEpochRef.current === myEpoch) await refreshSyncCounts(myEpoch);
         return 'quarantined'; // processQueue treats it as recoverable: shift + continue
       }
       throw err;
     }
     if (outcome.kind === 'cancelled') return 'cancelled';
+    // Quarantined between enqueue and the atomic begin (e.g. by another tab):
+    // no HTTP was made, nothing was written — shift + continue, like
+    // 'quarantined' above.
+    if (outcome.kind === 'blocked') return 'blocked';
     const result = outcome.result;
 
     // React state + registration meta — ONLY under the current epoch. The
@@ -2469,18 +2496,28 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     for (const record of accepted) {
       if (vaultEpochRef.current !== myEpoch) return; // locked mid-poll — stop
       if (!record.txId) continue;
+      // A quarantined record must not even be QUERIED: the check is a
+      // guaranteed no-op (recovery_invalidated) or meaningless (malformed),
+      // and afterFailure keeps such records in 'accepted' where this index
+      // finds them.
+      if (record.terminalError !== undefined) continue;
 
       const status = await getTxStatus(record.txId);
 
       // Pure transition (sync-transitions.ts): confirm only after server
       // reconciliation; dropped/invalid/timed-out pending → needsRecheck;
       // unavailable → unchanged (gateway degradation).
-      const next = afterPoll(record, status, now, TX_CONFIRM_THRESHOLD, TX_TIMEOUT_MS);
-      if (next) {
-        if (getDbGeneration() !== myDbGen) return; // reset won — refuse the write
-        await setSyncRecord(next);
-        changed = true;
-      }
+      // Terminal-preserving + guarded on the FRESH row: this request may have
+      // been in flight while another writer quarantined or re-dispatched the
+      // record — a late poll result must never erase a quarantine (blocked
+      // inside the commit) nor resurrect a row that moved on (the status/txId
+      // guard turns it into a no-op).
+      if (getDbGeneration() !== myDbGen) return; // reset won — refuse the write
+      const applied = await commitSyncUnlessTerminal(record.noteId, fresh =>
+        fresh && fresh.status === 'accepted' && fresh.txId === record.txId
+          ? afterPoll(fresh, status, now, TX_CONFIRM_THRESHOLD, TX_TIMEOUT_MS)
+          : null);
+      if (applied === 'applied') changed = true;
     }
 
     if (changed) await refreshSyncCounts(myEpoch);

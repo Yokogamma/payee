@@ -8,6 +8,7 @@ import {
   type UploadItem,
   type UploadKeys,
 } from './upload-flow';
+import { toUploading } from './sync-transitions';
 import type { UploadResult } from './arweave';
 import type { SyncRecord } from './storage';
 import type { EncryptedSafeboxEntry } from './crypto';
@@ -41,15 +42,34 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
   const writes: SyncRecord[] = [];
   const v3Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
   const v4Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
+  // In-memory sync row — the «fresh» source every commit re-reads, mirroring
+  // the terminal-preserving storage primitives (§1.9).
+  const row: { value: SyncRecord | undefined } = { value: opts.prev };
   let bodyText = '';
   let httpCalls = 0;
   const deps: UploadAttemptDeps = {
     now: () => NOW,
     currentEpoch: () => 1,
-    getSyncRecord: async () => opts.prev,
-    setSyncRecord: async r => { writes.push(r); },
-    commitV3PausedFailure: async (record, pausedAt) => { v3Pauses.push({ record, pausedAt }); },
-    commitV4PausedFailure: async (record, pausedAt) => { v4Pauses.push({ record, pausedAt }); },
+    getSyncRecord: async () => row.value,
+    beginUpload: async (noteId, kind, now) => {
+      if (row.value?.terminalError !== undefined) return false;
+      row.value = toUploading(noteId, kind, row.value, now);
+      writes.push(row.value);
+      return true;
+    },
+    commitResult: async (_noteId, build) => {
+      if (row.value?.terminalError !== undefined) return;
+      const next = build(row.value);
+      if (next !== null) { row.value = next; writes.push(next); }
+    },
+    commitV3PausedFailure: async (_noteId, build, pausedAt) => {
+      if (row.value?.terminalError === undefined) row.value = build(row.value);
+      v3Pauses.push({ record: row.value!, pausedAt });
+    },
+    commitV4PausedFailure: async (_noteId, build, pausedAt) => {
+      if (row.value?.terminalError === undefined) row.value = build(row.value);
+      v4Pauses.push({ record: row.value!, pausedAt });
+    },
     signPayload: async () => 'sig',
     uploadViaProxy: async body => {
       httpCalls++;
@@ -57,7 +77,7 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
       return opts.result ?? { kind: 'accepted', txId: 'TX', committed: true };
     },
   };
-  return { deps, writes, v3Pauses, v4Pauses, calls: () => httpCalls, body: () => bodyText };
+  return { deps, writes, v3Pauses, v4Pauses, row, calls: () => httpCalls, body: () => bodyText };
 }
 
 describe('uploadItemId', () => {
@@ -97,14 +117,19 @@ describe('kind-driven serialization', () => {
     }
   });
 
-  it('terminalError survives a transition (it used to be silently dropped)', async () => {
+  it('карантинная запись вообще не стартует: begin отказывает, HTTP нет (§1.9)', async () => {
+    // Раньше terminalError «переживал» транзишены; теперь строже — карантинная
+    // строка не доходит до транзишенов вовсе: атомарный begin отказывает.
     const prev: SyncRecord = {
       noteId: SB.entryId, kind: 'safebox', status: 'error', transport: 'proxy',
       updatedAt: NOW - 1, terminalError: 'unsupported_version',
     };
     const h = harness({ prev, result: { kind: 'unavailable', error: 'ua' } });
-    await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
-    for (const w of h.writes) expect(w.terminalError).toBe('unsupported_version');
+    const outcome = await runUploadAttempt(SB_ITEM, KEYS, 1, h.deps);
+    expect(outcome).toEqual({ kind: 'blocked' });
+    expect(h.calls()).toBe(0);
+    expect(h.writes).toEqual([]);
+    expect(h.row.value?.terminalError).toBe('unsupported_version');
   });
 });
 

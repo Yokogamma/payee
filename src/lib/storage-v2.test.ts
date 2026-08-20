@@ -245,7 +245,7 @@ describe('v4 pause marker (independent of v3)', () => {
   };
 
   it('commits the failure record and the v4 marker together — and NOT the v3 one', async () => {
-    await commitV4PausedFailure(REC, 999);
+    await commitV4PausedFailure('p4', () => REC, 999);
     expect(await getSyncRecord('p4')).toEqual(REC);
     expect(await readV4PauseMeta()).toEqual({ pausedAt: 999 });
     expect(await readV3PauseMeta()).toBeNull(); // pausing v4 must not stall notes
