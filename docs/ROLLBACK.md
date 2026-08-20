@@ -1174,11 +1174,11 @@ already written stays readable (an older client ignores the key).
 
 ### Acceptance — Android, the cause, and what it cost
 
-**RESOLVED 2026-08-20 (tag `client-qu2-hotfix1`): quick unlock works on the
-OnePlus 12 and on a Windows PC with a fingerprint reader.** The cause was
-`residentKey`. Read the rest of this section before touching that setting
-again — it is the only thing standing between this feature and «works
-everywhere except Android».
+**UNBLOCKED 2026-08-20 (tag `client-qu2-hotfix1`): quick unlock works on the
+OnePlus 12 (installed PWA) and on one Windows PC with a fingerprint reader.**
+The change that unblocked it was `residentKey` — a confirmed workaround, not a
+proven cause; see below for why the distinction is kept. Read the rest of this
+section before touching that setting again.
 
 **How it started. OnePlus 12 / Android 16 / installed PWA, 2026-08-19 — SETUP
 FAILED: the credential was created, the platform then returned no PRF.** The
@@ -1208,27 +1208,33 @@ rewritten without jargon, each line ending in what the reader can DO.
 restart the button returns and one more orphaned credential can be created.
 Persisting it needs a new meta key and was not added silently.
 
-**THE CAUSE: `residentKey: 'discouraged'`.** Changed to `'preferred'` in
-`1a90c13` (PR #65); the retry on the same device succeeded. One variable
-changed, the symptom went away — that is as close to proof as a single device
-gets, and it is enough to treat the setting as the cause.
+**A CONFIRMED WORKAROUND — not a proven cause.** `residentKey: 'discouraged'`
+→ `'preferred'` (`1a90c13`, PR #65), and the retry on the same device
+succeeded. That is a working hypothesis confirmed on THIS combination, and the
+wording matters, because two things stop it short of a diagnosis:
 
-**The MECHANISM is still inference, and the distinction matters.** An earlier
-version of this section claimed a missing PRF is «the signature» of a
-non-discoverable credential. It is not: CTAP requires `hmac-secret` support for
-discoverable and non-discoverable credentials alike, and `'preferred'` may
-still yield a plain server-side credential. What is likely happening is
-ROUTING — on Android the request goes to different credential providers, and
-what you ask for influences which one takes it; `'discouraged'` can steer away
-from the provider that implements `hmac-secret`. We did NOT read
-`credProps.rk` on the successful run, so «it is now discoverable» is an
-assumption, not an observation. `credProps: true` is requested and logged on
-both no-PRF paths (`33c874f`), so the next failure anywhere will say more.
+1. **The successful run was not a single-variable experiment.** By the time it
+   happened, the deployed build carried BOTH the `residentKey` change AND
+   `credProps: true` (`33c874f`, PR #66). `credProps` is itself a request
+   extension, so it cannot be ruled out as an influence on which provider took
+   the request. Nobody re-tested with one change at a time, and nobody needs
+   to — but the record should not pretend otherwise.
+2. **The mechanism was never observed.** An earlier version of this section
+   claimed a missing PRF is «the signature» of a non-discoverable credential.
+   It is not: CTAP requires `hmac-secret` support for discoverable and
+   non-discoverable credentials alike, and `'preferred'` may still yield a
+   plain server-side credential. The plausible story is ROUTING — on Android
+   the request goes to different credential providers, and what you ask for
+   influences which one takes it — but `credProps.rk` was NOT read on the
+   successful run, so even «the credential is now discoverable» is an
+   assumption. It is requested and logged on both no-PRF paths now, so the
+   next failure anywhere will say more.
 
-**The price, accepted knowingly:** the key is now visible in the system
-password manager and, on a syncing provider, synced. It can therefore be
-deleted by hand — which §2 already covers: losing it costs only the
-accelerator, never the data.
+**The price, accepted knowingly:** the key MAY now become visible in the system
+password manager and, on a syncing provider, synced — `'preferred'` asks, it
+does not guarantee, and again `rk` was not observed. If it does, it can also be
+deleted by hand, which §2 already covers: losing it costs only the accelerator,
+never the data.
 
 **Do not «tidy» this back to `'discouraged'`.** The original rationale («do not
 clutter the passkey list, lower the chance of an accidental deletion») reads
@@ -1236,22 +1242,29 @@ perfectly sensible and was written on the assumption that the choice was free.
 It is not. That assumption cost one failed acceptance, two UI defects and three
 releases to unwind.
 
-### §13 device matrix — where it actually stands (2026-08-20)
+### §13 — PARTIAL hardware smoke, not a completed acceptance (2026-08-20)
+
+Two devices were smoke-tested. That is not the §13 matrix; calling it one would
+turn «the platform that was broken now works» into «the feature is accepted».
 
 | Platform | Result |
 |---|---|
-| Android — OnePlus 12 / Android 16 / installed PWA | **PASS**, after `residentKey: 'preferred'` |
-| Windows PC, fingerprint | **PASS** |
+| Android — OnePlus 12 / Android 16 / **installed PWA** | **PASS**, after `residentKey: 'preferred'` |
+| Android — **Chrome tab** (not the PWA) on the same device | not run |
+| Windows PC — **fingerprint** | **PASS** |
+| Windows — **Hello PIN** rather than the fingerprint | not run |
+| Windows — which browser, and Chrome vs **Edge** | not recorded / not run |
 | iPhone — Safari | not run |
 | iPhone — installed PWA (its own IndexedDB; configure again there) | not run |
-| Windows Hello laptop — Edge specifically | not run |
 | A machine WITHOUT KB5077181 — must say «не поддерживается», not fail silently | not run |
 | macOS Safari (optional second Keychain) | not run |
 
 The two passes are real and they cover the platform that was broken. What they
-do NOT cover is the whole point of the remaining rows: iOS is a different
-WebKit/Keychain path entirely, Edge is a different WebAuthn client from Chrome
-on the same OS, and the no-KB5077181 machine is the only way to see whether the
+do NOT cover is the whole point of the remaining rows: an installed PWA and a
+plain Chrome tab are not the same client on Android, Hello PIN and a
+fingerprint are different verification methods, Edge is a different WebAuthn
+client from Chrome on the same OS, iOS is a different WebKit/Keychain path
+entirely, and the no-KB5077181 machine is the only way to see whether the
 HONEST refusal appears rather than a silent failure — the one behaviour the
 support matrix cannot predict and the tests cannot exercise.
 

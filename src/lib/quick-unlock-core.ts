@@ -313,11 +313,14 @@ export async function createPrfCredential(opts: {
         authenticatorSelection: {
           authenticatorAttachment: 'platform',
           userVerification: USER_VERIFICATION,
-          // 'preferred', NOT 'discouraged' (changed 2026-08-19). AN UNPROVEN
-          // HYPOTHESIS, deliberately labelled as one.
+          // 'preferred', NOT 'discouraged' (changed 2026-08-19). A CONFIRMED
+          // WORKAROUND, not a proven cause — deliberately labelled as one.
           //
           // What is FACT: a OnePlus 12 / Android 16 installed PWA created the
-          // credential happily and then returned no PRF.
+          // credential happily and then returned no PRF; after this change the
+          // same device works. What that does NOT establish is the mechanism —
+          // and note the successful run carried BOTH this change and the
+          // `credProps` request below, so it was not a single-variable test.
           //
           // What is NOT fact, and what an earlier version of this comment
           // wrongly asserted: that a missing PRF is «the signature» of a
@@ -334,11 +337,13 @@ export async function createPrfCredential(opts: {
           // discoverable credential without hard-requiring it, so a platform
           // that only offers non-discoverable still gets its chance.
           //
-          // The price is real and was accepted knowingly: the key becomes
+          // The price is real and was accepted knowingly: the key MAY become
           // visible in the system manager — and, on a syncing provider,
-          // synced — so it can also be deleted by hand. §2 already promises
-          // that losing it costs only the accelerator, and a visible key that
-          // works beats an invisible one that does not.
+          // synced — so it may also be deleted by hand. «May», because
+          // 'preferred' asks and does not guarantee, and `credProps.rk` was
+          // never actually observed on a successful run. §2 already promises
+          // that losing the key costs only the accelerator, and a visible key
+          // that works beats an invisible one that does not.
           //
           // `credProps` below is what will actually settle this: if the retry
           // reports `rk: true` and PRF is STILL missing, this hypothesis is
