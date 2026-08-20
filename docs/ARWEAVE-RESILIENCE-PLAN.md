@@ -1,12 +1,14 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v11 — девятый раунд ревью учтён** (ревью 9 по v10: 1 medium —
-принят: инвариант generation переформулирован с «одна ПОДПИСЬ» на «один
-DURABLE/POSTABLE txId» — exactly-once вызова signer-а недоказуем и не
-требуется, эфемерные подписи проигравших CAS/оборванных попыток
-отбрасываются и не POST-ятся; `resign_violation` считает durable-txId, не
-вызовы signer; в схему `signed` добавлен опциональный `deadTxId`-lineage).
-История: v10 — alarm-подпись только в фазе 2, durable-источник фазы 2 =
+Статус: **v12 — десятый раунд ревью учтён (механические правки
+согласованности)** (ревью 10 по v11: 1 medium + 2 gap — приняты: alarm-тест
+переформулирован «вызов signer — только в фазе 2; durable-коммит и POST —
+только CAS-победителю»; ADR-инвариант same-signed-tx = «не создаёт второй
+durable/postable txId без доказанного dead»; cap сформулирован через
+recovery-записи/durable txId). История: v11 — инвариант generation
+переформулирован с «одна ПОДПИСЬ» на «один DURABLE/POSTABLE txId»,
+эфемерные подписи отбрасываются, `resign_violation` считает durable-txId,
+`deadTxId`-lineage в схеме (ревью 9); v10 — alarm-подпись только в фазе 2, durable-источник фазы 2 =
 сохранённый `signedTx` (ревью 8); v9 — durable `redrop_pending`
 scheduler-visible и в общем cap (`recoveryCount`), reader-floor возобновляет
 фазу 2 (ревью 7); v8 —
@@ -221,8 +223,10 @@ domain: общий баг (например, ложный `404`) затроне�
 - `docs/adr/0001-...md`: «Arweave — permanent layer, gateway — заменяемый
   transport», решения D1–D8, privacy trade-off D2 (абзац), **остаточная
   Byzantine-модель полноты (§1)**, список «не делаем» с условиями пересмотра.
-- В ADR также: **инвариант same-signed-tx** (write-path не создаёт вторую
-  подпись) и **trust-инвариант restore** (байты HTML проверяются в runtime до
+- В ADR также: **инвариант same-signed-tx** (уточнено v12, ревью 10:
+  write-path не создаёт второй DURABLE/POSTABLE txId без доказанного
+  `dead`; эфемерные вызовы signer инвариантом не считаются — §4.PR-3b) и
+  **trust-инвариант restore** (байты HTML проверяются в runtime до
   приёма seed).
 
 ### PR-2 «Метрики»
@@ -441,8 +445,10 @@ reconciliation по кворуму статуса. Это снимает нео�
   накоплении зависших redrop-записей, возвращая storage/cost DoS). Cap
   нормативно: **`MAX_RECOVERY_INFLIGHT = quotaLimit`** (часовая квота
   пользователя). При достижении cap новый upload отклоняется **ДО
-  подписания** (`503`, retryable) — подписей сверх границы не существует по
-  построению.
+  подписания** (`503`, retryable) — recovery-записей, а значит и
+  durable/postable txId, сверх границы не существует по построению
+  (уточнено v12: число ЭФЕМЕРНЫХ вызовов signer cap не ограничивает и не
+  обязан — они не порождают ни storage, ни POST).
 - **Reconciliation — сервер-инициированная, два триггера (ревью 4 H2):**
   (а) как сегодня — любой `/upload`/recheck этого noteId; (б) DO alarm через
   scheduler ниже. Клиент, который никогда не повторит запрос, больше не
@@ -621,8 +627,11 @@ reconciliation по кворуму статуса. Это снимает нео�
   через кворум (alive→posted / dead+age→redrop);
 - **DO alarm**: в состоянии `signed` — повторяет ТОЛЬКО тот же txId и
   НИКОГДА не подписывает (поправка v10, ревью 8: формулировка v9 «никогда»
-  противоречила scheduler-driven фазе 2); подпись из alarm-прогона возможна
-  ЕДИНСТВЕННО в фазе 2 `redrop_pending` — и только у CAS-победителя;
+  противоречила scheduler-driven фазе 2); **вызов signer разрешён только в
+  фазе 2 `redrop_pending`; durable-коммит и POST разрешены только
+  CAS-победителю** (поправка v12, ревью 10: «подписывает только победитель»
+  из v11 противоречило подписи-до-CAS — подписать могут и проигравшие, их
+  подписи эфемерны и отбрасываются);
   худший размер `signedTx` при `MAX_BODY_BYTES=51200` ≤ внутреннего предела
   ~75 KB;
 - **scheduler (ревью 5):** две и более signed-записи с разными `dueAt` —
@@ -917,7 +926,7 @@ BFCache-lifecycle; форматы v1–v4.
 рискованный кусок (state machine DO, два последовательных Worker-релиза с
 floor, платные staging-испытания) и не должен задерживать автотриггеры.
 
-1. PR-1: ADR + этот план v11 (D7 утверждён — §2.1; формула кворума и
+1. PR-1: ADR + этот план v12 (D7 утверждён — §2.1; формула кворума и
    логические источники — v6; scheduler и hash-барьер — v7;
    transaction-атомарность и alarm-fault-tolerance — v8; durable
    `redrop_pending` + `recoveryCount` — v9; generation-правило подписи и
@@ -972,14 +981,14 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v11)
+## 8. Карта соответствия (статус v12)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready** после схемы | transport adapter (no hidden SDK req), split repost-метрик, AE schema+sampling, auth 401/503/no-store (семантика уже в `/admin/*`) |
 | PR-3a read | ready (D7 §2.1 + формула кворума v6) | строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | **спецификация ЗАВЕРШЕНА v11** (вердикт ревью 9: после этой правки PR-3b готов); ждёт своей очереди (§6 п.6) | durable/postable-инвариант generation + `resign_violation` по durable-txId + `deadTxId`-lineage (ревью 9), durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | **спецификация ЗАВЕРШЕНА v12** (ревью 10: после механических правок план готов); ждёт своей очереди (§6 п.6) | согласованность alarm-теста/ADR/cap с durable-инвариантом (ревью 10), durable/postable-инвариант generation + `resign_violation` по durable-txId + `deadTxId`-lineage (ревью 9), durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky | логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт→incomplete, nullable height, abort-backoff |
 | PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
@@ -1016,5 +1025,8 @@ POST только после durable-коммита нового `signed`, backo
 DURABLE/POSTABLE txId на generation, POST только у CAS-победителя, эфемерные
 подписи проигравших/оборванных попыток отбрасываются; `resign_violation`
 считает второй durable-txId без нового dead, не вызовы signer; `deadTxId?`
-закреплён в схеме `signed` как lineage). Вердикт ревью 9: после этой правки
-PR-3b готов; остальные PR не заблокированы.
+закреплён в схеме `signed` как lineage); из ревью 10 (по v11) — medium + 2
+gap (alarm-тест: «вызов signer — только фаза 2; durable-коммит и POST —
+только CAS-победителю»; ADR same-signed-tx через durable/postable txId; cap
+через recovery-записи). Вердикт ревью 10: после этих механических правок
+план готов; остальные PR не заблокированы.
