@@ -10,7 +10,9 @@ name: Deploy Worker (proxy) — dev
 # NOTE: a workflow_dispatch workflow must already exist on the default branch
 # before it can be run from the Actions UI, so land this file in main FIRST
 # (both deploys here are manual, so merging does not auto-publish anything).
-# Requires repo secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
+# Requires the GitHub Environment "dev" (its deployment branch policy is the
+# real access boundary for the token — §1.7):
+#   variable CLOUDFLARE_ACCOUNT_ID, secret CLOUDFLARE_API_TOKEN.
 # Worker secrets must be set beforehand (wrangler secret put), incl. the
 # MANDATORY RECOVERY_HMAC_SECRET — without it /upload returns 503.
 on:
@@ -21,9 +23,19 @@ on:
 permissions:
   contents: read
 
+# Two dispatches must finish in dispatch order: without this, a rehearsal run
+# and the real deploy right after it can land in REVERSE order, putting the
+# old build on top of the new one. Never cancel a deploy mid-flight —
+# waiting beats a half-shipped worker.
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
 jobs:
   deploy-worker:
     runs-on: ubuntu-latest
+    # vars.*/secrets.* below resolve from this environment.
+    environment: dev
     steps:
       # Actions are pinned to immutable commit SHAs (tags are movable — a
       # retagged/compromised action would run with the Cloudflare API token).
@@ -33,11 +45,19 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
+      # Early config gate: presence + repo-pinned expectations for NON-SECRET
+      # variables only. The deploy token is deliberately NOT passed to any
+      # repo script — this workflow can be dispatched from arbitrary branches
+      # (--ref), and repo JS receiving the secret would hand it to whatever
+      # that branch contains.
+      - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck
       - run: npm --prefix worker test
       - uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: worker
