@@ -36,6 +36,14 @@ id = "8d9e7ee08bff44f793933d69718600ef"
 ALLOWED_ORIGINS = "https://notes.matamata.dev,http://localhost:5173"
 MAX_BODY_BYTES = "51200"
 RATE_LIMIT_PER_HOUR = "20"
+# GLOBAL upload kill switch — the incident lever (§1.9). STRICTLY "true"
+# enables; anything else fails CLOSED: every /upload (v1–v4, rechecks and
+# recovery included) gets 503 {code:'uploads_disabled'}. Unlike the V3/V4
+# switches below this stops the WHOLE flow — those gate only their declared
+# version. Flip to "false" + deploy = full stop (e.g. RECOVERY_HMAC_SECRET
+# compromise). Verify after EVERY worker deploy:
+#   curl https://<worker>/health  →  "uploads" matches the intended state.
+UPLOADS_ENABLED = "true"
 # v3 upload kill switch. STRICTLY "true" enables; anything else fails CLOSED
 # (v3 uploads get 503 {code:'v3_uploads_disabled'}, v1/v2 unaffected).
 # SOURCE OF TRUTH is this file: toggling = edit here + `npm run deploy` from the
@@ -109,5 +117,6 @@ id = "STAGING_KV_ID_PLACEHOLDER_CREATE_VIA_WRANGLER"
 ALLOWED_ORIGINS = "http://localhost:5173"
 MAX_BODY_BYTES = "51200"
 RATE_LIMIT_PER_HOUR = "20"
+UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"

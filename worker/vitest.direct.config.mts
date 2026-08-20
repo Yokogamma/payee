@@ -22,7 +22,12 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ['test/e2e-repost.test.ts', 'test/v3-gate-e2e.test.ts', 'test/v4-gate-e2e.test.ts'],
+    include: [
+      'test/e2e-repost.test.ts',
+      'test/v3-gate-e2e.test.ts',
+      'test/v4-gate-e2e.test.ts',
+      'test/uploads-gate-e2e.test.ts',
+    ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.
     isolate: false,
