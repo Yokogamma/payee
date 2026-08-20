@@ -11,7 +11,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // all keep working — otherwise a rollback would strand people out of their
 // passwords.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
 vi.mock('hash-wasm', () => ({
   argon2id: async ({ password, salt }: { password: string; salt: Uint8Array }) => {

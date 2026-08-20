@@ -13,7 +13,7 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // inheriting whatever flags.ts currently ships, so the W3 flip stays a pure
 // one-line change and both matrices (here / store.v3-writer.test.tsx) keep
 // asserting their own half forever.
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
 vi.mock('./arweave', async importOriginal => {
   const actual = await importOriginal<typeof import('./arweave')>();
@@ -56,11 +56,19 @@ vi.mock('./storage', async importOriginal => {
     setMeta: vi.fn(actual.setMeta),
     saveNote: vi.fn(actual.saveNote),
     getPinConfigMeta: vi.fn(actual.getPinConfigMeta),
+    // The auto-lock VERDICT still reads two keys; everything else (bootstrap
+    // hydration, the cross-tab reconcile) reads this four-key snapshot.
+    readClientConfigSnapshot: vi.fn(actual.readClientConfigSnapshot),
     clearPinConfigMeta: vi.fn(actual.clearPinConfigMeta),
     // Overridable per-test: the vault-identity transaction and the conditional
     // PIN write are exactly where the restore-with-PIN races live.
     bindVaultIdentity: vi.fn(actual.bindVaultIdentity),
     commitPinSeedIfAbsent: vi.fn(actual.commitPinSeedIfAbsent),
+    // Stage P: the generation-guarded PIN-unlock commits. Overridable so the
+    // store tests can land a reset / a cross-tab PIN change exactly on them.
+    commitPinUnlockFailure: vi.fn(actual.commitPinUnlockFailure),
+    commitPinUnlockSuccess: vi.fn(actual.commitPinUnlockSuccess),
+    commitPinSeedRewrap: vi.fn(actual.commitPinSeedRewrap),
   };
 });
 
@@ -96,7 +104,24 @@ import {
 import {
   initStorage, resetAll, getMeta, setMeta, getPinConfigMeta, getAllSyncRecords,
   clearPinConfigMeta, saveNote, getAllNotes as getStoredNotes,
+  commitPinUnlockFailure, commitPinUnlockSuccess, commitPinSeedRewrap,
+  readClientConfigSnapshot,
 } from './storage';
+
+/** The four-key snapshot `reconcileLockScreen` and bootstrap now read. */
+function configSnapshot(over: {
+  pinSeed?: unknown;
+  autoLockTimeout?: unknown;
+  vaultPublicKey?: unknown;
+} = {}) {
+  return {
+    pinSeed: undefined,
+    autoLockTimeout: undefined,
+    vaultPublicKey: undefined,
+    quickUnlock: { kind: 'none' as const },
+    ...over,
+  };
+}
 import { isArweaveOnline, uploadViaProxy, type UploadResult } from './arweave';
 import { decryptWithPin, WrongPinError, deriveKey, encryptEnvelopeV3, type EncryptedNote } from './crypto';
 import { NoteTooLongError, MAX_NOTE_JSON_BYTES } from './limits';
@@ -803,8 +828,10 @@ describe('config publication ordering and reset lifecycle', () => {
 
     // Reconcile A hangs on its read…
     let releaseRead!: () => void;
-    vi.mocked(getPinConfigMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    vi.mocked(readClientConfigSnapshot).mockImplementationOnce(
+      () => new Promise(res => {
+        releaseRead = () => res(configSnapshot({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }));
+      }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r4-a' });
     await act(async () => {});
@@ -871,8 +898,10 @@ describe('stale verdict vs newer config', () => {
     const { channel } = listenOnChannel();
 
     let releaseRead!: () => void;
-    vi.mocked(getPinConfigMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    vi.mocked(readClientConfigSnapshot).mockImplementationOnce(
+      () => new Promise(res => {
+        releaseRead = () => res(configSnapshot({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }));
+      }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-b' });
     await act(async () => {}); // reconcile A is now pending on the deferred read
@@ -900,8 +929,10 @@ describe('stale verdict vs newer config', () => {
     const { channel } = listenOnChannel();
 
     let releaseRead!: () => void;
-    vi.mocked(getPinConfigMeta).mockImplementationOnce(
-      () => new Promise(res => { releaseRead = () => res({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }); }),
+    vi.mocked(readClientConfigSnapshot).mockImplementationOnce(
+      () => new Promise(res => {
+        releaseRead = () => res(configSnapshot({ pinSeed: FAKE_PIN_BLOB, autoLockTimeout: 300 }));
+      }),
     );
     channel.postMessage({ type: 'config', originId: 'other-tab', messageId: 'r5-c' });
     await act(async () => {}); // reconcile A pending with the OLD timeout
@@ -960,7 +991,10 @@ describe('10-strike PIN wipe', () => {
     const { received } = listenOnChannel();
 
     vi.mocked(decryptWithPin).mockRejectedValueOnce(new WrongPinError());
-    vi.mocked(clearPinConfigMeta).mockRejectedValueOnce(new Error('db down'));
+    // Stage P moved the wipe INSIDE the metering transaction: the one commit
+    // that can fail mid-cleanup is now commitPinUnlockFailure, and it rolls
+    // back with tx.abort() — meter and wipe are all-or-nothing together.
+    vi.mocked(commitPinUnlockFailure).mockRejectedValueOnce(new Error('db down'));
     await act(async () => {
       await expect(store.unlockWithPin('000000')).rejects.toThrow('db down');
     });
@@ -1667,5 +1701,354 @@ describe('setupPin without an open vault', () => {
     await untilReady();
     await expect(store.setupPin(PIN)).rejects.toBeDefined();
     expect(await storedPinSeed()).toBeUndefined();
+  });
+});
+
+// ─── Stage P: the bindVaultIdentity window ──────────────────────────
+//
+// Until stage P, openVault cleared `vaultOpAbortRef` in a `finally` right
+// after prepareVaultSnapshot — i.e. BEFORE `await bindVaultIdentity`. In that
+// window the tab held nothing lockable at all (no key, no session seed, no op
+// in flight), so lockApp() took its `!vaultPresentInTab()` early exit WITHOUT
+// bumping the epoch; the post-bind epoch check then passed and the vault was
+// published against the lock verdict. The tests below pause exactly there.
+
+import type { VaultBindResult } from './storage';
+
+/** The real transaction, captured before any test replaces it: the identity
+ *  tests need the bind to actually COMMIT, then hold. */
+const realBindVaultIdentity = vi.mocked(bindVaultIdentity).getMockImplementation()!;
+
+/** Take over the identity transaction for ONE test, dispatching on the 1-based
+ *  call number. Deliberately NOT mockImplementationOnce: a test that fails
+ *  before its gate opens would leave an unconsumed implementation queued for
+ *  whatever runs next. `restoreRealBind` in afterEach always undoes this. */
+function stubBind(
+  impl: (call: number, pk: string, opts: { initialize: boolean }, gen: number) => Promise<VaultBindResult>,
+) {
+  let call = 0;
+  vi.mocked(bindVaultIdentity).mockImplementation((pk, opts, gen) => impl(++call, pk, opts, gen));
+}
+
+function restoreRealBind() {
+  vi.mocked(bindVaultIdentity).mockImplementation(realBindVaultIdentity);
+}
+
+/** Park an open in the bind window: prepare has COMPLETED, the identity
+ *  transaction has been entered and has not returned yet. */
+async function openPausedInBindWindow(start: () => Promise<void>) {
+  const entered = deferred<void>();
+  const gate = deferred<VaultBindResult>();
+  stubBind(async (call, pk, opts, gen) => {
+    if (call > 1) return realBindVaultIdentity(pk, opts, gen);
+    entered.resolve();
+    return gate.promise;
+  });
+  let pending!: Promise<void>;
+  act(() => { pending = start(); });
+  await act(async () => { await entered.promise; });
+  return { gate, pending };
+}
+
+describe('lock inside the bindVaultIdentity window (stage P)', () => {
+  afterEach(restoreRealBind);
+
+  it('«Сразу» + hidden→visible during bind: openVault publishes NOTHING', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 0); // «Сразу»
+
+    renderStore();
+    await untilReady();
+    expect(store.screen).toBe('pin');
+
+    const { gate, pending } = await openPausedInBindWindow(() => store.confirmMnemonic(MN));
+
+    // The system sheet / task switcher round-trip. A tab with an open in
+    // flight is NOT empty — the gate must rise and the return must lock.
+    act(() => { setVisibility('hidden'); });
+    expect(gateUp()).toBe(true);
+    act(() => { setVisibility('visible'); });
+    expect(store.screen).toBe('pin'); // locked synchronously at «Сразу»
+
+    await act(async () => { gate.resolve('bound'); await pending; });
+
+    expect(store.screen).toBe('pin');
+    expect(store.mnemonic).toBeNull();
+    expect(store.notes).toEqual([]);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull(); // no session seed
+    expect(gateUp()).toBe(false);                           // decided — gate down
+  });
+});
+
+describe('competing openVault calls (stage P)', () => {
+  afterEach(restoreRealBind);
+
+  it('the preempted call publishes nothing and its VaultMismatchError stays silent', async () => {
+    renderStore();
+    await untilReady();
+
+    const { gate: gateA, pending: pendingA } =
+      await openPausedInBindWindow(() => store.confirmMnemonic(MN));
+
+    // B starts while A sits in its bind: it aborts A's controller on entry and
+    // runs the REAL identity transaction through to publication.
+    await act(async () => { await store.confirmMnemonic(MN); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+
+    // A's bind finally lands — with a verdict that would normally raise a
+    // user-facing error. A preempted attempt has no UI to report into: the
+    // epoch never moved (a new openVault does not bump it), so ONLY the abort
+    // signal can catch this.
+    await act(async () => {
+      gateA.resolve('foreign');
+      await expect(pendingA).resolves.toBeUndefined();
+    });
+
+    expect(store.screen).toBe('main');
+    expect(store.mnemonic).toBe(MN);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBe(MN);
+  });
+
+  it("a preempted call's finally does NOT clear the newer call's controller", async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('auto-lock-timeout', 0);
+
+    renderStore();
+    await untilReady();
+
+    const enteredA = deferred<void>();
+    const enteredB = deferred<void>();
+    const gateA = deferred<VaultBindResult>();
+    const gateB = deferred<VaultBindResult>();
+    stubBind(async call => {
+      if (call === 1) { enteredA.resolve(); return gateA.promise; }
+      enteredB.resolve();
+      return gateB.promise;
+    });
+
+    let pendingA!: Promise<void>;
+    act(() => { pendingA = store.confirmMnemonic(MN); });
+    await act(async () => { await enteredA.promise; });
+
+    let pendingB!: Promise<void>;
+    act(() => { pendingB = store.confirmMnemonic(MN); });
+    await act(async () => { await enteredB.promise; });
+
+    // A stands down. Its `finally` clears the ref ONLY if the ref still holds
+    // A's own controller — otherwise the tab would look empty for the rest of
+    // B's bind window, and the lock below would silently do nothing.
+    await act(async () => { gateA.resolve('bound'); await pendingA; });
+
+    act(() => { setVisibility('hidden'); });
+    act(() => { setVisibility('visible'); });
+
+    await act(async () => { gateB.resolve('bound'); await pendingB; });
+
+    expect(store.screen).toBe('pin');
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+  });
+});
+
+describe('the bind transaction is the point of no return for IDENTITY (stage P)', () => {
+  afterEach(restoreRealBind);
+
+  /** Run restoreFromMnemonic up to a COMMITTED bind, then lock before it
+   *  returns. Leaves the vault bound on disk and unpublished in the tab. */
+  async function lockAfterCommittedBind(mn: string) {
+    const committed = deferred<void>();
+    const gate = deferred<void>();
+    stubBind(async (call, pk, opts, gen) => {
+      // A readwrite transaction cannot be cancelled by an AbortSignal — and
+      // must not be: identity is linearized by transaction creation order,
+      // exactly like resetAll. Let it COMMIT, then let the lock land.
+      const result = await realBindVaultIdentity(pk, opts, gen);
+      if (call > 1) return result; // the retry binds normally
+      committed.resolve();
+      await gate.promise;
+      return result;
+    });
+    let pending!: Promise<void>;
+    act(() => { pending = store.restoreFromMnemonic(mn); });
+    await act(async () => { await committed.promise; });
+    act(() => { store.lockApp(); }); // e.g. another tab's 'lock' broadcast
+    await act(async () => { gate.resolve(); await pending; });
+  }
+
+  it('keeps BOTH vault-public-key and meta.init, and publishes no vault', async () => {
+    renderStore();
+    await untilReady();
+    await lockAfterCommittedBind(MN);
+
+    // Identity — written by the one transaction that had already started.
+    expect(typeof await getMeta('vault-public-key')).toBe('string');
+    expect(await getMeta('init')).toBe(true);
+    // Publication — nothing at all.
+    expect(store.mnemonic).toBeNull();
+    expect(store.notes).toEqual([]);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).toBe('restore'); // no PIN configured → seed re-entry
+  });
+
+  it('a retry with the SAME seed binds and succeeds', async () => {
+    renderStore();
+    await untilReady();
+    await lockAfterCommittedBind(MN);
+
+    await act(async () => { await store.restoreFromMnemonic(MN); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+    expect(store.mnemonic).toBe(MN);
+  });
+
+  it('a DIFFERENT seed is refused — documented first-writer-wins', async () => {
+    renderStore();
+    await untilReady();
+    await lockAfterCommittedBind(MN);
+
+    await act(async () => {
+      await expect(store.restoreFromMnemonic(MN_B)).rejects.toBeInstanceOf(VaultMismatchError);
+    });
+    expect(store.mnemonic).toBeNull();
+    expect(store.screen).toBe('restore');
+  });
+});
+
+// ─── Stage P: the PIN unlock commits ────────────────────────────────
+
+describe('PIN unlock against a configuration that changed mid-derivation', () => {
+  const OTHER_BLOB = { ciphertext: 'other', iv: 'iv', salt: 's' };
+
+  it('a wrong-PIN verdict for a REPLACED blob is silent: no error, no metering', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    renderStore();
+    await untilReady();
+
+    // Another tab changes the PIN while Argon2id is running (~1 s). The
+    // verdict below belongs to a configuration that no longer exists.
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => {
+      await setMeta('pin-seed', OTHER_BLOB);
+      await setMeta('pin-attempts', 4);
+      throw new WrongPinError();
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithPin('000000')).resolves.toBeUndefined();
+    });
+
+    expect(await getMeta('pin-seed')).toEqual(OTHER_BLOB); // not wiped
+    expect(await getMeta('pin-attempts')).toBe(4);         // not metered
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(store.screen).toBe('pin');
+  });
+
+  it('a reset during the derivation is a silent stand-down — nothing is resurrected', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    renderStore();
+    await untilReady();
+
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => {
+      await resetAll(); // «Удалить всё» in another tab, mid-KDF
+      throw new WrongPinError();
+    });
+
+    await act(async () => {
+      await expect(store.unlockWithPin('000000')).resolves.toBeUndefined();
+    });
+
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  // A blob whose kdf is already Argon2id — no legacy re-wrap on the success
+  // path, so the reset below lands in the window this describe is about.
+  const ARGON2_PIN_BLOB = {
+    ciphertext: 'ct', iv: 'iv', salt: 's',
+    kdf: 'argon2id' as const, v: 1,
+    argon2: { iterations: 3, memorySize: 65_536, parallelism: 1, hashLength: 32 },
+  };
+
+  it('a reset AFTER the success commit, before openVault: nothing is re-bound', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', ARGON2_PIN_BLOB);
+    renderStore();
+    await untilReady();
+
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => MN);
+    // The commit itself succeeds — «Удалить всё» lands immediately after it,
+    // in the window between the last guarded write and openVault.
+    const realSuccess = vi.mocked(commitPinUnlockSuccess).getMockImplementation()!;
+    vi.mocked(commitPinUnlockSuccess).mockImplementationOnce(async (blob, gen) => {
+      const outcome = await realSuccess(blob, gen);
+      await resetAll();
+      return outcome;
+    });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    await act(async () => {
+      await expect(store.unlockWithPin('000000')).resolves.toBeUndefined();
+    });
+
+    // openVault carries the token captured before the KDF: it stands down
+    // BEFORE the identity transaction, so nothing is bound into the wiped DB.
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(await getMeta('vault-public-key')).toBeUndefined();
+    expect(store.mnemonic).toBeNull();
+    expect(store.notes).toEqual([]);
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).not.toBe('main');
+  });
+
+  it('a reset AFTER the legacy re-wrap, before openVault: nothing is re-bound', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB); // legacy → the re-wrap branch runs
+    renderStore();
+    await untilReady();
+
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => MN);
+    vi.mocked(encryptWithPin).mockResolvedValueOnce(ARGON2_PIN_BLOB); // skip a real Argon2
+    const realRewrap = vi.mocked(commitPinSeedRewrap).getMockImplementation()!;
+    vi.mocked(commitPinSeedRewrap).mockImplementationOnce(async (blob, next, gen) => {
+      const outcome = await realRewrap(blob, next, gen);
+      await resetAll(); // the re-wrap committed; THEN the database is wiped
+      return outcome;
+    });
+    vi.mocked(bindVaultIdentity).mockClear();
+
+    await act(async () => {
+      await expect(store.unlockWithPin('000000')).resolves.toBeUndefined();
+    });
+
+    expect(vi.mocked(bindVaultIdentity)).not.toHaveBeenCalled();
+    expect(await getMeta('vault-public-key')).toBeUndefined();
+    expect(await getMeta('pin-seed')).toBeUndefined(); // the wipe stands
+    expect(store.mnemonic).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(store.screen).not.toBe('main');
+  });
+
+  it('a SUCCESSFUL unlock still opens the vault, but leaves foreign counters alone', async () => {
+    await setMeta('init', true);
+    await setMeta('pin-seed', FAKE_PIN_BLOB);
+    await setMeta('pin-attempts', 3);
+    renderStore();
+    await untilReady();
+
+    vi.mocked(decryptWithPin).mockImplementationOnce(async () => {
+      await setMeta('pin-seed', OTHER_BLOB);
+      return MN;
+    });
+
+    await act(async () => { await store.unlockWithPin('000000'); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+
+    // Same seed came out, so the vault opens — but the metering (and the blob
+    // the legacy re-wrap would have replaced) belongs to the other tab now.
+    expect(await getMeta('pin-attempts')).toBe(3);
+    expect(await getMeta('pin-seed')).toEqual(OTHER_BLOB);
   });
 });

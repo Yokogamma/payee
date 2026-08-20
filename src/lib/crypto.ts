@@ -1082,8 +1082,13 @@ async function decryptBytesWithPinInternal(
  *  The NAME is the contract, not the class: when WebCrypto lives in another
  *  realm (Node's webcrypto under jsdom, an iframe) `instanceof DOMException`
  *  is false for the very same error — and misclassifying a wrong PIN as an
- *  environment failure would silently disable the attempt limiter. */
-function isOperationError(e: unknown): boolean {
+ *  environment failure would silently disable the attempt limiter.
+ *
+ *  EXPORTED so `quick-unlock-core.ts` classifies its own AES-GCM failures with
+ *  the very same predicate. A second copy of these two lines is exactly how
+ *  the two contours would drift apart on the one distinction that matters:
+ *  «the key is wrong» versus «the environment broke». */
+export function isOperationError(e: unknown): boolean {
   return (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'OperationError')
     || (e instanceof Error && e.name === 'OperationError');
 }

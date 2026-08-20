@@ -6,7 +6,7 @@ import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-libra
 // card actions (a copied password must NEVER reach the DOM), the reveal
 // auto-hide, the anti-autofill attribute set and the writer-OFF surface.
 
-vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true }));
+vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true, QUICK_UNLOCK_ENABLED: false }));
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', async importOriginal => {
@@ -489,7 +489,7 @@ describe('SafeboxSection — откат по SAFEBOX_WRITER_ENABLED', () => {
   // без вложений и в одной версии не даёт меню ни одного пункта.
   it('у записи, которой нечего показать в меню, триггера нет', async () => {
     vi.resetModules();
-    vi.doMock('../lib/flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false }));
+    vi.doMock('../lib/flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
     const { SafeboxSection: Section } = await import('./SafeboxSection');
 
     h.store = baseStore([entry({ id: 'e1', login: '', files: [] })]);

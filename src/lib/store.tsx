@@ -56,7 +56,28 @@ import {
 } from './crypto';
 import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } from './chains';
 import { noteSearchText } from './note-search-text';
-import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED } from './flags';
+import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED } from './flags';
+import {
+  detectQuickUnlockCapability,
+  createPrfCredential,
+  evalPrf,
+  deriveQuickUnlockKek,
+  wrapWithKek,
+  unwrapWithKek,
+  QuickUnlockUnavailableError,
+  QuickUnlockCancelledError,
+  QuickUnlockKeyMismatchError,
+  QuickUnlockRecordInvalidError,
+  QUICK_UNLOCK_VAULT_INFO,
+  type QuickUnlockCapability,
+} from './quick-unlock-core';
+import {
+  bytesToBase64Url,
+  base64UrlToBytes,
+  parseQuickUnlockRecord,
+  quickUnlockRecordEquals,
+  type QuickUnlockRecord,
+} from './quick-unlock';
 import {
   isNoteTooLong,
   noteJsonByteLength,
@@ -120,12 +141,22 @@ import {
   getPinConfigMeta,
   clearPinConfigMeta,
   bindVaultIdentity,
+  readClientConfigSnapshot,
+  commitQuickUnlockSeedWrite,
+  commitQuickUnlockSeedDelete,
+  commitQuickUnlockSeedDeleteIfMatches,
+  commitQuickUnlockSeedCleanup,
   commitPinSeedIfAbsent,
+  commitPinUnlockFailure,
+  commitPinUnlockSuccess,
+  commitPinSeedRewrap,
+  mainPinLockSeconds,
   resetAll,
   recoverStorage,
   getDbGeneration,
   noteExternalReset,
   isDbVersionError,
+  type PinUnlockFailureOutcome,
   type SyncRecord,
   type VaultBindResult,
 } from './storage';
@@ -235,6 +266,22 @@ export class VaultMismatchError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'VaultMismatchError';
+  }
+}
+
+/**
+ * The stored authorization an open was carrying (today: the quick-unlock
+ * record, and the PIN it depends on) was withdrawn while that open was in
+ * flight — detected INSIDE the bind transaction, so nothing was written and
+ * nothing was published.
+ *
+ * Distinct from VaultMismatchError, which is about a DIFFERENT vault: here the
+ * vault is right and the way in is gone.
+ */
+export class VaultAccessRevokedError extends Error {
+  constructor() {
+    super('Доступ был изменён или отозван в другой вкладке — войдите по PIN.');
+    this.name = 'VaultAccessRevokedError';
   }
 }
 
@@ -439,6 +486,16 @@ interface NotesStore {
   pinSetupNotice: PinSetupNotice | null;
   /** Current auto-lock threshold (§1): null=never, 0=immediately, 300/1800 s. */
   autoLockTimeout: AutoLockTimeout;
+  /** «Быстрый вход»: `null` = no record. The date is what the settings block
+   *  shows; it is NOT plaintext, which is why publishing it survives a lock —
+   *  the PIN screen has to know whether to offer the button at all. */
+  quickUnlockMeta: { createdAt: number } | null;
+  /** DERIVED from `quickUnlockMeta`. There is deliberately no mutable boolean
+   *  for this anywhere — not in state, not in a ref: two sources of truth for
+   *  one fact drift apart, and unlike `hasPin` (read synchronously inside
+   *  `lockApp`) nothing here needs a synchronous mirror. */
+  hasQuickUnlock: boolean;
+  quickUnlockCapability: QuickUnlockCapability;
   bootError: string | null;
   /** Another tab still holds the previous IndexedDB schema, so the upgrade
    *  cannot start — the user must close it (then this clears by itself). */
@@ -521,6 +578,18 @@ interface NotesStore {
   setupPin: (pin: string) => Promise<void>;
   removePin: () => Promise<void>;
   unlockWithPin: (pin: string) => Promise<void>;
+  /** Two system prompts (create + the mandatory control get). Requires an OPEN
+   *  vault and an existing PIN; gated by QUICK_UNLOCK_ENABLED. */
+  setupQuickUnlock: () => Promise<void>;
+  /** NEVER gated — by the flag or by the lock. Rolling the flag back must not
+   *  strand a user with a live record and no control for it. */
+  removeQuickUnlock: () => Promise<void>;
+  /** One system prompt. Resolves silently when a lock/reset cancelled it —
+   *  our own abort is the only outcome the user did not ask to hear about. */
+  unlockWithQuickUnlock: () => Promise<void>;
+  /** Lazy capability probe (settings block mount, PinUnlock mount). Never
+   *  throws and never publishes after unmount. */
+  refreshQuickUnlockCapability: () => void;
   /** Current PIN lockout/attempt state — read on PinUnlock mount so a reload
    *  doesn't bypass the visible lockout timer. */
   getPinLockState: () => Promise<{ lockedSeconds: number; attempts: number }>;
@@ -761,6 +830,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // This build is OLDER than the stored database (a newer client migrated it).
   const [storageOutdated, setStorageOutdated] = useState(false);
   const [autoLockTimeout, setAutoLockTimeoutState] = useState<AutoLockTimeout>(null);
+  // «Быстрый вход». State ONLY — no ref mirror and no separate boolean: see
+  // the contract note on `hasQuickUnlock`.
+  const [quickUnlockMeta, setQuickUnlockMeta] = useState<{ createdAt: number } | null>(null);
+  const [quickUnlockCapability, setQuickUnlockCapability] = useState<QuickUnlockCapability>('unknown');
   // Opaque privacy gate (review rounds 2–3): raised SYNCHRONOUSLY on the
   // hidden edge — or when a vault COMMITS into a hidden tab — and dropped only
   // by the lifecycle cycle that owns it, so no frame painted after a return
@@ -940,6 +1013,47 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   const applyHasPin = (v: boolean) => { hasPinRef.current = v; setHasPin(v); };
   const applyAutoLockTimeout = (t: AutoLockTimeout) => { autoLockTimeoutRef.current = t; setAutoLockTimeoutState(t); };
+  /** The ONLY setter for the quick-unlock state. `hasQuickUnlock` is computed
+   *  from it at the context boundary; there is no `applyHasQuickUnlock`. */
+  const applyQuickUnlockMeta = (meta: { createdAt: number } | null) => setQuickUnlockMeta(meta);
+
+  // ONE controller for BOTH quick-unlock ceremonies (setup and unlock). It is
+  // registered SYNCHRONOUSLY, before the first await of either: a lock landing
+  // during the storage read or the capability probe must not find the ref
+  // empty. A new attempt aborts the previous one first — a double invocation
+  // must never leave the old operation without its cancel handle — and the
+  // `finally` clears the ref only when it still holds THIS attempt's
+  // controller, or a finishing old attempt would erase the new one's.
+  //
+  // Why a signal at all, when every other flow leans on the epoch: on the PIN
+  // screen `vaultPresentInTab()` is false, so `lockApp()` early-returns
+  // WITHOUT bumping the epoch, and a foreign `reset` bumps only the db
+  // generation. During a ceremony (up to 60 s of system sheet) neither token
+  // moves — only this signal can end it.
+  const quickUnlockAbortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+  // Last-caller-wins for the capability probe: two mounts (settings block and
+  // PinUnlock) can have probes in flight at once, and a slow older one must
+  // not overwrite a newer verdict.
+  const quickUnlockCapabilityGenerationRef = useRef(0);
+  // What a real ceremony proved, once it has. Outranks every probe for the
+  // rest of the session — see publishQuickUnlockCapability.
+  const quickUnlockCeremonyVerdictRef = useRef<QuickUnlockCapability | null>(null);
+  useEffect(() => {
+    // Set on SETUP, not only cleared on cleanup. React StrictMode mounts,
+    // cleans up and mounts again in development: without this line the trial
+    // cleanup would leave the ref false forever and the capability verdict
+    // would never publish there.
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // An in-flight ceremony belongs to a screen that no longer exists. It
+      // cannot publish anything useful, and its commit would land against a
+      // torn-down tree — stand it down like a lock.
+      quickUnlockAbortRef.current?.abort();
+      quickUnlockAbortRef.current = null;
+    };
+  }, []);
 
   // Encrypted-at-rest draft (§2) + multi-tab identity (§8)
   const draftStoreRef = useRef<DraftStore | null>(null);
@@ -1232,6 +1346,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         seen.add(msg.messageId);
       }
       if (msg.type === 'lock') {
+        // EXPLICIT, not via lockApp: on the PIN screen `vaultPresentInTab()`
+        // is false, so lockApp early-returns and never reaches
+        // invalidateVaultLifecycle — yet that is exactly where an unlock
+        // ceremony lives. Without this line a foreign lock would leave the
+        // sheet open and let it publish a vault afterwards.
+        quickUnlockAbortRef.current?.abort();
         lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
       } else if (msg.type === 'config') {
         void reconcileLockScreen();
@@ -1248,6 +1368,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // a vault) downgrades a now-seedless PIN screen to seed entry.
         noteExternalReset();
         draftStoreRef.current?.clear();
+        // Same reason as the 'lock' branch: a ceremony started on the PIN
+        // screen would otherwise survive the wipe and re-bind an old seed
+        // into the fresh database.
+        quickUnlockAbortRef.current?.abort();
         lockApp({ broadcast: false });
         void reconcileLockScreen();
       }
@@ -1289,14 +1413,23 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   async function reconcileLockScreen(): Promise<void> {
     const myReconcile = ++reconcileGenerationRef.current;
     try {
-      const { pinSeed, autoLockTimeout: rawTimeout } = await getPinConfigMeta();
+      // FOUR keys from ONE transaction (§4): hasPin, the threshold and the
+      // quick-unlock verdict are published together, so no reconcile can ever
+      // announce a combination that never existed at any instant.
+      const snap = await readClientConfigSnapshot();
       if (reconcileGenerationRef.current !== myReconcile) return; // a newer read/write owns the refs
-      const pinData = pinSeed as PinEncryptedSeed | undefined;
+      const pinData = snap.pinSeed as PinEncryptedSeed | undefined;
       applyHasPin(!!pinData);
-      applyAutoLockTimeout(isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null);
+      applyAutoLockTimeout(isValidAutoLockTimeout(snap.autoLockTimeout) ? snap.autoLockTimeout : null);
+      applyQuickUnlockMeta(
+        snap.quickUnlock.kind === 'valid' ? { createdAt: snap.quickUnlock.record.createdAt } : null,
+      );
+      if (snap.quickUnlock.kind === 'stale') void cleanupStaleQuickUnlock();
       if (!pinData) setScreen(prev => (prev === 'pin' ? 'restore' : prev));
     } catch {
-      // storage not ready / broken — the periodic paths will retry
+      // storage not ready / broken — the periodic paths will retry. The LAST
+      // CONFIRMED state stays on screen: a failed four-key read tells us
+      // nothing about the PIN either, so «no quick unlock» would be a guess.
     }
   }
 
@@ -1408,6 +1541,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setLockGate(false);
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = null;
+    // A quick-unlock ceremony in flight belongs to the vault being locked.
+    // Its own epoch/generation tokens cannot see this lock (see the ref's
+    // comment), so the signal is the only thing that stops it.
+    quickUnlockAbortRef.current?.abort();
+    quickUnlockAbortRef.current = null;
   }
 
   async function bootstrap() {
@@ -1438,14 +1576,24 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      // 3. Check for PIN-encrypted seed + auto-lock config — ONE consistent
-      //    snapshot: a concurrent wipe in another tab must not be seen
-      //    half-applied (round 5 gap).
-      const { pinSeed, autoLockTimeout: rawTimeout } = await getPinConfigMeta();
-      const pinData = pinSeed as PinEncryptedSeed | undefined;
+      // 3. Check for PIN-encrypted seed + auto-lock config + quick unlock —
+      //    ONE consistent snapshot of FOUR keys: a concurrent wipe in another
+      //    tab must not be seen half-applied (round 5 gap), and the quick
+      //    unlock button must not pop in after the first frame.
+      //
+      //    A THROW here falls into the bootstrap catch below and lands on the
+      //    fail-closed error screen — deliberately NOT «there is no quick
+      //    unlock»: this reader also carries `pin-seed`, so a failed
+      //    transaction leaves us with no trustworthy PIN state either.
+      const snap = await readClientConfigSnapshot();
+      const pinData = snap.pinSeed as PinEncryptedSeed | undefined;
       if (pinData) applyHasPin(true);
-      const timeout = isValidAutoLockTimeout(rawTimeout) ? rawTimeout : null;
+      const timeout = isValidAutoLockTimeout(snap.autoLockTimeout) ? snap.autoLockTimeout : null;
       applyAutoLockTimeout(timeout);
+      applyQuickUnlockMeta(
+        snap.quickUnlock.kind === 'valid' ? { createdAt: snap.quickUnlock.record.createdAt } : null,
+      );
+      if (snap.quickUnlock.kind === 'stale') void cleanupStaleQuickUnlock();
 
       // 4. Check session (survives tab refresh but not browser close)
       const sessionMn = sessionStorage.getItem(SESSION_STORAGE_KEY);
@@ -1576,81 +1724,151 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * setMeta('init') would be writable into a database that was cleared or
    * re-bound in between, leaving a phantom-initialized empty vault.
    *
+   * `expectedDbGeneration` lets a caller that captured its reset-exclusivity
+   * token EARLIER hand it over instead of letting this function capture a
+   * fresh one. The PIN path needs it: it takes its token before ~1 s of
+   * Argon2id, and a reset landing anywhere in that window (including AFTER
+   * the metering/re-wrap commits, which have their own guard) must not let
+   * this open re-bind the old seed into the freshly wiped database and
+   * publish a vault the user just deleted. Omitted ⇒ captured here, the
+   * previous behaviour for every caller whose token is already current.
+   *
    * ORDER MATTERS (review round 4): every storage-side refusal happens BEFORE
    * commitVaultSnapshot() and the session write, so a rejected open cannot
    * leave a decrypted vault or the seed behind in this tab. What this does NOT
    * catch is a reset by another tab whose 'reset' broadcast has not arrived —
    * the project-wide residual window (see storage.ts, dbGeneration).
+   *
+   * ABORT-CONTROLLER LIFETIME (stage P): the controller stays parked in
+   * `vaultOpAbortRef` for the WHOLE run and is cleared only when the ref still
+   * holds THIS operation's controller — the discipline runArweaveSweep already
+   * follows for its own sweep. Clearing it right after prepareVaultSnapshot
+   * (as this did until stage P) made the tab look empty during the
+   * bindVaultIdentity await: no key, no session seed, no op in flight. A
+   * lockApp() landing in that window — «Сразу» on a return to foreground —
+   * took the `!vaultPresentInTab()` early exit WITHOUT bumping the epoch, the
+   * post-bind epoch check therefore passed, and the vault got published against
+   * the lock verdict. Both owners of this ref abort whatever they find on
+   * entry, so an openVault started during a sweep still cancels it; the two
+   * never overlap in practice (every sweep call site runs after its openVault
+   * has resolved).
    */
   async function openVault(
     mn: string,
-    opts: { initialize?: boolean } = {},
+    opts: {
+      initialize?: boolean;
+      expectedDbGeneration?: number;
+      /** Quick-unlock only: the record this open was authorized by. The bind
+       *  transaction refuses (`'revoked'`) unless it is STILL stored and a PIN
+       *  still exists — the one place where no window remains. */
+      requireQuickUnlock?: QuickUnlockRecord;
+    } = {},
   ): Promise<{ epoch: number; pkB64: string } | null> {
+    const myDbGen = opts.expectedDbGeneration ?? getDbGeneration();
+    // Stand down BEFORE touching the shared abort ref: a caller arriving with
+    // a token that a reset has already invalidated must not cancel somebody
+    // else's in-flight operation on its way out. Synchronous ⇒ no TOCTOU
+    // window, the same discipline as assertDbGeneration in storage.ts.
+    if (myDbGen !== getDbGeneration()) return null;
+
     const myEpoch = vaultEpochRef.current;
-    const myDbGen = getDbGeneration();
     const abort = new AbortController();
     vaultOpAbortRef.current?.abort();
     vaultOpAbortRef.current = abort;
 
-    let snap: VaultSnapshot;
+    /** This attempt no longer owns the vault — because it was LOCKED/reset
+     *  (epoch) or because a NEWER openVault preempted it (signal). Both halves
+     *  are load-bearing: a new openVault aborts its predecessor but does NOT
+     *  bump the epoch, so without the signal check the preempted call would
+     *  finish its uncancellable bind and publish stale keys over the newer
+     *  open. Superseded ⇒ publish nothing and stay completely silent. */
+    const superseded = () => abort.signal.aborted || vaultEpochRef.current !== myEpoch;
+
     try {
-      snap = await prepareVaultSnapshot(mn, { signal: abort.signal });
+      const snap: VaultSnapshot = await prepareVaultSnapshot(mn, { signal: abort.signal });
+      if (superseded()) return null;
+
+      let bind: VaultBindResult;
+      try {
+        // POINT OF NO RETURN FOR IDENTITY. A readwrite transaction cannot be
+        // cancelled by an AbortSignal — and must not be: identity is linearized
+        // by transaction creation order, exactly like resetAll. A bind that
+        // started before a lock/preemption RUNS TO COMPLETION, so with
+        // `initialize` BOTH `vault-public-key` and `meta.init` land. That is
+        // deliberate first-writer-wins: the vault is not published (no keys, no
+        // seed, no main screen — the app stays on the restore screen), and a
+        // retry with the SAME seed binds 'same' and succeeds, while a DIFFERENT
+        // seed gets 'foreign' → VaultMismatchError with its explicit reset.
+        // Preemption governs PUBLICATION only, never identity.
+        bind = await bindVaultIdentity(
+          snap.pkB64,
+          { initialize: !!opts.initialize, requireQuickUnlock: opts.requireQuickUnlock },
+          myDbGen,
+        );
+      } catch (err) {
+        // A reset this tab already knows about. Nothing is published yet — stand
+        // down silently, exactly like an abort during preparation.
+        if (err instanceof StorageResetError) return null;
+        throw err;
+      }
+      // The PAIR of checks, BEFORE the 'foreign' verdict is turned into a
+      // user-facing error: a superseded attempt must not raise one either.
+      if (superseded()) return null;
+
+      if (bind === 'revoked') {
+        // The authorization this open carried was withdrawn while it was in
+        // flight. The transaction wrote nothing — no key, no `init`.
+        throw new VaultAccessRevokedError();
+      }
+
+      if (bind === 'foreign') {
+        throw new VaultMismatchError(
+          'На устройстве уже есть данные другого хранилища. ' +
+          'Выполните «Сбросить приложение» перед восстановлением другого seed.'
+        );
+      }
+
+      commitVaultSnapshot(snap);
+      sessionStorage.setItem(SESSION_STORAGE_KEY, mn);
+
+      // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
+      // populate them (and flip countsReady) before the UI is interactive, so the
+      // destructive-reset dialog never renders against empty placeholder state
+      // (round-21 P1).
+      await refreshSyncCounts(myEpoch);
+
+      // Surface a persisted v3-upload pause immediately: a transient toast died
+      // with the lock/reload, but the fail-closed pause itself must never look
+      // like silently-stuck sync. Malformed marker = paused (fail closed).
+      try {
+        const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
+        if (vaultEpochRef.current === myEpoch) {
+          setV3Paused(pause3 !== null);
+          setV4Paused(pause4 !== null);
+        }
+      } catch (err) {
+        console.error('readV3PauseMeta at unlock failed:', err);
+      }
+
+      // Safebox presence (§3 hydration): the PIN-config record + the encrypted
+      // entry COUNT. Both readable with the section locked — they drive the entry
+      // point, the «Найден сейф: N» banner and reset-safety.
+      await refreshSafeboxPresence(myEpoch);
+
+      // Background: network-dependent parts only (online probe + queue kick).
+      void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
+
+      return { epoch: myEpoch, pkB64: snap.pkB64 };
     } catch (err) {
-      if (abort.signal.aborted) return null; // lock during prepare — stand down silently
+      // Every error of a superseded attempt is swallowed — INCLUDING
+      // VaultMismatchError and the AbortError from prepareVaultSnapshot. A
+      // preempted or locked call has no UI left to report into, and surfacing
+      // its verdict would put an error banner on the attempt that replaced it.
+      if (superseded()) return null;
       throw err;
     } finally {
       if (vaultOpAbortRef.current === abort) vaultOpAbortRef.current = null;
     }
-    if (vaultEpochRef.current !== myEpoch) return null; // locked between prepare and commit
-
-    let bind: VaultBindResult;
-    try {
-      bind = await bindVaultIdentity(snap.pkB64, { initialize: !!opts.initialize }, myDbGen);
-    } catch (err) {
-      // A reset this tab already knows about. Nothing is published yet — stand
-      // down silently, exactly like an abort during preparation.
-      if (err instanceof StorageResetError) return null;
-      throw err;
-    }
-    if (bind === 'foreign') {
-      throw new VaultMismatchError(
-        'На устройстве уже есть данные другого хранилища. ' +
-        'Выполните «Сбросить приложение» перед восстановлением другого seed.'
-      );
-    }
-    if (vaultEpochRef.current !== myEpoch) return null; // locked during the transaction
-
-    commitVaultSnapshot(snap);
-    sessionStorage.setItem(SESSION_STORAGE_KEY, mn);
-
-    // Sync counts + per-note statuses come from local IndexedDB and are CHEAP —
-    // populate them (and flip countsReady) before the UI is interactive, so the
-    // destructive-reset dialog never renders against empty placeholder state
-    // (round-21 P1).
-    await refreshSyncCounts(myEpoch);
-
-    // Surface a persisted v3-upload pause immediately: a transient toast died
-    // with the lock/reload, but the fail-closed pause itself must never look
-    // like silently-stuck sync. Malformed marker = paused (fail closed).
-    try {
-      const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
-      if (vaultEpochRef.current === myEpoch) {
-        setV3Paused(pause3 !== null);
-        setV4Paused(pause4 !== null);
-      }
-    } catch (err) {
-      console.error('readV3PauseMeta at unlock failed:', err);
-    }
-
-    // Safebox presence (§3 hydration): the PIN-config record + the encrypted
-    // entry COUNT. Both readable with the section locked — they drive the entry
-    // point, the «Найден сейф: N» banner and reset-safety.
-    await refreshSafeboxPresence(myEpoch);
-
-    // Background: network-dependent parts only (online probe + queue kick).
-    void initArweaveState(myEpoch).catch(err => console.error('initArweaveState:', err));
-
-    return { epoch: myEpoch, pkB64: snap.pkB64 };
   }
 
   /** Re-read the two locked-safe safebox facts (config presence + entry count)
@@ -2886,6 +3104,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     applyHasPin(false);
     applyAutoLockTimeout(null);
+    // resetAll clears the whole meta store, quick-unlock record included —
+    // this only mirrors that into the UI.
+    applyQuickUnlockMeta(null);
 
     // 6. Redirect
     setScreen('landing');
@@ -3017,10 +3238,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  error mid-cleanup leaves the configuration fully intact, never partial. */
   async function clearPinConfiguration(): Promise<void> {
     await clearPinConfigMeta();
+    publishPinConfigurationCleared();
+  }
+
+  /** The React/broadcast half of the cleanup above, on its own because the
+   *  10-strike wipe no longer runs `clearPinConfigMeta`: it happens INSIDE the
+   *  metering transaction of commitPinUnlockFailure (stage P), and only the
+   *  publication is left for the store. */
+  function publishPinConfigurationCleared(): void {
     // Local write wins over any in-flight reconcile read (round 5).
     reconcileGenerationRef.current++;
     applyHasPin(false);
     applyAutoLockTimeout(null);
+    // The record died in the SAME transaction as the PIN (wipePinConfigInto):
+    // quick unlock only ever exists on top of a PIN.
+    applyQuickUnlockMeta(null);
     postVaultMessage('config');
   }
 
@@ -3030,6 +3262,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const unlockWithPinAction = useCallback(async (pin: string) => {
+    // Reset-exclusivity token, captured BEFORE the first read (stage P). Every
+    // meta write below carries it, so a wipe landing during the ~1 s Argon2id
+    // derivation can no longer be undone by this flow — the metering, the
+    // lockout and the legacy re-wrap used to resurrect a PIN configuration in
+    // a database that had just been cleared.
+    const myDbGen = getDbGeneration();
+
     // 1. Check lockout
     const lockedUntil = await getMeta<number>('pin-locked-until');
     if (lockedUntil && Date.now() < lockedUntil) {
@@ -3051,47 +3290,65 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // PIN after 10 environment hiccups. Surface it without metering.
         throw err;
       }
-      // Wrong PIN — increment attempts
-      const attempts = ((await getMeta<number>('pin-attempts')) ?? 0) + 1;
-      await setMeta('pin-attempts', attempts);
-
-      if (attempts >= 10) {
-        // Wipe PIN — require seed. Atomic (§8): also resets the auto-lock
-        // timeout and tells the other tabs, or changes nothing on failure.
-        await clearPinConfiguration();
+      // Wrong PIN — meter it atomically against the configuration that was
+      // ACTUALLY checked (re-verified inside the transaction, blob and all).
+      let outcome: PinUnlockFailureOutcome;
+      try {
+        outcome = await commitPinUnlockFailure(pinData, myDbGen);
+      } catch (e) {
+        // The database this attempt belonged to is gone. Stand down silently,
+        // exactly like openVault — there is nothing left to meter.
+        if (e instanceof StorageResetError) return;
+        throw e;
+      }
+      if (outcome.outcome === 'config-changed') {
+        // Another tab replaced (or removed) the PIN while we were deriving:
+        // this verdict is about a configuration that no longer exists. NOTHING
+        // was metered and nothing was wiped — re-read the authoritative state
+        // and leave the user on the PIN screen without an error message.
+        void reconcileLockScreen();
+        return;
+      }
+      if (outcome.wiped) {
+        // The 10th strike wiped the configuration inside the transaction
+        // above; only the React state and the cross-tab notice are left.
+        publishPinConfigurationCleared();
         throw new PinWipedError();
       }
-
-      // Progressive lockout
-      const lockSeconds =
-        attempts <= 3 ? 0 :
-        attempts <= 5 ? 30 :
-        attempts <= 7 ? 300 :
-        1800;
-
-      if (lockSeconds > 0) {
-        await setMeta('pin-locked-until', Date.now() + lockSeconds * 1000);
-        throw new PinLockedError(lockSeconds);
-      }
+      if (outcome.lockedUntil !== null) throw new PinLockedError(mainPinLockSeconds(outcome.attempts));
 
       throw new Error('wrong_pin');
     }
 
-    // 3. Success — reset attempts
-    await deleteMeta('pin-attempts');
-    await deleteMeta('pin-locked-until');
+    // 3. Success — clear the metering, under the same blob check. A
+    // 'config-changed' outcome is NOT a failure: the seed that came out is the
+    // same one, so the vault still opens; the counters simply belong to the
+    // configuration another tab has just written and are not ours to reset.
+    try {
+      await commitPinUnlockSuccess(pinData, myDbGen);
+    } catch (err) {
+      if (err instanceof StorageResetError) return;
+      throw err;
+    }
 
-    // Transparently upgrade a legacy PBKDF2 blob to Argon2id. If the rewrap
-    // fails, keep the working legacy blob and continue — don't block login.
+    // Transparently upgrade a legacy PBKDF2 blob to Argon2id — written ONLY
+    // over the exact legacy blob just unwrapped ('config-changed' otherwise:
+    // an older client may have replaced one legacy blob with another, and this
+    // re-wrap carries the OLD PIN). If it fails, keep the working legacy blob
+    // and continue — don't block login.
     if (isPinKdfLegacy(pinData)) {
       try {
-        await setMeta('pin-seed', await encryptWithPin(mn, pin));
+        await commitPinSeedRewrap(pinData, await encryptWithPin(mn, pin), myDbGen);
       } catch (err) {
+        if (err instanceof StorageResetError) return;
         console.error('PIN rewrap to Argon2id failed (keeping legacy blob):', err);
       }
     }
 
-    const opened = await openVault(mn);
+    // The token captured at the top, NOT a fresh one: a reset that landed
+    // after the commits above (each of which refused to write) must not be
+    // rewarded with a vault re-bound into the wiped database.
+    const opened = await openVault(mn, { expectedDbGeneration: myDbGen });
     if (!opened) return;
     const epoch = opened.epoch;
     // An explicit unlock — a user action the persistence request belongs to.
@@ -3114,6 +3371,342 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       : 0;
     return { lockedSeconds, attempts };
   }, []);
+
+  // ─── «Быстрый вход» (§8) ───────────────────────────────────────────
+  //
+  // HARD INVARIANT, the one this feature may never break: NOTHING here reads
+  // or writes `pin-attempts` / `pin-locked-until`. Not on cancel, not on
+  // timeout, not on a missing PRF, not on a corrupt record, not on a GCM
+  // mismatch, not on a foreign vault. A quick-unlock failure is a DIFFERENT
+  // contour with a DIFFERENT rate limiter (the authenticator's own UV
+  // counter), and an active PIN lockout does not block it either. Symmetrically
+  // a successful quick unlock does NOT clear the PIN counters — it has no
+  // right to reset somebody else's meter.
+
+  /** Register this attempt's controller — synchronously, before the first
+   *  await — aborting whatever was in flight. */
+  function beginQuickUnlockOp(): AbortController {
+    const abort = new AbortController();
+    quickUnlockAbortRef.current?.abort();
+    quickUnlockAbortRef.current = abort;
+    return abort;
+  }
+
+  /** Clear the ref ONLY if it still holds this attempt's controller. */
+  function endQuickUnlockOp(abort: AbortController): void {
+    if (quickUnlockAbortRef.current === abort) quickUnlockAbortRef.current = null;
+  }
+
+  /** Best-effort housekeeping for an orphaned/invalid record. Silent by
+   *  design: the commit re-checks the condition in its own transaction, and a
+   *  failure here must never surface as a user-facing error. */
+  async function cleanupStaleQuickUnlock(): Promise<void> {
+    try {
+      if (await commitQuickUnlockSeedCleanup(getDbGeneration()) === 'deleted') postVaultMessage('config');
+    } catch {
+      // storage busy / reset mid-flight — the next read tries again
+    }
+  }
+
+  function quickUnlockCapabilityMessage(capability: QuickUnlockCapability): string {
+    const fallback = ' Вход по PIN-коду и seed-фразе работает как обычно.';
+    if (capability === 'no-api') return 'Этот браузер не поддерживает быстрый вход.' + fallback;
+    if (capability === 'no-platform') {
+      return 'На этом устройстве нет встроенной проверки — отпечатка, лица или кода устройства.' + fallback;
+    }
+    return 'Это устройство не поддерживает быстрый вход.' + fallback;
+  }
+
+  /** Publish a PROBE verdict under three guards: still mounted, still the
+   *  newest probe, and no ceremony has already settled the question. */
+  function publishQuickUnlockCapability(capability: QuickUnlockCapability, myProbe: number): void {
+    if (!mountedRef.current) return;
+    if (quickUnlockCapabilityGenerationRef.current !== myProbe) return;
+    // A real ceremony outranks every probe (§6): the probes only guess, and on
+    // this platform they guessed wrong — which is how a credential got created
+    // that turned out to be useless. Letting a later probe overwrite that with
+    // an optimistic 'unknown' would put the setup button back and mint another.
+    if (quickUnlockCeremonyVerdictRef.current !== null) return;
+    setQuickUnlockCapability(capability);
+  }
+
+  /** Record what the CEREMONY proved, and make it stick for this session. */
+  function publishQuickUnlockCeremonyVerdict(verdict: QuickUnlockCapability): void {
+    quickUnlockCeremonyVerdictRef.current = verdict;
+    quickUnlockCapabilityGenerationRef.current++; // outrun any probe in flight
+    if (mountedRef.current) setQuickUnlockCapability(verdict);
+  }
+
+  const refreshQuickUnlockCapability = useCallback(() => {
+    const myProbe = ++quickUnlockCapabilityGenerationRef.current;
+    void detectQuickUnlockCapability().then(capability => {
+      publishQuickUnlockCapability(capability, myProbe);
+    });
+    // detectQuickUnlockCapability never rejects — see its contract.
+  }, []);
+
+  const setupQuickUnlock = useCallback(async () => {
+    if (!QUICK_UNLOCK_ENABLED) throw new QuickUnlockUnavailableError('Быстрый вход пока недоступен.');
+    const mn = mnemonicRef.current;
+    if (!mn) throw new Error('No open vault');
+
+    // ALL THREE tokens captured synchronously, before the first await.
+    const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration();
+    const abort = beginQuickUnlockOp();
+    const superseded = () =>
+      abort.signal.aborted || vaultEpochRef.current !== myEpoch || getDbGeneration() !== myDbGen;
+
+    try {
+      // 1a. Cheap early filter from ONE snapshot — a FILTER, not the
+      // guarantee: the authoritative decision is the conditional commit below.
+      // Its point is to avoid showing a pointless system sheet and minting a
+      // credential we would then have to orphan.
+      const snap = await readClientConfigSnapshot();
+      if (abort.signal.aborted) return;
+      if (snap.pinSeed === undefined) {
+        throw new QuickUnlockUnavailableError('Сначала установите PIN — быстрый вход работает поверх него.');
+      }
+      if (snap.quickUnlock.kind === 'valid') {
+        applyQuickUnlockMeta({ createdAt: snap.quickUnlock.record.createdAt });
+        throw new QuickUnlockUnavailableError('Быстрый вход уже настроен.');
+      }
+      const pkB64 = typeof snap.vaultPublicKey === 'string' ? snap.vaultPublicKey : null;
+      if (!pkB64) throw new QuickUnlockUnavailableError('Хранилище ещё не привязано — повторите вход.');
+
+      // 2. Capability probe, then the ceremony. A lock during the PROBE must
+      // not let `create()` start.
+      const myProbe = ++quickUnlockCapabilityGenerationRef.current;
+      const capability = await detectQuickUnlockCapability();
+      if (abort.signal.aborted) return;
+      publishQuickUnlockCapability(capability, myProbe);
+      if (capability === 'no-api' || capability === 'no-platform' || capability === 'no-prf') {
+        throw new QuickUnlockUnavailableError(quickUnlockCapabilityMessage(capability));
+      }
+
+      const prfSalt = crypto.getRandomValues(new Uint8Array(32));
+      const { credentialId, prfOutput } = await createPrfCredential({ prfSalt, signal: abort.signal });
+      if (superseded()) return;
+
+      // 3. A check after EVERY async step: a lock arriving during HKDF or the
+      // AES-GCM wrap moves neither the epoch nor the generation.
+      const hkdfSalt = crypto.getRandomValues(new Uint8Array(32));
+      const kek = await deriveQuickUnlockKek(prfOutput, hkdfSalt, QUICK_UNLOCK_VAULT_INFO);
+      if (superseded()) return;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await wrapWithKek(kek, iv, mn);
+      if (superseded()) return;
+
+      const record: QuickUnlockRecord = {
+        v: 1,
+        credentialId: bytesToBase64Url(credentialId),
+        prfSalt: bufferToBase64(prfSalt),
+        hkdfSalt: bufferToBase64(hkdfSalt),
+        iv: bufferToBase64(iv),
+        ciphertext: bufferToBase64(ciphertext),
+        pk: pkB64,
+        createdAt: Date.now(),
+      };
+
+      // The credential id comes from the AUTHENTICATOR, so its length is not
+      // ours to assume. Run the record through the very validator every later
+      // READ will use: without this, a rawId outside 16…1024 bytes would be
+      // written, reported as a successful setup, and then silently deleted as
+      // invalid by this same client on the next read — the worst outcome of
+      // the three, because it looks like it worked.
+      if (!parseQuickUnlockRecord(record)) {
+        throw new QuickUnlockUnavailableError(
+          'Устройство вернуло ключ в неподдерживаемом формате — быстрый вход не настроен.',
+        );
+      }
+
+      // 4. Final synchronous triple, then THE POINT OF NO RETURN: an
+      // AbortSignal cannot cancel a readwrite transaction once created — and
+      // must not. A commit begun after these checks is carried to completion
+      // and broadcast, exactly like resetAll's linearization by transaction
+      // creation order.
+      if (superseded()) return;
+      const outcome = await commitQuickUnlockSeedWrite(record, myDbGen);
+      if (outcome !== 'written') {
+        void reconcileLockScreen(); // re-read whatever the winner actually wrote
+        throw new QuickUnlockUnavailableError(
+          outcome === 'already-configured' ? 'Быстрый вход уже настроен в другой вкладке.'
+          : outcome === 'no-pin' ? 'PIN был снят в другой вкладке — быстрый вход работает только поверх PIN.'
+          : 'Хранилище сменилось — повторите настройку.',
+        );
+      }
+
+      // 5. Publication is split by SENSITIVITY, not by locked/unlocked
+      // (revision 14). `createdAt` is not plaintext, and the PIN screen has to
+      // know whether to show the button — a tab that locked right after setup
+      // would otherwise not see its own record until a reload, because it does
+      // not hear its own `config` broadcast (echo is filtered by originId).
+      // The only gate is the db generation: metadata must not resurrect in a
+      // database that was just wiped. The token bump is mandatory — a reconcile
+      // that started BEFORE the commit would otherwise publish `null` over it.
+      if (getDbGeneration() === myDbGen) {
+        reconcileGenerationRef.current++;
+        applyQuickUnlockMeta({ createdAt: record.createdAt });
+      }
+      postVaultMessage('config');
+    } catch (err) {
+      if (err instanceof QuickUnlockCancelledError) return; // our own abort — silent
+      // The ceremony settled a capability question the probes had guessed
+      // wrong. Record it: the block must stop offering a setup that creates
+      // another credential this device cannot use.
+      if (err instanceof QuickUnlockUnavailableError && err.verdict) {
+        publishQuickUnlockCeremonyVerdict(err.verdict);
+      }
+      throw err;
+    } finally {
+      endQuickUnlockOp(abort);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const removeQuickUnlock = useCallback(async () => {
+    // NOT gated by the flag and NOT gated by the lock: removing is never a
+    // privacy downgrade, and a rolled-back flag must not strand a live record.
+    await commitQuickUnlockSeedDelete(getDbGeneration());
+    reconcileGenerationRef.current++;
+    applyQuickUnlockMeta(null);
+    postVaultMessage('config');
+  }, []);
+
+  const unlockWithQuickUnlock = useCallback(async () => {
+    if (!QUICK_UNLOCK_ENABLED) throw new QuickUnlockUnavailableError('Быстрый вход пока недоступен.');
+
+    // Generation + controller, synchronously, before the first await. The
+    // epoch is NOT a token here: there is no vault in this tab to lock.
+    const myDbGen = getDbGeneration();
+    const abort = beginQuickUnlockOp();
+    const superseded = () => abort.signal.aborted || getDbGeneration() !== myDbGen;
+
+    try {
+      const snap = await readClientConfigSnapshot();
+      if (abort.signal.aborted) return;
+      if (snap.quickUnlock.kind !== 'valid') {
+        if (snap.quickUnlock.kind === 'stale') await cleanupStaleQuickUnlock();
+        applyQuickUnlockMeta(null);
+        throw new QuickUnlockUnavailableError('Быстрый вход недоступен — войдите по PIN.');
+      }
+      const record = snap.quickUnlock.record;
+      const credentialId = base64UrlToBytes(record.credentialId);
+      if (!credentialId) throw new QuickUnlockRecordInvalidError('Запись быстрого входа повреждена.');
+
+      const prfOutput = await evalPrf({
+        credentialId,
+        prfSalt: base64ToBuffer(record.prfSalt),
+        signal: abort.signal,
+      });
+      if (superseded()) return;
+
+      const kek = await deriveQuickUnlockKek(
+        prfOutput, base64ToBuffer(record.hkdfSalt), QUICK_UNLOCK_VAULT_INFO,
+      );
+      if (superseded()) return;
+
+      let mn: string;
+      try {
+        mn = await unwrapWithKek(kek, base64ToBuffer(record.iv), base64ToBuffer(record.ciphertext));
+      } catch (err) {
+        if (err instanceof QuickUnlockKeyMismatchError) throw await onQuickUnlockMismatch(record, myDbGen);
+        throw err;
+      }
+      if (superseded()) return;
+
+      // Garbage that happened to pass the GCM tag must never reach openVault.
+      if (!isValidMnemonic(mn)) {
+        throw new QuickUnlockRecordInvalidError(
+          'Быстрый вход вернул повреждённые данные. Войдите по PIN и настройте быстрый вход заново.',
+        );
+      }
+
+      // FINAL AUTHORITY, re-read from storage (round 11 of review). The
+      // snapshot above is up to 60 seconds old — the whole length of the system
+      // sheet — and NOTHING this flow holds can notice a cross-tab removal in
+      // that window: `dbGeneration` moves only on a reset, the epoch only on a
+      // lock, and the `config` broadcast merely triggers a reconcile. Without
+      // this read, a quick entry the user had just deleted in another tab — or
+      // one orphaned by an OLDER client removing the PIN, which is exactly the
+      // case the «no pin-seed ⇒ void» rule exists for — would still open the
+      // vault one more time.
+      //
+      // What remains after this check is the interval between it and
+      // `commitVaultSnapshot`, i.e. the key derivation inside
+      // prepareVaultSnapshot. That residual is the SAME one the PIN path has
+      // always had (its ~1 s of Argon2id sits in exactly this position), and
+      // closing it would mean re-verifying inside the bind transaction — a
+      // change to the shared open path that belongs to its own review.
+      const fresh = await readClientConfigSnapshot();
+      if (superseded()) return;
+      if (fresh.quickUnlock.kind !== 'valid'
+          || !quickUnlockRecordEquals(fresh.quickUnlock.record, record)) {
+        applyQuickUnlockMeta(
+          fresh.quickUnlock.kind === 'valid' ? { createdAt: fresh.quickUnlock.record.createdAt } : null,
+        );
+        if (fresh.quickUnlock.kind === 'stale') void cleanupStaleQuickUnlock();
+        throw new QuickUnlockUnavailableError(
+          'Быстрый вход был изменён или удалён — войдите по PIN.',
+        );
+      }
+
+      // Final synchronous pair, then the shared open path — carrying the
+      // generation captured BEFORE the ceremony, so a reset that landed during
+      // those (up to 60) seconds cannot be re-bound over, AND the record this
+      // open is authorized by, which the bind transaction re-verifies with no
+      // window left at all.
+      if (superseded()) return;
+      const opened = await openVault(mn, {
+        expectedDbGeneration: myDbGen,
+        requireQuickUnlock: record,
+      });
+      if (!opened) return;
+      const epoch = opened.epoch;
+      void ensurePersistentStorage(); // an explicit unlock is a user gesture
+
+      await checkAndSetRegistration(epoch);
+      if (vaultEpochRef.current === epoch) setScreen('main');
+      if (arweaveRef.current.enabled) {
+        void retryAllPending().catch(err => console.error('quick unlock retryAllPending:', err));
+      }
+    } catch (err) {
+      if (err instanceof QuickUnlockCancelledError) return; // our own abort — silent
+      // The bind transaction refused: the record (or the PIN) went away in the
+      // window the pre-check above cannot cover. Re-read the state, then say
+      // the same thing the pre-check would have.
+      if (err instanceof VaultAccessRevokedError) {
+        void reconcileLockScreen();
+        throw new QuickUnlockUnavailableError('Быстрый вход был изменён или удалён — войдите по PIN.');
+      }
+      throw err;
+    } finally {
+      endQuickUnlockOp(abort);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * A GCM mismatch: the key and the blob diverged (the passkey was re-created,
+   * a platform bug, data corruption). Removal is CONDITIONAL — while this tab
+   * waited on the system sheet another tab could have removed the record and
+   * configured a NEW one, and `dbGeneration` does not move for that.
+   *
+   * The message follows the OUTCOME: only `'deleted'` may say the record is
+   * gone. Returns the error to throw so the caller keeps a single throw site.
+   */
+  async function onQuickUnlockMismatch(record: QuickUnlockRecord, myDbGen: number): Promise<Error> {
+    let outcome: 'deleted' | 'changed' | 'absent' | 'failed';
+    try {
+      outcome = await commitQuickUnlockSeedDeleteIfMatches(record, myDbGen);
+    } catch {
+      outcome = 'failed'; // reset or storage hiccup — say nothing about deletion
+    }
+    void reconcileLockScreen();
+    return outcome === 'deleted'
+      ? new QuickUnlockKeyMismatchError()
+      : new QuickUnlockUnavailableError('Быстрый вход не выполнен — войдите по PIN.');
+  }
 
   // ─── Safebox actions (§6) ──────────────────────────────────────────
 
@@ -3889,6 +4482,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     removePin: removePinAction,
     unlockWithPin: unlockWithPinAction,
     getPinLockState,
+    quickUnlockMeta,
+    // COMPUTED, never stored: one fact, one source.
+    hasQuickUnlock: quickUnlockMeta !== null,
+    quickUnlockCapability,
+    setupQuickUnlock,
+    removeQuickUnlock,
+    unlockWithQuickUnlock,
+    refreshQuickUnlockCapability,
     setAutoLockTimeout: setAutoLockTimeoutAction,
     lockApp: lockAppAction,
     persistDraft: persistDraftAction,
@@ -3917,6 +4518,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
+    quickUnlockMeta, quickUnlockCapability,
+    setupQuickUnlock, removeQuickUnlock, unlockWithQuickUnlock, refreshQuickUnlockCapability,
     setAutoLockTimeoutAction, lockAppAction, persistDraftAction,
     readDraftAction, clearDraftAction,
     resetBrokenStorage, retryRestore, checkForUpdates, clearRestoreStatus, dismissError,

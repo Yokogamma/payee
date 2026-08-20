@@ -6,7 +6,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 // controls, markdown rendering, the search plain-fallback and the composer
 // preview toggle. Separate file: the flag is a build-time constant.
 
-vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false }));
+vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({

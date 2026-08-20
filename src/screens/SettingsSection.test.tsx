@@ -31,6 +31,14 @@ beforeEach(() => {
     setupPin: vi.fn(),
     removePin: vi.fn(),
     showMnemonic: vi.fn(() => 'a b c'),
+    // Quick-unlock slice — this file uses the REAL flags module, so the block
+    // renders here whenever QUICK_UNLOCK_ENABLED is on.
+    quickUnlockMeta: null,
+    hasQuickUnlock: false,
+    quickUnlockCapability: 'ready',
+    setupQuickUnlock: vi.fn(async () => {}),
+    removeQuickUnlock: vi.fn(async () => {}),
+    refreshQuickUnlockCapability: vi.fn(),
     // Safebox slice — defaults: nothing configured, no data.
     safeboxPinConfigured: false,
     safeboxDataPresent: false,
@@ -146,8 +154,13 @@ describe('SettingsSection — safebox seed gate (§2)', () => {
     // The same appear/disappear formula the nav item lost. «Nothing configured
     // yet» is a state to show, not a reason to hide the only route to it.
     renderSection();
-    expect(screen.getByText('Защищённый сейф')).toBeTruthy();
-    expect(screen.getByText('не настроен')).toBeTruthy();
+    const title = screen.getByText('Защищённый сейф');
+    // Scoped to THIS block's own chip: «не настроен» is not a unique string on
+    // the screen any more — «Быстрый вход» uses the same word for the same
+    // state, and an unscoped getByText would break on any future block that
+    // does too.
+    expect(title.parentElement?.querySelector('.settings-block-chip')?.textContent)
+      .toBe('не настроен');
 
     cleanup();
     h.store.safeboxPinConfigured = true;

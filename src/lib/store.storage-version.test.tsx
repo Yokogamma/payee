@@ -10,7 +10,7 @@ import { render, cleanup, waitFor, act } from '@testing-library/react';
 //  - the stored DB is NEWER than this build → a RELOAD screen, and explicitly
 //    NOT the generic error screen whose destructive reset is two clicks away.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false }));
+vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
 const h = vi.hoisted(() => ({
   initBehaviour: 'ok' as 'ok' | 'version-error' | 'blocked' | 'blocking' | 'generic-error',

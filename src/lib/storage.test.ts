@@ -481,3 +481,503 @@ describe('commitPinSeedIfAbsent (first-writer-wins)', () => {
     expect(await getMeta('pin-seed')).toBeUndefined();
   });
 });
+
+// ─── Main PIN unlock commits (stage P) ──────────────────────────────
+
+import {
+  commitPinUnlockFailure,
+  commitPinUnlockSuccess,
+  commitPinSeedRewrap,
+  pinSeedEquals,
+  mainPinLockSeconds,
+  MAIN_MAX_PIN_ATTEMPTS,
+} from './storage';
+
+/** The pinned v1 Argon2id profile — the only one assertValidPinBlob accepts. */
+const ARGON2_V1 = { iterations: 3, memorySize: 65_536, parallelism: 1, hashLength: 32 };
+
+const argon2Blob = (ciphertext: string): PinEncryptedSeed => ({
+  ciphertext, iv: 'iv', salt: 's', kdf: 'argon2id', v: 1, argon2: { ...ARGON2_V1 },
+});
+/** Pre-Argon2id blob (no `kdf` field) — what the re-wrap path upgrades. */
+const legacyBlob = (ciphertext: string): PinEncryptedSeed => ({ ciphertext, iv: 'iv', salt: 's' });
+
+describe('pinSeedEquals (the ONE ownership check for the main PIN)', () => {
+  it('is true for a byte-identical blob read back from storage', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    expect(pinSeedEquals(await getMeta('pin-seed'), argon2Blob('ctA'))).toBe(true);
+  });
+
+  it('is false when ciphertext, iv or salt differ', () => {
+    expect(pinSeedEquals(argon2Blob('ctA'), argon2Blob('ctB'))).toBe(false);
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), iv: 'other' })).toBe(false);
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), salt: 'other' })).toBe(false);
+  });
+
+  it('is false when ONLY the kdf differs', () => {
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), kdf: 'pbkdf2' })).toBe(false);
+  });
+
+  it('is false when ONLY the version differs', () => {
+    expect(pinSeedEquals(argon2Blob('ct'), { ...argon2Blob('ct'), v: 2 })).toBe(false);
+  });
+
+  it('is false when ONLY one Argon2 parameter differs — every field is normative', () => {
+    for (const field of ['iterations', 'memorySize', 'parallelism', 'hashLength'] as const) {
+      const tweaked = { ...argon2Blob('ct'), argon2: { ...ARGON2_V1, [field]: ARGON2_V1[field] + 1 } };
+      expect(pinSeedEquals(argon2Blob('ct'), tweaked)).toBe(false);
+    }
+  });
+
+  it('is false when one side carries an Argon2 profile and the other does not', () => {
+    expect(pinSeedEquals(argon2Blob('ct'), legacyBlob('ct'))).toBe(false);
+    expect(pinSeedEquals(legacyBlob('ct'), argon2Blob('ct'))).toBe(false);
+  });
+
+  it('treats two legacy blobs with the same fields as equal', () => {
+    expect(pinSeedEquals(legacyBlob('ct'), legacyBlob('ct'))).toBe(true);
+  });
+
+  it('is false against undefined — "no PIN configured" owns nothing', () => {
+    expect(pinSeedEquals(undefined, argon2Blob('ct'))).toBe(false);
+    expect(pinSeedEquals(argon2Blob('ct'), undefined)).toBe(false);
+    expect(pinSeedEquals(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('commitPinUnlockFailure (atomic metering + lockout + wipe)', () => {
+  it('counts the attempt in ONE transaction — no lockout below the threshold', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out).toEqual({ outcome: 'committed', attempts: 1, lockedUntil: null, wiped: false });
+    expect(await getMeta('pin-attempts')).toBe(1);
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  it('applies the progressive lockout schedule', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('pin-attempts', 3);
+    const before = Date.now();
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.attempts).toBe(4);
+    expect(mainPinLockSeconds(4)).toBe(30);
+    expect(out.lockedUntil ?? 0).toBeGreaterThanOrEqual(before + 30_000);
+    expect(await getMeta('pin-locked-until')).toBe(out.lockedUntil);
+  });
+
+  it('two concurrent failures BOTH count — the increment is inside the transaction', async () => {
+    // The two-step getMeta+setMeta this replaced lost one of them: both reads
+    // returned the same number. IndexedDB serializes readwrite transactions
+    // per store, so re-reading inside the transaction cannot.
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const gen = getDbGeneration();
+    await Promise.all([
+      commitPinUnlockFailure(argon2Blob('ctA'), gen),
+      commitPinUnlockFailure(argon2Blob('ctA'), gen),
+    ]);
+    expect(await getMeta('pin-attempts')).toBe(2);
+  });
+
+  it('the 10th strike wipes the WHOLE configuration in the same transaction', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('pin-attempts', MAIN_MAX_PIN_ATTEMPTS - 1);
+    await setMeta('pin-locked-until', Date.now() + 1_800_000);
+    await setMeta('auto-lock-timeout', 300);
+
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out).toEqual({
+      outcome: 'committed', attempts: MAIN_MAX_PIN_ATTEMPTS, lockedUntil: null, wiped: true,
+    });
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    // No observable "attempts = 10": the counter is gone in the same commit.
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(await getMeta('auto-lock-timeout')).toBeNull();
+  });
+
+  it('a reset during the (slow) KDF does NOT resurrect attempts or a lockout', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const stale = getDbGeneration();
+    await resetAll(); // «Удалить всё» landed while Argon2 was running
+    await expect(commitPinUnlockFailure(argon2Blob('ctA'), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+
+  it('a PIN replaced by another tab during the KDF: config-changed, ZERO writes', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB')); // tab B already wrote its blob
+    await setMeta('pin-attempts', 2);             // …and its own metering
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.outcome).toBe('config-changed');
+    expect(out.attempts).toBe(0);
+    expect(out.wiped).toBe(false);
+    expect(await getMeta('pin-attempts')).toBe(2);      // NOT metered
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('ctB')); // NOT wiped
+  });
+
+  it('does not WIPE a foreign configuration on what would have been the 10th strike', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB'));
+    await setMeta('pin-attempts', MAIN_MAX_PIN_ATTEMPTS - 1);
+    await setMeta('auto-lock-timeout', 300);
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.outcome).toBe('config-changed');
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('ctB'));
+    expect(await getMeta('auto-lock-timeout')).toBe(300);
+  });
+
+  it('a PIN REMOVED by another tab during the KDF: config-changed, nothing written', async () => {
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.outcome).toBe('config-changed');
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+  });
+});
+
+describe('commitPinUnlockSuccess', () => {
+  it('clears the metering of the configuration that was proved', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('pin-attempts', 4);
+    await setMeta('pin-locked-until', Date.now() + 30_000);
+    expect(await commitPinUnlockSuccess(argon2Blob('ctA'), getDbGeneration())).toBe('committed');
+    expect(await getMeta('pin-attempts')).toBeUndefined();
+    expect(await getMeta('pin-locked-until')).toBeUndefined();
+  });
+
+  it('leaves a foreign configuration\'s counters ALONE (the vault still opens)', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB'));
+    await setMeta('pin-attempts', 4);
+    const lockedUntil = Date.now() + 30_000;
+    await setMeta('pin-locked-until', lockedUntil);
+    expect(await commitPinUnlockSuccess(argon2Blob('ctA'), getDbGeneration())).toBe('config-changed');
+    expect(await getMeta('pin-attempts')).toBe(4);
+    expect(await getMeta('pin-locked-until')).toBe(lockedUntil);
+  });
+
+  it('refuses after a reset', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitPinUnlockSuccess(argon2Blob('ctA'), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+  });
+});
+
+describe('commitPinSeedRewrap (legacy → Argon2id)', () => {
+  it('replaces the exact legacy blob that was unwrapped', async () => {
+    await setMeta('pin-seed', legacyBlob('legacyA'));
+    expect(await commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), getDbGeneration()))
+      .toBe('committed');
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('newA'));
+  });
+
+  it('legacy A replaced by legacy B: the re-wrap of A does NOT overwrite B', async () => {
+    // "Still legacy" would have passed here — and silently re-encrypted B's
+    // configuration under A's (old) PIN.
+    await setMeta('pin-seed', legacyBlob('legacyB'));
+    expect(await commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), getDbGeneration()))
+      .toBe('config-changed');
+    expect(await getMeta('pin-seed')).toEqual(legacyBlob('legacyB'));
+  });
+
+  it('a reset during the re-wrap does NOT resurrect pin-seed', async () => {
+    await setMeta('pin-seed', legacyBlob('legacyA'));
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+
+  it('writes nothing once the PIN was removed by another tab', async () => {
+    expect(await commitPinSeedRewrap(legacyBlob('legacyA'), argon2Blob('newA'), getDbGeneration()))
+      .toBe('config-changed');
+    expect(await getMeta('pin-seed')).toBeUndefined();
+  });
+});
+
+// ─── Quick unlock: atomic reader + conditional commits (stage 1) ─────
+
+import {
+  readClientConfigSnapshot,
+  commitQuickUnlockSeedWrite,
+  commitQuickUnlockSeedDelete,
+  commitQuickUnlockSeedDeleteIfMatches,
+  commitQuickUnlockSeedCleanup,
+} from './storage';
+import {
+  QUICK_UNLOCK_META_KEY,
+  parseQuickUnlockRecord,
+  bytesToBase64Url,
+  type QuickUnlockRecord,
+} from './quick-unlock';
+import { bufferToBase64 } from './crypto';
+
+const qb64 = (n: number, fill = 1) => bufferToBase64(new Uint8Array(n).fill(fill));
+const VAULT_PK = qb64(32, 9);
+const OTHER_PK = qb64(32, 8);
+
+function quickRecord(over: Partial<QuickUnlockRecord> = {}): QuickUnlockRecord {
+  return {
+    v: 1,
+    credentialId: bytesToBase64Url(new Uint8Array(32).fill(1)),
+    prfSalt: qb64(32, 2),
+    hkdfSalt: qb64(32, 3),
+    iv: qb64(12, 4),
+    ciphertext: qb64(48, 5),
+    pk: VAULT_PK,
+    createdAt: 1_700_000_000_000,
+    ...over,
+  };
+}
+
+/** A configured vault: PIN set and the identity bound. */
+async function configuredVault(): Promise<void> {
+  await setMeta('pin-seed', argon2Blob('ctA'));
+  await setMeta('vault-public-key', VAULT_PK);
+}
+
+describe('readClientConfigSnapshot (ONE transaction, four keys)', () => {
+  it('returns all four values and the record verdict together', async () => {
+    await configuredVault();
+    await setMeta('auto-lock-timeout', 300);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+
+    const snap = await readClientConfigSnapshot();
+    expect(snap.pinSeed).toEqual(argon2Blob('ctA'));
+    expect(snap.autoLockTimeout).toBe(300);
+    expect(snap.vaultPublicKey).toBe(VAULT_PK);
+    expect(snap.quickUnlock).toEqual({ kind: 'valid', record: quickRecord() });
+  });
+
+  it('reports an empty configuration without inventing one', async () => {
+    const snap = await readClientConfigSnapshot();
+    expect(snap).toEqual({
+      pinSeed: undefined,
+      autoLockTimeout: undefined,
+      vaultPublicKey: undefined,
+      quickUnlock: { kind: 'none' },
+    });
+  });
+
+  it('never shows a HALF-APPLIED wipe: PIN gone AND threshold reset AND record gone', async () => {
+    await configuredVault();
+    await setMeta('auto-lock-timeout', 1800);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+
+    await clearPinConfigMeta(); // the atomic wipe another tab may run
+
+    const snap = await readClientConfigSnapshot();
+    expect(snap.pinSeed).toBeUndefined();
+    expect(snap.autoLockTimeout).toBeNull();
+    expect(snap.quickUnlock).toEqual({ kind: 'none' });
+  });
+
+  it('a record left by an OLDER client (PIN gone) reads as stale, not valid', async () => {
+    await setMeta('vault-public-key', VAULT_PK);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord()); // no pin-seed at all
+    expect((await readClientConfigSnapshot()).quickUnlock).toEqual({ kind: 'stale', reason: 'no-pin' });
+  });
+
+  it('a record from ANOTHER vault reads as stale', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord({ pk: OTHER_PK }));
+    expect((await readClientConfigSnapshot()).quickUnlock).toEqual({ kind: 'stale', reason: 'foreign-vault' });
+  });
+});
+
+describe('clearPinConfigMeta removes the quick-unlock record', () => {
+  it('deletes it in the SAME transaction as the PIN', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+    await clearPinConfigMeta();
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it('the 10-strike wipe takes it too — one transaction, no window', async () => {
+    await setMeta('pin-seed', argon2Blob('ctA'));
+    await setMeta('vault-public-key', VAULT_PK);
+    await setMeta('pin-attempts', MAIN_MAX_PIN_ATTEMPTS - 1);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+
+    const out = await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration());
+    expect(out.wiped).toBe(true);
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it('leaves it ALONE when the wipe is refused (foreign configuration)', async () => {
+    await setMeta('pin-seed', argon2Blob('ctB')); // another tab's PIN
+    await setMeta('vault-public-key', VAULT_PK);
+    await setMeta('pin-attempts', MAIN_MAX_PIN_ATTEMPTS - 1);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+
+    expect((await commitPinUnlockFailure(argon2Blob('ctA'), getDbGeneration())).outcome).toBe('config-changed');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual(quickRecord());
+  });
+});
+
+describe('resetAll clears the quick-unlock record', () => {
+  it('the whole meta store goes, so nothing survives a reset', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+    await resetAll();
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+});
+
+describe('commitQuickUnlockSeedWrite (conditional, first-writer-wins)', () => {
+  it('writes when the vault is configured and nothing is set up yet', async () => {
+    await configuredVault();
+    expect(await commitQuickUnlockSeedWrite(quickRecord(), getDbGeneration())).toBe('written');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual(quickRecord());
+  });
+
+  it('refuses when the PIN was removed between the snapshot and the commit', async () => {
+    await setMeta('vault-public-key', VAULT_PK); // no pin-seed
+    expect(await commitQuickUnlockSeedWrite(quickRecord(), getDbGeneration())).toBe('no-pin');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it('refuses a record bound to a DIFFERENT vault', async () => {
+    await configuredVault();
+    expect(await commitQuickUnlockSeedWrite(quickRecord({ pk: OTHER_PK }), getDbGeneration()))
+      .toBe('foreign-vault');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it('TWO concurrent setups: the first wins, the second does NOT clobber it', async () => {
+    await configuredVault();
+    const first = quickRecord({ credentialId: bytesToBase64Url(new Uint8Array(32).fill(1)) });
+    const second = quickRecord({ credentialId: bytesToBase64Url(new Uint8Array(32).fill(2)) });
+    const gen = getDbGeneration();
+
+    const outcomes = await Promise.all([
+      commitQuickUnlockSeedWrite(first, gen),
+      commitQuickUnlockSeedWrite(second, gen),
+    ]);
+
+    expect(outcomes.filter(o => o === 'written')).toHaveLength(1);
+    expect(outcomes.filter(o => o === 'already-configured')).toHaveLength(1);
+    // Whichever won, the stored record is intact — not a mix of the two.
+    const stored = parseQuickUnlockRecord(await getMeta(QUICK_UNLOCK_META_KEY));
+    expect([first.credentialId, second.credentialId]).toContain(stored?.credentialId);
+  });
+
+  it('OVERWRITES a void record — a stale one is nobody’s working setup', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, { v: 2, junk: true }); // unparseable
+    expect(await commitQuickUnlockSeedWrite(quickRecord(), getDbGeneration())).toBe('written');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual(quickRecord());
+  });
+
+  it('refuses after a reset in another tab', async () => {
+    await configuredVault();
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitQuickUnlockSeedWrite(quickRecord(), stale))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+});
+
+describe('commitQuickUnlockSeedDelete (unconditional, manual only)', () => {
+  it('removes whatever is there', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+    await commitQuickUnlockSeedDelete(getDbGeneration());
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it('is idempotent and touches nothing else', async () => {
+    await configuredVault();
+    await commitQuickUnlockSeedDelete(getDbGeneration());
+    expect(await getMeta('pin-seed')).toEqual(argon2Blob('ctA'));
+    expect(await getMeta('vault-public-key')).toBe(VAULT_PK);
+  });
+
+  it('refuses after a reset', async () => {
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitQuickUnlockSeedDelete(stale)).rejects.toBeInstanceOf(StorageResetError);
+  });
+});
+
+describe('commitQuickUnlockSeedDeleteIfMatches (conditional)', () => {
+  it('deletes the exact record it was given', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+    expect(await commitQuickUnlockSeedDeleteIfMatches(quickRecord(), getDbGeneration())).toBe('deleted');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it("returns 'changed' and KEEPS a record another tab replaced meanwhile", async () => {
+    // The whole point: while this tab waited on the system sheet, tab B could
+    // remove the record and set up a NEW one. dbGeneration does not move for
+    // that, so a mismatch computed against the old snapshot must not delete
+    // the new, working record.
+    await configuredVault();
+    const replacement = quickRecord({ credentialId: bytesToBase64Url(new Uint8Array(32).fill(7)) });
+    await setMeta(QUICK_UNLOCK_META_KEY, replacement);
+
+    expect(await commitQuickUnlockSeedDeleteIfMatches(quickRecord(), getDbGeneration())).toBe('changed');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual(replacement);
+  });
+
+  it("returns 'absent' when the record is already gone", async () => {
+    await configuredVault();
+    expect(await commitQuickUnlockSeedDeleteIfMatches(quickRecord(), getDbGeneration())).toBe('absent');
+  });
+
+  it("treats an unparseable current record as 'changed', not as a match", async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, { v: 2 });
+    expect(await commitQuickUnlockSeedDeleteIfMatches(quickRecord(), getDbGeneration())).toBe('changed');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual({ v: 2 });
+  });
+});
+
+describe('commitQuickUnlockSeedCleanup (re-checks inside its own transaction)', () => {
+  it('deletes an orphaned record (PIN gone)', async () => {
+    await setMeta('vault-public-key', VAULT_PK);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+    expect(await commitQuickUnlockSeedCleanup(getDbGeneration())).toBe('deleted');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toBeUndefined();
+  });
+
+  it('deletes a foreign-vault record', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord({ pk: OTHER_PK }));
+    expect(await commitQuickUnlockSeedCleanup(getDbGeneration())).toBe('deleted');
+  });
+
+  it('deletes an unparseable record', async () => {
+    await configuredVault();
+    await setMeta(QUICK_UNLOCK_META_KEY, { nonsense: true });
+    expect(await commitQuickUnlockSeedCleanup(getDbGeneration())).toBe('deleted');
+  });
+
+  it('a PIN that REAPPEARED between the snapshot and the cleanup CANCELS the delete', async () => {
+    // The readonly snapshot said «orphaned»; by the time we got here another
+    // tab had configured a PIN again, which makes the record valid. Deleting
+    // it now would destroy a working setup.
+    await setMeta('vault-public-key', VAULT_PK);
+    await setMeta(QUICK_UNLOCK_META_KEY, quickRecord());
+    await setMeta('pin-seed', argon2Blob('ctA')); // reappeared
+
+    expect(await commitQuickUnlockSeedCleanup(getDbGeneration())).toBe('kept');
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual(quickRecord());
+  });
+
+  it("returns 'kept' when there is nothing to clean up", async () => {
+    await configuredVault();
+    expect(await commitQuickUnlockSeedCleanup(getDbGeneration())).toBe('kept');
+  });
+
+  it('refuses after a reset', async () => {
+    const stale = getDbGeneration();
+    await resetAll();
+    await expect(commitQuickUnlockSeedCleanup(stale)).rejects.toBeInstanceOf(StorageResetError);
+  });
+});

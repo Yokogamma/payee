@@ -905,6 +905,395 @@ Unchanged: **`client-r4`**. Lifecycle and presentation only — no storage, no
 sync protocol, no crypto. Rolling back to `client-nav2` or any tag at or above
 `client-r4` is a plain Pages redeploy (and reinstates the stuck gate).
 
+## PIN-path and vault-open races — `client-pin1` (client-only)
+
+Stage P of the quick-unlock plan, shipped on its own **before** any of that
+feature: four pre-existing production races, all on paths the feature would
+later reuse. Nothing user-visible changes, no flag was flipped, and no line of
+the quick-unlock feature is in this release.
+
+What it closes:
+
+1. **A reset during Argon2id (~1 s).** `unlockWithPinAction` metered, wrote the
+   lockout and re-wrapped the legacy blob with no reset guard at all, so
+   «Удалить всё» landing inside that second could leave `pin-attempts`,
+   `pin-locked-until` or `pin-seed` behind in a database that had just been
+   cleared — the `resetAll` invariant, broken by the unlock flow finishing
+   afterwards.
+2. **A cross-tab PIN change.** `dbGeneration` does not move for it (same
+   database), so a verdict produced against blob A metered configuration B —
+   and on the 10th strike WIPED it. Each commit now re-reads `pin-seed` inside
+   its own transaction and refuses unless it is still byte-for-byte the blob
+   that was checked (`pinSeedEquals`, every normative field including `v` and
+   the whole Argon2 profile).
+3. **A lock inside the `bindVaultIdentity` window.** `openVault` cleared
+   `vaultOpAbortRef` right after `prepareVaultSnapshot`, so during the identity
+   transaction the tab held nothing lockable: `lockApp()` took its
+   `!vaultPresentInTab()` early exit WITHOUT bumping the epoch, the post-bind
+   epoch check passed, and the vault was published against the lock verdict.
+   Reachable from the ordinary «Сразу» auto-lock on a return to foreground.
+   The controller now lives for the whole run and is cleared only when the ref
+   still holds THIS operation's — the discipline `runArweaveSweep` already
+   followed.
+4. **A reset between the PIN commits and `openVault`.** The commits refuse to
+   write, but `openVault` then captured a FRESH generation, re-bound the old
+   seed into the wiped database and published mnemonic, keys and session. It
+   now accepts an optional `expectedDbGeneration` and stands down
+   synchronously — before touching the shared abort ref, so a departing call
+   cannot cancel somebody else's in-flight operation.
+
+Also recorded as behaviour, not left to chance: **the bind transaction is the
+point of no return for IDENTITY.** A bind that started before a lock or a
+preemption RUNS TO COMPLETION, so with `initialize` both `vault-public-key`
+and `meta.init` land. That is deliberate first-writer-wins — the vault is not
+published, a retry with the SAME seed binds `'same'` and succeeds, a DIFFERENT
+seed gets `'foreign'` → `VaultMismatchError` with its explicit reset.
+Preemption governs PUBLICATION only, never identity.
+
+**DEPLOYED 2026-08-19** (main `5c60857`, PR #56, tag `client-pin1`) on
+notes.matamata.dev, run 32262237375 — all gates green in a clean `npm ci`
+checkout (lint, `tsc -b`, **1086 client tests / 58 files**, worker typecheck +
+130 tests, staging config check, bundle budget and font guards),
+`smoke-headers` passed against the deployment URL. **The Worker was NOT
+deployed** — this release does not touch it.
+
+### Verified on the live origin
+
+Live bundle `index-BTbSf7zD.js`. It contains the string `config-changed`, which
+did not exist anywhere in the source before stage P — direct evidence that the
+artifact carries the new code rather than a cached older build. This release
+adds no user-facing copy, so the usual «grep the bundle for new text» check does
+not apply, exactly as with `client-sync1`. `smoke-headers.mjs` run against
+`https://notes.matamata.dev` reports CSP, `X-Frame-Options`, `nosniff` and
+`Referrer-Policy` present on the custom domain.
+
+**ACCEPTED 2026-08-19** — the operator ran the manual check on the live origin
+and reported the PIN path working. That is what this release needed to
+establish: it changes no user-facing behaviour, so acceptance is the absence of
+a regression on the ordinary path (a correct PIN opens the vault, a wrong one
+is refused and counted, the app unlocks again after an auto-lock), not a new
+capability to demonstrate.
+
+**NOT established by that acceptance — read before trusting this section:**
+
+- **The four races themselves.** All are timing windows: a reset landing inside
+  a ~1 s KDF, two tabs changing a PIN at the same moment, a lock arriving
+  during an IndexedDB transaction, a reset between the last guarded commit and
+  `openVault`. None is reachable by hand on purpose. They are proven by
+  deterministic tests — and each new guard test was additionally confirmed to
+  FAIL with its own fix reverted, so the tests are known to discriminate rather
+  than merely pass. A production run neither confirms nor refutes them.
+- **The 10-strike wipe.** It destroys a working PIN configuration, so it is not
+  something an operator re-runs on a live vault, and it should NOT be assumed
+  covered by the acceptance above. Its guarantee stays where it has always
+  been: `commitPinUnlockFailure` wipes inside the SAME transaction that meters
+  the 10th attempt (storage tests), and the store publishes the cleared state
+  and the cross-tab notice afterwards (store tests). If it is ever exercised
+  deliberately on a throwaway vault, record the result here.
+
+If a PIN-path complaint arrives later, this ordering is the useful one: an
+attempt counted twice or not at all points at the metering commit; a lockout
+that outlives its window points at `pin-locked-until`; a vault that opens right
+after «Удалить всё» points at the generation handover into `openVault`.
+
+⚠️ Prompt-gated as always: an already-loaded tab keeps the old build until
+«Обновить».
+
+### Floor
+
+Unchanged: **`client-r4`** / **`worker-r3`**. `DB_VERSION` stays 2, no schema
+change, no new meta key, no sync-protocol or crypto change — the PIN blob
+format is untouched (the ownership check compares the existing fields; no
+`configId` was added). Rolling back is a plain Pages redeploy of
+`client-sync1`, and it simply reinstates the four races.
+
+## «Быстрый вход» (WebAuthn PRF) — `client-qu1` / `client-qu2`
+
+A second key to the SAME seed, opened by the device's own verification
+(Windows Hello, Touch ID / Face ID, or a device passcode). It is an
+ACCELERATOR, not a replacement: the PIN stays, which means the attacker still
+picks the weakest wrapper and the vault's strength does not increase. That is
+stated in the settings copy, in those words, and a test asserts the sentences
+are in the DOM.
+
+The feature is never called «биометрия» anywhere the user can see. WebAuthn
+user verification is satisfied by a Windows Hello PIN or a device passcode just
+as well as by a fingerprint, and the platform gives the web no way to tell —
+so naming a modality on the button would be a lie.
+
+### Two releases, deliberately
+
+1. **`client-qu1`** — the whole feature merged with **`QUICK_UNLOCK_ENABLED =
+   false`**. Users see nothing new; the code bakes in production. The flag
+   contract is PER OPERATION: setup and unlock are gated, while READING the
+   record and REMOVING it never are. That asymmetry is what makes a rollback
+   safe — a user who configured quick unlock on a build with the flag on must
+   still find the block, and a «Удалить быстрый вход» button in it, after the
+   flag goes back off.
+2. **`client-qu2`** — one commit flipping the flag, after the manual device
+   acceptance below. Nothing else changes.
+
+### What the format is, and why floors do not move
+
+`quick-unlock-seed` is an ordinary string in the `meta` store: **`DB_VERSION`
+stays 2**, and the floors stay **`client-r4`** / **`worker-r3`**. An older
+client does not know the key and ignores it; a newer one accepts everything an
+older one wrote. The Worker and the on-chain protocol are not involved at all —
+WebAuthn is not a network call, so the **CSP is unchanged** too
+(`publickey-credentials-get`/`-create` are not listed in `Permissions-Policy`;
+their default allowlist is `self`, which is what we need, and the app cannot be
+framed — `frame-ancestors 'none'`).
+
+Crypto, for the record: `HKDF-SHA256(ikm = PRF output, salt = a random 32-byte
+hkdfSalt, info = "eternal-notes-quick-unlock-v1")` → AES-256-GCM over the
+mnemonic. The `info` is mandatory and versioned — using a raw PRF output as a
+key, or skipping `info`, are the two canonical PRF anti-patterns — and it is
+also what would keep a future contour (a safebox one, say) cryptographically
+independent on the SAME passkey. `deriveKey`, the `eternal-notes-v1` salt and
+the Argon2id profile are untouched.
+
+### The compatibility hole, and the rule that closes it
+
+A client from `client-r4` up to `client-pin1` clears the PIN — manually or
+through the 10-strike wipe — with a `clearPinConfigMeta` that knows nothing
+about `quick-unlock-seed`. It would leave a working quick entry to a vault
+whose PIN is gone.
+
+Closed by a rule applied on **every read**, not just at startup: **no
+`pin-seed` ⇒ the record is void** — ignored, and cleaned up. It doubles as the
+product rule («quick unlock only on top of a PIN»), so it is one invariant
+working in both directions rather than a compatibility patch. From this release
+on, the wipe itself is atomic: the record is deleted in the SAME transaction as
+`pin-seed`.
+
+### Invariants worth not rediscovering
+
+- **The PIN meter is untouchable.** No quick-unlock outcome — cancel, timeout,
+  no PRF, corrupt record, GCM mismatch, foreign vault — reads or writes
+  `pin-attempts` / `pin-locked-until`. An active PIN lockout does NOT block
+  quick unlock (different contour, hardware rate limit), and a successful quick
+  unlock does NOT clear the PIN counters.
+- **`userVerification: 'required'` in both ceremonies, forever.** Unwrapping the
+  seed is always behind a system check. Changing the policy ⇒ a new record `v`:
+  the spec does not guarantee the PRF output survives such a change.
+- **Never store a blob we have not opened.** `prf.enabled === true` is a
+  promise, not a fact, and known WebKit bugs (311099, 314934) returned garbage
+  and null on create. So setup always runs a control `get()` and wraps the seed
+  with THAT output — the path every later unlock takes. The price is two system
+  prompts during setup; a blob that cannot be opened is worse than no feature.
+- **`NotAllowedError` is a catch-all BY DESIGN of the spec** — cancel, timeout
+  and «that credential is gone» are indistinguishable for privacy reasons. It
+  therefore deletes nothing and claims nothing. The only silent outcome is our
+  OWN AbortError (a lock, a reset, an unmount).
+- **A record is deleted only on an `OperationError` from `subtle.decrypt`
+  itself**, and even then CONDITIONALLY: another tab may have re-configured
+  meanwhile, and `dbGeneration` does not move for that.
+- **Setup is first-writer-wins.** Two tabs configuring at once: one writes, the
+  other is told so and clobbers nothing.
+
+### Manual acceptance — MANDATORY before `client-qu2`
+
+Automated tests prove nothing about whether PRF works: only hardware knows.
+Re-check the minimum browser/OS versions against live sources immediately
+before running this — support moves fast (Firefox Android gained PRF between
+two revisions of the plan).
+
+- **iPhone (iOS 18.4+)**: Safari AND the installed PWA separately. Setup, entry,
+  cancelling the sheet; delete the key in the Passwords app → a neutral «не
+  выполнен», the record NOT auto-deleted, PIN entry still works. The PWA has
+  its own IndexedDB — configuring again there is expected, not a bug.
+- **Android**: Chrome and the installed PWA. Same, plus entry from the lock
+  screen and behaviour with the fingerprint disabled in the system.
+- **Windows Hello laptop**: Chrome AND Edge, 147+, 25H2 with KB5077181; and
+  separately a machine WITHOUT that update, where the honest «не
+  поддерживается» must appear instead of a silent failure. Test the Hello PIN,
+  not only the fingerprint.
+- **End to end everywhere**: setup at «Сразу» shows the explanation and no
+  button; setup at «5 минут» succeeds and then «Сразу» still unlocks; two tabs
+  reconcile; removing the PIN removes quick unlock; 10 wrong PINs remove both;
+  reset removes the record; the sheet stays local (`transports: ['internal']`)
+  and refusing a «another device» offer leaves the record intact; airplane mode
+  works (no network involved).
+
+### `client-qu1` — DEPLOYED 2026-08-19
+
+main `2ed5b98` (PR #59), tag `client-qu1`, run 32292249783 on
+notes.matamata.dev. All gates green in a clean `npm ci` checkout (lint,
+`tsc -b`, **1257 client tests / 64 files**, worker typecheck + 130 tests,
+staging config check, bundle budget **189.3 / 195 KB gz**, font guard),
+`smoke-headers` passed against the deployment URL and re-run against the custom
+domain. **The Worker was NOT deployed** — untouched by this release.
+
+**What actually reached the artifact — read this before assuming «the code is
+baking in production».** Live bundle `index-DpOYaNfh.js` contains
+`quick-unlock-seed` and the «Быстрый вход» strings, and does NOT contain
+`eternal-notes-quick-unlock-v1` or `already-configured`. That is correct and
+expected: the bundler resolves `QUICK_UNLOCK_ENABLED` to `false` and eliminates
+everything behind the two `if (!QUICK_UNLOCK_ENABLED) throw` gates, i.e. the
+bodies of `setupQuickUnlock` and `unlockWithQuickUnlock`. The UNGATED half —
+the record schema, the four-key reader, the commits, the «no pin-seed ⇒ void»
+cleanup, the settings block and its removal button — IS shipped, which is
+exactly the flag contract.
+
+Consequence, and it is the point of the two-release split: this deploy proves
+the ungated half and the absence of a regression; it does NOT exercise the
+ceremonies. Those ship with `client-qu2`. The manual acceptance below therefore
+has to run against a temporary flag-ON build (local or a separate preview), not
+against production — as the release order already states.
+
+**NOT verified by this deploy:** everything the flag gates, plus the four races
+closed in `client-pin1` (timing windows, proven by tests). What IS verified is
+that the app still boots, the PIN path is unchanged, and no quick-unlock UI
+appears for a user who has no record.
+
+### `client-qu2` — DEPLOYED 2026-08-19, THE FEATURE IS LIVE
+
+main `4a2c798` (PR #61), tag `client-qu2`, run 32294225175. One line:
+`QUICK_UNLOCK_ENABLED = false → true`. Nothing else in production code changed.
+All gates green; bundle **191.9 / 195 KB gz**; `smoke-headers` passed against
+the deployment URL and re-run against the custom domain.
+
+Verified on the live origin: bundle `index-Ul18PfRV.js` contains
+`eternal-notes-quick-unlock-v1`, `already-configured`, «Настроить быстрый вход»
+and the WebAuthn `publicKey` options — i.e. the ceremony bodies the flag-off
+build had eliminated are now genuinely shipped.
+
+**THE RELEASE ORDER WAS INVERTED, deliberately, by the operator.** §14 puts the
+§13 hardware acceptance BEFORE the flag; here the flag went first and the
+acceptance runs on production. The reasoning, recorded so a future reader does
+not mistake it for an oversight: the feature is fail-safe by construction — no
+PRF, a GCM mismatch, a cancelled sheet, a deleted passkey all end in an honest
+refusal with PIN entry intact, and NO outcome touches `pin-attempts` /
+`pin-locked-until`. The worst case is «the accelerator does not work here»,
+which is the same case the support matrix predicts anyway.
+
+What that costs: if PRF turns out broken on a given platform, a real user meets
+the failure instead of the operator meeting it on a preview build. Rollback is
+a redeploy of `client-qu1` — the feature disappears from the UI, and any record
+already written stays readable (an older client ignores the key).
+
+### Acceptance — Android, the workaround, and what it cost
+
+**UNBLOCKED 2026-08-20 (tag `client-qu2-hotfix1`): quick unlock works on the
+OnePlus 12 (installed PWA) and on one Windows PC with a fingerprint reader.**
+The change that unblocked it was `residentKey` — a confirmed workaround, not a
+proven cause; see below for why the distinction is kept. Read the rest of this
+section before touching that setting again.
+
+**How it started. OnePlus 12 / Android 16 / installed PWA, 2026-08-19 — SETUP
+FAILED: the credential was created, the platform then returned no PRF.** The
+capability probes had said «go ahead» — which is exactly the case §3 predicts
+and the reason the design treats a real ceremony, not a probe, as the only
+authority.
+
+Two defects surfaced with it, and the second was the serious one:
+
+1. The message was jargon («это устройство не выдаёт PRF») and its instruction
+   was wrong twice over: with `residentKey: 'discouraged'` the leftover
+   credential may not be VISIBLE in the manager at all, and leaving it is
+   harmless — it opens nothing. Nothing told the reader the one thing that
+   mattered: nothing is broken, the PIN still works.
+2. The block stayed in «не настроен» WITH the setup button. So the only obvious
+   next action — press it again — minted another unusable platform credential,
+   every time. A dead end that punishes the user for trying to fix it.
+
+Fixed in `b9d3722` (PR #63): `QuickUnlockUnavailableError` now carries the
+verdict a ceremony PROVED, the store publishes it and makes it sticky for the
+session, so a later probe cannot put the button back with an optimistic
+`'unknown'`. A transient environment failure carries no verdict and leaves the
+capability alone — it proves nothing about the device. All refusal copy was
+rewritten without jargon, each line ending in what the reader can DO.
+
+**KNOWN LIMIT of that fix:** the verdict does not survive a reload. After a
+restart the button returns and one more orphaned credential can be created.
+Persisting it needs a new meta key and was not added silently.
+
+**A CONFIRMED WORKAROUND — not a proven cause.** `residentKey: 'discouraged'`
+→ `'preferred'` (`1a90c13`, PR #65), and the retry on the same device
+succeeded. That is a working hypothesis confirmed on THIS combination, and the
+wording matters, because two things stop it short of a diagnosis:
+
+1. **One success, on one unrecorded configuration.** A single retry on a single
+   device, and neither the browser build nor the selected credential provider
+   was written down — the two things that actually decide whether PRF is
+   available on Android. Repeatable ≠ explained.
+
+   (An earlier version of this list also called `credProps: true` a second
+   variable that might have influenced provider routing. That was wrong:
+   `credProps` is a CLIENT registration extension — it has no authenticator
+   extension input and no authenticator processing at all, so it cannot reach
+   the authenticator, let alone steer which provider takes the request. It
+   only reports `rk` back from the client. See WebAuthn L3 §10.4.)
+2. **The mechanism was never observed.** An earlier version of this section
+   claimed a missing PRF is «the signature» of a non-discoverable credential.
+   It is not: CTAP requires `hmac-secret` support for discoverable and
+   non-discoverable credentials alike, and `'preferred'` may still yield a
+   plain server-side credential. The plausible story is ROUTING — on Android
+   the request goes to different credential providers, and what you ask for
+   influences which one takes it — but `credProps.rk` was NOT read on the
+   successful run, so even «the credential is now discoverable» is an
+   assumption. It is requested and logged on both no-PRF paths now, so the
+   next failure anywhere will say more.
+
+**The price, accepted knowingly:** the key MAY now become visible in the system
+password manager and, on a syncing provider, synced — `'preferred'` asks, it
+does not guarantee, and again `rk` was not observed. If it does, it can also be
+deleted by hand, which §2 already covers: losing it costs only the accelerator,
+never the data.
+
+**Do not «tidy» this back to `'discouraged'`.** The original rationale («do not
+clutter the passkey list, lower the chance of an accidental deletion») reads
+perfectly sensible and was written on the assumption that the choice was free.
+It is not. That assumption cost one failed acceptance, two UI defects and three
+releases to unwind.
+
+### §13 — PARTIAL hardware smoke, not a completed acceptance (2026-08-20)
+
+Two devices were smoke-tested. That is not the §13 matrix; calling it one would
+turn «the platform that was broken now works» into «the feature is accepted».
+
+| Platform | Result |
+|---|---|
+| Android — OnePlus 12 / Android 16 / **installed PWA** | **PASS**, after `residentKey: 'preferred'` |
+| Android — **Chrome tab** (not the PWA) on the same device | not run |
+| Windows PC — **fingerprint** | **PASS** |
+| Windows — **Hello PIN** rather than the fingerprint | not run |
+| Windows — which browser, and Chrome vs **Edge** | not recorded / not run |
+| iPhone — Safari | not run |
+| iPhone — installed PWA (its own IndexedDB; configure again there) | not run |
+| A machine WITHOUT KB5077181 — must say «не поддерживается», not fail silently | not run |
+| macOS Safari (optional second Keychain) | not run |
+
+The two passes are real and they cover the platform that was broken. What they
+do NOT cover is the whole point of the remaining rows: an installed PWA and a
+plain Chrome tab are not the same client on Android, Hello PIN and a
+fingerprint are different verification methods, Edge is a different WebAuthn
+client from Chrome on the same OS, iOS is a different WebKit/Keychain path
+entirely, and the no-KB5077181 machine is the only way to see whether the
+HONEST refusal appears rather than a silent failure — the one behaviour the
+support matrix cannot predict and the tests cannot exercise.
+
+Scenario coverage on the two passing devices is also partial: the end-to-end
+list (setup at «Сразу» shows the explanation and no button; two tabs reconcile;
+removing the PIN removes quick unlock; 10 wrong PINs remove both; reset removes
+the record; refusing an «another device» offer leaves the record intact;
+airplane mode) has not been walked through and reported.
+
+### Bundle budget — worth watching now
+
+With the flag on, the client sits at **191.9 KB gz against a 195 KB ceiling**:
+**3.1 KB of headroom**, down from 5.7 with the flag off. The next feature of any
+size will hit it. Raising the ceiling is a decision, not a formality — the
+number exists because this is a PWA people install on phones.
+
+### Rollback
+
+Redeploy **`client-pin1`** to undo the whole feature, or **`client-qu1`** to
+keep the code and only hide it (the flag). Data is unaffected either way:
+`quick-unlock-seed` is an unknown meta key to `client-pin1`, which ignores it.
+The one trace is that removing the PIN there leaves the record orphaned — and
+the next newer client deletes it on its first read, by the rule above.
+
 ## Wallet (owner) rotation — TRUSTED_OWNERS runbook
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
