@@ -29,10 +29,10 @@ version: 2
 # относятся только к version-updates (applies-to: version-updates), и это здесь
 # осознанно — фикс CVE не должен ждать своей еженедельной пачки.
 #
-# open-pull-requests-limit поднят с дефолтных 5 ВРЕМЕННО: на момент правки все
-# три экосистемы упёрлись в лимит (5/5/5), и сгруппированному PR просто некуда
-# приехать, пока слоты не освободятся. После разбора очереди (сгруппированные
-# PR приехали, старые закрыты) лимит возвращается к 5 отдельным PR.
+# open-pull-requests-limit — дефолтные 5. Временный подъём до 10 (нужен был,
+# чтобы сгруппированным PR было куда приехать при забитой очереди 5/5/5)
+# закончился вместе с разбором очереди 2026-08-21: группы приехали, мажоры
+# разобраны поштучно, слоты свободны.
 updates:
   # ── GitHub Actions ────────────────────────────────────────────────────
   # Actions are pinned to immutable commit SHAs; without this they would never
@@ -47,7 +47,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     groups:
       actions-minor:
         patterns:
@@ -70,7 +70,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     groups:
       # Связанная четвёрка: react и react-dom обязаны совпадать до патча,
       # типы ходят с ними. Ровно та пара, расщепление которой дало #12/#17.
@@ -142,7 +142,7 @@ updates:
     directory: /worker
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     groups:
       # Тестовый стек worker'а движется как одно целое: vitest и
       # vitest-pool-workers связаны версиями, wrangler и workers-types — средой.
@@ -160,10 +160,10 @@ updates:
     # @noble/ed25519 и arweave в worker'е не группируются: это проверка подписей
     # и протокол публикации — каждый своим PR.
     #
-    # Та же парковка TS-мажора, что и у клиента: worker не должен уезжать на
-    # TS 7 в одиночку (для этого закрывается PR #8); выравнивание на ~5.9.x
-    # приедет через worker-tooling. Про заглушенные security-обновления линии —
-    # см. комментарий у корневого ignore.
+    # Та же парковка TS-мажора >=7, что и у клиента: worker не должен уезжать
+    # на новый мажор в одиночку (урок закрытого PR #8). Обе половины выровнены
+    # на 6.0.3 (2026-08-21). Про заглушенные security-обновления линии — см.
+    # комментарий у корневого ignore.
     ignore:
       - dependency-name: typescript
         versions: [">=7"]
