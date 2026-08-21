@@ -492,8 +492,11 @@ describe('privacy gate never outlives the screen it covers', () => {
     // running. That is the shape of both production reports, and the shape of
     // whatever path is missed next. The handle must not depend on the event.
     it('the escape hatch appears — and locks — with no return event at all', async () => {
+      // NB: openAndHide() has already frozen the clock — do NOT call
+      // freezeTheClock() again here. Under vitest 4 a repeated useFakeTimers()
+      // re-installs the fake clock and DISCARDS the gate's armed timers, so
+      // advancing time would move nothing (vitest 3 tolerated the double call).
       await openAndHide();
-      freezeTheClock();
 
       // Visible again, but the browser never told us (property flipped WITHOUT
       // dispatching, the same way the file-level afterEach does it).
@@ -513,8 +516,8 @@ describe('privacy gate never outlives the screen it covers', () => {
     });
 
     it('stays mute over a BACKGROUND tab — nobody is looking at it', async () => {
+      // Same rule: the clock is already frozen by openAndHide().
       await openAndHide();
-      freezeTheClock();
       await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
 
       expect(gateUp()).toBe(true); // correct: a hidden tab holds an open vault
