@@ -1451,8 +1451,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * session behind it.
    */
   async function reconcileSafeboxConfig(): Promise<void> {
-    let configured = false;
-    let currentId: string | null = null;
+    // No initializers: try and catch both assign, so an initial value would be
+    // dead code (eslint 10 no-useless-assignment) — and TS proves assignment.
+    let configured: boolean;
+    let currentId: string | null;
     try {
       const cfg = await readSafeboxPinConfig();
       configured = cfg !== null;
@@ -2387,13 +2389,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // Pause markers: don't even enqueue a gated record while its shared marker
     // stands — the per-dispatch check in processQueue is the backstop, this
     // avoids the churn. An unreadable marker counts as paused (fail closed).
-    let v3PausedNow = false;
+    let v3PausedNow: boolean;
     try {
       v3PausedNow = (await readV3PauseMeta()) !== null;
     } catch {
       v3PausedNow = true;
     }
-    let v4PausedNow = false;
+    let v4PausedNow: boolean;
     try {
       v4PausedNow = (await readV4PauseMeta()) !== null;
     } catch {
@@ -3354,7 +3356,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
       if (outcome.lockedUntil !== null) throw new PinLockedError(mainPinLockSeconds(outcome.attempts));
 
-      throw new Error('wrong_pin');
+      // The WrongPinError that proved the mismatch rides along as `cause` —
+      // the symptom error keeps its matchable message, the diagnosis survives.
+      throw new Error('wrong_pin', { cause: err });
     }
 
     // 3. Success — clear the metering, under the same blob check. A
@@ -3777,7 +3781,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * lock that happened during the (slow) decrypt.
    */
   async function assertSafeboxSessionLive(session: SafeboxSession): Promise<void> {
-    let live = false;
+    let live: boolean;
     try {
       const cfg = await readSafeboxPinConfig();
       live = cfg !== null && cfg.configId === session.configId;
@@ -3879,7 +3883,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
     // FINAL storage recheck — the same guarantee assertSafeboxSessionLive gives
     // every other secret path, applied to the session's own birth.
-    let stillOurs = false;
+    let stillOurs: boolean;
     try {
       const current = await readSafeboxPinConfig();
       stillOurs = current !== null && current.configId === configId;
