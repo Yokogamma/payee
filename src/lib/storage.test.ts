@@ -405,7 +405,10 @@ describe('v3 EncryptedNote round-trip', () => {
 
 // ─── DB generation (reset-exclusivity token, P1) ────────────────────
 
-import { getDbGeneration, noteExternalReset } from './storage';
+// getDbGeneration уже импортирован в шапке файла; дублировать его здесь нельзя:
+// парсер vitest 4 (oxc) считает повторное объявление ошибкой трансформации и
+// роняет ВЕСЬ файл как suite-ошибку (vitest 3 дубль терпел).
+import { noteExternalReset } from './storage';
 
 describe('dbGeneration', () => {
   it('bumps on resetAll — a captured token from before the wipe goes stale', async () => {
