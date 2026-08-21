@@ -26,11 +26,11 @@ merge. Reader-before-writer ordering is operator-driven.
 > on purpose — they record what was true during those rollouts, and rewriting
 > them would destroy the audit trail. Read them as history, not as instructions.
 >
-> Open follow-up: `VITE_BASE` still defaults to `/payee/` (`vite.config.ts`,
-> `scripts/postbuild.mjs`) — the base of the retired target. Both deploy paths
-> pass `VITE_BASE=/` explicitly, so nothing is broken today, but a build run
-> without the variable now produces artefacts for a target that no longer
-> exists. Flipping the default is a separate decision.
+> ~~Open follow-up: `VITE_BASE` still defaults to `/payee/`…~~ **Resolved
+> 2026-08-21 (§1.8, PR #93):** the default in `vite.config.ts` and
+> `scripts/postbuild.mjs` is now `/` — a build without the variable produces
+> Cloudflare-Pages-shaped artefacts. Both deploy paths still pass
+> `VITE_BASE=/` explicitly.
 
 ## FIRST rollout of the recovery protocol — CLIENT BEFORE WORKER
 
