@@ -1,6 +1,24 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v17 — закрытие ревью по v16 (1 high + 1 medium + 1 low,
+Статус: **v18 — закрытие ревью по v17 (1 medium + 1 low, 2026-08-22)**:
+
+1. **MEDIUM — переходы `activate` сведены в единую нормативную таблицу**
+   (§4.PR-3b «Привязка activate»). v17 описывал исход при несовпадении
+   revision / истёкшем lease неоднозначно: протокол разрешал remap с
+   продолжением, тест безусловно требовал «POST не делается», ADR знал
+   только CAS по трём полям. Нормативно: точное совпадение →
+   `prepared → active`; несовпадение/отсутствие → атомарный **remap**
+   (replacement + все проверки `prepare` + НЕМЕДЛЕННАЯ активация в одной
+   транзакции; отказ — без частичных изменений); повтор того же
+   активированного tuple — no-op; другой `active`-tuple или `settled` —
+   fail-closed + инцидент (`activate_conflict`). POST разрешён ТОЛЬКО после
+   исхода `active`; тест исправлен соответственно; remap-путь
+   синхронизирован в ADR.
+2. **LOW:** локальный файл-указатель обновлён (актуальные версия/SHA);
+   после мержа PR #87 каноническая ссылка переводится на `main`, чтобы не
+   зависеть от сохранности feature-ветки.
+
+Предыдущий шаг: **v17 — закрытие ревью по v16 (1 high + 1 medium + 1 low,
 2026-08-22)**:
 
 1. **HIGH — `activate` привязан к конкретной резервации и её reward.**
@@ -1331,7 +1349,8 @@ Reader-релиз этим не блокируется: он не создаёт
   «в той же транзакции, где запись переходит в `redrop_pending`» были
   технически невозможны. Координация — **идемпотентная сага**, ключ
   `spendKey = {publicKeyB64, noteId, gen}` (tenant-правила выше).
-  Нормативная таблица состояний (единственная таблица D10):
+  Нормативная таблица состояний саги (переходы `activate` — отдельной
+  таблицей ниже, v18):
 
   | Состояние | Что означает | Истечение |
   |---|---|---|
@@ -1364,20 +1383,28 @@ Reader-релиз этим не блокируется: он не создаёт
   `activate(spendKey, reward, revision)` → **только теперь POST** →
   `settle`. Тот же `reward`, что зарезервирован, передаётся в
   `createTransaction` — расхождение котировки и резервации запрещено.
-- **Привязка `activate` к резервации (v17, HIGH ревью по v16) —
-  нормативно.** `activate(spendKey)` без параметров допускал гонку: резерв
+- **Привязка `activate` к резервации (v17, HIGH ревью по v16; единая
+  таблица переходов — v18, MEDIUM ревью по v17) — нормативно.**
+  `activate(spendKey)` без параметров допускал гонку: резерв
   100 → конкурентный повторный `prepare` на 1 (до подписи это законно) →
   подписана транзакция на 100 → активирован учёт на 1 — занижение
   `pendingReservations` и обход cap/floor. Поэтому `activate(spendKey,
   reward, revision)` — атомарный CAS в ОДНОЙ `storage.transaction`
-  `SpendGuard`: `prepared → active` переходит ТОЛЬКО резервация, совпавшая
-  и по `reward`, и по `revision` (аргументы — из durable `signed`, не из
-  памяти обработчика). Несовпадение (конкурентная пере-резервация между
-  `prepare` и `activate`) и отсутствие резервации (lease истёк)
-  обрабатываются ОДНОЙ ветвью: атомарная пере-резервация на `reward` ИЗ
-  `signed` под всеми тремя проверками `prepare` + метрика (roadmap PR-3b:
-  `activate_remap`); бюджета/floor не хватает → `activate` отказывает, POST
-  не делается, backoff. Сходимость: конкурент, чья резервация вытесняется,
+  `SpendGuard`; аргументы — ТОЛЬКО из durable `signed` (поля `reward`,
+  `spendRevision`), никогда из памяти обработчика. Исходы исчерпываются
+  таблицей:
+
+  | Состояние резервации `spendKey` на входе | Исход `activate(spendKey, reward, revision)` |
+  |---|---|
+  | `prepared`, `{reward, revision}` совпали | CAS `prepared → active`; в резервации фиксируется `activatedBy = {reward, revision}` |
+  | `prepared` с ДРУГИМ `{reward, revision}` (конкурентная пере-резервация) ЛИБО резервации нет (lease истёк) | **remap** в ТОЙ ЖЕ транзакции: release резервации-сироты (если есть) + новая резервация на `reward` ИЗ `signed` под всеми тремя проверками `prepare` + **немедленный** переход в `active` с `activatedBy = {reward, revision}` + метрика (roadmap PR-3b: `activate_remap`). Любая проверка не прошла → отказ БЕЗ ЧАСТИЧНЫХ изменений (транзакция откатывается целиком, сирота не тронута), backoff |
+  | уже `active`, `activatedBy` совпал | no-op (идемпотентный повтор — в т.ч. повтор со старым `spendRevision` после успешного remap) |
+  | уже `active` с ДРУГИМ `activatedBy`, либо `settled` | fail-closed отказ + инцидентная метрика (roadmap PR-3b: `activate_conflict`) — дефект протокола, не штатный путь |
+
+  **POST разрешён ТОЛЬКО после исхода `active`** (строки 1, 2 или no-op);
+  «POST не делается» — следствие ИМЕННО отказа remap-а (бюджет/floor) или
+  конфликта, а не истёкшего lease самого по себе: успешный remap продолжает
+  публикацию. Сходимость: конкурент, чья резервация вытесняется remap-ом,
   свою подпись durable-закоммитить уже не может (durable `signed` — только
   у CAS-победителя per-key DO), поэтому его резервация — сирота, и учёт
   обязан сойтись к `reward` единственного `signed`. Занижение учёта против
@@ -1385,8 +1412,8 @@ Reader-релиз этим не блокируется: он не создаёт
 - **Crash-границы саги:** после `prepare` до `signed` — lease чинит (терять
   нечего); после `signed` до `activate` — scheduler повторяет идемпотентный
   `activate(spendKey, reward, revision)` из полей `signed` (несовпадение или
-  истёкший lease → пере-резервация ветвью выше; бюджета нет → POST не
-  делается, backoff); после `activate` до POST — резервация `active` без
+  истёкший lease → remap-строка таблицы переходов; POST не делается ТОЛЬКО
+  при отказе remap-а/конфликте, backoff); после `activate` до POST — резервация `active` без
   TTL, scheduler ресендит ТОТ ЖЕ tx; POST ушёл, ответ потерян — `active`
   остаётся и разрешается кворумом статусов (v14): вердикт `confirmed` →
   `settle('spent')`.
@@ -1624,17 +1651,25 @@ Reader-релиз этим не блокируется: он не создаёт
   settle из сохранённого `spendKey`; истёкший lease `prepared` освобождает
   резервацию, у `active` lease/TTL нет; crash после `signed` до `activate` →
   идемпотентный `activate(spendKey, reward, revision)` повторяется
-  scheduler-ом, при истёкшем lease POST не делается (backoff);
-- **D10 привязка activate (v17, HIGH ревью по v16) — тест гонки
-  обязателен:** `prepare` на 100 (revision r₁) → конкурентная
-  пере-резервация того же `spendKey` на 1 (revision r₂) → durable `signed`
-  с `{reward: 100, spendRevision: r₁}` → `activate(spendKey, 100, r₁)` НЕ
-  активирует резервацию на 1: CAS ловит несовпадение, происходит атомарная
-  пере-резервация на 100 под всеми проверками `prepare` (+
-  `activate_remap`), `pendingReservations` учитывает 100, а не 1; вариант с
-  нехваткой бюджета на 100 → `activate` отказывает, POST не делается
-  (backoff), учёт НЕ занижен; идемпотентный повтор `activate` с теми же
-  `{reward, revision}` — no-op;
+  scheduler-ом; истёкший lease сам по себе POST не запрещает — успешный
+  remap пере-резервирует, активирует и публикация продолжается (исправлено
+  v18: POST запрещён ТОЛЬКО если remap/активация не прошли — тогда
+  backoff);
+- **D10 привязка activate (v17 + таблица переходов v18) — тесты всех
+  четырёх строк обязательны:** (1) гонка: `prepare` на 100 (revision r₁) →
+  конкурентная пере-резервация того же `spendKey` на 1 (revision r₂) →
+  durable `signed` с `{reward: 100, spendRevision: r₁}` →
+  `activate(spendKey, 100, r₁)` НЕ активирует резервацию на 1: CAS ловит
+  несовпадение, remap атомарно пере-резервирует на 100 под всеми проверками
+  `prepare` (+ `activate_remap`), запись СРАЗУ `active`,
+  `pendingReservations` учитывает 100, а не 1 — и POST выполняется;
+  (2) отказ remap-а: бюджета/floor на 100 не хватает → отказ БЕЗ частичных
+  изменений (резервация-сирота на 1 не тронута), POST не делается
+  (backoff), учёт НЕ занижен; (3) no-op: повтор `activate` с тем же
+  `{reward, revision}` — в т.ч. со старым `spendRevision` ПОСЛЕ успешного
+  remap — ничего не меняет; (4) конфликт: `activate` при `active` с ДРУГИМ
+  `activatedBy` или при `settled` → fail-closed отказ + `activate_conflict`,
+  POST не делается;
 - **D10 окно (v16, M3 ревью 14):** двойная трата у границы окна — трата,
   сделанная 23 ч 59 мин назад, всё ещё занимает бюджет (25-й бакет
   удерживается до истечения ПОЛНЫХ 24 ч с его конца); prune не трогает
@@ -2106,14 +2141,14 @@ floor, платные staging-испытания) и не должен заде�
    App-Version (restore знает формат до появления таких записей on-chain).
    Боевой upload-кошелёк на локальную машину не выносится.
 
-## 8. Карта соответствия (статус v17)
+## 8. Карта соответствия (статус v18)
 
 | PR | Статус | Главное, что закрыть |
 |---|---|---|
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready — полная реализационная спецификация в §4.PR-2 «Реализация» (v16); единственный незаблокированный кодовый шаг** | transport adapter (no hidden SDK req), 5 фактически пишущихся событий + `docs/METRICS.md` строго по написанному, отдельный `METRICS_ADMIN_SECRET`, `/admin/metrics` по контракту H2 ревью 15, dev-smoke гейт (§R6) |
 | PR-3a read | **не стартует до ревью протоколов** (v15); объём вырос на гейт D9 | **верификация `txId ↔ bytes` перед пулом payload + правка комментария F1 (security)**, строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | спецификация завершена; **writer-релиз заблокирован предусловием D10 + ревью протокола** (reader — нет); ждёт своей очереди (§6 п.6) | **предохранитель кошелька в Winston: floor + бюджет + per-tx cap + идемпотентная сага `prepared/active/settled` по `spendKey = {publicKeyB64, noteId, gen}` с монотонным settle и 24-ч окном часовых бакетов (v16, ревью 13–16) + привязка `activate(spendKey, reward, revision)` CAS-ом к durable `signed` (v17) + баланс-минимум / цена-медиана (security F5/R5, протокол v14–v17)**, согласованность alarm-теста/ADR/cap с durable-инвариантом (ревью 10), durable/postable-инвариант generation + `resign_violation` по durable-txId + `deadTxId`-lineage (ревью 9), durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | спецификация завершена; **writer-релиз заблокирован предусловием D10 + ревью протокола** (reader — нет); ждёт своей очереди (§6 п.6) | **предохранитель кошелька в Winston: floor + бюджет + per-tx cap + идемпотентная сага `prepared/active/settled` по `spendKey = {publicKeyB64, noteId, gen}` с монотонным settle и 24-ч окном часовых бакетов (v16, ревью 13–16) + привязка `activate(spendKey, reward, revision)` CAS-ом к durable `signed` (v17) с единой таблицей переходов activate/remap (v18) + баланс-минимум / цена-медиана (security F5/R5, протокол v14–v18)**, согласованность alarm-теста/ADR/cap с durable-инвариантом (ревью 10), durable/postable-инвариант generation + `resign_violation` по durable-txId + `deadTxId`-lineage (ревью 9), durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky; **v16: формула D11 однозначна — отсутствие только между `complete=true`, независимость по `operatorId` (fail-closed), пороги таблицей; подлежит ревью** | **D11: presence-расхождение → метрика, `incomplete` по порогу давности от кворума статусов; restore остаётся аддитивным (security F3/R3)**, логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт → арбитр header D9 + метрика (v15), nullable height, abort-backoff |
 | PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
