@@ -71,7 +71,7 @@ METRICS_DATASET = "eternal_notes_metrics"
 # a secret (same value as the Actions CLOUDFLARE_ACCOUNT_ID variable). EMPTY
 # until the operator fills it: /admin/metrics answers 503 meanwhile, metric
 # WRITES are unaffected (they go through the binding, not the SQL API).
-CF_ACCOUNT_ID = ""
+CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 
 # Metrics dataset (PR-2). Explicitly DIFFERENT names per environment (M6 r14) —
 # staging rows must never blend into the production dataset.
@@ -152,7 +152,7 @@ V4_UPLOADS_ENABLED = "true"
 # to its OWN dataset (explicit different name, M6 r14).
 METRICS_ENABLED = "true"
 METRICS_DATASET = "eternal_notes_metrics_staging"
-CF_ACCOUNT_ID = ""
+CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 
 # Executable block, not a comment (L r17): a named environment inherits
 # NOTHING, so the binding must be declared here explicitly or staging deploys
