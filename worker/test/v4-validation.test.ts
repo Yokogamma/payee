@@ -25,7 +25,7 @@ async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
 interface Tag { name: string; value: string }
 
 async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Response> {
-  const priv = ed.utils.randomPrivateKey();
+  const priv = ed.utils.randomSecretKey();
   const pub = await ed.getPublicKeyAsync(priv);
   const pkB64 = b64(pub);
   const ownerHash = b64(await sha256(pub));
