@@ -52,12 +52,14 @@ exactly how the github.io contour almost outlived its retirement):
   die fail-closed via CORS, but the page opens);
 - `https://eternal-notes-proxy.sopi-88c.workers.dev` — the worker API;
 - retired: `https://yokogamma.github.io/payee/` — unpublished 2026-08-20,
-  serves 404. **Residual risk:** a previously INSTALLED PWA from that origin
-  keeps opening offline (service worker precache + navigateFallback survive
-  the 404). Operator and testers must uninstall the app and clear site data
-  for `yokogamma.github.io` on every device that ever installed it. Do NOT
-  ship a farewell auto-update: the client is deliberately built with
-  `registerType: "prompt"` and no unconditional skipWaiting.
+  serves 404. **Residual risk — CLOSED as void (owner statement 2026-08-21):**
+  the PWA from that origin was never installed on any device — there were no
+  users of that contour — so there is nothing to uninstall. Kept here as the
+  record of the question having been asked and answered. (Had installs
+  existed, an installed PWA would keep opening offline: service worker
+  precache + navigateFallback survive a network 404. Never ship a farewell
+  auto-update for such a case — the client is deliberately built with
+  `registerType: "prompt"` and no unconditional skipWaiting.)
 
 **Recovery mailbox.** The mailbox behind GitHub, Cloudflare and the domain
 registrar accounts is the recovery root ABOVE all of them. Requirements: 2FA
