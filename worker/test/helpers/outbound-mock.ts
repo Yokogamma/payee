@@ -23,6 +23,9 @@ export interface OutboundRoute {
   calls: number;
   /** Optional artificial latency before the mocked response resolves. */
   delayMs?: number;
+  /** Optional body factory overriding `body` — lets a test hand out a
+   *  streaming/erroring body (e.g. a truncated connection). */
+  makeBody?: () => BodyInit;
   /** Body of the LAST matching request (string bodies and Request inputs). */
   lastBody?: string;
   /** URL of the LAST matching request (for asserting computed path params). */
@@ -40,9 +43,12 @@ export function setupOutboundMock() {
 
   function mockRoute(
     method: string, url: RegExp, status: number, body: string, times = 1,
-    opts: { delayMs?: number } = {},
+    opts: { delayMs?: number; makeBody?: () => BodyInit } = {},
   ): OutboundRoute {
-    const route: OutboundRoute = { method, url, status, body, times, calls: 0, delayMs: opts.delayMs };
+    const route: OutboundRoute = {
+      method, url, status, body, times, calls: 0,
+      delayMs: opts.delayMs, makeBody: opts.makeBody,
+    };
     outboundRoutes.push(route);
     return route;
   }
@@ -63,7 +69,7 @@ export function setupOutboundMock() {
       const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
       route.lastAuthorization = headers.get('Authorization') ?? undefined;
       if (route.delayMs) await new Promise(r => setTimeout(r, route.delayMs));
-      return new Response(route.body, { status: route.status });
+      return new Response(route.makeBody ? route.makeBody() : route.body, { status: route.status });
     });
   });
   afterAll(() => vi.unstubAllGlobals());

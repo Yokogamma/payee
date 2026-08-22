@@ -683,7 +683,7 @@ double теряет точность выше `Number.MAX_SAFE_INTEGER`. Нор�
 |---|---|
 | `getAnchor` / `getPrice` вернулись или упали (transport adapter) | `gateway_call` kind=`anchor`/`price` с классом; сбой ведёт затем к `upload_outcome=arweave_error`/`arweave_throw` по существующим веткам 502 |
 | `postSignedTx` завершился (внутри блока `:775-794`) | `gateway_call` kind=`post`; при 200/202 — плюс `post_accepted` (то есть `post_accepted` = **принятый шлюзом POST**, до `mark-posted`/`commit`) |
-| тот же успешный POST в redrop-ветке (`doRedrop` → `repost`) | дополнительно `redrop_new_tx` |
+| тот же успешный POST, когда новый txId следует за ДОКАЗАННЫМ dead: ветки `doRedrop` → `repost` И recovery-hint ветка (валидный токен + вердикт dead + age guard) | дополнительно `redrop_new_tx` (уточнение по ревью PR #105: определение события — «новый txId после подтверждённого dead», а не «прошёл через /redrop»; пропуск recovery-пути прятал бы из security-метрики самый рискованный triple-failure сценарий) |
 | терминальный `return` из `handleUpload` — **ТОЛЬКО из веток платного пути** (L ревью 19) | `upload_outcome`: `accepted` = итоговый 200 `/upload` ПОСЛЕ реально выполненного POST этого запроса (commit/anchor/recovery); `arweave_error` = не-2xx от шлюза (ветка 502 `:785-788`); `arweave_throw` = catch (`:790-793`). **Ранние возвраты события НЕ эмитят:** validation 4xx, kill switch 503, rate limit 429, идемпотентный hit (`exists`), reconciliation-ветки без нового POST — иначе метрика перестала бы отвечать на вопрос «чем кончаются платные публикации». Семантика: `upload_outcome` — про ответ клиенту по платному пути, `post_accepted` — про шлюз |
 | `getTxStatusWorker` вернул вердикт (`:981`) | `gateway_call` kind=`status` + `status_verdict` |
 

@@ -851,8 +851,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const checkResult: { status: string; txId?: string; committedAt?: number; postedAt?: number; token?: string } = await checkResp.json();
 
   let reserveToken: string;
-  // True only when the reservation came out of a /redrop (dead TX → new paid
-  // TX): a successful POST then additionally emits redrop_new_tx.
+  // True whenever the upcoming POST creates a NEW paid txId after a PROVEN
+  // dead (the event's definition): both /redrop branches AND the
+  // recovery-hint branch (dead verdict + age guard). A successful POST then
+  // additionally emits redrop_new_tx.
   let viaRedrop = false;
 
   if (checkResult.status === 'exists') {
@@ -930,6 +932,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         return error('Recheck deferred: posted too recently', 503);
       }
       // dead & old enough → fall through to re-post under reserveToken.
+      // This IS a new paid txId after a proven dead — same event as /redrop
+      // (missing it would hide exactly the riskiest triple-failure scenario
+      // from the security metric).
+      viaRedrop = true;
     }
   }
 
@@ -1018,8 +1024,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return json({ txId, status: 'accepted', committed: false });
   }
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
-  emit('upload_outcome', ['accepted', declaredVersion], []);
+  // accepted is emitted only AFTER signRecovery resolves: should WebCrypto
+  // reject, the request would not end in a terminal paid-path 200, and the
+  // metric must not have claimed one.
   const recoveryToken = await signRecovery(env, noteId, txId, postedAt);
+  emit('upload_outcome', ['accepted', declaredVersion], []);
   if (recoveryToken === null) {
     // Unreachable: the step-0 gate 503s uploads without RECOVERY_HMAC_SECRET.
     // Kept as defense in depth — never imply a hint exists when it doesn't.

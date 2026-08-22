@@ -46,11 +46,15 @@ async function makeIdentity() {
   return { priv, pkB64, ownerHash };
 }
 
-/** Well-formed v2 upload; `mutate` lets a test corrupt the parsed body. */
+/** Well-formed v2 upload; opts let a test corrupt tags or attach recovery. */
 async function uploadRequest(
   id: { priv: Uint8Array; pkB64: string; ownerHash: string },
   noteId: string,
-  opts: { recheck?: boolean; extraTag?: { name: string; value: string } } = {},
+  opts: {
+    recheck?: boolean;
+    extraTag?: { name: string; value: string };
+    recovery?: { txId: string; postedAt: number; token: string };
+  } = {},
 ): Promise<{ request: Request; dataString: string }> {
   const dataString = JSON.stringify({ id: noteId, c: C, iv: IV });
   const body = JSON.stringify({
@@ -66,6 +70,7 @@ async function uploadRequest(
     ownerHash: id.ownerHash,
     timestamp: Date.now(),
     ...(opts.recheck ? { recheck: true } : {}),
+    ...(opts.recovery ? { recovery: opts.recovery } : {}),
   });
   const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), id.priv));
   return {
@@ -308,6 +313,75 @@ describe('upload_outcome matrix — paid-path returns ONLY (L r19/r20)', () => {
   });
 });
 
+describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (review PR #105)', () => {
+  it('doRedrop path: aged posted anchor + dead status → repost emits EXACTLY ONE redrop_new_tx', async () => {
+    const id = await makeIdentity();
+    const noteId = crypto.randomUUID();
+    const deadTxId = `TXDEAD${noteId.slice(0, 8)}`;
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put(`note:${noteId}`, {
+        status: 'posted', token: 'srv-token', gen: 0,
+        txId: deadTxId, postedAt: Date.now() - 31 * 60_000,
+      });
+    });
+
+    const cap = capture();
+    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${deadTxId}/status$`), 404, 'not found');
+    mockPaidLegs('0');
+
+    const { request } = await uploadRequest(id, noteId, { recheck: true });
+    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    expect(r.status).toBe(200);
+    const body = await r.json() as { txId: string; committed: boolean };
+    expect(body.committed).toBe(true);
+    expect(body.txId).not.toBe(deadTxId);
+
+    expect(cap.byEvent('redrop_new_tx')).toHaveLength(1);
+    expect(cap.byEvent('post_accepted')).toHaveLength(1);
+    expect(cap.byEvent('status_verdict').map(p => p.blobs?.[1])).toEqual(['dead']);
+    expect(cap.byEvent('upload_outcome').map(p => p.blobs?.[1])).toEqual(['accepted']);
+  });
+
+  it('recovery-hint path: triple-failure token + dead + age guard → repost emits EXACTLY ONE redrop_new_tx', async () => {
+    const id = await makeIdentity();
+    const noteId = crypto.randomUUID();
+    const deadTxId = `TXDEAD${noteId.slice(0, 8)}`;
+    const postedAt = Date.now() - 31 * 60_000; // past the 30-min age guard
+    // Recreate signRecovery: HMAC over `${noteId}:${txId}:${postedAt}` with a
+    // key derived from SHA-256(RECOVERY_HMAC_SECRET + ':recovery').
+    const secret = (baseEnv as unknown as { RECOVERY_HMAC_SECRET: string }).RECOVERY_HMAC_SECRET;
+    const material = new Uint8Array(
+      await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret + ':recovery')),
+    );
+    const key = await crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const token = b64(new Uint8Array(
+      await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${deadTxId}:${postedAt}`)),
+    ));
+
+    const cap = capture();
+    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${deadTxId}/status$`), 404, 'not found');
+    mockPaidLegs('0');
+
+    // The DO has NO record (that is the triple-failure): the fresh reservation
+    // reconciles through the recovery hint, proves dead, passes the age guard
+    // and re-posts — a new paid txId after a proven dead, same event.
+    const { request } = await uploadRequest(id, noteId, {
+      recheck: true, recovery: { txId: deadTxId, postedAt, token },
+    });
+    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    expect(r.status).toBe(200);
+    const body = await r.json() as { txId: string; committed: boolean };
+    expect(body.committed).toBe(true);
+    expect(body.txId).not.toBe(deadTxId);
+
+    expect(cap.byEvent('redrop_new_tx')).toHaveLength(1);
+    expect(cap.byEvent('post_accepted')).toHaveLength(1);
+    expect(cap.byEvent('status_verdict').map(p => p.blobs?.[1])).toEqual(['dead']);
+    expect(cap.byEvent('upload_outcome').map(p => p.blobs?.[1])).toEqual(['accepted']);
+  });
+});
+
 describe('status leg: gateway_call(status) + status_verdict, body is BEST-EFFORT', () => {
   async function seedCommitted(pkB64: string, noteId: string) {
     const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(pkB64));
@@ -358,6 +432,29 @@ describe('status leg: gateway_call(status) + status_verdict, body is BEST-EFFORT
       expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.doubles?.[0]]))
         .toEqual([['alive', -1]]);
     }
+  });
+
+  it('TRUNCATED body stream (connection reset mid-read) → −1, verdict alive stands', async () => {
+    const id = await makeIdentity();
+    const noteId = crypto.randomUUID();
+    const txId = await seedCommitted(id.pkB64, noteId);
+    const cap = capture();
+    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${txId}/status$`), 200, '', 1, {
+      makeBody: () => new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"number_of_confirmations":'));
+          controller.error(new Error('connection reset'));
+        },
+      }),
+    });
+
+    const { request } = await uploadRequest(id, noteId, { recheck: true });
+    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    expect(r.status).toBe(200); // alive by HTTP code — the broken body cannot demote it
+    expect(cap.byEvent('gateway_call').map(p => [p.blobs?.[1], p.blobs?.[3]]))
+      .toEqual([['status', '2xx']]);
+    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.doubles?.[0]]))
+      .toEqual([['alive', -1]]);
   });
 
   it('404 → verdict dead with −1 (fresh commit defers the redrop)', async () => {
