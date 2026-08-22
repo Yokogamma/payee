@@ -21,13 +21,34 @@ export interface OutboundRoute {
   body: string;
   times: number;
   calls: number;
+  /** Optional artificial latency before the mocked response resolves. */
+  delayMs?: number;
+  /** Optional body factory overriding `body` — lets a test hand out a
+   *  streaming/erroring body (e.g. a truncated connection). */
+  makeBody?: () => BodyInit;
+  /** Body of the LAST matching request (string bodies and Request inputs). */
+  lastBody?: string;
+  /** URL of the LAST matching request (for asserting computed path params). */
+  lastUrl?: string;
+  /** True when the caller passed an AbortSignal via init (string-URL calls
+   *  only — a Request input always carries its own signal object, so the
+   *  distinction is meaningless there and the field stays undefined). */
+  gotSignal?: boolean;
+  /** Authorization header of the LAST matching request, if any. */
+  lastAuthorization?: string;
 }
 
 export function setupOutboundMock() {
   const outboundRoutes: OutboundRoute[] = [];
 
-  function mockRoute(method: string, url: RegExp, status: number, body: string, times = 1): OutboundRoute {
-    const route: OutboundRoute = { method, url, status, body, times, calls: 0 };
+  function mockRoute(
+    method: string, url: RegExp, status: number, body: string, times = 1,
+    opts: { delayMs?: number; makeBody?: () => BodyInit } = {},
+  ): OutboundRoute {
+    const route: OutboundRoute = {
+      method, url, status, body, times, calls: 0,
+      delayMs: opts.delayMs, makeBody: opts.makeBody,
+    };
     outboundRoutes.push(route);
     return route;
   }
@@ -39,7 +60,16 @@ export function setupOutboundMock() {
       const route = outboundRoutes.find(r => r.method === method && r.url.test(url) && r.calls < r.times);
       if (!route) throw new Error(`unmocked or exhausted outbound fetch: ${method} ${url}`);
       route.calls++;
-      return new Response(route.body, { status: route.status });
+      route.lastUrl = url;
+      if (!(input instanceof Request)) route.gotSignal = init?.signal != null;
+      if (typeof init?.body === 'string') route.lastBody = init.body;
+      else if (input instanceof Request) {
+        try { route.lastBody = await input.clone().text(); } catch { /* keep undefined */ }
+      }
+      const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
+      route.lastAuthorization = headers.get('Authorization') ?? undefined;
+      if (route.delayMs) await new Promise(r => setTimeout(r, route.delayMs));
+      return new Response(route.makeBody ? route.makeBody() : route.body, { status: route.status });
     });
   });
   afterAll(() => vi.unstubAllGlobals());

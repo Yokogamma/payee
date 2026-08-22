@@ -36,6 +36,9 @@ export default defineConfig({
       'test/e2e-repost.test.ts',
       'test/v3-gate-e2e.test.ts',
       'test/v4-gate-e2e.test.ts',
+      'test/arweave-transport.test.ts',
+      'test/metrics-upload-e2e.test.ts',
+      'test/admin-metrics.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that
