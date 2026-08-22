@@ -27,7 +27,7 @@ async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
 
 /** Build a validly-signed v2 upload for a fresh key. Returns pk + a sender. */
 async function makeUpload(ip: string) {
-  const priv = ed.utils.randomPrivateKey();
+  const priv = ed.utils.randomSecretKey();
   const pub = await ed.getPublicKeyAsync(priv);
   const pkB64 = b64(pub);
   const ownerHash = b64(await sha256(pub));

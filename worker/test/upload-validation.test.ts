@@ -22,7 +22,7 @@ interface Tag { name: string; value: string }
 
 /** Sign and send an /upload with the given tags + data object, as an allowlisted key. */
 async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Response> {
-  const priv = ed.utils.randomPrivateKey();
+  const priv = ed.utils.randomSecretKey();
   const pub = await ed.getPublicKeyAsync(priv);
   const pkB64 = b64(pub);
   const ownerHash = b64(await sha256(pub));
@@ -268,7 +268,7 @@ describe('upload validation: version contract (v1/v2)', () => {
 
   it('releases the reservation on Arweave failure so the note can retry (M6)', async () => {
     // Reuse ONE key so both uploads hit the same RateLimiter shard + noteId.
-    const priv = ed.utils.randomPrivateKey();
+    const priv = ed.utils.randomSecretKey();
     const pub = await ed.getPublicKeyAsync(priv);
     const pkB64 = b64(pub);
     const ownerHash = b64(await sha256(pub));

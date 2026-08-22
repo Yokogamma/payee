@@ -22,7 +22,7 @@ async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
 
 /** Canonical base64 of a 32-byte key ends in '='; strip it → same bytes, different string. */
 async function makeKeys() {
-  const priv = ed.utils.randomPrivateKey();
+  const priv = ed.utils.randomSecretKey();
   const pub = await ed.getPublicKeyAsync(priv);
   const canonical = b64(pub);
   const nonCanonical = canonical.replace(/=+$/, '');
