@@ -1,15 +1,18 @@
-name: Deploy Worker (proxy)
+name: Deploy Worker (proxy) — dev
 
+# Deploys the WORKING (dev) contour worker (contour reclassified 2026-08-20;
+# the future production gets its own `… — production` workflow, never this one).
 # Manual trigger, intentionally decoupled from the client deploys so the
 # operator controls the sequence (authoritative order: docs/ROLLBACK.md).
-#   FIRST rollout of the recovery protocol:  recovery-aware CLIENT on the legacy
-#   GitHub Pages origin → THEN this Worker → smoke → Cloudflare Pages. Running
-#   this Worker against pre-recovery clients opens the duplicate-paid-TX window.
-#   Subsequent compatible releases: Worker → smoke → Pages (reader-before-writer).
+#   Release order: Worker → smoke → Pages (reader-before-writer). The first
+#   recovery-protocol rollout used a special order — recorded in ROLLBACK.md
+#   as history; the legacy GitHub Pages origin is retired.
 # NOTE: a workflow_dispatch workflow must already exist on the default branch
 # before it can be run from the Actions UI, so land this file in main FIRST
 # (both deploys here are manual, so merging does not auto-publish anything).
-# Requires repo secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
+# Requires the GitHub Environment "dev" (its deployment branch policy is the
+# real access boundary for the token — §1.7):
+#   variable CLOUDFLARE_ACCOUNT_ID, secret CLOUDFLARE_API_TOKEN.
 # Worker secrets must be set beforehand (wrangler secret put), incl. the
 # MANDATORY RECOVERY_HMAC_SECRET — without it /upload returns 503.
 on:
@@ -20,23 +23,41 @@ on:
 permissions:
   contents: read
 
+# Two dispatches must finish in dispatch order: without this, a rehearsal run
+# and the real deploy right after it can land in REVERSE order, putting the
+# old build on top of the new one. Never cancel a deploy mid-flight —
+# waiting beats a half-shipped worker.
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
 jobs:
   deploy-worker:
     runs-on: ubuntu-latest
+    # vars.*/secrets.* below resolve from this environment.
+    environment: dev
     steps:
       # Actions are pinned to immutable commit SHAs (tags are movable — a
       # retagged/compromised action would run with the Cloudflare API token).
       # Version comments are what Dependabot bumps; verify with:
       #   git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>^{}'
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
+      # Early config gate: presence + repo-pinned expectations for NON-SECRET
+      # variables only. The deploy token is deliberately NOT passed to any
+      # repo script — this workflow can be dispatched from arbitrary branches
+      # (--ref), and repo JS receiving the secret would hand it to whatever
+      # that branch contains.
+      - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck
       - run: npm --prefix worker test
-      - uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
+      - uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: worker

@@ -3,6 +3,18 @@
 Both deploys are **manual** (`workflow_dispatch`) so nothing auto-publishes on
 merge. Reader-before-writer ordering is operator-driven.
 
+> **Contour reclassified 2026-08-20 (operator decision).**
+> `notes.matamata.dev` is the **working (dev) contour**, not production. The
+> real production will be provisioned **from scratch** on a `.app` domain when
+> v1 is declared ready; nothing from the current contour — data, wallets,
+> secrets, floor tags — is carried over. The deploy workflows are named
+> `… — dev` accordingly; future production workflows will be `… — production`.
+>
+> Historical entries below that say "production"/"PRODUCTION" are left
+> untouched on purpose: at the time of writing this contour *was* the
+> production, and rewriting the records would destroy the audit trail. Read
+> them as history. Active instructions in this runbook operate the dev contour.
+
 > **Legacy GitHub Pages target retired 2026-08-20 (operator decision).**
 > `.github/workflows/deploy.yml` («Deploy to GitHub Pages (legacy)») is deleted.
 > The cutover to Cloudflare Pages is complete, and GitHub Pages could never
@@ -14,11 +26,11 @@ merge. Reader-before-writer ordering is operator-driven.
 > on purpose — they record what was true during those rollouts, and rewriting
 > them would destroy the audit trail. Read them as history, not as instructions.
 >
-> Open follow-up: `VITE_BASE` still defaults to `/payee/` (`vite.config.ts`,
-> `scripts/postbuild.mjs`) — the base of the retired target. Both deploy paths
-> pass `VITE_BASE=/` explicitly, so nothing is broken today, but a build run
-> without the variable now produces artefacts for a target that no longer
-> exists. Flipping the default is a separate decision.
+> ~~Open follow-up: `VITE_BASE` still defaults to `/payee/`…~~ **Resolved
+> 2026-08-21 (§1.8, PR #93):** the default in `vite.config.ts` and
+> `scripts/postbuild.mjs` is now `/` — a build without the variable produces
+> Cloudflare-Pages-shaped artefacts. Both deploy paths still pass
+> `VITE_BASE=/` explicitly.
 
 ## FIRST rollout of the recovery protocol — CLIENT BEFORE WORKER
 
@@ -276,11 +288,19 @@ users**, so the operator must provision staging before the v4-acceptor deploy:
    entries into KV);
 6. `npm --prefix worker run deploy:staging:check`, then `deploy:staging`.
 
-A production smoke is an **escape hatch that requires a separate, explicit
-operator decision** and must be recorded here when used. `smoke-v4.mjs`
-enforces this: it refuses any `SMOKE_URL` host that is not localhost or a
-recognisable `staging` target unless `ALLOW_PRODUCTION_SMOKE=true` is set —
-the script posts real, paid Arweave transactions.
+A smoke against anything beyond the allow-listed worker origins is an
+**escape hatch that requires a separate, explicit operator decision** and must
+be recorded here when used. Both `smoke-v3.mjs` and `smoke-v4.mjs` enforce this
+through the shared fail-closed classifier (`worker/scripts/smoke-target.mjs`):
+the FULL `SMOKE_URL` is classified, http is allowed only for local loopback,
+https only for the explicit worker-origin allowlist in that module, and any
+other target needs `SMOKE_ALLOW_ORIGIN=<exact https origin>` — the grant is
+per-origin (never a boolean, never a hostname) and remote http is refused even
+with a grant. The scripts post real, paid Arweave transactions.
+(The former `ALLOW_PRODUCTION_SMOKE=true` boolean and the `*staging*` hostname
+heuristic are retired: the boolean, once exported, silently authorized the
+next, different target, and the heuristic was fail-open —
+`staging.evil.example` matched it.)
 
 Every staging command (`deploy:staging`, `deploy:staging:check`) is gated by
 `npm run check:staging-config`, which fails with the checklist above while the

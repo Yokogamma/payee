@@ -85,7 +85,11 @@ describe('base layer, as the browser resolves it', () => {
   it('the section label is mono, uppercase and spaced', () => {
     expect(resolved('section-label', 'font-size')).toBe('12px');
     expect(resolved('section-label', 'text-transform')).toBe('uppercase');
-    expect(resolved('section-label', 'letter-spacing')).toBe('0.12em');
+    // jsdom ≥30 RESOLVES relative units in computed style (0.12em × 12px →
+    // '1.44px'); jsdom ≤29 echoes the authored '0.12em'. Both are the same
+    // declaration — accept either so the assertion survives the bump without
+    // weakening the intent (a spaced label).
+    expect(['0.12em', '1.44px']).toContain(resolved('section-label', 'letter-spacing'));
   });
 
   it('body text is the reading size', () => {

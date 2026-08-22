@@ -19,8 +19,11 @@ export default defineConfig(({ command, mode }) => {
     }
   }
 
-  // '/payee/' for GitHub Pages (default); set VITE_BASE=/ for Cloudflare Pages.
-  const base = process.env.VITE_BASE || "/payee/";
+  // Default '/' — the Cloudflare Pages layout. The old '/payee/' default was
+  // the base of the retired GitHub Pages target (unpublished 2026-08-20): a
+  // build without the variable used to produce artifacts for a target that no
+  // longer exists. Both deploy paths still pass VITE_BASE explicitly.
+  const base = process.env.VITE_BASE || "/";
 
   return {
     plugins: [

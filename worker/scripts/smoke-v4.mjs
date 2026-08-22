@@ -15,9 +15,14 @@
  * The key must already be registered on staging via invite (InviteManager is
  * the source of truth — see wrangler.toml [env.staging] prerequisites).
  * NOTE: this posts a REAL (tiny) Arweave transaction paid by the staging wallet.
+ *
+ * Target policy lives in smoke-target.mjs (fail-closed allowlist of worker
+ * origins). A non-listed target additionally needs
+ * SMOKE_ALLOW_ORIGIN=<exact https origin> — record why in docs/ROLLBACK.md.
  */
 
 import * as ed from '@noble/ed25519';
+import { classifySmokeTarget } from './smoke-target.mjs';
 
 const url = process.env.SMOKE_URL;
 const privB64 = process.env.SMOKE_PRIVATE_KEY;
@@ -27,37 +32,16 @@ if (!url || !privB64) {
 }
 
 // ── Target gate ─────────────────────────────────────────────────────
-// This script posts REAL, PAID Arweave transactions. docs/ROLLBACK.md allows a
-// production smoke only as an escape hatch requiring a separate, explicit
-// operator decision — so pointing it at anything that is not a recognisable
-// staging/local target needs an equally explicit opt-in.
-{
-  let host;
-  try {
-    host = new URL(url).hostname;
-  } catch {
-    console.error(`SMOKE_URL is not a valid URL: ${url}`);
-    process.exit(2);
-  }
-  const isStagingTarget =
-    host === 'localhost' || host === '127.0.0.1' || /(^|[-.])staging([-.]|$)/.test(host);
-  if (!isStagingTarget && process.env.ALLOW_PRODUCTION_SMOKE !== 'true') {
-    console.error(`
-✗ Refusing to smoke a NON-STAGING target: ${host}
-
-  This posts real, paid Arweave transactions. Per docs/ROLLBACK.md a production
-  smoke is an escape hatch that needs its own explicit operator decision — and
-  must be recorded in the runbook when used.
-
-  Staging target?  use the eternal-notes-proxy-staging URL.
-  Really production? re-run with ALLOW_PRODUCTION_SMOKE=true and write down why.
-`);
-    process.exit(2);
-  }
-  if (!isStagingTarget) {
-    console.warn(`⚠ PRODUCTION SMOKE against ${host} — explicitly allowed via ALLOW_PRODUCTION_SMOKE.`);
-  }
+// Shared fail-closed classifier (see smoke-target.mjs): full-URL check,
+// worker-origin allowlist, per-origin SMOKE_ALLOW_ORIGIN escape hatch,
+// no remote http. Requests below are built from the returned origin.
+const target = classifySmokeTarget(url, process.env.SMOKE_ALLOW_ORIGIN);
+if (!target.ok) {
+  console.error(`✗ ${target.reason}`);
+  process.exit(2);
 }
+if (target.warning) console.warn(`⚠ ${target.warning}`);
+const origin = target.origin;
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const sha256 = async (bytes) =>
@@ -91,7 +75,7 @@ async function signedUpload(tags, dataObj) {
     timestamp: Date.now(),
   });
   const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), priv));
-  return fetch(`${url}/upload`, {
+  return fetch(new URL('/upload', origin), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -111,7 +95,7 @@ const v4Tags = (noteId) => [
 ];
 
 // ── 1. /health capability ──────────────────────────────────────────
-const health = await (await fetch(`${url}/health`)).json();
+const health = await (await fetch(new URL('/health', origin))).json();
 check('health.ok', health.ok === true);
 check('health.versions includes 4', Array.isArray(health.versions) && health.versions.includes('4'));
 check('health.v4Uploads', health.v4Uploads === true, `got ${health.v4Uploads}`);

@@ -5,7 +5,7 @@ import type { ThemePref } from '../lib/theme';
 import { SECRET_PASSWORD_FIELD_PROPS, SAFEBOX_SECRET_FIELD_CLASS } from '../components/secretFieldProps';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { navigate } from '../lib/route';
-import { QUARANTINE_EXPLANATION } from '../lib/syncCounters';
+import { QUARANTINE_EXPLANATION, RECOVERY_INVALIDATED_EXPLANATION } from '../lib/syncCounters';
 import { QUICK_UNLOCK_ENABLED } from '../lib/flags';
 import type { QuickUnlockCapability } from '../lib/quick-unlock-core';
 
@@ -412,11 +412,19 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               {arweave.errorCount > 0 && (
                 <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>
               )}
-              {arweave.quarantinedCount > 0 && (
+              {arweave.quarantinedCount > arweave.recoveryInvalidatedCount && (
                 // Permanent by design — deliberately NOT lumped into «Ошибки»:
                 // no «Повторить» can ever fix a quarantined record.
                 <div>
-                  Отложено записей: <strong>{arweave.quarantinedCount}</strong> — {QUARANTINE_EXPLANATION}
+                  Отложено записей: <strong>{arweave.quarantinedCount - arweave.recoveryInvalidatedCount}</strong> — {QUARANTINE_EXPLANATION}
+                </div>
+              )}
+              {arweave.recoveryInvalidatedCount > 0 && (
+                // Separate reason, separate honest advice: the record is
+                // intact, the server rejected its publication proof — seed
+                // restore can bring it back; «Повторить» never will.
+                <div>
+                  Отложено записей: <strong>{arweave.recoveryInvalidatedCount}</strong> — {RECOVERY_INVALIDATED_EXPLANATION}
                 </div>
               )}
               {arweave.lastSync && (

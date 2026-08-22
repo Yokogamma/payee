@@ -50,7 +50,7 @@ const IV = 'AAAAAAAAAAAAAAAA';
 
 /** A fixed identity so we can inject DO state for exactly this pk's shard. */
 async function makeIdentity() {
-  const priv = ed.utils.randomPrivateKey();
+  const priv = ed.utils.randomSecretKey();
   const pub = await ed.getPublicKeyAsync(priv);
   const pkB64 = b64(pub);
   const ownerHash = b64(await sha256(pub));

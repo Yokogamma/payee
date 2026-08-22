@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { runUploadAttempt, type UploadAttemptDeps, type UploadKeys } from './upload-flow';
+import { toUploading } from './sync-transitions';
 import type { UploadResult } from './arweave';
 import type { SyncRecord } from './storage';
 import type { EncryptedNote } from './crypto';
@@ -29,9 +30,15 @@ const ACCEPTED: UploadResult = { kind: 'accepted', txId: 'TX9', committed: true 
 
 interface Harness {
   deps: UploadAttemptDeps;
+  /** Every APPLIED sync write, in order (begin + results). */
   writes: SyncRecord[];
-  /** Atomic sync+meta commits for the v3_disabled branch (record, pausedAt). */
+  /** Atomic sync+meta commits for the vN_disabled branch (record, pausedAt). */
   pausedCommits: Array<{ record: SyncRecord; pausedAt: number }>;
+  /** Result commits REFUSED because the fresh row was quarantined. */
+  blockedCommits: number;
+  /** The in-memory sync row — the «fresh» source every commit re-reads,
+   *  faithfully mirroring the storage primitives' contract. */
+  row: { value: SyncRecord | undefined };
   httpCalls: number;
   epoch: { value: number };
 }
@@ -45,32 +52,72 @@ function makeHarness(opts?: {
   lockDuringToUploading?: boolean;
   /** flip the epoch while the HTTP request is in flight */
   lockDuringDispatch?: boolean;
+  /** another tab quarantines the row while the signature is being computed
+   *  (i.e. AFTER the queue read prev, BEFORE the atomic begin) */
+  quarantineDuringSign?: NonNullable<SyncRecord['terminalError']>;
+  /** another tab quarantines the row while the HTTP request is in flight */
+  quarantineDuringDispatch?: NonNullable<SyncRecord['terminalError']>;
 }): Harness {
   const epoch = { value: 1 };
   const writes: SyncRecord[] = [];
   const pausedCommits: Array<{ record: SyncRecord; pausedAt: number }> = [];
-  const h: Harness = { deps: null as unknown as UploadAttemptDeps, writes, pausedCommits, httpCalls: 0, epoch };
+  const row: { value: SyncRecord | undefined } = { value: opts?.prev };
+  const h: Harness = {
+    deps: null as unknown as UploadAttemptDeps,
+    writes, pausedCommits, blockedCommits: 0, row, httpCalls: 0, epoch,
+  };
+  const quarantineRow = (reason: NonNullable<SyncRecord['terminalError']>) => {
+    row.value = {
+      noteId: 'note-1', kind: 'note', txId: row.value?.txId, status: 'error',
+      transport: 'proxy', updatedAt: NOW, recovery: row.value?.recovery,
+      terminalError: reason,
+    };
+  };
   h.deps = {
     now: () => NOW,
     currentEpoch: () => epoch.value,
-    getSyncRecord: async () => opts?.prev,
-    setSyncRecord: async record => {
-      writes.push(record);
-      if (record.status === 'uploading' && opts?.lockDuringToUploading) epoch.value++;
+    getSyncRecord: async () => row.value,
+    beginUpload: async (noteId, kind, now) => {
+      if (row.value?.terminalError !== undefined) return false;
+      row.value = toUploading(noteId, kind, row.value, now);
+      writes.push(row.value);
+      if (opts?.lockDuringToUploading) epoch.value++;
+      return true;
     },
-    commitV3PausedFailure: async (record, pausedAt) => {
-      pausedCommits.push({ record, pausedAt });
+    commitResult: async (_noteId, build) => {
+      if (row.value?.terminalError !== undefined) {
+        h.blockedCommits++;
+        return;
+      }
+      const next = build(row.value);
+      if (next !== null) {
+        row.value = next;
+        writes.push(next);
+      }
     },
-    commitV4PausedFailure: async (record, pausedAt) => {
-      pausedCommits.push({ record, pausedAt });
+    commitV3PausedFailure: async (_noteId, build, pausedAt) => {
+      // Marker unconditional, record terminal-preserving — like the real one.
+      if (row.value?.terminalError !== undefined) {
+        h.blockedCommits++;
+        pausedCommits.push({ record: row.value, pausedAt });
+        return;
+      }
+      const rec = build(row.value);
+      row.value = rec;
+      pausedCommits.push({ record: rec, pausedAt });
+    },
+    commitV4PausedFailure: async (noteId, build, pausedAt) => {
+      await h.deps.commitV3PausedFailure(noteId, build, pausedAt);
     },
     signPayload: async () => {
       if (opts?.lockDuringSign) epoch.value++;
+      if (opts?.quarantineDuringSign) quarantineRow(opts.quarantineDuringSign);
       return 'signature-b64';
     },
     uploadViaProxy: async () => {
       h.httpCalls++;
       if (opts?.lockDuringDispatch) epoch.value++;
+      if (opts?.quarantineDuringDispatch) quarantineRow(opts.quarantineDuringDispatch);
       return opts?.result ?? ACCEPTED;
     },
   };
@@ -153,11 +200,11 @@ describe('runUploadAttempt — in_progress WITHOUT a prior record (round-5 #1)',
 describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)', () => {
   const V3_DISABLED: UploadResult = { kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}' };
 
-  it('commits the failure record + pause via commitV3PausedFailure, NOT setSyncRecord', async () => {
+  it('commits the failure record + pause via commitV3PausedFailure, NOT the ordinary result commit', async () => {
     const h = makeHarness({ result: V3_DISABLED });
     const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome.kind).toBe('committed');
-    // Only the toUploading write went through setSyncRecord — the final record
+    // Only the begin write went through the ordinary path — the final record
     // travelled through the atomic sync+meta path exactly once.
     expect(h.writes.map(w => w.status)).toEqual(['uploading']);
     expect(h.pausedCommits).toHaveLength(1);
@@ -211,5 +258,107 @@ describe('runUploadAttempt — happy path', () => {
       await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
       expect(h.writes.at(-1)!.status).not.toBe('uploading');
     }
+  });
+});
+
+// ─── §1.9: терминальный карантин и монотонность terminalError ────────
+
+const QUARANTINED_PREV: SyncRecord = {
+  noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'error', transport: 'proxy',
+  updatedAt: NOW - 100_000, recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
+  terminalError: 'recovery_invalidated',
+};
+
+describe('runUploadAttempt — карантин между постановкой в очередь и begin', () => {
+  it('терминальная запись при входе: begin отказывает, HTTP не отправляется, outcome blocked', async () => {
+    const h = makeHarness({ prev: QUARANTINED_PREV });
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(outcome).toEqual({ kind: 'blocked' });
+    expect(h.httpCalls).toBe(0);
+    expect(h.writes).toEqual([]); // ни toUploading, ни чего-либо ещё
+    expect(h.row.value).toEqual(QUARANTINED_PREV); // карантин нетронут
+  });
+
+  it('вторая вкладка ставит карантин ВО ВРЕМЯ подписи (до begin): отказ без HTTP', async () => {
+    const h = makeHarness({ quarantineDuringSign: 'recovery_invalidated' });
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(outcome).toEqual({ kind: 'blocked' });
+    expect(h.httpCalls).toBe(0);
+    expect(h.writes).toEqual([]);
+    expect(h.row.value?.terminalError).toBe('recovery_invalidated');
+  });
+});
+
+describe('runUploadAttempt — поздний результат не стирает карантин', () => {
+  // Гонка из плана: вкладка B ушла в HTTP, вкладка A поставила карантин,
+  // затем B завершилась — accepted, 503 и обычной ошибкой. Во всех трёх
+  // случаях карантин обязан сохраниться.
+  it.each([
+    ['accepted', { kind: 'accepted', txId: 'TX-late', committed: true } as UploadResult],
+    ['503/unavailable', { kind: 'unavailable', error: '503' } as UploadResult],
+    ['обычная ошибка', { kind: 'error', error: 'boom' } as UploadResult],
+  ])('карантин во время запроса + результат «%s» → коммит заблокирован', async (_label, result) => {
+    const h = makeHarness({ result, quarantineDuringDispatch: 'recovery_invalidated' });
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(outcome.kind).toBe('committed'); // HTTP состоялся — но…
+    expect(h.blockedCommits).toBe(1);       // …запись результата отвергнута
+    expect(h.row.value?.terminalError).toBe('recovery_invalidated');
+    expect(h.row.value?.status).toBe('error'); // строка карантина, не «accepted»
+  });
+
+  it('vN_disabled во время карантина: запись пропущена, но маркер паузы поставлен', async () => {
+    const h = makeHarness({
+      result: { kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}' },
+      quarantineDuringDispatch: 'malformed_record',
+    });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.blockedCommits).toBe(1);
+    expect(h.pausedCommits).toHaveLength(1); // пауза — состояние ВЕРСИИ, не записи
+    expect(h.row.value?.terminalError).toBe('malformed_record');
+  });
+});
+
+describe('runUploadAttempt — recovery_invalid → терминальный карантин', () => {
+  const RECOVERY_INVALID: UploadResult = {
+    kind: 'recovery_invalid',
+    error: '{"code":"recovery_invalid","error":"Invalid recovery token"}',
+  };
+
+  it('запись становится recovery_invalidated; txId и recovery-данные сохранены', async () => {
+    const prev: SyncRecord = {
+      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      updatedAt: NOW - 100_000, needsRecheck: true,
+      recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
+    };
+    const h = makeHarness({ prev, result: RECOVERY_INVALID });
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(outcome.kind).toBe('committed');
+    const final = h.row.value!;
+    expect(final.terminalError).toBe('recovery_invalidated');
+    expect(final.status).toBe('error');
+    expect(final.needsRecheck).toBe(false); // вечный recheck остановлен
+    expect(final.txId).toBe('TX-old');      // доказательства сохранены
+    expect(final.recovery).toEqual(prev.recovery);
+  });
+
+  it('без prev.txId берётся txId из recovery-хинта (единственный след транзакции)', async () => {
+    const prev: SyncRecord = {
+      noteId: 'note-1', kind: 'note', status: 'error', transport: 'proxy',
+      updatedAt: NOW - 100_000, needsRecheck: true,
+      recovery: { txId: 'TX-hint', postedAt: NOW - 200_000, token: 'tok' },
+    };
+    const h = makeHarness({ prev, result: RECOVERY_INVALID });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.row.value?.txId).toBe('TX-hint');
+  });
+
+  it('уже стоящий карантин ДРУГОЙ причины не перезаписывается', async () => {
+    const h = makeHarness({
+      result: RECOVERY_INVALID,
+      quarantineDuringDispatch: 'unsupported_version',
+    });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.blockedCommits).toBe(1);
+    expect(h.row.value?.terminalError).toBe('unsupported_version'); // первая причина стоит
   });
 });

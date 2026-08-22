@@ -14,9 +14,14 @@
  * The key must already be registered on staging via invite (InviteManager is
  * the source of truth — see wrangler.toml [env.staging] prerequisites).
  * NOTE: this posts a REAL (tiny) Arweave transaction paid by the staging wallet.
+ *
+ * Target policy lives in smoke-target.mjs (fail-closed allowlist of worker
+ * origins). A non-listed target additionally needs
+ * SMOKE_ALLOW_ORIGIN=<exact https origin> — record why in docs/ROLLBACK.md.
  */
 
 import * as ed from '@noble/ed25519';
+import { classifySmokeTarget } from './smoke-target.mjs';
 
 const url = process.env.SMOKE_URL;
 const privB64 = process.env.SMOKE_PRIVATE_KEY;
@@ -24,6 +29,20 @@ if (!url || !privB64) {
   console.error('SMOKE_URL and SMOKE_PRIVATE_KEY are required');
   process.exit(2);
 }
+
+// ── Target gate ─────────────────────────────────────────────────────
+// Shared fail-closed classifier (see smoke-target.mjs). This script used to
+// post a real, paid transaction to WHATEVER SMOKE_URL said, with no check at
+// all — the gate is deliberately identical to smoke-v4's: full-URL check,
+// worker-origin allowlist, per-origin SMOKE_ALLOW_ORIGIN escape hatch,
+// no remote http. Requests below are built from the returned origin.
+const target = classifySmokeTarget(url, process.env.SMOKE_ALLOW_ORIGIN);
+if (!target.ok) {
+  console.error(`✗ ${target.reason}`);
+  process.exit(2);
+}
+if (target.warning) console.warn(`⚠ ${target.warning}`);
+const origin = target.origin;
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64');
 const sha256 = async (bytes) =>
@@ -57,7 +76,7 @@ async function signedUpload(tags, dataObj) {
     timestamp: Date.now(),
   });
   const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), priv));
-  return fetch(`${url}/upload`, {
+  return fetch(new URL('/upload', origin), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -69,7 +88,7 @@ async function signedUpload(tags, dataObj) {
 }
 
 // ── 1. /health capability ──────────────────────────────────────────
-const health = await (await fetch(`${url}/health`)).json();
+const health = await (await fetch(new URL('/health', origin))).json();
 check('health.ok', health.ok === true);
 check('health.versions includes 3', Array.isArray(health.versions) && health.versions.includes('3'));
 check('health.v3Uploads', health.v3Uploads === true, `got ${health.v3Uploads}`);

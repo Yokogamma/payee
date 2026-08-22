@@ -58,7 +58,7 @@ async function adminRevoke(publicKey: unknown, auth: Record<string, string> = AU
 
 describe('M11 revoke-flow: allowed → revoke → denied', () => {
   it('removes the key, overwrites stale KV with denied, marks the invite revoked', async () => {
-    const priv = ed.utils.randomPrivateKey();
+    const priv = ed.utils.randomSecretKey();
     const pkB64 = b64(await ed.getPublicKeyAsync(priv));
     const code = `INV-${crypto.randomUUID().slice(0, 8)}`;
 
@@ -167,7 +167,7 @@ describe('revoke ↔ register race hardening (allowed resurrection)', () => {
   }
 
   it('an alreadyRegistered /register writes NOTHING to KV — a mid-revoke denied survives', async () => {
-    const priv = ed.utils.randomPrivateKey();
+    const priv = ed.utils.randomSecretKey();
     const pkB64 = b64(await ed.getPublicKeyAsync(priv));
     const code = `RACE-${crypto.randomUUID().slice(0, 8)}`;
     await seedInvite(code);

@@ -1,22 +1,22 @@
-name: Deploy to Cloudflare Pages
+name: Deploy to Cloudflare Pages — dev
 
-# Migration target (Phase 3 runbook). Unlike GitHub Pages, Cloudflare Pages
-# parses dist/_headers, so the generated CSP + security headers are actually
-# applied to responses. Builds at root base (VITE_BASE=/).
+# Deploys the client of the WORKING (dev) contour to Cloudflare Pages (contour
+# reclassified 2026-08-20; the future production gets its own `… — production`
+# workflow, never this one). Cloudflare Pages parses dist/_headers, so the
+# generated CSP + security headers are actually applied to responses. Builds at
+# root base (VITE_BASE=/).
 #
 # Manual trigger; ordering is operator-driven (authoritative: docs/ROLLBACK.md).
-#   FIRST rollout of the recovery protocol:
-#     1. deploy the recovery-aware client to the LEGACY GitHub Pages origin,
-#     2. run "Deploy Worker (proxy)" and smoke-test it,
-#     3. then run THIS workflow to publish the client on Cloudflare Pages
-#        (ALLOWED_ORIGINS must already contain the Pages origin).
-#   Subsequent compatible releases: Worker → smoke → THIS workflow.
+#   Release order: "Deploy Worker (proxy) — dev" → smoke → THIS workflow
+#   (reader-before-writer). The first recovery-protocol rollout used a special
+#   order — recorded in ROLLBACK.md as history; the legacy GitHub Pages origin
+#   is retired.
 #   The header smoke-test (scripts/smoke-headers.mjs) runs against the URL after.
 #
-# Requires repo secrets:
-#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
-#   VITE_PROXY_URL (https), VITE_TRUSTED_OWNERS,
-#   CF_PAGES_PROJECT (the Pages project name).
+# Requires the GitHub Environment "dev" (its deployment branch policy is the
+# real access boundary for the token — §1.7):
+#   variables CF_PAGES_PROJECT, VITE_PROXY_URL, VITE_TRUSTED_OWNERS,
+#   CLOUDFLARE_ACCOUNT_ID; secret CLOUDFLARE_API_TOKEN.
 on:
   workflow_dispatch:
 
@@ -25,15 +25,36 @@ on:
 permissions:
   contents: read
 
+# Two dispatches must finish in dispatch order: without this, a rehearsal run
+# and the real deploy right after it can land in REVERSE order, putting the
+# old build on top of the new one. Never cancel a deploy mid-flight —
+# waiting beats a half-shipped client.
+concurrency:
+  group: deploy-pages
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # vars.*/secrets.* below resolve from this environment.
+    environment: dev
     steps:
       # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
+      # Early config gate: presence + repo-pinned expectations for the four
+      # NON-SECRET variables (the build reads only the VITE_* pair; the other
+      # two would otherwise ride into the deploy action empty and surface
+      # late). The deploy token is deliberately NOT passed to any repo script
+      # — this workflow can be dispatched from arbitrary branches (--ref).
+      - run: node scripts/check-deploy-config.mjs
+        env:
+          CF_PAGES_PROJECT: ${{ vars.CF_PAGES_PROJECT }}
+          VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}
+          VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       # ── Quality gates ──
       - run: npm ci
       - run: npm run lint
@@ -49,10 +70,19 @@ jobs:
       - run: npm run build
         env:
           VITE_BASE: "/"
-          VITE_PROXY_URL: ${{ secrets.VITE_PROXY_URL }}
-          VITE_TRUSTED_OWNERS: ${{ secrets.VITE_TRUSTED_OWNERS }}
+          VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}
+          VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
           # SW updates are driven by Workbox content-hash revisions — no
           # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
+      # Semantic check: the client we just built must TRUST the worker it is
+      # configured to talk to — /wallet-address of the live worker has to be
+      # INCLUDED in VITE_TRUSTED_OWNERS (inclusion, not equality: rotation
+      # keeps old+new). Build-time validation is format-only, so this is the
+      # step that catches a wrong-but-well-formed owner list before deploy.
+      - run: node scripts/check-owners-vs-worker.mjs
+        env:
+          VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}
+          VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
       # Bundle budget: fail before deploying if the gzipped JS quietly grew
       # past the declared ceiling (see scripts/check-bundle-budget.mjs).
       - run: node scripts/check-bundle-budget.mjs
@@ -61,12 +91,21 @@ jobs:
       # in every subset. Both are invisible at runtime — hence a build gate.
       - run: node scripts/check-no-inlined-fonts.mjs
       # ── Deploy ──
+      # wrangler itself comes from the ROOT lockfile (devDependency): the
+      # action prefers the locally installed CLI over downloading one at
+      # runtime, so the tool that runs WITH the API token is pinned and
+      # Dependabot-updated like everything else.
       - id: deploy
-        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=${{ secrets.CF_PAGES_PROJECT }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ vars.CF_PAGES_PROJECT }}
       # ── Post-deploy security gate: prove the CSP + headers are actually applied.
-      #     Fails the run if they are missing (e.g. a misconfigured Pages project). ──
-      - run: node scripts/smoke-headers.mjs "${{ steps.deploy.outputs.deployment-url }}"
+      #     Fails the run if they are missing (e.g. a misconfigured Pages project).
+      #     The URL goes through env: — no ${{ }} inside run: anywhere (§1.7):
+      #     the expression expands TEXTUALLY before the shell starts, so any
+      #     third-party value would land directly on the command line. ──
+      - run: node scripts/smoke-headers.mjs "$DEPLOY_URL"
+        env:
+          DEPLOY_URL: ${{ steps.deploy.outputs.deployment-url }}
