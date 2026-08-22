@@ -53,6 +53,16 @@ jobs:
       - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      # ROOT deps are needed by the worker TEST suite since #104:
+      # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
+      # which resolves @scure/bip39 from the root node_modules (in ci.yml the
+      # root `npm ci` runs first, which is why CI never saw the gap; the first
+      # worker deploy after #104 did — the test step failed on module
+      # resolution). --ignore-scripts on purpose: the parity test only needs
+      # IMPORT RESOLUTION of pure-JS packages, so no lifecycle script of any
+      # root transitive dependency ever runs in this CREDENTIALED job — the
+      # accepted npm-ci residual risk (docs/SECRETS.md) does not widen.
+      - run: npm ci --ignore-scripts
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck
       - run: npm --prefix worker test
