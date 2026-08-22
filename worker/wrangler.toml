@@ -58,6 +58,26 @@ V3_UPLOADS_ENABLED = "true"
 # Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
 V4_UPLOADS_ENABLED = "true"
+# ── Metrics (PR-2) ── Telemetry is fail-closed, the request path fail-open:
+# writes happen STRICTLY when METRICS_ENABLED = "true" AND the METRICS binding
+# exists; ANY other value (missing, garbage, no binding) disables writes
+# without ever touching the request path.
+METRICS_ENABLED = "true"
+# Must equal the [[analytics_engine_datasets]] dataset below. /admin/metrics
+# validates it as ^[a-z0-9_]{1,64}$ BEFORE substituting it into whitelisted
+# SQL templates (never hardcoded in SQL, never concatenated unchecked).
+METRICS_DATASET = "eternal_notes_metrics"
+# Cloudflare account id for the Analytics Engine SQL API — an IDENTIFIER, not
+# a secret (same value as the Actions CLOUDFLARE_ACCOUNT_ID variable). EMPTY
+# until the operator fills it: /admin/metrics answers 503 meanwhile, metric
+# WRITES are unaffected (they go through the binding, not the SQL API).
+CF_ACCOUNT_ID = ""
+
+# Metrics dataset (PR-2). Explicitly DIFFERENT names per environment (M6 r14) —
+# staging rows must never blend into the production dataset.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "eternal_notes_metrics"
 
 # Secrets (via `wrangler secret put`):
 # ARWEAVE_JWK — server Arweave wallet (JSON string)
@@ -68,6 +88,14 @@ V4_UPLOADS_ENABLED = "true"
 #   Keep it STABLE — never rotate together with ARWEAVE_JWK (outstanding tokens
 #   would stop verifying and fail closed). If it ever must rotate, plan a
 #   dual-verify window (current + previous, keyed by `kid`).
+# METRICS_ADMIN_SECRET — dedicated bearer for POST /admin/metrics (PR-2,
+#   least privilege: the metrics reader gets NO seed-invite/revoke rights and
+#   ADMIN_SECRET does NOT open /admin/metrics). 503 while missing.
+# CF_ANALYTICS_TOKEN — Analytics Engine SQL API token (PR-2). Scope: Account →
+#   Account Analytics → Read, for this ONE account and NOTHING else. The scope
+#   cannot be narrowed to a single dataset — it honestly reads analytics of
+#   the WHOLE account (docs/SECRETS.md). Until it exists /admin/metrics
+#   answers 503; metric writes are unaffected.
 
 # ─── Staging environment ─────────────────────────────────────────────
 # Fully isolated stand-in for the mandatory pre-W3 signed v3 smoke
@@ -120,3 +148,15 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
+# Metrics (PR-2) — same contract as production vars above; staging writes go
+# to its OWN dataset (explicit different name, M6 r14).
+METRICS_ENABLED = "true"
+METRICS_DATASET = "eternal_notes_metrics_staging"
+CF_ACCOUNT_ID = ""
+
+# Executable block, not a comment (L r17): a named environment inherits
+# NOTHING, so the binding must be declared here explicitly or staging deploys
+# without METRICS at all (CI catches drift via deploy:staging:check).
+[[env.staging.analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "eternal_notes_metrics_staging"

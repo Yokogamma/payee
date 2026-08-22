@@ -27,6 +27,11 @@ export default defineConfig({
       'test/v3-gate-e2e.test.ts',
       'test/v4-gate-e2e.test.ts',
       'test/uploads-gate-e2e.test.ts',
+      // PR-2 metrics suites: they import src modules directly and/or stub the
+      // isolate's global fetch — same isolation reasoning as above.
+      'test/arweave-transport.test.ts',
+      'test/metrics-upload-e2e.test.ts',
+      'test/admin-metrics.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.

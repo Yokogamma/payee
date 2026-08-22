@@ -17,14 +17,17 @@ provisioned» until then.
 | `ARWEAVE_JWK` | secret, **top category** | worker | money + the right to write on behalf of the service |
 | `RECOVERY_HMAC_SECRET` | secret, **stable by contract** | worker | forged recovery tokens; while missing, `/upload` = 503 |
 | `ADMIN_SECRET` | secret | worker: `/admin/seed-invite`, `/admin/revoke` | issuing invites and revoking access |
-| `CLOUDFLARE_API_TOKEN` | secret, **top category (transitively)** | GitHub Actions (Environment `dev`) | **equals the radius of `ARWEAVE_JWK`.** Deploy rights = the right to read every worker secret: an attacker deploys code that returns `env.ARWEAVE_JWK`, `env.RECOVERY_HMAC_SECRET`, `env.ADMIN_SECRET` on the first request. Money + forged recovery tokens + invite issuance; with a shared Cloudflare account — in BOTH contours |
+| `METRICS_ADMIN_SECRET` | secret | worker: `/admin/metrics` (PR-2) | read-only metrics reports. DELIBERATELY separate from `ADMIN_SECRET` (least privilege): leaking the metrics bearer grants no invite/revoke rights, and a future dashboard never needs the admin secret |
+| `CF_ANALYTICS_TOKEN` | secret | worker: `/admin/metrics` upstream (Analytics Engine SQL API) | **honestly wider than one dataset:** the `Account → Account Analytics → Read` scope cannot be narrowed — the token reads analytics of the WHOLE account. Still read-only |
+| `CLOUDFLARE_API_TOKEN` | secret, **top category (transitively)** | GitHub Actions (Environment `dev`) | **equals the radius of `ARWEAVE_JWK`.** Deploy rights = the right to read every worker secret: an attacker deploys code that returns `env.ARWEAVE_JWK`, `env.RECOVERY_HMAC_SECRET`, `env.ADMIN_SECRET` — and, after PR-2, `env.METRICS_ADMIN_SECRET` and `env.CF_ANALYTICS_TOKEN` — on the first request. Money + forged recovery tokens + invite issuance + admin metrics + account-wide Analytics Read; with a shared Cloudflare account — in BOTH contours |
 | `CLOUDFLARE_ACCOUNT_ID` | identifier → Environment variable | GitHub Actions | harmless |
 | `CF_PAGES_PROJECT` | config → Environment variable | GitHub Actions | deploy to the wrong project |
 | `VITE_PROXY_URL` | config → Environment variable | client build | pinned in CSP; also repo-pinned (scripts/check-deploy-config.mjs) |
 | `VITE_TRUSTED_OWNERS` | config, **integrity-critical** → Environment variable | client build | trusting a stranger's transactions; repo-pinned inclusion check |
 | `SMOKE_PRIVATE_KEY`, `MNEMONIC` | operator secrets | local paid smokes | access to the smoke vault |
 | `SMOKE_URL`, `SMOKE_ALLOW_ORIGIN` | **non-secret** operator setting | local paid smokes | not a secret; `SMOKE_ALLOW_ORIGIN` is a deliberate per-origin grant for a paid smoke (worker/scripts/smoke-target.mjs) |
-| `ALLOWED_ORIGINS`, `MAX_BODY_BYTES`, `RATE_LIMIT_PER_HOUR`, `UPLOADS_ENABLED`, `V3/V4_UPLOADS_ENABLED` | config in `wrangler.toml` | worker | source of truth is the repository |
+| `ALLOWED_ORIGINS`, `MAX_BODY_BYTES`, `RATE_LIMIT_PER_HOUR`, `UPLOADS_ENABLED`, `V3/V4_UPLOADS_ENABLED`, `METRICS_ENABLED`, `METRICS_DATASET` | config in `wrangler.toml` | worker | source of truth is the repository |
+| `CF_ACCOUNT_ID` | identifier → var in `wrangler.toml` (empty until filled) | worker: `/admin/metrics` upstream URL | harmless (same value as `CLOUDFLARE_ACCOUNT_ID`) |
 
 ## Resource registry by contour
 
@@ -156,3 +159,15 @@ Compromise procedure (levers that exist in the code today):
 
 **`ADMIN_SECRET`, Cloudflare token** — rotate freely; a test deploy to dev
 afterwards.
+
+**`METRICS_ADMIN_SECRET` (PR-2)** — rotate freely:
+`wrangler secret put METRICS_ADMIN_SECRET` (and `--env staging` where
+provisioned); update the operator's stored value; verify with a
+`POST /admin/metrics` → 200. Nothing else depends on it (read-only reports).
+
+**`CF_ANALYTICS_TOKEN` (PR-2)** — rotate by RECREATING the token in the
+Cloudflare dashboard (scope: `Account → Account Analytics → Read`, this one
+account, nothing else), then `wrangler secret put CF_ANALYTICS_TOKEN` (and
+`--env staging` where provisioned) and revoke the old token. While it is
+missing `/admin/metrics` answers 503 and metric WRITES are unaffected — the
+rotation window costs only report availability.

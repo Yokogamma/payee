@@ -8,6 +8,25 @@
 import Arweave from 'arweave';
 import * as ed25519 from '@noble/ed25519';
 import { readAllowCache } from './allowlist';
+import {
+  ARWEAVE_HOST,
+  assertStructurallyCompleteJwk,
+  classifyStatus,
+  classifyThrow,
+  getAnchor,
+  getArweave,
+  getPrice,
+  postSignedTx,
+  readCappedText,
+} from './arweave-transport';
+import {
+  buildMetricsReportSql,
+  makeEmit,
+  METRICS_DATASET_RE,
+  METRICS_REPORTS,
+  type Emit,
+  type MetricsReport,
+} from './metrics';
 
 export { RateLimiter } from './rate-limiter';
 export { InviteManager } from './invite-manager';
@@ -55,6 +74,29 @@ interface Env {
    *  IP limiter but BEFORE any per-owner RateLimiter DO call or Arweave POST.
    *  v1/v2/v3 are unaffected. Source of truth: wrangler.toml. */
   V4_UPLOADS_ENABLED?: string;
+  /** Analytics Engine dataset (PR-2 metrics). ALL metrics values are OPTIONAL
+   *  by contract: the runtime deliberately survives a missing binding/vars —
+   *  telemetry is fail-closed, the request path is fail-open (see makeEmit). */
+  METRICS?: AnalyticsEngineDataset;
+  /** Metrics master switch. STRICTLY "true" enables writes; any other value
+   *  (missing, garbage) disables them without touching requests. */
+  METRICS_ENABLED?: string;
+  /** AE dataset name for /admin/metrics SQL. Validated as ^[a-z0-9_]{1,64}$
+   *  before it is EVER substituted into a SQL template; invalid/missing → 503. */
+  METRICS_DATASET?: string;
+  /** Cloudflare account id for the AE SQL API (a var and an identifier, not a
+   *  secret — same value as the Actions CLOUDFLARE_ACCOUNT_ID variable). Empty
+   *  until the operator fills it; /admin/metrics answers 503 meanwhile. */
+  CF_ACCOUNT_ID?: string;
+  /** AE SQL API token (secret). Scope: Account → Account Analytics → Read for
+   *  this ONE account and nothing else — the scope cannot be narrowed to a
+   *  single dataset, so it honestly reads analytics of the whole account
+   *  (docs/SECRETS.md). /admin/metrics answers 503 while it is missing. */
+  CF_ANALYTICS_TOKEN?: string;
+  /** Dedicated bearer for POST /admin/metrics (least privilege: the metrics
+   *  reader gets NO seed-invite/revoke rights and vice versa). 503 while
+   *  missing. Compared with the same constant-time helper as ADMIN_SECRET. */
+  METRICS_ADMIN_SECRET?: string;
 }
 
 // ─── Per-IP baseline rate limit (D-baseline) ────────────────────────
@@ -81,11 +123,25 @@ export default {
     const origin = request.headers.get('Origin') || '';
     const allowedOrigins = env.ALLOWED_ORIGINS.split(',');
 
-    if (request.method === 'OPTIONS') return handleOptions(origin, allowedOrigins);
-
     // All responses go through addCors() — handlers don't know about CORS
-    const response = await handleRequest(request, env);
-    return addCors(response, origin, allowedOrigins);
+    const response = request.method === 'OPTIONS'
+      ? handleOptions(origin, allowedOrigins)
+      : addCors(await handleRequest(request, env), origin, allowedOrigins);
+
+    // Cache-Control: no-store on EVERY /admin/metrics response — centrally,
+    // not in the handler (M r19): the router's Content-Type check answers 415
+    // BEFORE dispatch, and a wrong method falls through to 404, so the header
+    // must be attached here to cover 415/404/401/4xx/5xx alike.
+    if (new URL(request.url).pathname === '/admin/metrics') {
+      const headers = new Headers(response.headers);
+      headers.set('Cache-Control', 'no-store');
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
+    return response;
   },
 };
 
@@ -140,6 +196,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (url.pathname === '/admin/revoke' && request.method === 'POST') {
     return handleAdminRevoke(request, env);
   }
+  if (url.pathname === '/admin/metrics' && request.method === 'POST') {
+    return handleAdminMetrics(request, env);
+  }
 
   return new Response('Not found', { status: 404 });
 }
@@ -179,18 +238,24 @@ async function handleWalletAddress(request: Request, env: Env): Promise<Response
 // ─── Admin auth (L12) ───────────────────────────────────────────────
 
 /**
- * Constant-time admin auth: SHA-256 both sides to a fixed 32 bytes, then
+ * Constant-time bearer auth: SHA-256 both sides to a fixed 32 bytes, then
  * timingSafeEqual — no early exit on length mismatch and no crash on it
  * (timingSafeEqual itself throws on unequal input lengths; digests never are).
+ * Generalised over WHICH secret (PR-2): /admin/metrics authenticates against
+ * its own METRICS_ADMIN_SECRET without duplicating the cryptography.
  */
-async function verifyAdminSecret(env: Env, authHeader: string | null): Promise<boolean> {
-  if (!env.ADMIN_SECRET || !authHeader) return false;
+async function verifyBearerSecret(expectedSecret: string | undefined, authHeader: string | null): Promise<boolean> {
+  if (!expectedSecret || !authHeader) return false;
   const enc = new TextEncoder();
   const [given, expected] = await Promise.all([
     crypto.subtle.digest('SHA-256', enc.encode(authHeader)),
-    crypto.subtle.digest('SHA-256', enc.encode(`Bearer ${env.ADMIN_SECRET}`)),
+    crypto.subtle.digest('SHA-256', enc.encode(`Bearer ${expectedSecret}`)),
   ]);
   return crypto.subtle.timingSafeEqual(new Uint8Array(given), new Uint8Array(expected));
+}
+
+async function verifyAdminSecret(env: Env, authHeader: string | null): Promise<boolean> {
+  return verifyBearerSecret(env.ADMIN_SECRET, authHeader);
 }
 
 // ─── /admin/seed-invite ─────────────────────────────────────────────
@@ -273,6 +338,93 @@ async function handleAdminRevoke(request: Request, env: Env): Promise<Response> 
     return error(body.error || 'Revoke failed', resp.status);
   }
   return json(await resp.json());
+}
+
+// ─── /admin/metrics (PR-2) ──────────────────────────────────────────
+
+// Server-to-server / operator-only by declaration: CORS deliberately does NOT
+// allow the Authorization header (corsHeaders below), so the long-lived
+// METRICS_ADMIN_SECRET can never end up in a browser dashboard — a future UI
+// gets its own backend or Cloudflare Access. Response order: missing OWN
+// secret → 503, bad bearer → 401, missing upstream config → 503 (config is
+// checked only AFTER authentication). Cache-Control: no-store is attached
+// centrally in fetch() for EVERY response on this path, including 415/404.
+const METRICS_UPSTREAM_TIMEOUT_MS = 10_000;
+const METRICS_UPSTREAM_BODY_CAP_BYTES = 256 * 1024; // 256 KiB
+const METRICS_REQUEST_BODY_CAP_BYTES = 1024; // authenticated ≠ exempt from body caps
+
+async function handleAdminMetrics(request: Request, env: Env): Promise<Response> {
+  if (!env.METRICS_ADMIN_SECRET) return error('Metrics endpoint not configured', 503);
+  if (!(await verifyBearerSecret(env.METRICS_ADMIN_SECRET, request.headers.get('Authorization')))) {
+    return error('Unauthorized', 401);
+  }
+  // Upstream config — after auth. The dataset name is validated BEFORE it may
+  // ever be substituted into a SQL template (unchecked concatenation is
+  // forbidden — see buildMetricsReportSql).
+  if (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN) {
+    return error('Metrics upstream not configured', 503);
+  }
+  if (typeof env.METRICS_DATASET !== 'string' || !METRICS_DATASET_RE.test(env.METRICS_DATASET)) {
+    return error('Metrics upstream not configured', 503);
+  }
+
+  const body = await readLimitedBody(request, METRICS_REQUEST_BODY_CAP_BYTES);
+  if ('tooLarge' in body) return body.tooLarge;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.text);
+  } catch {
+    return error('Invalid JSON', 400);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return error('Invalid body: must be a JSON object', 400);
+  }
+  const { report, hours } = parsed as { report?: unknown; hours?: unknown };
+  if (typeof report !== 'string' || !(METRICS_REPORTS as readonly string[]).includes(report)) {
+    return error('Unknown report', 400);
+  }
+  const effectiveHours = hours === undefined ? 24 : hours;
+  if (typeof effectiveHours !== 'number' || !Number.isInteger(effectiveHours)
+      || effectiveHours < 1 || effectiveHours > 168) {
+    return error('hours must be an integer in 1..168', 400);
+  }
+
+  const sql = buildMetricsReportSql(report as MetricsReport, env.METRICS_DATASET, effectiveHours);
+  let upstream: Response;
+  try {
+    upstream = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.CF_ANALYTICS_TOKEN}` },
+        body: sql,
+        signal: AbortSignal.timeout(METRICS_UPSTREAM_TIMEOUT_MS),
+      },
+    );
+  } catch {
+    return error('Metrics upstream unavailable', 503); // timeout / network
+  }
+  // Upstream body is NEVER proxied to the client — only the class and our own
+  // strings. Non-2xx → 502; oversized/malformed 2xx → 502.
+  if (!upstream.ok) return error('Metrics upstream error', 502);
+  let text: string | null;
+  try {
+    text = await readCappedText(upstream, METRICS_UPSTREAM_BODY_CAP_BYTES);
+  } catch {
+    return error('Metrics upstream unavailable', 503); // aborted mid-body = timeout
+  }
+  if (text === null) return error('Metrics upstream error', 502); // over the cap
+  // Every template ends in FORMAT JSON; the standard upstream document is
+  // {meta, data, rows} (L r17). ONE response shape — ours: {rows: data}.
+  let doc: unknown;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return error('Metrics upstream error', 502);
+  }
+  const data = (typeof doc === 'object' && doc !== null) ? (doc as { data?: unknown }).data : undefined;
+  if (!Array.isArray(data)) return error('Metrics upstream error', 502);
+  return json({ rows: data });
 }
 
 // ─── /check-registration ────────────────────────────────────────────
@@ -427,6 +579,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (typeof env.RECOVERY_HMAC_SECRET !== 'string' || env.RECOVERY_HMAC_SECRET.length < 16) {
     return error('Server misconfigured', 503);
   }
+
+  // Metrics emitter (PR-2). Telemetry is fail-closed / request path fail-open:
+  // a noop unless METRICS_ENABLED === 'true' AND the binding exists.
+  const emit = makeEmit(env);
 
   // 1. Read body under the configured cap (Content-Length pre-check included)
   const body = await readLimitedBody(request, maxBytes);
@@ -695,13 +851,16 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const checkResult: { status: string; txId?: string; committedAt?: number; postedAt?: number; token?: string } = await checkResp.json();
 
   let reserveToken: string;
+  // True only when the reservation came out of a /redrop (dead TX → new paid
+  // TX): a successful POST then additionally emits redrop_new_tx.
+  let viaRedrop = false;
 
   if (checkResult.status === 'exists') {
     // Already committed. Without recheck this is the idempotent happy path.
     if (!wantsRecheck) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
 
     // Recheck: is the committed TX still alive on-chain?
-    const live = await getTxStatusWorker(checkResult.txId!);
+    const live = await getTxStatusWorker(checkResult.txId!, emit);
     if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted', committed: true });
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
@@ -711,10 +870,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (rd.kind === 'resolved') return json({ txId: rd.txId, status: 'accepted', committed: true });
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
+    viaRedrop = true;
   } else if (checkResult.status === 'posted') {
     // POST succeeded but the commit was lost. Reconcile using the SERVER's txId
     // (never a client-supplied one), its CAS token, and the postedAt age guard.
-    const live = await getTxStatusWorker(checkResult.txId!);
+    const live = await getTxStatusWorker(checkResult.txId!, emit);
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (live === 'alive') {
       try {
@@ -731,6 +891,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (rd.kind === 'resolved') return json({ txId: rd.txId, status: 'accepted', committed: true });
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
+    viaRedrop = true;
   } else if (checkResult.status === 'reserved') {
     return error('Upload already in progress for this noteId', 409);
   } else if (checkResult.status === 'rate_limited') {
@@ -752,7 +913,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         // "Invalid recovery token" responses must carry the SAME code.
         return recoveryInvalid();
       }
-      const live = await getTxStatusWorker(recoveryHint.txId);
+      const live = await getTxStatusWorker(recoveryHint.txId, emit);
       if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
       if (live === 'alive') {
         try {
@@ -774,22 +935,39 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   // 11. Create + sign + post the Arweave TX. Any failure releases the reservation
   //     (quota is not spent, so the note can be retried) and returns 502.
+  //     PR-2: anchor and price are EXPLICIT (transport adapter) and handed to
+  //     createTransaction pre-loaded as {last_tx, reward} — the SDK makes no
+  //     hidden network calls. Status codes, safeRelease and error texts are
+  //     unchanged; the POST deliberately still has NO timeout (a response lost
+  //     to our own timeout would not prove the gateway rejected the TX — see
+  //     postSignedTx).
   let txId: string;
+  const transportDeps = { host: ARWEAVE_HOST, emit };
   try {
-    const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
-    const serverWallet = JSON.parse(env.ARWEAVE_JWK);
-    const tx = await arweave.createTransaction({ data }, serverWallet);
+    const arweave = getArweave();
+    const serverWallet = assertStructurallyCompleteJwk(env.ARWEAVE_JWK);
+    const last_tx = await getAnchor(transportDeps);
+    // Exactly the byte count the SDK itself would price — the UTF-8 length of
+    // the data string (arweave/node/common.js: stringToBuffer(data).byteLength).
+    // An underpriced reward is a network-rejected transaction.
+    const reward = await getPrice(new TextEncoder().encode(data).byteLength, transportDeps);
+    const tx = await arweave.createTransaction({ data, last_tx, reward }, serverWallet);
     for (const tag of tags) tx.addTag(tag.name, tag.value);
     await arweave.transactions.sign(tx, serverWallet);
-    const response = await arweave.transactions.post(tx);
+    const response = await postSignedTx(arweave, tx, transportDeps);
     if (response.status !== 200 && response.status !== 202) {
       await safeRelease(reserveToken);
+      emit('upload_outcome', ['arweave_error', declaredVersion], []);
       return error(`Arweave error: ${response.status}`, 502);
     }
+    // post_accepted = the gateway ACCEPTED the POST — before mark-posted/commit.
+    emit('post_accepted', [ARWEAVE_HOST], []);
+    if (viaRedrop) emit('redrop_new_tx', [ARWEAVE_HOST], []);
     txId = tx.id;
   } catch (e) {
     await safeRelease(reserveToken);
     console.error('ARWEAVE_POST_FAILED', noteId, e);
+    emit('upload_outcome', ['arweave_throw', declaredVersion], []);
     return error('Arweave upload failed', 502);
   }
 
@@ -820,7 +998,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  if (committed) return json({ txId, status: 'accepted', committed: true });
+  // upload_outcome=accepted fires ONLY on terminal returns of the PAID path —
+  // a 200 /upload after a POST actually performed by THIS request. Early
+  // returns (validation 4xx, kill switches, 429, idempotent hits,
+  // reconciliation without a new POST) deliberately emit nothing: the metric
+  // answers "how do paid publications end", not "how do requests end".
+  if (committed) {
+    emit('upload_outcome', ['accepted', declaredVersion], []);
+    return json({ txId, status: 'accepted', committed: true });
+  }
 
   // Not committed. If it's ANCHORED, the DO holds a `posted` record → the client
   // just keeps needsRecheck and reconciles server-side. If NOT anchored, the DO
@@ -828,9 +1014,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // prove this txId later instead of triggering a duplicate re-post.
   if (anchored) {
     console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
+    emit('upload_outcome', ['accepted', declaredVersion], []);
     return json({ txId, status: 'accepted', committed: false });
   }
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
+  emit('upload_outcome', ['accepted', declaredVersion], []);
   const recoveryToken = await signRecovery(env, noteId, txId, postedAt);
   if (recoveryToken === null) {
     // Unreachable: the step-0 gate 503s uploads without RECOVERY_HMAC_SECRET.
@@ -977,19 +1165,49 @@ async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: 
 /**
  * Server-side liveness check for a committed TX (recheck path). Maps the gateway
  * contract to a coarse verdict: 200/202 → alive, 404/400 → dead, else unknown.
+ * PR-2 wraps the SAME fetch in a stopwatch and emits gateway_call(status) +
+ * status_verdict; the verdict logic itself is unchanged (quorum is PR-3a).
  */
-async function getTxStatusWorker(txId: string): Promise<'alive' | 'dead' | 'unavailable'> {
+async function getTxStatusWorker(txId: string, emit: Emit): Promise<'alive' | 'dead' | 'unavailable'> {
+  const started = performance.now();
+  let r: Response;
   try {
-    const r = await fetch(`https://arweave.net/tx/${txId}/status`, {
+    r = await fetch(`https://${ARWEAVE_HOST}/tx/${txId}/status`, {
       method: 'GET',
       signal: AbortSignal.timeout(10_000),
     });
-    if (r.status === 200 || r.status === 202) return 'alive';
-    if (r.status === 404 || r.status === 400) return 'dead';
-    return 'unavailable';
-  } catch {
+  } catch (e) {
+    emit('gateway_call', ['status', ARWEAVE_HOST, classifyThrow(e)], [performance.now() - started]);
+    emit('status_verdict', ['unavailable', ARWEAVE_HOST], [-1]);
     return 'unavailable';
   }
+  emit('gateway_call', ['status', ARWEAVE_HOST, classifyStatus(r.status)], [performance.now() - started]);
+
+  // The verdict is decided by the HTTP code ALONE — exactly as before PR-2.
+  const verdict: 'alive' | 'dead' | 'unavailable' =
+    (r.status === 200 || r.status === 202) ? 'alive'
+      : (r.status === 404 || r.status === 400) ? 'dead'
+        : 'unavailable';
+
+  // number_of_confirmations (the exact Arweave field name, L r19) — a
+  // BEST-EFFORT read of the 200 body only: capped at 1 KiB under the fetch's
+  // own 10s AbortSignal; ANY parse failure (malformed, oversized, truncated,
+  // slow) yields −1 and NEVER changes the verdict.
+  let confirmations = -1;
+  if (r.status === 200) {
+    try {
+      const text = await readCappedText(r, 1024);
+      if (text !== null) {
+        const doc: unknown = JSON.parse(text);
+        const n = (typeof doc === 'object' && doc !== null)
+          ? (doc as { number_of_confirmations?: unknown }).number_of_confirmations
+          : undefined;
+        if (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0) confirmations = n;
+      }
+    } catch { /* −1 stands; the verdict is already fixed */ }
+  }
+  emit('status_verdict', [verdict, ARWEAVE_HOST], [confirmations]);
+  return verdict;
 }
 
 /**

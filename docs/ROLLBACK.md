@@ -1364,6 +1364,71 @@ expires.
   must ALSO take a coarse action: rotate `ADMIN_SECRET`/`ARWEAVE_JWK`, or
   disable the Worker route — do not rely on revoke alone.
 
+## PR-2 «Метрики» — transport adapter + Analytics Engine (worker-only)
+
+What ships: an explicit Arweave transport adapter
+(`worker/src/arweave-transport.ts` — anchor/price are explicit `fetch`es
+handed to the SDK pre-loaded, so `createTransaction` makes no hidden network
+calls), Analytics Engine events (schema and semantics: `docs/METRICS.md`),
+and `POST /admin/metrics` behind the DEDICATED `METRICS_ADMIN_SECRET`. The
+client is untouched.
+
+**Rollback = redeploy the previous worker.** Metrics simply stop being
+written. The external `/upload` request/response contract and the durable DO
+schema are UNCHANGED — the previous worker just returns the prior SDK
+transport (PR-2 does change the transport of the paid path; what stays
+invariant is the contract). No floor moves.
+
+**Release-notes honesty (P0 r18) — two known paid-path risks PR-2 does NOT
+close, stated plainly:**
+
+1. the ambiguous POST exception: a gateway-ACCEPTED transaction with a lost
+   response still ends in `safeRelease` and a possible second paid POST on a
+   client retry — closed only by durable same-signed-tx in PR-3b;
+2. the single-gateway `404/400 → dead` verdict from `arweave.net` alone —
+   closed only by the PR-3a status quorum.
+
+Pace (owner): after PR-2 merges, run one–two weeks of metrics, then PR-3a.
+
+### Operator provisioning (endpoint is 503 until then; writes work anyway)
+
+1. `wrangler secret put METRICS_ADMIN_SECRET` (dev; `--env staging` when
+   staging is provisioned). Generate: `openssl rand -base64 32`.
+2. Create the Analytics token in the Cloudflare dashboard — scope
+   **`Account → Account Analytics → Read`, this ONE account, nothing else**
+   (the scope honestly reads analytics of the whole account — see
+   `docs/SECRETS.md`). Then `wrangler secret put CF_ANALYTICS_TOKEN`.
+3. Fill `CF_ACCOUNT_ID` in `worker/wrangler.toml` `[vars]` (both blocks; the
+   same value as the Actions `CLOUDFLARE_ACCOUNT_ID` variable) and deploy.
+4. Verify:
+
+   ```bash
+   curl -sS -X POST https://<worker>/admin/metrics -H 'Content-Type: application/json' -H 'Authorization: Bearer <METRICS_ADMIN_SECRET>' -d '{"report":"gateway_health","hours":24}'
+   ```
+
+### Dev-smoke acceptance checklist (P2 r18 — mandatory after deploy)
+
+(a) a fresh paid upload passes (`smoke-v3.mjs` / `smoke-v4.mjs` +
+`smoke-target.mjs`); (b) an immediate REPEAT of the same request creates no
+second POST (check-and-reserve idempotency survived the refactor); (c) a
+separate signed request with `recheck: true` — the existing smokes never call
+`getTxStatusWorker`, so the status leg needs this extra step; the criterion
+is THE FACT of a status call, not its response code (an immediate recheck may
+legitimately answer 503 «Recheck deferred» — the status metric is already
+written); (d) `/admin/metrics` shows ALL FOUR legs (anchor/price/post from
+the smoke, status from the recheck). The SQL API is not strictly
+read-after-write: poll with backoff, ceiling ~2 min, then the smoke is RED —
+never an endless loop; (e) redeploy the PREVIOUS worker — an upload passes
+again (the rollback is rehearsed, not postulated).
+
+### Launch gate for the REAL production contour (M r19 — carry into part 2)
+
+The `.app` production does NOT open to users until PR-3a (status quorum
+instead of the single-gateway dead) AND the writer part of PR-3b (durable
+same-signed-tx) have closed both acknowledged paid-path risks above.
+«Well-worn on dev» is necessary but NOT sufficient. This gate must be copied
+into the `.app` provisioning runbook when part 2 of happy-toasting begins.
+
 ## Required secrets
 
 GitHub Actions: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
@@ -1376,3 +1441,6 @@ shorter than 16 characters (enforced in code). Generate once with
 `openssl rand -base64 32` and keep it STABLE — never rotate it together with
 `ARWEAVE_JWK` (outstanding recovery tokens would stop verifying and fail
 closed, blocking reconciliation until operator intervention).
+Since PR-2 additionally: `METRICS_ADMIN_SECRET` and `CF_ANALYTICS_TOKEN`
+(both OPTIONAL for uploads — only `/admin/metrics` 503s while they are
+missing; see the PR-2 section above and `docs/SECRETS.md`).
