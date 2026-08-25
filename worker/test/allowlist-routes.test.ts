@@ -13,7 +13,7 @@ const ALLOWLIST = (env as unknown as { ALLOWLIST: KVNamespace }).ALLOWLIST;
 const INVITE_MANAGER = (env as unknown as { INVITE_MANAGER: DurableObjectNamespace }).INVITE_MANAGER;
 
 const NOTE_ID = '11111111-2222-4333-8444-555555555555';
-const C = 'AAAA';
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA';
 
 function b64(bytes: Uint8Array): string {

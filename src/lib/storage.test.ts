@@ -121,24 +121,32 @@ describe('mergeRestoredNote (restore repair)', () => {
     expect((await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm4')?.txId).toBe('tx-m4');
   });
 
-  it('a reset landing INSIDE the merge (between the sync read and the write) writes nothing', async () => {
-    // The caller's pre-merge generation check cannot cover this: `await
-    // getSyncRecord()` is a real suspension point. Starting the merge and then
-    // resetting hits exactly that window — resetAll bumps the generation and
-    // creates its clear transaction while the merge is parked on the read.
+  it('a reset racing the merge resurrects nothing', async () => {
+    // The window this used to guard against no longer exists: the merge reads
+    // the row INSIDE the transaction it writes to, and `assertDbGeneration`
+    // sits immediately before `transaction(...)` with nothing awaited between
+    // them. A reset therefore either lands entirely before the merge starts
+    // (next test) or entirely after its transaction was created — and IndexedDB
+    // runs resetAll's clear AFTER that transaction, so the write is wiped.
+    //
+    // The invariant is about DATA, not about which mechanism fired.
     const gen = getDbGeneration();
-    // The handler is attached SYNCHRONOUSLY: the rejection lands during the
-    // resetAll below, and a bare pending promise would surface as an unhandled
-    // rejection before the assertion ever gets to look at it.
     const merge = mergeRestoredNote({ ...NOTE, noteId: 'm5' }, 'tx-m5', 100, gen)
       .then(() => null, (e: unknown) => e);
     await resetAll();
 
-    // Data first: «nothing was resurrected» is the invariant; the typed error
-    // is only the mechanism that enforces it.
     expect(await getNoteById('m5')).toBeUndefined();
     expect(await getAllSyncRecords()).toHaveLength(0);
-    expect(await merge).toBeInstanceOf(StorageResetError);
+    await merge; // never an unhandled rejection, whichever way it went
+  });
+
+  it('a merge started AFTER a reset is refused by the generation token', async () => {
+    const staleGen = getDbGeneration();
+    await resetAll(); // bumps the generation
+
+    await expect(mergeRestoredNote({ ...NOTE, noteId: 'm6' }, 'tx-m6', 100, staleGen))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await getNoteById('m6')).toBeUndefined();
   });
 });
 

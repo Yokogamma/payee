@@ -13,7 +13,8 @@ const NOW = 1_750_000_000_000;
 
 const NOTE: EncryptedNote = {
   noteId: 'note-1',
-  ciphertext: 'Y2lwaGVy',
+  // 16 bytes exactly: the GCM tag floor assertUploadableItem now enforces.
+  ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==',
   iv: 'AAAAAAAAAAAAAAAA', // canonical base64 of exactly 12 bytes
   createdAt: NOW - 60_000,
 };

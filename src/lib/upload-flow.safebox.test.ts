@@ -22,14 +22,15 @@ const IV12 = 'AAAAAAAAAAAAAAAA';
 
 const SB: EncryptedSafeboxEntry = {
   entryId: '11111111-2222-8333-8444-555555555555',
-  metaCiphertext: 'AAAA', metaIv: IV12,
-  secretCiphertext: 'BBBB', secretIv: IV12,
+  // 16 bytes each: the GCM tag floor assertUploadableItem now enforces.
+  metaCiphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', metaIv: IV12,
+  secretCiphertext: 'BBBBBBBBBBBBBBBBBBBBBB==', secretIv: IV12,
   createdAt: NOW - 60_000, v: 4,
 };
 const SB_ITEM: UploadItem = { kind: 'safebox', record: SB };
 const NOTE_ITEM: UploadItem = {
   kind: 'note',
-  record: { noteId: 'n1', ciphertext: 'Y2lwaGVy', iv: IV12, createdAt: NOW - 1000, v: 3 },
+  record: { noteId: 'n1', ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: IV12, createdAt: NOW - 1000, v: 3 },
 };
 
 const KEYS: UploadKeys = {
@@ -194,6 +195,12 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
       { metaIv: 'AAAA' },
       { secretCiphertext: '' },
       { createdAt: -1 },
+      // Valid base64, but shorter than the 128-bit GCM tag: provably not
+      // something AES-GCM produced. Both halves are checked.
+      { metaCiphertext: 'AAAA' },                        // 3 bytes
+      { secretCiphertext: 'AAAA' },                      // 3 bytes
+      { metaCiphertext: 'AAAAAAAAAAAAAAAAAAAA' },        // 15 bytes — one short
+      { secretCiphertext: 'AAAAAAAAAAAAAAAAAAAA' },      // 15 bytes — one short
     ];
     for (const patch of bad) {
       expect(() => assertUploadableItem({ kind: 'safebox', record: { ...SB, ...patch } }),
@@ -205,5 +212,22 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
     expect(() => assertUploadableItem({
       kind: 'note', record: { noteId: 'n', ciphertext: 'AAAA', iv: 'AAAA', createdAt: 1 },
     })).toThrow(MalformedRecordError);
+  });
+
+  it('a ciphertext shorter than the GCM tag is quarantined, never published', () => {
+    // The cost of getting this wrong is permanent: the record would be posted
+    // under its forever-idempotent noteId, paid for, and undecryptable by
+    // anyone including its owner. Valid base64 says nothing about being a
+    // cipher envelope, so 0-15 bytes must all fail.
+    const iv = 'AAAAAAAAAAAAAAAA';
+    for (const ciphertext of ['AAAA', 'AAAAAAAA', 'AAAAAAAAAAAAAAAAAAAA']) {
+      expect(() => assertUploadableItem({
+        kind: 'note', record: { noteId: 'n', ciphertext, iv, createdAt: 1 },
+      }), ciphertext).toThrow(MalformedRecordError);
+    }
+    // ...and exactly 16 bytes (an empty plaintext plus the tag) passes.
+    expect(() => assertUploadableItem({
+      kind: 'note', record: { noteId: 'n', ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv, createdAt: 1 },
+    })).not.toThrow();
   });
 });

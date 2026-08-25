@@ -743,7 +743,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return error('Invalid data structure: id (string) required', 400);
   }
 
-  /** ciphertext+iv pair: non-empty strings, valid base64, iv exactly 12 bytes. */
+  /** ciphertext+iv pair: non-empty strings, valid base64, iv exactly 12 bytes,
+   *  ciphertext at least the 16-byte GCM tag. The last check is not cosmetic:
+   *  a shorter blob is provably not AES-GCM output, and posting it would burn a
+   *  paid, permanent transaction under this record's forever-idempotent id on
+   *  bytes nobody can ever decrypt. The client refuses the same shape
+   *  (upload-flow.ts assertCiphertext) — this side must not depend on it. */
   const checkEnvelope = (cName: string, cVal: unknown, ivName: string, ivVal: unknown): Response | null => {
     if (typeof cVal !== 'string' || typeof ivVal !== 'string') {
       return error(`Invalid data structure: ${cName}, ${ivName} (strings) required`, 400);
@@ -752,11 +757,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       return error(`Invalid data: ${cName} and ${ivName} must be non-empty`, 400);
     }
     let bytes: Uint8Array;
+    let cipherBytes: Uint8Array;
     try {
       bytes = base64ToBytes(ivVal);
-      base64ToBytes(cVal); // validate base64
+      cipherBytes = base64ToBytes(cVal);
     } catch {
       return error(`Invalid data: ${cName} and ${ivName} must be base64`, 400);
+    }
+    if (cipherBytes.length < 16) {
+      return error(`Invalid data: ${cName} must be at least 16 bytes (GCM tag)`, 400);
     }
     if (bytes.length !== 12) return error(`Invalid data: ${ivName} must be 12 bytes`, 400);
     return null;

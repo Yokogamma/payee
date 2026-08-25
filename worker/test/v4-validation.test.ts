@@ -55,8 +55,8 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
 
 const ID_V8 = '11111111-2222-8333-8444-555555555555';  // UUIDv8 (v3/v4 namespace)
 const ID_V4 = '11111111-2222-4333-8444-555555555555';  // UUIDv4 (v1/v2 namespace)
-const MC = 'AAAAAAAA';                 // valid base64
-const SC = 'BBBBBBBB';                 // valid base64
+const MC = 'QUFBQUFBQUFBQUFBQUFBQQ=='; // 16 bytes                 // valid base64
+const SC = 'QkJCQkJCQkJCQkJCQkJCQg=='; // 16 bytes                 // valid base64
 const IV12 = 'AAAAAAAAAAAAAAAA';       // valid base64, exactly 12 bytes
 const IV3 = 'AAAA';                    // valid base64, 3 bytes
 
@@ -134,6 +134,21 @@ describe('upload validation: App-Version=4 (safebox split envelope)', () => {
     const r = await upload(v4Tags(), { ...v4Data(), sc: '' }, nextIp());
     expect(r.status).toBe(400);
     expect(await r.text()).toMatch(/sc and siv must be non-empty/);
+  });
+
+  it('rejects a ciphertext shorter than the GCM tag — BOTH halves', async () => {
+    // Same reasoning as the note path, applied to each half independently: a
+    // v4 record with a well-formed meta blob and a stub secret blob must never
+    // reach the chain.
+    for (const short of ['AAAA', 'AAAAAAAAAAAAAAAAAAAA']) { // 3 and 15 bytes
+      const meta = await upload(v4Tags(), { ...v4Data(), mc: short }, nextIp());
+      expect(meta.status, `mc ${short}`).toBe(400);
+      expect(await meta.text()).toMatch(/mc must be at least 16 bytes/);
+
+      const secret = await upload(v4Tags(), { ...v4Data(), sc: short }, nextIp());
+      expect(secret.status, `sc ${short}`).toBe(400);
+      expect(await secret.text()).toMatch(/sc must be at least 16 bytes/);
+    }
   });
 
   it('rejects a non-string secret ciphertext', async () => {
