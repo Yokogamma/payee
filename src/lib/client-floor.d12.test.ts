@@ -12,6 +12,7 @@ import {
   mergeRestoredNote,
   mergeRestoredSafeboxEntry,
   getDbGeneration,
+  beginUploadUnlessTerminal,
   StorageResetError,
   STALE_UPLOADING_MS,
   type SyncRecord,
@@ -254,5 +255,72 @@ describe('why the client floor exists: the PRE-D12 writer against the new storag
 
     expect((await getNoteById('n-1'))?.ciphertext).toBe(noteB.ciphertext);
     expect((await getSyncRecord('n-1'))?.txId).toBe('tx-B');
+  });
+});
+
+describe('D12 — the freshness check and the write cannot be separated', () => {
+  // Reading the row before the transaction used to leave a window: another tab
+  // could begin an upload in it, and the merge would overwrite both the bytes
+  // and that row anyway. The late answer would still be dropped by the
+  // attempt-CAS, but the request had already gone out against bytes the store
+  // no longer held — a possible second paid publication and a DO that
+  // disagrees with the device.
+  //
+  // IndexedDB runs readwrite transactions with overlapping scope in CREATION
+  // order, and both writers now create theirs synchronously on entry, so the
+  // interleaving is decided by call order and both directions are checked.
+  it.each(['begin-first', 'merge-first'] as const)('order «%s»', async order => {
+    await saveNoteWithSync(noteA, {
+      noteId: 'n-1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
+    });
+    const begin = () => beginUploadUnlessTerminal('n-1', { kind: 'note', record: noteA }, NOW);
+    const merge = () => mergeRestoredNote(noteB, 'tx-B', NOW, getDbGeneration());
+
+    let began: Awaited<ReturnType<typeof beginUploadUnlessTerminal>>;
+    let merged: Awaited<ReturnType<typeof mergeRestoredNote>>;
+    if (order === 'begin-first') {
+      [began, merged] = await Promise.all([begin(), merge()]);
+    } else {
+      const [m, b] = await Promise.all([merge(), begin()]);
+      merged = m;
+      began = b;
+    }
+
+    if (order === 'begin-first') {
+      // The upload owns the row, so the merge defers and touches nothing.
+      expect(began.ok).toBe(true);
+      expect(merged).toBe('deferred');
+      expect((await getNoteById('n-1'))?.ciphertext).toBe(noteA.ciphertext);
+      expect((await getSyncRecord('n-1'))?.status).toBe('uploading');
+    } else {
+      // The merge won, so the payload-CAS refuses the attempt: no HTTP is
+      // dispatched against bytes that are no longer there.
+      expect(merged).toBe('merged');
+      expect(began).toEqual({ ok: false, reason: 'stale' });
+      expect((await getNoteById('n-1'))?.ciphertext).toBe(noteB.ciphertext);
+      expect((await getSyncRecord('n-1'))?.status).toBe('confirmed');
+    }
+  });
+
+  it('in NEITHER order does an upload start against bytes the merge replaced', async () => {
+    // The property both branches above encode, stated once on its own: an
+    // attempt either owns the record (and the merge steps aside) or is refused.
+    for (const order of ['begin-first', 'merge-first'] as const) {
+      await resetAll();
+      await saveNoteWithSync(noteA, {
+        noteId: 'n-1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
+      });
+      const begin = () => beginUploadUnlessTerminal('n-1', { kind: 'note', record: noteA }, NOW);
+      const merge = () => mergeRestoredNote(noteB, 'tx-B', NOW, getDbGeneration());
+      const [first, second] = order === 'begin-first'
+        ? await Promise.all([begin(), merge()])
+        : await Promise.all([merge(), begin()]);
+      const began = (order === 'begin-first' ? first : second) as
+        Awaited<ReturnType<typeof beginUploadUnlessTerminal>>;
+
+      const stored = (await getNoteById('n-1'))!.ciphertext;
+      // If the attempt started, the stored bytes must still be the ones it signed.
+      if (began.ok) expect(stored).toBe(noteA.ciphertext);
+    }
   });
 });

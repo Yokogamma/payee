@@ -131,13 +131,24 @@ function assertIv12(value: unknown, field: string): void {
   if (bytes.byteLength !== 12) throw new MalformedRecordError(`${field} length`);
 }
 
+/** AES-GCM output is plaintext + a 128-bit tag, so ANY genuine ciphertext this
+ *  app produces is at least 16 bytes — an empty plaintext still carries the
+ *  tag. */
+const GCM_TAG_BYTES = 16;
+
 function assertCiphertext(value: unknown, field: string): void {
   if (typeof value !== 'string' || value.length === 0) throw new MalformedRecordError(field);
+  let bytes: Uint8Array;
   try {
-    base64ToBuffer(value);
+    bytes = base64ToBuffer(value);
   } catch {
     throw new MalformedRecordError(`${field} base64`);
   }
+  // Shorter than the tag = provably not something AES-GCM produced. Without
+  // this the row passes validation and gets PUBLISHED under a permanent,
+  // per-id idempotency — paid, irreversible, and undecryptable forever. Being
+  // valid base64 says nothing about being a cipher envelope.
+  if (bytes.byteLength < GCM_TAG_BYTES) throw new MalformedRecordError(`${field} length`);
 }
 
 /**

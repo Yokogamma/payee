@@ -378,6 +378,22 @@ export async function saveNoteWithSync(
   }
 }
 
+/** The per-reason quarantine decision, as a PURE function of the row that was
+ *  read inside the writer's transaction. Pure so the merge below can make every
+ *  decision from ONE in-transaction read instead of reading twice. */
+function resolveRestoreQuarantine(
+  fresh: SyncRecord | undefined,
+  record: SyncRecord,
+): SyncRecord {
+  if (fresh?.terminalError === undefined) return record;
+  if (fresh.terminalError === 'recovery_invalidated') {
+    const cleared = { ...record };
+    delete cleared.terminalError;
+    return cleared;
+  }
+  return { ...record, terminalError: fresh.terminalError };
+}
+
 /** The per-reason quarantine decision shared by both restore writers. Runs on
  *  the row re-read INSIDE the caller's transaction (TOCTOU-safe: a quarantine
  *  set after the caller's preliminary read still wins/clears correctly). */
@@ -386,13 +402,61 @@ async function applyRestoreQuarantineRule(
   record: SyncRecord,
 ): Promise<SyncRecord> {
   const fresh = normalizeSyncRecord(await syncStore.get(record.noteId) as SyncRecord | undefined);
-  if (fresh?.terminalError === undefined) return record;
-  if (fresh.terminalError === 'recovery_invalidated') {
-    const cleared = { ...record };
-    delete cleared.terminalError;
-    return cleared;
+  return resolveRestoreQuarantine(fresh, record);
+}
+
+/**
+ * The D12 merge itself: ONE readwrite transaction over the payload store and
+ * `sync`, in which the row is read ONCE and every decision is made from that
+ * read — «is an attempt live?», «does the existing confirmed row name this
+ * transaction?» and the per-reason quarantine rule alike.
+ *
+ * Reading the row BEFORE the transaction (as this used to) is a TOCTOU window
+ * with real consequences: between that read and the write, another tab can
+ * begin an upload and stamp the row with its `attemptId`. The merge would then
+ * overwrite both the payload and that row — the late answer is still discarded
+ * by the attempt-CAS, but the HTTP request has already gone out against bytes
+ * the store no longer holds, which can mean a second paid publication and a DO
+ * that disagrees with the device. Deferring is only meaningful if the check and
+ * the write cannot be separated.
+ *
+ * CONTRACT, same as save*WithSync: `assertDbGeneration` and the transaction
+ * creation are adjacent and synchronous. An await between them silently
+ * reopens the reset-resurrection window.
+ */
+async function mergeRestoredPair(
+  payloadStore: 'notes' | 'safebox',
+  kind: SyncRecord['kind'],
+  id: string,
+  payload: EncryptedNote | EncryptedSafeboxEntry,
+  txId: string,
+  now: number,
+  expectedDbGeneration: number,
+): Promise<MergeRestoredOutcome> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction([payloadStore, 'sync'], 'readwrite');
+  try {
+    const syncStore = tx.objectStore('sync');
+    const fresh = normalizeSyncRecord(await syncStore.get(id) as SyncRecord | undefined);
+    if (isFreshUploading(fresh, now)) {
+      await tx.done;
+      return 'deferred'; // a live attempt owns these bytes — touch nothing
+    }
+    const record: SyncRecord = fresh?.status === 'confirmed' && fresh.txId === txId
+      ? fresh
+      : { noteId: id, kind, txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+
+    await tx.objectStore(payloadStore).put(payload);
+    await syncStore.put(resolveRestoreQuarantine(fresh, record));
+    await tx.done;
+    return 'merged';
+  } catch (e) {
+    // Same rollback discipline as save*WithSync: an error on the SECOND put
+    // must not let the transaction auto-commit with only the payload written.
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
   }
-  return { ...record, terminalError: fresh.terminalError };
 }
 
 /**
@@ -431,6 +495,11 @@ export type MergeRestoredOutcome = 'merged' | 'deferred';
  * because the attempt-CAS (D14a) drops the late answer: time alone proves
  * nothing about a POST that has no timeout.
  *
+ * All three decisions are made INSIDE one transaction, from ONE read of the
+ * row (mergeRestoredPair). Checking «is an attempt live?» before the
+ * transaction would leave a window in which another tab starts an upload and
+ * this merge overwrites it anyway.
+ *
  * UI visibility is the CALLER's decision (against the currently-decrypted note
  * list, not DB presence — a corrupted-but-present note is invisible in the UI).
  */
@@ -440,19 +509,7 @@ export async function mergeRestoredNote(
   now: number,
   expectedDbGeneration: number,
 ): Promise<MergeRestoredOutcome> {
-  const sync = await getSyncRecord(note.noteId);
-  if (isFreshUploading(sync, now)) return 'deferred'; // D12 — live attempt owns these bytes
-  const record: SyncRecord = sync?.status === 'confirmed' && sync.txId === txId
-    ? sync
-    : { noteId: note.noteId, kind: 'note', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
-  // The CALLER's pre-merge check is not enough (P1): the getSyncRecord await
-  // above is a real suspension point, and a reset landing inside it would create
-  // its clear transaction BEFORE the write below — resurrecting the note in a
-  // database the user just wiped. Re-assert here, with nothing awaited between
-  // this line and the transaction saveNoteWithSync creates on entry.
-  assertDbGeneration(expectedDbGeneration);
-  await saveNoteWithSync(note, record);
-  return 'merged';
+  return mergeRestoredPair('notes', 'note', note.noteId, note, txId, now, expectedDbGeneration);
 }
 
 /** Get all notes sorted by createdAt DESC (newest first) */
@@ -531,15 +588,7 @@ export async function mergeRestoredSafeboxEntry(
   now: number,
   expectedDbGeneration: number,
 ): Promise<MergeRestoredOutcome> {
-  const sync = await getSyncRecord(entry.entryId);
-  if (isFreshUploading(sync, now)) return 'deferred'; // D12 — live attempt owns these bytes
-  const record: SyncRecord = sync?.status === 'confirmed' && sync.txId === txId
-    ? sync
-    : { noteId: entry.entryId, kind: 'safebox', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
-  // Same P1 window as mergeRestoredNote — see the comment there.
-  assertDbGeneration(expectedDbGeneration);
-  await saveSafeboxEntryWithSync(entry, record);
-  return 'merged';
+  return mergeRestoredPair('safebox', 'safebox', entry.entryId, entry, txId, now, expectedDbGeneration);
 }
 
 /** The safebox PIN configuration was replaced or removed between the start of

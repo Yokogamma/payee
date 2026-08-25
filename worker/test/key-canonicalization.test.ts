@@ -78,7 +78,7 @@ describe('canonical public-key enforcement', () => {
     const ownerHash = b64(await sha256(pub));
     const noteId = '99999999-1111-4222-8333-444444444444';
     const r = await signedFetch('/upload', nonCanonical, priv, {
-      data: JSON.stringify({ id: noteId, c: 'AAAA', iv: 'AAAAAAAAAAAAAAAA' }),
+      data: JSON.stringify({ id: noteId, c: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: 'AAAAAAAAAAAAAAAA' }),
       tags: [
         { name: 'App-Name', value: 'EternalNotes' },
         { name: 'App-Version', value: '2' },

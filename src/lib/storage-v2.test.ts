@@ -162,20 +162,27 @@ describe('safebox store helpers', () => {
     expect(rec).toMatchObject({ status: 'confirmed', txId: 'TX-NEW', kind: 'safebox' });
   });
 
-  it('a reset landing INSIDE the merge (between the sync read and the write) writes nothing', async () => {
-    // Same window as the note merge — see storage.test.ts. Split by store on
+  it('a reset racing the merge resurrects nothing', async () => {
+    // Same reasoning as the note merge — see storage.test.ts. Split by store on
     // purpose: the sweep's notes loop returns on the mismatch and never reaches
     // the safebox loop, so only a safebox-only case exercises this guard.
     const gen = getDbGeneration();
-    // Handler attached synchronously — see the note in storage.test.ts.
     const merge = mergeRestoredSafeboxEntry(entry(ID), 'TX-RACE', 50, gen)
       .then(() => null, (e: unknown) => e);
     await resetAll();
 
-    // Data first — see the note in storage.test.ts.
     expect(await countSafeboxEntries()).toBe(0);
     expect(await getSyncRecord(ID)).toBeUndefined();
-    expect(await merge).toBeInstanceOf(StorageResetError);
+    await merge;
+  });
+
+  it('a merge started AFTER a reset is refused by the generation token', async () => {
+    const staleGen = getDbGeneration();
+    await resetAll();
+
+    await expect(mergeRestoredSafeboxEntry(entry(ID), 'TX-RACE', 50, staleGen))
+      .rejects.toBeInstanceOf(StorageResetError);
+    expect(await countSafeboxEntries()).toBe(0);
   });
 
   it('resetAll clears the safebox store too', async () => {

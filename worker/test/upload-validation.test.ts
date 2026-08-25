@@ -56,7 +56,7 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
 
 const NOTE_ID = '11111111-2222-4333-8444-555555555555';    // valid UUIDv4 shape
 const NOTE_ID_V8 = '11111111-2222-8333-8444-555555555555'; // valid UUIDv8 shape (v3 namespace)
-const C = 'AAAA';                 // valid base64 (3 bytes)
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA';    // valid base64, exactly 12 bytes
 
 function v1Tags(): Tag[] {
@@ -228,6 +228,24 @@ describe('upload validation: version contract (v1/v2)', () => {
     const r = await upload(v2Tags(), { id: NOTE_ID, c: C, iv: 'AAAA' }, nextIp()); // 3 bytes
     expect(r.status).toBe(400);
     expect(await r.text()).toMatch(/iv must be 12 bytes/);
+  });
+
+  it('rejects a ciphertext shorter than the GCM tag — valid base64 is not enough', async () => {
+    // AES-GCM output is plaintext + a 128-bit tag, so 0-15 bytes is provably
+    // not a cipher envelope. Accepting one would burn a PAID, permanent
+    // transaction under this record's forever-idempotent Note-Id on bytes
+    // nobody can ever decrypt. The client refuses the same shape; this side
+    // must not depend on that.
+    for (const c of ['AAAA', 'AAAAAAAA', 'AAAAAAAAAAAAAAAAAAAA']) { // 3, 6, 15 bytes
+      const r = await upload(v2Tags(), { id: NOTE_ID, c, iv: IV }, nextIp());
+      expect(r.status, c).toBe(400);
+      expect(await r.text()).toMatch(/c must be at least 16 bytes/);
+    }
+  });
+
+  it('accepts exactly 16 bytes — an empty plaintext still carries the tag', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: IV }, nextIp());
+    expect(r.status).not.toBe(400);
   });
 
   it('rejects null data', async () => {
