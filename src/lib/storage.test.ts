@@ -19,6 +19,7 @@ import {
   clearPinConfigMeta,
   getDbGeneration,
   StorageResetError,
+  DB_VERSION,
   type SyncRecord,
 } from './storage';
 
@@ -96,18 +97,21 @@ describe('mergeRestoredNote (restore repair)', () => {
     expect((await getRecordsByStatus('confirmed')).some(r => r.noteId === 'm2')).toBe(true);
   });
 
-  it('REPAIRS a corrupted local payload even when the sync record is already confirmed', async () => {
+  it('REPAIRS a corrupted local payload and keeps the confirmed record naming the SAME tx', async () => {
     // Local ciphertext rotted (undecryptable) but sync says confirmed — restore
-    // must replace the payload with the known-good on-chain copy while keeping
-    // the ORIGINAL confirmed record (txId untouched).
+    // replaces the payload with the known-good on-chain copy and keeps the
+    // ORIGINAL confirmed record, because it names the transaction being merged.
+    // A DIFFERENT txId no longer survives (D12: the pair moves together) —
+    // both directions live in client-floor.d12.test.ts.
     await saveNoteWithSync({ noteId: 'm3', ciphertext: 'CORRUPTED', iv: 'iv', createdAt: 1 },
       { noteId: 'm3', kind: 'note', txId: 'tx-old', status: 'confirmed', transport: 'proxy', updatedAt: 1 });
 
-    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-new', 100, getDbGeneration());
+    await mergeRestoredNote({ noteId: 'm3', ciphertext: 'GOOD-ONCHAIN', iv: 'iv2', createdAt: 1 }, 'tx-old', 100, getDbGeneration());
 
     expect((await getNoteById('m3'))?.ciphertext).toBe('GOOD-ONCHAIN'); // payload repaired
     const rec = (await getRecordsByStatus('confirmed')).find(r => r.noteId === 'm3');
-    expect(rec?.txId).toBe('tx-old'); // original confirmed record preserved
+    expect(rec?.txId).toBe('tx-old');
+    expect(rec?.updatedAt).toBe(1); // original record preserved as-is
   });
 
   it('upgrades a non-terminal sync record (e.g. error) to confirmed', async () => {
@@ -151,7 +155,7 @@ describe('recoverStorage', () => {
 
   it('waits out a blocking tab (onBlocked fires) and completes once it closes — never pretends cancelled', async () => {
     // Simulate another tab: an independent connection that ignores versionchange.
-    const otherTab = await openDB('eternal-notes', 2);
+    const otherTab = await openDB('eternal-notes', DB_VERSION);
 
     let blockedSignalled = false;
     const recovery = recoverStorage({ onBlocked: () => { blockedSignalled = true; } });
@@ -282,14 +286,35 @@ import {
 } from './storage';
 
 describe('commitV3PausedFailure (atomic sync+meta)', () => {
+  /** The row this attempt owns. The record half is attempt-scoped (D14a), so
+   *  every case that expects a WRITE has to start from a row stamped with the
+   *  attemptId it commits under. */
+  const owning = (noteId: string, attemptId: string): SyncRecord => ({
+    noteId, kind: 'note', status: 'uploading', transport: 'proxy', updatedAt: 1, attemptId,
+  });
+
   it('a successful commit writes the SyncRecord AND the pause marker together', async () => {
     const record: SyncRecord = {
       noteId: 'p1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 5,
       lastError: 'v3_uploads_disabled',
     };
-    await commitV3PausedFailure('p1', () => record, 12345);
+    await setSyncRecord(owning('p1', 'A1'));
+    await commitV3PausedFailure('p1', 'A1', () => record, 12345);
     expect(await getSyncRecord('p1')).toEqual(record);
     expect(await readV3PauseMeta()).toEqual({ pausedAt: 12345 });
+  });
+
+  it('a row owned by ANOTHER attempt is NOT overwritten — but the pause marker IS set', async () => {
+    // The late answer of a hung attempt: someone else has taken the row over.
+    // The record must not move, yet the worker's kill switch is real and the
+    // marker is version-global state, not state about this attempt.
+    const takenOver = owning('p1x', 'A-other');
+    await setSyncRecord(takenOver);
+    await commitV3PausedFailure('p1x', 'A-mine', () => ({
+      noteId: 'p1x', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 9,
+    }), 555);
+    expect(await getSyncRecord('p1x')).toEqual(takenOver);
+    expect(await readV3PauseMeta()).toEqual({ pausedAt: 555 });
   });
 
   it('preserves txId/recovery/needsRecheck fields on the committed record', async () => {
@@ -298,7 +323,8 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
       updatedAt: 5, needsRecheck: true,
       recovery: { txId: 'TX-KEEP', postedAt: 1, token: 'tok' },
     };
-    await commitV3PausedFailure('p2', () => record, 1);
+    await setSyncRecord(owning('p2', 'A2'));
+    await commitV3PausedFailure('p2', 'A2', () => record, 1);
     const stored = await getSyncRecord('p2');
     expect(stored?.txId).toBe('TX-KEEP');
     expect(stored?.needsRecheck).toBe(true);
@@ -307,11 +333,11 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
 
   it('the builder receives the FRESH row from inside the transaction', async () => {
     const prior: SyncRecord = {
-      noteId: 'p2f', kind: 'note', txId: 'TX-FRESH', status: 'accepted',
-      transport: 'proxy', updatedAt: 5,
+      noteId: 'p2f', kind: 'note', txId: 'TX-FRESH', status: 'uploading',
+      transport: 'proxy', updatedAt: 5, attemptId: 'A3',
     };
     await setSyncRecord(prior);
-    await commitV3PausedFailure('p2f', fresh => ({
+    await commitV3PausedFailure('p2f', 'A3', fresh => ({
       noteId: 'p2f', kind: 'note', txId: fresh?.txId, status: 'error',
       transport: 'proxy', updatedAt: 6,
     }), 2);
@@ -324,7 +350,7 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
       updatedAt: 5, terminalError: 'recovery_invalidated',
     };
     await setSyncRecord(quarantined);
-    await commitV3PausedFailure('p2q', () => ({
+    await commitV3PausedFailure('p2q', 'A4', () => ({
       noteId: 'p2q', kind: 'note', status: 'error', transport: 'proxy', updatedAt: 9,
     }), 42);
     // The record half is terminal-preserving (monotone quarantine)…
@@ -336,7 +362,8 @@ describe('commitV3PausedFailure (atomic sync+meta)', () => {
   it('aborts BOTH writes when the record is invalid (rollback, no half-commit)', async () => {
     // sync store keyPath is noteId — a record without it fails the first put.
     const bad = { kind: 'note', status: 'error', transport: 'proxy', updatedAt: 5 } as unknown as SyncRecord;
-    await expect(commitV3PausedFailure('missing-key', () => bad, 777)).rejects.toBeDefined();
+    await setSyncRecord(owning('missing-key', 'A5'));
+    await expect(commitV3PausedFailure('missing-key', 'A5', () => bad, 777)).rejects.toBeDefined();
     expect(await readV3PauseMeta()).toBeNull(); // pause marker NOT written
   });
 });

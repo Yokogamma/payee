@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runUploadAttempt, type UploadAttemptDeps, type UploadKeys } from './upload-flow';
+import { runUploadAttempt, uploadItemId, type UploadAttemptDeps, type UploadKeys } from './upload-flow';
 import { toUploading } from './sync-transitions';
 import type { UploadResult } from './arweave';
 import type { SyncRecord } from './storage';
@@ -36,6 +36,9 @@ interface Harness {
   pausedCommits: Array<{ record: SyncRecord; pausedAt: number }>;
   /** Result commits REFUSED because the fresh row was quarantined. */
   blockedCommits: number;
+  /** Result commits REFUSED because the fresh row belongs to another attempt
+   *  (D14a) — a late answer arriving after someone else took the row over. */
+  staleCommits: number;
   /** The in-memory sync row — the «fresh» source every commit re-reads,
    *  faithfully mirroring the storage primitives' contract. */
   row: { value: SyncRecord | undefined };
@@ -57,14 +60,22 @@ function makeHarness(opts?: {
   quarantineDuringSign?: NonNullable<SyncRecord['terminalError']>;
   /** another tab quarantines the row while the HTTP request is in flight */
   quarantineDuringDispatch?: NonNullable<SyncRecord['terminalError']>;
+  /** a restore/import replaced the stored payload between the queue snapshot
+   *  and the atomic begin — the payload-CAS must refuse (D14) */
+  payloadChangedBeforeBegin?: boolean;
+  /** another writer takes the record over WHILE the request is in flight,
+   *  leaving exactly what an import's rule 3 leaves: a minimal retryable row
+   *  with no attempt owner. The late answer must not land on it (D14a). */
+  takeoverDuringDispatch?: boolean;
 }): Harness {
   const epoch = { value: 1 };
+  let attemptCounter = 0;
   const writes: SyncRecord[] = [];
   const pausedCommits: Array<{ record: SyncRecord; pausedAt: number }> = [];
   const row: { value: SyncRecord | undefined } = { value: opts?.prev };
   const h: Harness = {
     deps: null as unknown as UploadAttemptDeps,
-    writes, pausedCommits, blockedCommits: 0, row, httpCalls: 0, epoch,
+    writes, pausedCommits, blockedCommits: 0, staleCommits: 0, row, httpCalls: 0, epoch,
   };
   const quarantineRow = (reason: NonNullable<SyncRecord['terminalError']>) => {
     row.value = {
@@ -77,16 +88,26 @@ function makeHarness(opts?: {
     now: () => NOW,
     currentEpoch: () => epoch.value,
     getSyncRecord: async () => row.value,
-    beginUpload: async (noteId, kind, now) => {
-      if (row.value?.terminalError !== undefined) return false;
-      row.value = toUploading(noteId, kind, row.value, now);
+    // Mirrors storage.beginUploadUnlessTerminal: quarantine guard, then the
+    // payload-CAS against the SNAPSHOT (D14), then the attempt stamp (D14a).
+    beginUpload: async (queued, now) => {
+      if (row.value?.terminalError !== undefined) return { ok: false, reason: 'blocked' as const };
+      if (opts?.payloadChangedBeforeBegin) return { ok: false, reason: 'stale' as const };
+      const attemptId = `attempt-${++attemptCounter}`;
+      row.value = toUploading(uploadItemId(queued), queued.kind, row.value, now, attemptId);
       writes.push(row.value);
       if (opts?.lockDuringToUploading) epoch.value++;
-      return true;
+      return { ok: true as const, attemptId };
     },
-    commitResult: async (_noteId, build) => {
+    // Mirrors storage.commitUploadResultIfAttempt: quarantine reported first,
+    // then the attempt check — both refuse before `build` runs.
+    commitResult: async (_noteId, attemptId, build) => {
       if (row.value?.terminalError !== undefined) {
         h.blockedCommits++;
+        return;
+      }
+      if (row.value?.attemptId !== attemptId) {
+        h.staleCommits++;
         return;
       }
       const next = build(row.value);
@@ -95,19 +116,25 @@ function makeHarness(opts?: {
         writes.push(next);
       }
     },
-    commitV3PausedFailure: async (_noteId, build, pausedAt) => {
-      // Marker unconditional, record terminal-preserving — like the real one.
+    commitV3PausedFailure: async (_noteId, attemptId, build, pausedAt) => {
+      // Marker unconditional; the RECORD half is terminal-preserving AND
+      // attempt-scoped — like the real one.
       if (row.value?.terminalError !== undefined) {
         h.blockedCommits++;
         pausedCommits.push({ record: row.value, pausedAt });
+        return;
+      }
+      if (row.value?.attemptId !== attemptId) {
+        h.staleCommits++;
+        pausedCommits.push({ record: row.value!, pausedAt });
         return;
       }
       const rec = build(row.value);
       row.value = rec;
       pausedCommits.push({ record: rec, pausedAt });
     },
-    commitV4PausedFailure: async (noteId, build, pausedAt) => {
-      await h.deps.commitV3PausedFailure(noteId, build, pausedAt);
+    commitV4PausedFailure: async (noteId, attemptId, build, pausedAt) => {
+      await h.deps.commitV3PausedFailure(noteId, attemptId, build, pausedAt);
     },
     signPayload: async () => {
       if (opts?.lockDuringSign) epoch.value++;
@@ -118,6 +145,12 @@ function makeHarness(opts?: {
       h.httpCalls++;
       if (opts?.lockDuringDispatch) epoch.value++;
       if (opts?.quarantineDuringDispatch) quarantineRow(opts.quarantineDuringDispatch);
+      if (opts?.takeoverDuringDispatch) {
+        row.value = {
+          noteId: 'note-1', kind: 'note', status: 'error',
+          transport: 'proxy', updatedAt: NOW,
+        };
+      }
       return opts?.result ?? ACCEPTED;
     },
   };
@@ -360,5 +393,101 @@ describe('runUploadAttempt — recovery_invalid → терминальный к�
     await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(h.blockedCommits).toBe(1);
     expect(h.row.value?.terminalError).toBe('unsupported_version'); // первая причина стоит
+  });
+});
+
+// ─── D14 / D14a: the two CAS guards, seen from the attempt state machine ─────
+
+describe('D14 — a snapshot the store no longer holds is never dispatched', () => {
+  it('the atomic begin refuses with «stale»: no HTTP, no writes', async () => {
+    const h = makeHarness({
+      prev: { noteId: 'note-1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1 },
+      payloadChangedBeforeBegin: true,
+    });
+
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    expect(outcome).toEqual({ kind: 'stale' });
+    expect(h.httpCalls).toBe(0);
+    expect(h.writes).toEqual([]);
+    expect(h.row.value?.status).toBe('error'); // the row keeps its previous state
+  });
+});
+
+describe('D14a — a late answer never lands on a row this attempt no longer owns', () => {
+  /** Every branch that persists something. The scenario is identical in each:
+   *  the request is in flight, another writer normalizes the row (exactly what
+   *  an import leaves — a minimal retryable row with no attempt owner), and the
+   *  answer finally arrives. Covering ONLY the successful branch would be
+   *  useless: an `in_progress`, a quarantine verdict or a 5xx written onto
+   *  someone else's row is the same defect with a different value. */
+  const BRANCHES: ReadonlyArray<{
+    name: string;
+    result: UploadResult;
+    prev?: SyncRecord;
+    paused?: 'v3' | 'v4';
+  }> = [
+    { name: 'accepted', result: ACCEPTED },
+    {
+      name: 'in_progress WITH a prior txId (restores accepted)',
+      result: { kind: 'in_progress', error: '409' },
+      prev: { noteId: 'note-1', kind: 'note', txId: 'TX-OLD', status: 'accepted', transport: 'proxy', updatedAt: NOW - 1 },
+    },
+    { name: 'in_progress WITHOUT one (falls back to a failure)', result: { kind: 'in_progress', error: '409' } },
+    { name: 'recovery_invalid (quarantine verdict)', result: { kind: 'recovery_invalid', error: 'recovery_invalid' } },
+    { name: 'generic 5xx', result: { kind: 'unavailable', error: '503' } },
+    { name: 'error', result: { kind: 'error', error: 'boom' } },
+    { name: 'v3_disabled', result: { kind: 'v3_disabled', error: 'v3_uploads_disabled' }, paused: 'v3' },
+    { name: 'v4_disabled', result: { kind: 'v4_disabled', error: 'v4_uploads_disabled' }, paused: 'v4' },
+  ];
+
+  for (const branch of BRANCHES) {
+    it(`${branch.name}: the answer is dropped and the row is untouched`, async () => {
+      const h = makeHarness({ prev: branch.prev, result: branch.result, takeoverDuringDispatch: true });
+
+      const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+      // The request DID happen and its outcome is reported honestly...
+      expect(outcome).toEqual({ kind: 'committed', result: branch.result });
+      expect(h.httpCalls).toBe(1);
+      // ...but nothing was written on top of the new owner's row.
+      expect(h.staleCommits).toBe(1);
+      expect(h.blockedCommits).toBe(0);
+      expect(h.row.value).toEqual({
+        noteId: 'note-1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW,
+      });
+      // Only the 'uploading' write of this attempt ever applied.
+      expect(h.writes).toHaveLength(1);
+      expect(h.writes[0].status).toBe('uploading');
+    });
+  }
+
+  it('the version-global pause marker is written even when the record half is skipped', async () => {
+    // The kill switch is state about the WORKER, not about this attempt.
+    // Dropping it because the row changed owners would let the next unlock
+    // burst the whole backlog at a worker that has already said no.
+    const h = makeHarness({
+      result: { kind: 'v3_disabled', error: 'v3_uploads_disabled' },
+      takeoverDuringDispatch: true,
+    });
+
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    expect(h.pausedCommits).toHaveLength(1);
+    expect(h.pausedCommits[0].pausedAt).toBe(NOW);
+    expect(h.staleCommits).toBe(1);
+  });
+
+  it('an UNDISTURBED attempt still applies its answer (the guard is not a blanket refusal)', async () => {
+    const h = makeHarness({ result: ACCEPTED });
+
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    expect(h.staleCommits).toBe(0);
+    expect(h.row.value?.status).toBe('accepted');
+    expect(h.row.value?.txId).toBe('TX9');
+    // The row left 'uploading', so it no longer names an attempt — a replayed
+    // or duplicated answer finds nothing to match.
+    expect(h.row.value?.attemptId).toBeUndefined();
   });
 });

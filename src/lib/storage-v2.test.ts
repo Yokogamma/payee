@@ -139,13 +139,18 @@ describe('safebox store helpers', () => {
     expect(await getSafeboxEntryById(ID)).toBeUndefined();
   });
 
-  it('mergeRestoredSafeboxEntry repairs a corrupted payload but keeps a CONFIRMED record', async () => {
+  it('mergeRestoredSafeboxEntry repairs a corrupted payload, keeping the record that names the SAME tx', async () => {
+    // D12: the record survives BECAUSE it names the transaction being merged.
+    // A different txId is replaced together with the bytes it describes —
+    // both directions live in client-floor.d12.test.ts.
     await saveSafeboxEntryWithSync(entry(ID, { metaCiphertext: 'CORRUPT' }), {
       noteId: ID, kind: 'safebox', txId: 'TX-OLD', status: 'confirmed', transport: 'proxy', updatedAt: 1,
     });
-    await mergeRestoredSafeboxEntry(entry(ID, { metaCiphertext: 'GOOD' }), 'TX-NEW', 50, getDbGeneration());
+    await mergeRestoredSafeboxEntry(entry(ID, { metaCiphertext: 'GOOD' }), 'TX-OLD', 50, getDbGeneration());
     expect((await getSafeboxEntryById(ID))?.metaCiphertext).toBe('GOOD');
-    expect((await getSyncRecord(ID))?.txId).toBe('TX-OLD'); // original record preserved
+    const rec = await getSyncRecord(ID);
+    expect(rec?.txId).toBe('TX-OLD');
+    expect(rec?.updatedAt).toBe(1); // original record preserved as-is
   });
 
   it('mergeRestoredSafeboxEntry upgrades a non-terminal record to confirmed:safebox', async () => {
@@ -245,7 +250,11 @@ describe('v4 pause marker (independent of v3)', () => {
   };
 
   it('commits the failure record and the v4 marker together — and NOT the v3 one', async () => {
-    await commitV4PausedFailure('p4', () => REC, 999);
+    // Attempt-scoped record half (D14a): the row must be the one this attempt owns.
+    await setSyncRecord({
+      noteId: 'p4', kind: 'note', status: 'uploading', transport: 'proxy', updatedAt: 1, attemptId: 'A4',
+    });
+    await commitV4PausedFailure('p4', 'A4', () => REC, 999);
     expect(await getSyncRecord('p4')).toEqual(REC);
     expect(await readV4PauseMeta()).toEqual({ pausedAt: 999 });
     expect(await readV3PauseMeta()).toBeNull(); // pausing v4 must not stall notes

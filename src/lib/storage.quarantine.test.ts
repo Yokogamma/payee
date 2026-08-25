@@ -6,6 +6,7 @@ import {
   resetAll,
   setSyncRecord,
   getSyncRecord,
+  saveNote,
   beginUploadUnlessTerminal,
   commitSyncUnlessTerminal,
   saveNoteWithSync,
@@ -57,11 +58,13 @@ beforeEach(async () => {
 
 describe('beginUploadUnlessTerminal', () => {
   it('без карантина: пишет uploading, построенный из СВЕЖЕЙ строки', async () => {
-    await setSyncRecord({
+    const note = { ...NOTE, noteId: 'b1' };
+    await saveNoteWithSync(note, {
       noteId: 'b1', kind: 'note', txId: 'TX-1', status: 'error', transport: 'proxy',
       updatedAt: NOW - 100, recovery: { txId: 'TX-1', postedAt: 1, token: 't' },
     });
-    expect(await beginUploadUnlessTerminal('b1', 'note', NOW)).toBe(true);
+    const began = await beginUploadUnlessTerminal('b1', { kind: 'note', record: note }, NOW);
+    expect(began.ok).toBe(true);
     const row = (await getSyncRecord('b1'))!;
     expect(row.status).toBe('uploading');
     expect(row.txId).toBe('TX-1');                 // поля свежей строки сохранены
@@ -69,15 +72,31 @@ describe('beginUploadUnlessTerminal', () => {
   });
 
   it('карантин: отказывает и НЕ пишет ничего (HTTP у вызывающего не будет)', async () => {
+    const note = { ...NOTE, noteId: 'b2' };
     const q = quarantined('b2', 'recovery_invalidated');
-    await setSyncRecord(q);
-    expect(await beginUploadUnlessTerminal('b2', 'note', NOW)).toBe(false);
+    await saveNoteWithSync(note, q);
+    // Карантин проверяется ДО чтения payload — отказ именно 'blocked'.
+    expect(await beginUploadUnlessTerminal('b2', { kind: 'note', record: note }, NOW))
+      .toEqual({ ok: false, reason: 'blocked' });
     expect(await getSyncRecord('b2')).toEqual(q);  // строка нетронута
   });
 
   it('отсутствующая строка: обычный первый uploading', async () => {
-    expect(await beginUploadUnlessTerminal('b3', 'safebox', NOW)).toBe(true);
-    expect((await getSyncRecord('b3'))?.kind).toBe('safebox');
+    const note = { ...NOTE, noteId: 'b3' };
+    await saveNote(note); // payload есть, sync-строки нет
+    const began = await beginUploadUnlessTerminal('b3', { kind: 'note', record: note }, NOW);
+    expect(began.ok).toBe(true);
+    expect((await getSyncRecord('b3'))?.status).toBe('uploading');
+  });
+
+  it('kind берётся из СНИМКА, а не из строки', async () => {
+    const entry = { ...SB_ENTRY, entryId: 'bbbbbbbb-bbbb-8ccc-8ddd-eeeeeeeeeeee' };
+    await saveSafeboxEntryWithSync(entry, {
+      noteId: entry.entryId, kind: 'safebox', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
+    });
+    const began = await beginUploadUnlessTerminal(entry.entryId, { kind: 'safebox', record: entry }, NOW);
+    expect(began.ok).toBe(true);
+    expect((await getSyncRecord(entry.entryId))?.kind).toBe('safebox');
   });
 });
 
@@ -269,13 +288,14 @@ describe('конкурентные транзакции (§1.9): каранти�
 
   it('перекрывающиеся begin-загрузки и карантин: в ЛЮБОМ порядке финал терминален и без uploading', async () => {
     for (const order of ['begin-first', 'quarantine-first'] as const) {
-      await setSyncRecord({
+      const raceNote = { ...NOTE, noteId: 'race-b' };
+      await saveNoteWithSync(raceNote, {
         noteId: 'race-b', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
       });
-      const begin = () => beginUploadUnlessTerminal('race-b', 'note', NOW);
+      const begin = () => beginUploadUnlessTerminal('race-b', { kind: 'note', record: raceNote }, NOW);
       const quarantine = () => commitSyncUnlessTerminal('race-b', fresh =>
         toRecoveryInvalidated('race-b', 'note', fresh, 'q', NOW));
-      let beginRes: boolean;
+      let beginRes: Awaited<ReturnType<typeof beginUploadUnlessTerminal>>;
       if (order === 'begin-first') {
         [beginRes] = await Promise.all([begin(), quarantine()]);
       } else {
@@ -290,7 +310,7 @@ describe('конкурентные транзакции (§1.9): каранти�
       // обязан был отказать.
       expect(row.terminalError).toBe('recovery_invalidated');
       expect(row.status).toBe('error');
-      if (order === 'quarantine-first') expect(beginRes).toBe(false);
+      if (order === 'quarantine-first') expect(beginRes.ok).toBe(false);
       await resetAll();
     }
   });

@@ -25,7 +25,7 @@
 
 import { buildUploadPayload, buildSafeboxUploadPayload, type UploadResult } from './arweave';
 import { bufferToBase64, base64ToBuffer, type EncryptedNote, type EncryptedSafeboxEntry } from './crypto';
-import type { SyncRecord } from './storage';
+import type { BeginUploadOutcome, SyncRecord } from './storage';
 import {
   toAccepted,
   afterInProgress,
@@ -61,39 +61,52 @@ export interface UploadAttemptDeps {
   getSyncRecord(noteId: string): Promise<SyncRecord | undefined>;
   /** ATOMIC begin (storage.beginUploadUnlessTerminal + the reset guard): in ONE
    *  transaction re-read the current row, REFUSE if quarantined, else write
-   *  'uploading' built from the FRESH row. On false the attempt is BLOCKED —
-   *  the caller dispatches NO HTTP. Direct setSyncRecord is banned on this
-   *  path: between the queue's `prev` read and this write another tab may have
-   *  quarantined the record, and a plain put would erase that. */
-  beginUpload(noteId: string, kind: SyncKind, now: number): Promise<boolean>;
-  /** Terminal-preserving result persist (storage.commitSyncUnlessTerminal +
-   *  the reset guard): applies build(fresh) in one transaction unless the row
-   *  is quarantined — a late result must never erase an established
-   *  quarantine, whatever the request's outcome was. */
+   *  'uploading' built from the FRESH row. Two refusals are possible:
+   *  'blocked' (quarantined) and 'stale' (the stored bytes no longer match the
+   *  snapshot this body was signed from, D14); on either, the caller
+   *  dispatches NO HTTP. On success the row carries a fresh `attemptId`
+   *  (D14a). Direct setSyncRecord is banned on this path: between the queue's
+   *  `prev` read and this write another tab may have quarantined the record,
+   *  and a plain put would erase that.
+   *
+   *  The snapshot passed here is the QUEUE ITEM — the very object the body was
+   *  built from a few lines earlier, never a re-read. */
+  beginUpload(item: UploadItem, now: number): Promise<BeginUploadOutcome>;
+  /** Attempt-scoped, terminal-preserving result persist
+   *  (storage.commitUploadResultIfAttempt + the reset guard): applies
+   *  build(fresh) in one transaction unless the row is quarantined or no
+   *  longer belongs to this attempt. A late result must neither erase an
+   *  established quarantine nor land on bytes another writer has replaced —
+   *  whatever the request's outcome was (D14a). */
   commitResult(
     noteId: string,
+    attemptId: string,
     build: (fresh: SyncRecord | undefined) => SyncRecord | null,
   ): Promise<void>;
   /** ATOMIC sync+meta write for a vN_disabled result: persists the failure
    *  record (terminal-preserving, like commitResult) AND that version's
    *  uploads-paused marker in one IndexedDB transaction. Called INSTEAD of
    *  commitResult for that branch — sequential writes would reopen the crash
-   *  window (error saved, pause lost → burst after unlock). */
+   *  window (error saved, pause lost → burst after unlock).
+   *
+   *  The MARKER is written even when the record half is skipped by the
+   *  attempt-CAS: it is state about the worker's kill switch, not about this
+   *  attempt. */
   commitV3PausedFailure(
     noteId: string,
+    attemptId: string,
     build: (fresh: SyncRecord | undefined) => SyncRecord,
     pausedAt: number,
   ): Promise<void>;
   commitV4PausedFailure(
     noteId: string,
+    attemptId: string,
     build: (fresh: SyncRecord | undefined) => SyncRecord,
     pausedAt: number,
   ): Promise<void>;
   signPayload(privateKey: Uint8Array, payload: string): Promise<string>;
   uploadViaProxy(bodyText: string, publicKeyB64: string, signature: string): Promise<UploadResult>;
 }
-
-type SyncKind = SyncRecord['kind'];
 
 /** The stored row failed runtime validation right before serialization.
  *  PERMANENT quarantine (terminalError:'malformed_record') — no HTTP is made
@@ -157,6 +170,12 @@ export type UploadAttemptOutcome =
   /** The record was quarantined (terminalError) between enqueue and the atomic
    *  begin — e.g. by another tab. No HTTP was dispatched, nothing written. */
   | { kind: 'blocked' }
+  /** The stored payload changed between the queue snapshot and the atomic
+   *  begin — a restore or an import replaced it (D14). No HTTP was dispatched
+   *  and nothing was written: the signed body describes bytes the store no
+   *  longer has. The record keeps its previous status, so the next queue pass
+   *  picks it up again with the CURRENT bytes. */
+  | { kind: 'stale' }
   /** Past the point of no return: dispatched and the result persisted. */
   | { kind: 'committed'; result: UploadResult };
 
@@ -195,22 +214,30 @@ export async function runUploadAttempt(
   //    between enqueue and here — the attempt stops with NO HTTP dispatched.
   //    Past a successful begin the upload is committed: dispatch + persist run
   //    unconditionally, with no further epoch checks.
-  const began = await deps.beginUpload(id, kind, deps.now());
-  if (!began) return { kind: 'blocked' };
+  //    The payload-CAS compares against the SNAPSHOT `item` — the same object
+  //    step 1 serialized and signed — so «what is about to be sent» and «what
+  //    is checked» cannot drift apart.
+  const began = await deps.beginUpload(item, deps.now());
+  if (!began.ok) return { kind: began.reason };
+  const attemptId = began.attemptId;
   const result = await deps.uploadViaProxy(bodyText, publicKeyB64, signature);
 
-  // 4) EVERY processed result branch persists through the terminal-preserving
-  //    commit — none leaves 'uploading', and none can erase a quarantine set
-  //    while the request was in flight. Builders receive the FRESH row (the
+  // 4) EVERY processed result branch persists through the attempt-scoped,
+  //    terminal-preserving commit — none leaves 'uploading', none can erase a
+  //    quarantine set while the request was in flight, and none can be applied
+  //    to a row this attempt no longer owns (D14a). Applying only the SUCCESS
+  //    branch under the attempt check would be worse than useless: a late
+  //    `in_progress` or 5xx landing on someone else's row is the same defect
+  //    with a different value. Builders receive the FRESH row (the
   //    re-read happens inside the commit's transaction), so late results
   //    cannot resurrect stale state either.
   if (result.kind === 'accepted') {
-    await deps.commitResult(id, fresh => toAccepted(id, kind, fresh, result, deps.now()));
+    await deps.commitResult(id, attemptId, fresh => toAccepted(id, kind, fresh, result, deps.now()));
   } else if (result.kind === 'in_progress') {
     // 409 with a prior accepted TX → restore it; WITHOUT one there is nothing
     // to restore — record a RETRYABLE failure, never a stranded 'uploading'
     // (round-5 #1).
-    await deps.commitResult(id, fresh =>
+    await deps.commitResult(id, attemptId, fresh =>
       afterInProgress(id, kind, fresh, deps.now())
         ?? afterFailure(id, kind, fresh, recheck, 'in_progress', deps.now()));
   } else if (result.kind === 'v3_disabled' || result.kind === 'v4_disabled') {
@@ -223,19 +250,19 @@ export async function runUploadAttempt(
     // server's answer is the authority).
     const now = deps.now();
     if (result.kind === 'v3_disabled') {
-      await deps.commitV3PausedFailure(id, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
+      await deps.commitV3PausedFailure(id, attemptId, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
     } else {
-      await deps.commitV4PausedFailure(id, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
+      await deps.commitV4PausedFailure(id, attemptId, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
     }
   } else if (result.kind === 'recovery_invalid') {
     // The server rejected the signed recovery proof (rotated key / forged
     // hint): PERMANENT quarantine instead of an endless recheck of a
     // guaranteed failure. txId + the hint are preserved as evidence; only
     // proof-bearing paths (seed restore) may clear this state.
-    await deps.commitResult(id, fresh => toRecoveryInvalidated(id, kind, fresh, result.error, deps.now()));
+    await deps.commitResult(id, attemptId, fresh => toRecoveryInvalidated(id, kind, fresh, result.error, deps.now()));
   } else {
     const errText = 'error' in result ? result.error : undefined;
-    await deps.commitResult(id, fresh => afterFailure(id, kind, fresh, recheck, errText, deps.now()));
+    await deps.commitResult(id, attemptId, fresh => afterFailure(id, kind, fresh, recheck, errText, deps.now()));
   }
 
   return { kind: 'committed', result };

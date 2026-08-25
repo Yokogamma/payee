@@ -130,6 +130,8 @@ import {
   getSyncRecord,
   beginUploadUnlessTerminal,
   commitSyncUnlessTerminal,
+  commitUploadResultIfAttempt,
+  STALE_UPLOADING_MS,
   commitV3PausedFailure,
   commitV4PausedFailure,
   readV3PauseMeta,
@@ -676,7 +678,9 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
 
 // ─── Stale uploading threshold ───────────────────────────────────────
 
-const STALE_UPLOADING_MS = 10 * 60 * 1000; // 10 minutes (matches server reservation timeout)
+// STALE_UPLOADING_MS now lives in storage.ts, next to SyncRecord: the restore
+// and import writers must defer to exactly the same «is this attempt live?»
+// answer as the queue below, and two copies of the number could disagree.
 const RECHECK_BACKOFF_MS = 5 * 60 * 1000;  // min gap between recheck re-attempts (503 backoff)
 const TX_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TX_CONFIRM_THRESHOLD = 25;            // Arweave confirmations needed
@@ -2275,23 +2279,25 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           now: () => Date.now(),
           currentEpoch: () => vaultEpochRef.current,
           getSyncRecord,
-          beginUpload: async (noteId, kind, now) => {
-            // Reset counts as a refusal: 'false' means NO HTTP is dispatched,
-            // which is exactly right when the DB was just wiped.
-            if (getDbGeneration() !== myDbGen) return false; // reset won — refuse
-            return beginUploadUnlessTerminal(noteId, kind, now);
+          beginUpload: async (queued, now) => {
+            // Reset counts as a refusal: no HTTP is dispatched, which is
+            // exactly right when the DB was just wiped. Reported as 'blocked'
+            // — nothing was written and nothing is stale, the database the
+            // attempt belonged to is simply gone.
+            if (getDbGeneration() !== myDbGen) return { ok: false, reason: 'blocked' }; // reset won
+            return beginUploadUnlessTerminal(uploadItemId(queued), queued, now);
           },
-          commitResult: async (noteId, build) => {
+          commitResult: async (noteId, attemptId, build) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
-            await commitSyncUnlessTerminal(noteId, build);
+            await commitUploadResultIfAttempt(noteId, attemptId, build);
           },
-          commitV3PausedFailure: async (noteId, build, pausedAt) => {
+          commitV3PausedFailure: async (noteId, attemptId, build, pausedAt) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
-            await commitV3PausedFailure(noteId, build, pausedAt);
+            await commitV3PausedFailure(noteId, attemptId, build, pausedAt);
           },
-          commitV4PausedFailure: async (noteId, build, pausedAt) => {
+          commitV4PausedFailure: async (noteId, attemptId, build, pausedAt) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
-            await commitV4PausedFailure(noteId, build, pausedAt);
+            await commitV4PausedFailure(noteId, attemptId, build, pausedAt);
           },
           signPayload,
           uploadViaProxy,
@@ -2335,6 +2341,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // no HTTP was made, nothing was written — shift + continue, like
     // 'quarantined' above.
     if (outcome.kind === 'blocked') return 'blocked';
+    // The stored payload changed under the queued snapshot (restore/import).
+    // Same handling: shift + continue. The sync row was NOT touched, so the
+    // next sweep re-enqueues the record with its current bytes — dropping it
+    // here loses nothing and re-sending the stale snapshot would be the bug.
+    if (outcome.kind === 'stale') return 'stale';
     const result = outcome.result;
 
     // React state + registration meta — ONLY under the current epoch. The
@@ -2712,10 +2723,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Upsert the note payload + confirmed sync state atomically. The
         // payload write matters even for an already-confirmed note: the local
         // ciphertext may be corrupted while the on-chain copy just decrypted.
-        await mergeRestoredNote(remote.encrypted, remote.txId, Date.now(), myDbGen);
+        const merged = await mergeRestoredNote(remote.encrypted, remote.txId, Date.now(), myDbGen);
         // Починено known-good копией — из ремонтного набора id выходит, чтобы
         // следующая инкрементальная проверка его больше не перекачивала.
-        undecryptableIdsRef.current.delete(remote.encrypted.noteId);
+        // 'deferred' (идёт живая отправка, D12) ремонтом НЕ является: байты не
+        // тронуты, и вычеркнуть id значило бы спрятать всё ещё битую запись до
+        // следующей полной сверки.
+        if (merged === 'merged') undecryptableIdsRef.current.delete(remote.encrypted.noteId);
 
         if (!claimRestoredForUi(visibleIds, remote.encrypted.noteId)) continue;
         if (vaultEpochRef.current !== myEpoch) return;
@@ -2755,9 +2769,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       for (const remote of remoteSafebox) {
         if (vaultEpochRef.current !== myEpoch) return;
         if (getDbGeneration() !== myDbGen) return;
-        await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now(), myDbGen);
-        // Как и у заметок: починенная запись покидает ремонтный набор.
-        undecryptableIdsRef.current.delete(remote.encrypted.entryId);
+        const mergedEntry = await mergeRestoredSafeboxEntry(remote.encrypted, remote.txId, Date.now(), myDbGen);
+        // Как и у заметок: ремонтный набор покидает только реально починенная
+        // запись — отложенная (живая отправка, D12) остаётся в нём.
+        if (mergedEntry === 'merged') undecryptableIdsRef.current.delete(remote.encrypted.entryId);
         safeboxMerged++;
         // Claim BEFORE the id joins the known set, so several new versions of
         // one root still count their root exactly once.

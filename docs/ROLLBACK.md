@@ -385,6 +385,20 @@ KV placeholder is still in `wrangler.toml`.
   so they keep writing v4 locally and uploading. Observed live on the W4
   deploy: an open tab stayed on R4 until «Обновить» was clicked. The immediate
   server-side stop is `V4_UPLOADS_ENABLED=false`, not a Pages rollback.
+  **Next client floor — `client-b1`, NOT YET RELEASED (tag/SHA to be recorded
+  here by the operator when it ships).** `DB_VERSION` is already **3** in the
+  code (`src/lib/storage.ts`). v3 adds no store and no index — the only schema
+  change is the additive `attemptId` on `sync` rows — so the bump costs
+  nothing to apply and everything to undo: any device that has launched a v3
+  client gives a `VersionError` to a client with `DB_VERSION=2`, which lands on
+  the non-destructive «update the app» screen. The bump is spent deliberately,
+  because the older client-side writers are unsafe on their own, with no worker
+  involved: a pre-D12 restore writer re-pairs restored bytes with whatever txId
+  the sync row already held, and a pre-D14/D14a upload path signs a payload
+  snapshot and then applies the answer unconditionally. Both recreate
+  «payload B ↔ txId A» locally. **Once the first v3 client is deployed, rolling
+  the client below it is forbidden** — the floor line above must be updated to
+  `client-b1` at that point, and `client-r4` stays recorded as history.
 - **CORS:** if the Pages origin changes, update `ALLOWED_ORIGINS` in
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
   the new origin is allowed while a stranger origin is rejected.

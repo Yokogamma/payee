@@ -40,6 +40,7 @@ const KEYS: UploadKeys = {
 
 function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
   const writes: SyncRecord[] = [];
+  let attemptCounter = 0;
   const v3Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
   const v4Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
   // In-memory sync row — the «fresh» source every commit re-reads, mirroring
@@ -51,23 +52,30 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
     now: () => NOW,
     currentEpoch: () => 1,
     getSyncRecord: async () => row.value,
-    beginUpload: async (noteId, kind, now) => {
-      if (row.value?.terminalError !== undefined) return false;
-      row.value = toUploading(noteId, kind, row.value, now);
+    beginUpload: async (queued, now) => {
+      if (row.value?.terminalError !== undefined) return { ok: false, reason: 'blocked' as const };
+      const attemptId = `attempt-${++attemptCounter}`;
+      row.value = toUploading(uploadItemId(queued), queued.kind, row.value, now, attemptId);
       writes.push(row.value);
-      return true;
+      return { ok: true as const, attemptId };
     },
-    commitResult: async (_noteId, build) => {
+    commitResult: async (_noteId, attemptId, build) => {
       if (row.value?.terminalError !== undefined) return;
+      if (row.value?.attemptId !== attemptId) return;
       const next = build(row.value);
       if (next !== null) { row.value = next; writes.push(next); }
     },
-    commitV3PausedFailure: async (_noteId, build, pausedAt) => {
-      if (row.value?.terminalError === undefined) row.value = build(row.value);
+    // Marker unconditional, record half terminal-preserving AND attempt-scoped.
+    commitV3PausedFailure: async (_noteId, attemptId, build, pausedAt) => {
+      if (row.value?.terminalError === undefined && row.value?.attemptId === attemptId) {
+        row.value = build(row.value);
+      }
       v3Pauses.push({ record: row.value!, pausedAt });
     },
-    commitV4PausedFailure: async (_noteId, build, pausedAt) => {
-      if (row.value?.terminalError === undefined) row.value = build(row.value);
+    commitV4PausedFailure: async (_noteId, attemptId, build, pausedAt) => {
+      if (row.value?.terminalError === undefined && row.value?.attemptId === attemptId) {
+        row.value = build(row.value);
+      }
       v4Pauses.push({ record: row.value!, pausedAt });
     },
     signPayload: async () => 'sig',
