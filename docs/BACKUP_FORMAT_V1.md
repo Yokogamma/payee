@@ -197,6 +197,12 @@ Stable fields, by collection, with the real key names:
 `counts` must equal the collection lengths. It is a cheap end-to-end check: a
 truncated or half-written body fails here instead of restoring silently short.
 
+**Every invariant in this section is enforced identically in BOTH
+directions**, by one shared validator. A decoder stricter than its encoder
+would let an export write a file that its own import rejects — and the
+rejection would surface at restore time, on another device, possibly after
+the original data is gone.
+
 **Id uniqueness is fail-closed on all three counts** (D10): unique within
 `notes`, unique within `safebox`, and **disjoint between them**. Notes and
 safebox entries share one key space downstream — the sync store is keyed by a

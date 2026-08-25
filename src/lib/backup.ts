@@ -302,10 +302,10 @@ export async function encodeBackup(input: EncodeBackupInput, key: CryptoKey): Pr
     safebox: input.safebox,
   };
 
-  // Uniqueness is enforced on the WAY OUT too, not only on the way in: writing
-  // a container whose own import would refuse it is a defect worth catching
-  // here, where the data is still available to explain it.
-  assertUniqueIds(body);
+  // The SAME invariants the decoder enforces, checked here: writing a container
+  // whose own import would refuse it is a defect worth catching where the data
+  // is still around to explain it — not at restore time on another device.
+  assertBodyInvariants(body);
 
   const plaintext = new TextEncoder().encode(canonicalJson(body));
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
@@ -472,34 +472,13 @@ function parseBody(plaintext: ArrayBuffer): BackupBody {
     throw new BackupError('corrupt', 'Counts do not match the collections');
   }
 
-  const notes = parsed.notes.map((r, i) => asRecord(r, `notes[${i}]`));
-  const safebox = parsed.safebox.map((r, i) => asRecord(r, `safebox[${i}]`));
-
-  // Stable per-collection fields (docs/BACKUP_FORMAT_V1.md). `notes[*].v` is
-  // deliberately OPTIONAL: its absence legitimately means v1, so requiring it
-  // would either reject legacy backups or mutate records that must travel «as
-  // they are».
-  for (let i = 0; i < notes.length; i++) {
-    if (typeof notes[i].noteId !== 'string' || notes[i].noteId === '') {
-      throw new BackupError('corrupt', 'Note without a noteId', `notes[${i}]`);
-    }
-  }
-  for (let i = 0; i < safebox.length; i++) {
-    if (typeof safebox[i].entryId !== 'string' || safebox[i].entryId === '') {
-      throw new BackupError('corrupt', 'Safebox entry without an entryId', `safebox[${i}]`);
-    }
-    if (safebox[i].v === undefined) {
-      throw new BackupError('corrupt', 'Safebox entry without a version', `safebox[${i}]`);
-    }
-  }
-
   const body: BackupBody = {
     counts: { notes: counts.notes, safebox: counts.safebox },
     incompleteRestore: parsed.incompleteRestore,
-    notes,
-    safebox,
+    notes: parsed.notes.map((r, i) => asRecord(r, `notes[${i}]`)),
+    safebox: parsed.safebox.map((r, i) => asRecord(r, `safebox[${i}]`)),
   };
-  assertUniqueIds(body);
+  assertBodyInvariants(body);
   return body;
 }
 
@@ -508,31 +487,59 @@ function asRecord(value: unknown, at: string): BackupRecord {
   return value;
 }
 
+/** Non-empty string id, checked at the runtime boundary rather than trusted
+ *  from a TypeScript cast — one side of this validator reads an untrusted
+ *  file, the other reads IndexedDB, and neither is a type system. */
+function requireId(record: BackupRecord, field: 'noteId' | 'entryId', at: string): string {
+  const id = record[field];
+  if (typeof id !== 'string' || id === '') {
+    throw new BackupError('corrupt', `Record without a usable ${field}`, at);
+  }
+  return id;
+}
+
 /**
- * Global id uniqueness (D10) — fail closed on all three violations.
+ * Every invariant the body must satisfy, enforced IDENTICALLY on both
+ * directions: stable per-collection fields, then global id uniqueness (D10).
  *
- * Notes and safebox entries share ONE key space downstream: the sync store is
- * keyed by a single id, and so is restore. A cross-collection collision would
- * therefore make the result depend on processing order, which is not a
- * property a restore is allowed to have.
+ * One function for both sides on purpose. A decoder stricter than its encoder
+ * means an export can write a file that its own import rejects — and the
+ * rejection would surface at restore time, on another device, when the
+ * original data may be gone.
  *
- * Raised on BOTH sides with the same `corrupt` code, but it does not mean the
+ * Stable fields (docs/BACKUP_FORMAT_V1.md §2.2). `notes[*].v` is deliberately
+ * NOT required: its absence legitimately means v1, so demanding it would
+ * either reject legacy backups or mutate records that must travel «as they
+ * are». `safebox[*].v` IS required — a safebox entry has always carried one.
+ *
+ * Uniqueness: notes and safebox entries share ONE key space downstream (the
+ * sync store is keyed by a single id, and so is restore), so a cross-collection
+ * collision would make the result depend on processing order — not a property
+ * a restore is allowed to have.
+ *
+ * Raised on both sides with the same `corrupt` code, which does not mean the
  * same thing to a person: on import the FILE is inconsistent, on export the
  * LOCAL STORE is. Whatever surfaces these must not tell an exporting user that
  * a file is damaged — there is no file yet.
  */
-function assertUniqueIds(body: BackupBody): void {
+function assertBodyInvariants(body: BackupBody): void {
   const noteIds = new Set<string>();
-  for (const n of body.notes) {
-    const id = n.noteId as string;
-    if (noteIds.has(id)) throw new BackupError('corrupt', `Duplicate note id ${id}`);
+  for (let i = 0; i < body.notes.length; i++) {
+    const id = requireId(body.notes[i], 'noteId', `notes[${i}]`);
+    if (noteIds.has(id)) throw new BackupError('corrupt', `Duplicate note id ${id}`, `notes[${i}]`);
     noteIds.add(id);
   }
+
   const entryIds = new Set<string>();
-  for (const e of body.safebox) {
-    const id = e.entryId as string;
-    if (entryIds.has(id)) throw new BackupError('corrupt', `Duplicate safebox id ${id}`);
-    if (noteIds.has(id)) throw new BackupError('corrupt', `Id ${id} is used by both collections`);
+  for (let i = 0; i < body.safebox.length; i++) {
+    const at = `safebox[${i}]`;
+    const entry = body.safebox[i];
+    const id = requireId(entry, 'entryId', at);
+    if (entry.v === undefined) {
+      throw new BackupError('corrupt', 'Safebox entry without a version', at);
+    }
+    if (entryIds.has(id)) throw new BackupError('corrupt', `Duplicate safebox id ${id}`, at);
+    if (noteIds.has(id)) throw new BackupError('corrupt', `Id ${id} is used by both collections`, at);
     entryIds.add(id);
   }
 }

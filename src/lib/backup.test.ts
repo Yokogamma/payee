@@ -5,6 +5,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   BACKUP_CAP_BYTES,
   BackupError,
+  type EncodeBackupInput,
   backupFileName,
   canonicalJson,
   decodeBackup,
@@ -414,10 +415,34 @@ describe('body consistency', () => {
   });
 });
 
+describe('export-side stable fields — an export cannot write what its own import refuses', () => {
+  it.each([
+    ['a note with no noteId', { notes: [{ ciphertext: 'QUFBQQ==' }] }],
+    ['a note with an empty noteId', { notes: [{ ...NOTE, noteId: '' }] }],
+    ['a note with a non-string noteId', { notes: [{ ...NOTE, noteId: 42 }] }],
+    ['a safebox entry with no entryId', { safebox: [{ ...ENTRY, entryId: undefined }] }],
+    ['a safebox entry with an empty entryId', { safebox: [{ ...ENTRY, entryId: '' }] }],
+    ['a safebox entry with no version', { safebox: [{ ...ENTRY, v: undefined }] }],
+  ])('refuses to encode %s', async (_name, patch) => {
+    const key = await deriveBackupKey(MNEMONIC);
+    await expect(encodeBackup(input(patch as Partial<EncodeBackupInput>), key))
+      .rejects.toMatchObject({ code: 'corrupt' });
+  });
+
+  it('the same invariants are enforced on the way IN', async () => {
+    // The point of sharing one validator: a container that would fail here can
+    // never have been written in the first place.
+    const key = await deriveBackupKey(MNEMONIC);
+    await expect(encodeBackup(input({ notes: [{ ...NOTE, noteId: '' }] }), key))
+      .rejects.toMatchObject({ code: 'corrupt' });
+  });
+});
+
 describe('export-side uniqueness', () => {
   it('an export that would produce a file its own import refuses fails HERE', async () => {
     const key = await deriveBackupKey(MNEMONIC);
-    await expect(encodeBackup(input({ notes: [NOTE, { ...NOTE }] }), key));
+    await expect(encodeBackup(input({ notes: [NOTE, { ...NOTE }] }), key))
+      .rejects.toMatchObject({ code: 'corrupt' });
   });
 
   it('a cross-collection id collision fails on export too', async () => {
