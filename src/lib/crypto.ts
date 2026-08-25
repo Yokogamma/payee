@@ -582,8 +582,10 @@ export class SafeboxEnvelopeError extends Error {
 }
 
 /** Base64 that round-trips EXACTLY — a non-canonical spelling of the same bytes
- *  must not pass (it would break the size cross-check and the wire contract). */
-function isCanonicalBase64(s: unknown): s is string {
+ *  must not pass (it would break the size cross-check and the wire contract).
+ *  Exported so the backup container validates its envelope with THIS check
+ *  rather than growing a second, subtly different one. */
+export function isCanonicalBase64(s: unknown): s is string {
   if (typeof s !== 'string') return false;
   try {
     return bufferToBase64(base64ToBuffer(s)) === s;
