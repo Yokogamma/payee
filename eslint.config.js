@@ -42,4 +42,25 @@ export default defineConfig([
       }],
     },
   },
+  {
+    // `fp` is a SERVER concept: the proof that «these bytes are that
+    // publication» lives in the worker, and the client has no production
+    // consumer for it. `publication-fp.fixture.ts` is the TEST-ONLY mirror that
+    // lets the client half be checked against the same documented byte vector
+    // (docs/BACKUP_FORMAT_V1.md §1). Enforced HERE rather than by a test,
+    // because an accidental production import would leave every suite green
+    // while creating a second source of truth for a frozen format.
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'src/lib/publication-fp.fixture.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['**/publication-fp.fixture', '**/publication-fp.fixture.js'],
+          message:
+            'publication-fp.fixture.ts is a test-only mirror of the server fingerprint — ' +
+            'production code must not compute `fp` on the client (see docs/BACKUP_FORMAT_V1.md §1.4).',
+        }],
+      }],
+    },
+  },
 ])
