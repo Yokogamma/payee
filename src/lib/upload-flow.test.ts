@@ -11,8 +11,12 @@ import type { EncryptedNote } from './crypto';
 
 const NOW = 1_750_000_000_000;
 
+/** A real UUIDv4: v1/v2 ids live in that namespace, and the client now
+ *  refuses anything else BEFORE signing (assertUploadableItem). */
+const NOTE_ID = '11111111-2222-4333-8444-555555555555';
+
 const NOTE: EncryptedNote = {
-  noteId: 'note-1',
+  noteId: NOTE_ID,
   // 16 bytes exactly: the GCM tag floor assertUploadableItem now enforces.
   ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==',
   iv: 'AAAAAAAAAAAAAAAA', // canonical base64 of exactly 12 bytes
@@ -80,7 +84,7 @@ function makeHarness(opts?: {
   };
   const quarantineRow = (reason: NonNullable<SyncRecord['terminalError']>) => {
     row.value = {
-      noteId: 'note-1', kind: 'note', txId: row.value?.txId, status: 'error',
+      noteId: NOTE_ID, kind: 'note', txId: row.value?.txId, status: 'error',
       transport: 'proxy', updatedAt: NOW, recovery: row.value?.recovery,
       terminalError: reason,
     };
@@ -148,7 +152,7 @@ function makeHarness(opts?: {
       if (opts?.quarantineDuringDispatch) quarantineRow(opts.quarantineDuringDispatch);
       if (opts?.takeoverDuringDispatch) {
         row.value = {
-          noteId: 'note-1', kind: 'note', status: 'error',
+          noteId: NOTE_ID, kind: 'note', status: 'error',
           transport: 'proxy', updatedAt: NOW,
         };
       }
@@ -205,7 +209,7 @@ describe('runUploadAttempt — past the point of no return (committed)', () => {
 
   it('in_progress after a mid-dispatch lock is persisted', async () => {
     const prev: SyncRecord = {
-      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      noteId: NOTE_ID, kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
       updatedAt: NOW - 100_000, needsRecheck: true,
     };
     const h = makeHarness({
@@ -250,7 +254,7 @@ describe('runUploadAttempt — v3_disabled (worker kill switch → atomic pause)
 
   it('preserves txId/recovery/needsRecheck from the prior record (afterFailure semantics)', async () => {
     const prev: SyncRecord = {
-      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      noteId: NOTE_ID, kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
       updatedAt: NOW - 100_000, needsRecheck: true,
       recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
     };
@@ -298,7 +302,7 @@ describe('runUploadAttempt — happy path', () => {
 // ─── §1.9: терминальный карантин и монотонность terminalError ────────
 
 const QUARANTINED_PREV: SyncRecord = {
-  noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'error', transport: 'proxy',
+  noteId: NOTE_ID, kind: 'note', txId: 'TX-old', status: 'error', transport: 'proxy',
   updatedAt: NOW - 100_000, recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
   terminalError: 'recovery_invalidated',
 };
@@ -360,7 +364,7 @@ describe('runUploadAttempt — recovery_invalid → терминальный к�
 
   it('запись становится recovery_invalidated; txId и recovery-данные сохранены', async () => {
     const prev: SyncRecord = {
-      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      noteId: NOTE_ID, kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
       updatedAt: NOW - 100_000, needsRecheck: true,
       recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
     };
@@ -377,7 +381,7 @@ describe('runUploadAttempt — recovery_invalid → терминальный к�
 
   it('без prev.txId берётся txId из recovery-хинта (единственный след транзакции)', async () => {
     const prev: SyncRecord = {
-      noteId: 'note-1', kind: 'note', status: 'error', transport: 'proxy',
+      noteId: NOTE_ID, kind: 'note', status: 'error', transport: 'proxy',
       updatedAt: NOW - 100_000, needsRecheck: true,
       recovery: { txId: 'TX-hint', postedAt: NOW - 200_000, token: 'tok' },
     };
@@ -402,7 +406,7 @@ describe('runUploadAttempt — recovery_invalid → терминальный к�
 describe('D14 — a snapshot the store no longer holds is never dispatched', () => {
   it('the atomic begin refuses with «stale»: no HTTP, no writes', async () => {
     const h = makeHarness({
-      prev: { noteId: 'note-1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1 },
+      prev: { noteId: NOTE_ID, kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1 },
       payloadChangedBeforeBegin: true,
     });
 
@@ -432,7 +436,7 @@ describe('D14a — a late answer never lands on a row this attempt no longer own
     {
       name: 'in_progress WITH a prior txId (restores accepted)',
       result: { kind: 'in_progress', error: '409' },
-      prev: { noteId: 'note-1', kind: 'note', txId: 'TX-OLD', status: 'accepted', transport: 'proxy', updatedAt: NOW - 1 },
+      prev: { noteId: NOTE_ID, kind: 'note', txId: 'TX-OLD', status: 'accepted', transport: 'proxy', updatedAt: NOW - 1 },
     },
     { name: 'in_progress WITHOUT one (falls back to a failure)', result: { kind: 'in_progress', error: '409' } },
     { name: 'recovery_invalid (quarantine verdict)', result: { kind: 'recovery_invalid', error: 'recovery_invalid' } },
@@ -455,7 +459,7 @@ describe('D14a — a late answer never lands on a row this attempt no longer own
       expect(h.staleCommits).toBe(1);
       expect(h.blockedCommits).toBe(0);
       expect(h.row.value).toEqual({
-        noteId: 'note-1', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW,
+        noteId: NOTE_ID, kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW,
       });
       // Only the 'uploading' write of this attempt ever applied.
       expect(h.writes).toHaveLength(1);

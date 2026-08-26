@@ -118,7 +118,32 @@ export class MalformedRecordError extends Error {
   }
 }
 
-const UUID_V8 = /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/** Any RFC-shaped UUID, capturing the version nibble — the same regex shape the
+ *  worker's namespace barrier uses (`worker/src/index.ts`), so the two sides
+ *  cannot disagree about what «a valid id» means. */
+const UUID_ANY = /^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * The id namespace barrier, enforced on the CLIENT before anything is signed.
+ *
+ * v1/v2 ids are UUIDv4 and v3/v4 ids are UUIDv8 — DISJOINT namespaces, and the
+ * worker rejects a mismatch with a plain 400. Leaving the check to the server
+ * is not free: a plain 400 is not typed, so the client turns it into a
+ * RETRYABLE error (`arweave.ts`), the record returns to the queue on every
+ * pass, and a single corrupted row becomes an endless request loop. Nothing is
+ * ever published and no wallet is spent, but the loop burns the shared IP rate
+ * limit and can crowd out healthy uploads.
+ *
+ * So the row is quarantined here instead: `MalformedRecordError` → permanent
+ * local `malformed_record`, with no HTTP at all. Retrying could only ever
+ * reproduce the same rejection.
+ */
+function assertIdNamespace(id: unknown, expected: '4' | '8', field: string): void {
+  if (typeof id !== 'string' || id.length === 0) throw new MalformedRecordError(field);
+  const match = UUID_ANY.exec(id);
+  if (!match) throw new MalformedRecordError(`${field} uuid`);
+  if (match[1].toLowerCase() !== expected) throw new MalformedRecordError(`${field} namespace`);
+}
 
 function assertIv12(value: unknown, field: string): void {
   if (typeof value !== 'string' || value.length === 0) throw new MalformedRecordError(field);
@@ -159,7 +184,15 @@ function assertCiphertext(value: unknown, field: string): void {
 export function assertUploadableItem(item: UploadItem): void {
   if (item.kind === 'note') {
     const n = item.record;
-    if (typeof n.noteId !== 'string' || n.noteId.length === 0) throw new MalformedRecordError('noteId');
+    // The namespace expected for THIS record's version. An unrecognized `v` is
+    // deliberately NOT judged here: the payload builder raises
+    // UnsupportedNoteVersionError for it, and that distinction is load-bearing.
+    // D5a treats an OPAQUE record — one a newer build wrote — differently from
+    // a malformed one, and must never replace it; labelling it
+    // 'malformed_record' here would throw that protection away.
+    if (n.v === undefined || n.v === 1 || n.v === 2) assertIdNamespace(n.noteId, '4', 'noteId');
+    else if (n.v === 3) assertIdNamespace(n.noteId, '8', 'noteId');
+    else if (typeof n.noteId !== 'string' || n.noteId.length === 0) throw new MalformedRecordError('noteId');
     if (!Number.isSafeInteger(n.createdAt) || n.createdAt < 0) throw new MalformedRecordError('createdAt');
     assertCiphertext(n.ciphertext, 'ciphertext');
     assertIv12(n.iv, 'iv');
@@ -167,7 +200,7 @@ export function assertUploadableItem(item: UploadItem): void {
   }
   const e = item.record;
   if (e.v !== 4) throw new MalformedRecordError('safebox v');
-  if (typeof e.entryId !== 'string' || !UUID_V8.test(e.entryId)) throw new MalformedRecordError('entryId');
+  assertIdNamespace(e.entryId, '8', 'entryId');
   if (!Number.isSafeInteger(e.createdAt) || e.createdAt < 0) throw new MalformedRecordError('createdAt');
   assertCiphertext(e.metaCiphertext, 'metaCiphertext');
   assertIv12(e.metaIv, 'metaIv');
