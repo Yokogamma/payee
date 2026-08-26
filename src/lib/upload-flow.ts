@@ -206,7 +206,14 @@ export function assertUploadableItem(item: UploadItem): void {
     return;
   }
   const e = item.record;
-  if (e.v !== 4) throw new MalformedRecordError('safebox v');
+  // SAME rule as the note branch above, and for the same reason: an
+  // unrecognized `v` is not judged here. `buildSafeboxUploadPayload` raises
+  // UnsupportedSafeboxVersionError for it — still before anything is signed —
+  // and D5a must keep the two verdicts apart. An OPAQUE record (one a NEWER
+  // build wrote) may never be replaced from a backup; a MALFORMED one may be
+  // repaired from it. Calling an unknown version 'malformed_record' here would
+  // hand an older backup permission to overwrite a newer format.
+  if (e.v !== 4) return;
   assertIdNamespace(e.entryId, '8', 'entryId');
   if (!Number.isSafeInteger(e.createdAt) || e.createdAt < 0) throw new MalformedRecordError('createdAt');
   assertCiphertext(e.metaCiphertext, 'metaCiphertext');
