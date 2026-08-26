@@ -10,6 +10,7 @@ import {
   getSyncRecord,
   getNoteById,
   getAllNotes,
+  getSafeboxEntryById,
   readBackupSnapshot,
   mergeBackupRecord,
   mergeRestoredSafeboxEntry,
@@ -19,7 +20,7 @@ import {
   BackupMergeContractError,
   type SyncRecord,
 } from './storage';
-import type { EncryptedNote } from './crypto';
+import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 
 /**
  * The two storage-level halves of the import path: the consistent snapshot the
@@ -314,5 +315,96 @@ describe('readBackupSnapshot — the size measure is an upper bound in BYTES', (
     await saveNote({ ...note(), extra: new ArrayBuffer(8) } as unknown as EncryptedNote);
 
     await expect(readBackupSnapshot(BIG_BUDGET)).rejects.toMatchObject({ code: 'unsupported_value' });
+  });
+});
+
+describe('mergeBackupRecord — safebox entries land in their OWN store', () => {
+  const ENTRY_ID = '88888888-9999-8aaa-baaa-cccccccccccc';
+  const entry = (over: Partial<EncryptedSafeboxEntry> = {}): EncryptedSafeboxEntry => ({
+    entryId: ENTRY_ID,
+    metaCiphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', metaIv: IV,
+    secretCiphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', secretIv: IV,
+    createdAt: NOW - 5000, v: 4, ...over,
+  });
+
+  it('added: the entry goes to `safebox`, not `notes`, and no note appears', async () => {
+    // `kind` picks the store, and nothing about the record is sniffed. Worth
+    // proving against a real database: a mis-chosen store would write a
+    // safebox entry into the notes list, where it would decrypt as garbage.
+    const outcome = await mergeBackupRecord({
+      kind: 'safebox', incoming: entry(), local: { state: 'absent' }, now: NOW,
+    });
+
+    expect(outcome).toBe('added');
+    expect((await getSafeboxEntryById(ENTRY_ID))?.secretCiphertext).toBe('QkJCQkJCQkJCQkJCQkJCQg==');
+    expect(await getNoteById(ENTRY_ID)).toBeUndefined();
+    expect(await getAllNotes()).toHaveLength(0);
+  });
+
+  it('repaired: both halves and a SAFEBOX-kinded retryable row land together', async () => {
+    await mergeBackupRecord({
+      kind: 'safebox', incoming: entry(), local: { state: 'absent' }, now: NOW,
+    });
+    await setSyncRecord({
+      noteId: ENTRY_ID, kind: 'safebox', status: 'confirmed',
+      transport: 'proxy', updatedAt: NOW - 1, txId: 'TX-OLD',
+    });
+
+    const outcome = await mergeBackupRecord({
+      kind: 'safebox',
+      incoming: entry({ secretCiphertext: 'Q0NDQ0NDQ0NDQ0NDQ0NDQw==' }),
+      local: { state: 'corrupt', record: entry() },
+      now: NOW,
+    });
+
+    expect(outcome).toBe('repaired');
+    expect((await getSafeboxEntryById(ENTRY_ID))?.secretCiphertext).toBe('Q0NDQ0NDQ0NDQ0NDQ0NDQw==');
+    expect(await getSyncRecord(ENTRY_ID)).toEqual({
+      noteId: ENTRY_ID, kind: 'safebox', status: 'error', transport: 'proxy', updatedAt: NOW,
+    });
+  });
+
+  it('the TOCTOU check reads the safebox store too', async () => {
+    await mergeBackupRecord({
+      kind: 'safebox', incoming: entry(), local: { state: 'absent' }, now: NOW,
+    });
+
+    const outcome = await mergeBackupRecord({
+      kind: 'safebox',
+      incoming: entry({ secretCiphertext: 'Q0NDQ0NDQ0NDQ0NDQ0NDQw==' }),
+      local: { state: 'absent' }, // stale: an entry exists now
+      now: NOW,
+    });
+
+    expect(outcome).toBe('concurrentChange');
+    expect((await getSafeboxEntryById(ENTRY_ID))?.secretCiphertext).toBe('QkJCQkJCQkJCQkJCQkJCQg==');
+  });
+});
+
+describe('mergeBackupRecord — a failing write leaves nothing behind', () => {
+  it('rolls the transaction back and preserves the previous state', async () => {
+    // A value IndexedDB cannot structured-clone makes the payload `put`
+    // reject. What is being proven is the discipline around it: the explicit
+    // abort in the catch, and that a pre-existing row is untouched afterwards.
+    //
+    // The mirror case — the payload written and the sync `put` then failing —
+    // is not reachable through this API, because the sync row is built by the
+    // pure decision from validated fields rather than supplied by the caller.
+    // Its atomicity rests on both writes sharing ONE transaction, which the
+    // successful cases above already exercise.
+    await saveNote(note());
+    const priorRow: SyncRecord = {
+      noteId: ID, kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
+    };
+    await setSyncRecord(priorRow);
+
+    const unclonable = { ...note(), ciphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', hook: () => 1 } as unknown as EncryptedNote;
+
+    await expect(mergeBackupRecord({
+      kind: 'note', incoming: unclonable, local: { state: 'corrupt', record: note() }, now: NOW,
+    })).rejects.toBeDefined();
+
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ==');
+    expect(await getSyncRecord(ID)).toEqual(priorRow);
   });
 });
