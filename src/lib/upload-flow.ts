@@ -191,6 +191,10 @@ function assertCiphertext(value: unknown, field: string): void {
 export function assertUploadableItem(item: UploadItem): void {
   if (item.kind === 'note') {
     const n = item.record;
+    // For NOTES the namespace is version-dependent — UUIDv4 for v1/v2, UUIDv8
+    // for v3 — so an unknown version leaves nothing to compare against, and
+    // only the stable part (a non-empty string id) can be required. The safebox
+    // branch below is the opposite case and checks its id unconditionally.
     // The namespace expected for THIS record's version. An unrecognized `v` is
     // deliberately NOT judged here: the payload builder raises
     // UnsupportedNoteVersionError for it, and that distinction is load-bearing.
@@ -206,15 +210,23 @@ export function assertUploadableItem(item: UploadItem): void {
     return;
   }
   const e = item.record;
-  // SAME rule as the note branch above, and for the same reason: an
-  // unrecognized `v` is not judged here. `buildSafeboxUploadPayload` raises
-  // UnsupportedSafeboxVersionError for it — still before anything is signed —
-  // and D5a must keep the two verdicts apart. An OPAQUE record (one a NEWER
-  // build wrote) may never be replaced from a backup; a MALFORMED one may be
-  // repaired from it. Calling an unknown version 'malformed_record' here would
-  // hand an older backup permission to overwrite a newer format.
-  if (e.v !== 4) return;
+  // ORDER MATTERS, and it is the opposite of the note branch's.
+  //
+  // `entryId` is a STABLE field: every version of a safebox record has one, and
+  // the UUIDv8 namespace belongs to the safebox id space rather than to v4 in
+  // particular. So it is checked FIRST and unconditionally. A record that is
+  // both of an unknown version AND missing a usable id is PROVABLY broken, and
+  // must be repairable ('malformed_record') rather than sealed as opaque —
+  // 'unsupported_version' is a promise never to replace it, which for a
+  // corrupted row means never repairing it either.
   assertIdNamespace(e.entryId, '8', 'entryId');
+  // Only VERSION-DEPENDENT fields stay unjudged. `buildSafeboxUploadPayload`
+  // raises UnsupportedSafeboxVersionError — still before anything is signed —
+  // and D5a keeps the two verdicts apart: an OPAQUE record (one a NEWER build
+  // wrote) may never be replaced from a backup; a MALFORMED one may be repaired
+  // from it. Calling an unknown version 'malformed_record' would hand an older
+  // backup permission to overwrite a newer format.
+  if (e.v !== 4) return;
   if (!Number.isSafeInteger(e.createdAt) || e.createdAt < 0) throw new MalformedRecordError('createdAt');
   assertCiphertext(e.metaCiphertext, 'metaCiphertext');
   assertIv12(e.metaIv, 'metaIv');
