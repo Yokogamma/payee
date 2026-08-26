@@ -100,6 +100,27 @@ const needsPayload = (state: LocalPayloadState) => state === 'absent' || state =
 export function decideBackupMerge(input: BackupMergeInput): BackupMergeDecision {
   const { id, kind, incoming, local, localState, sync, now } = input;
 
+  // ── The conflict check is ORTHOGONAL to everything below ────────────
+  //
+  // A readable local payload that DIFFERS from the file is a conflict, and it
+  // stays one whatever else is true of the record — quarantined or not, and
+  // whatever the quarantine's reason. This has to come first, because every
+  // branch further down answers a question about the LOCAL row and none of
+  // them looks at the file at all.
+  //
+  // Letting a quarantine short-circuit this was a silent data-loss path, not a
+  // cosmetic mis-count: the file's bytes were not applied, nothing was
+  // counted, so the import could report complete success, clear the
+  // provisional `incompleteRestore`, and leave the user confident enough to
+  // delete the only copy of a record they no longer have.
+  //
+  // Nothing is written in this case — not even a stale quarantine is lifted.
+  // Lifting one while refusing the bytes would mix two decisions that happen
+  // to be adjacent, and the user is being told about the conflict anyway.
+  if (localState === 'readable' && !samePublication(kind, local, incoming)) {
+    return leave('conflicts');
+  }
+
   // ── Rule 1: a LOCAL quarantine decides by its REASON ────────────────
   //
   // Not by whether a txId is present — that was the old formula and it was
@@ -168,14 +189,11 @@ export function decideBackupMerge(input: BackupMergeInput): BackupMergeDecision 
   }
 
   // ── Rule 2: a readable local payload is never overwritten ───────────
-  if (localState === 'readable') {
-    const equivalent = local !== undefined && samePublication(kind, local, incoming);
-    // Equivalent → the record is already honoured; NOT counted (§4).
-    // Different → a genuine conflict this phase does not resolve: nothing is
-    // written, and the user is told the file still holds something they do not
-    // have locally.
-    return leave(equivalent ? 'noop' : 'conflicts');
-  }
+  // Only the EQUIVALENT case can reach this line — the differing one was
+  // answered above. The record is already honoured, so it is NOT counted (§4):
+  // counting it would make a complete, correctly applied import report itself
+  // as incomplete.
+  if (localState === 'readable') return leave('noop');
 
   // ── Rule 3: bytes that are missing or unusable are restored ─────────
   if (isOpaque(localState)) {
@@ -214,12 +232,15 @@ function passesUploadShape(
 
 /** `publicationEquivalent` over the pair, with the kind supplied by the caller
  *  rather than sniffed off either record. Total by construction — an
- *  unsupported version or a malformed row reads as «not equivalent». */
+ *  unsupported version, a malformed row, or a missing local record all read as
+ *  «not equivalent», which is the fail-closed direction: the caller is then
+ *  told the file holds something the store does not. */
 function samePublication(
   kind: SyncRecord['kind'],
-  local: EncryptedNote | EncryptedSafeboxEntry,
+  local: EncryptedNote | EncryptedSafeboxEntry | undefined,
   incoming: EncryptedNote | EncryptedSafeboxEntry,
 ): boolean {
+  if (local === undefined) return false;
   const subject = (record: EncryptedNote | EncryptedSafeboxEntry): PublicationSubject =>
     kind === 'note'
       ? { kind: 'note', record: record as EncryptedNote }

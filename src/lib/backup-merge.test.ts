@@ -80,6 +80,10 @@ describe('rule 1 — a local quarantine is decided by its REASON (D5a)', () => {
     it(`${reason} + ${localState} → ${outcome}`, () => {
       const d = decide({
         localState,
+        // Equivalent on purpose: this table is about the fate of the LOCAL
+        // row. A differing file copy is a conflict FIRST, whatever the
+        // quarantine says — that matrix is its own block below.
+        incoming: localState === 'readable' ? incomingSame : incomingOther,
         local: localState === 'absent' ? undefined : localNote,
         sync: row({ terminalError: reason, txId: 'TX-EVIDENCE' }),
       });
@@ -99,7 +103,7 @@ describe('rule 1 — a local quarantine is decided by its REASON (D5a)', () => {
     // note that never sends.
     const stillBroken = { ...localNote, createdAt: -1 };
     expect(decide({
-      local: stillBroken, incoming: stillBroken, localState: 'readable',
+      local: stillBroken, incoming: { ...stillBroken }, localState: 'readable',
       sync: row({ terminalError: 'malformed_record' }),
     })).toEqual({ writePayload: false, sync: null, outcome: 'skipped' });
 
@@ -141,9 +145,62 @@ describe('rule 1 — a local quarantine is decided by its REASON (D5a)', () => {
   });
 
   it('a lifted quarantine leaves a retryable row with no publication claim', () => {
-    const d = decide({ localState: 'readable', sync: row({ terminalError: 'unsupported_version', txId: 'TX-OLD' }) });
+    const d = decide({
+      localState: 'readable', incoming: incomingSame,
+      sync: row({ terminalError: 'unsupported_version', txId: 'TX-OLD' }),
+    });
     expect(d.outcome).toBe('quarantineStale');
     expect(d.sync).toEqual({ noteId: ID, kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW });
+  });
+});
+
+describe('the conflict check is ORTHOGONAL to the quarantine table', () => {
+  const REASONS = [
+    undefined,
+    'unsupported_version',
+    'malformed_record',
+    'publication_conflict',
+    'recovery_invalidated',
+  ] as const;
+
+  it.each(REASONS)('a DIFFERING readable payload is a conflict — reason: %s', reason => {
+    // Every branch of the quarantine table answers a question about the LOCAL
+    // row and none of them looks at the file. Letting a quarantine
+    // short-circuit the comparison was silent data loss, not a mis-count: the
+    // file's bytes went unapplied, nothing was counted, and the import could
+    // report complete success — after which the user deletes the only copy of
+    // a record they no longer have.
+    const d = decide({
+      localState: 'readable',
+      local: localNote,
+      incoming: incomingOther,
+      sync: reason === undefined ? undefined : row({ terminalError: reason, txId: 'TX-EVIDENCE' }),
+    });
+
+    expect(d.outcome).toBe('conflicts');
+    expect(d.writePayload).toBe(false);
+    // Nothing at all is written — not even a stale quarantine is lifted.
+    // Lifting one while refusing the bytes mixes two decisions that merely
+    // happen to be adjacent.
+    expect(d.sync).toBeNull();
+  });
+
+  it.each(REASONS)('an EQUIVALENT readable payload still follows the table — reason: %s', reason => {
+    const d = decide({
+      localState: 'readable',
+      local: localNote,
+      incoming: incomingSame,
+      sync: reason === undefined ? undefined : row({ terminalError: reason, txId: 'TX-EVIDENCE' }),
+    });
+    expect(d.outcome).not.toBe('conflicts');
+  });
+
+  it('a readable state with no local record fails closed as a conflict', () => {
+    // The caller contradicted itself. «Not equivalent» is the safe reading:
+    // the file holds something the store cannot be shown to have.
+    const d = decide({ localState: 'readable', local: undefined, incoming: incomingSame });
+    expect(d.outcome).toBe('conflicts');
+    expect(d.writePayload).toBe(false);
   });
 });
 
