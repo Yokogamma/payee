@@ -26,6 +26,7 @@
  * the preview tell the user what will happen — while it still can be declined.
  */
 
+import type { BackupRecordState, ClassifiedBackupRecord } from './backup-classify';
 import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 
 export type PlannedKind = 'note' | 'safebox';
@@ -40,37 +41,54 @@ export interface PlannedRecord {
   prev?: string;
 }
 
-/** A record the plan will NOT apply, and which is therefore counted, warned
- *  about, and left in the file.
+/**
+ * Which counter a refused record lands in (§4).
  *
- * Two ways in, one outcome. Either the FILE's record is one this build cannot
- * read (D11a) — writing it would have the local queue serialize it and
- * quarantine it permanently, and that quarantine is irreversible — or the
- * record is readable but its predecessor is not in the plan, in which case
- * applying it alone would strand it (D12a). The user hears the same sentence
- * for both: something is still in the file that is not in the store. */
-export interface UnsupportedRecord {
+ * `unsupported` keeps its D11a meaning and nothing else: «this build does not
+ * know this version», possibly because a NEWER one wrote it — the case the UI
+ * answers with «not restored by THIS version of the app». A record whose shape
+ * is broken or whose bytes are damaged is not that, and reporting it there
+ * would send the user looking for a newer build that does not exist. Both are
+ * `skipped`: left unapplied, and not a version problem.
+ */
+export type NotAppliedCounter = 'unsupported' | 'skipped';
+
+/** A record the plan will NOT attempt, and the counter it belongs in.
+ *
+ * Two ways in. Either the FILE's record is one this build cannot use — writing
+ * it would have the local queue serialize it and quarantine it permanently,
+ * and that quarantine is irreversible — or the record is fine but its
+ * predecessor is not in the plan, in which case applying it alone would strand
+ * it (D12a). The second inherits the first's counter: a descendant is missing
+ * for its ancestor's reason, not for one of its own. */
+export interface NotAppliedRecord {
   kind: PlannedKind;
   id: string;
+  counter: NotAppliedCounter;
 }
+
+const COUNTER_OF: Record<Exclude<BackupRecordState, 'readable'>, NotAppliedCounter> = {
+  unsupported: 'unsupported',
+  malformed: 'skipped',
+  damaged: 'skipped',
+};
 
 export interface ImportPlan {
   /** Application order. Chains may interleave; within a chain, revisions
    *  strictly ascend. */
   ordered: PlannedRecord[];
-  /** Everything the plan refuses to attempt — unreadable records and the
-   *  descendants stranded behind them. */
-  unsupported: UnsupportedRecord[];
+  /** Everything the plan refuses to attempt — unusable records and the
+   *  descendants stranded behind them, each with its counter. */
+  notApplied: NotAppliedRecord[];
 }
 
-export interface PlanInput {
-  kind: PlannedKind;
-  id: string;
+/** One record as stage A classified it (`backup-classify.ts`), plus the
+ *  encrypted record itself. The verdict is TAKEN, never re-derived: a second
+ *  opinion about «can this be restored?» is exactly the drift this module must
+ *  not introduce. */
+export type PlanInput = ClassifiedBackupRecord & {
   record: EncryptedNote | EncryptedSafeboxEntry;
-  /** Topology from the decrypted envelope, or `undefined` when this build
-   *  could not read the record at all. */
-  topology?: { root: string; rev: number; prev?: string };
-}
+};
 
 /** Key that identifies one chain across both collections. */
 export const chainKey = (kind: PlannedKind, root: string): string => `${kind}:${root}`;
@@ -83,11 +101,11 @@ export const chainKey = (kind: PlannedKind, root: string): string => `${kind}:${
  */
 export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
   const readable: PlannedRecord[] = [];
-  const unsupported: UnsupportedRecord[] = [];
+  const notApplied: NotAppliedRecord[] = [];
 
   for (const input of inputs) {
-    if (input.topology === undefined) {
-      unsupported.push({ kind: input.kind, id: input.id });
+    if (input.state !== 'readable') {
+      notApplied.push({ kind: input.kind, id: input.id, counter: COUNTER_OF[input.state] });
       continue;
     }
     readable.push({
@@ -112,29 +130,43 @@ export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
   });
 
   // One forward pass in that order decides who has a predecessor to stand on.
-  // A record whose `prev` has not already been accepted is stranded, and so is
-  // everything behind it — the memo carries the verdict down the chain without
-  // walking it again.
+  // A record that does not is set aside, and so is everything behind it — the
+  // memo carries the verdict down the chain without walking it again.
   //
-  // «Not already accepted» is deliberately stricter than «present somewhere»:
-  // on input stage A would have rejected — a forward reference, a link into
-  // another chain — the predecessor is not in the memo yet and the record is
-  // set aside. Fail-closed is the right direction for a graph that is already
-  // known to be wrong.
-  const accepted = new Set<string>();
+  // The test is the SAME direct link stage A proves (`backup-chains.ts`), not
+  // «is some record with that id in the plan»: an id that happens to be accepted
+  // may belong to another chain entirely, and then whether THAT chain sorts
+  // earlier or later would decide whether a broken container gets written. A
+  // guard whose answer depends on sort order is not a guard.
+  const accepted = new Map<string, PlannedRecord>();
+  const refused = new Map<string, NotAppliedCounter>();
+  for (const record of notApplied) refused.set(key(record.kind, record.id), record.counter);
+
   const ordered: PlannedRecord[] = [];
   for (const record of readable) {
-    const stands = record.prev === undefined || accepted.has(`${record.kind}:${record.prev}`);
+    const prevKey = record.prev === undefined ? undefined : key(record.kind, record.prev);
+    const prev = prevKey === undefined ? undefined : accepted.get(prevKey);
+    const stands = record.rev === 1
+      ? record.prev === undefined
+      : prev !== undefined && prev.root === record.root && prev.rev === record.rev - 1;
+
     if (!stands) {
-      unsupported.push({ kind: record.kind, id: record.id });
+      // A descendant is missing for its ANCESTOR's reason (D12a). A link stage
+      // A would have rejected outright has no ancestor to inherit from, and
+      // «left unapplied» is all that can honestly be said about it.
+      const counter = (prevKey === undefined ? undefined : refused.get(prevKey)) ?? 'skipped';
+      notApplied.push({ kind: record.kind, id: record.id, counter });
+      refused.set(key(record.kind, record.id), counter);
       continue;
     }
-    accepted.add(`${record.kind}:${record.id}`);
+    accepted.set(key(record.kind, record.id), record);
     ordered.push(record);
   }
 
-  return { ordered, unsupported };
+  return { ordered, notApplied };
 }
+
+const key = (kind: PlannedKind, id: string): string => `${kind}:${id}`;
 
 /**
  * Outcomes after which the rest of the chain must NOT be attempted.

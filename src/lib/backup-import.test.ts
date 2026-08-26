@@ -22,7 +22,11 @@ const rec = (id: string): EncryptedNote =>
   ({ noteId: id, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: 'AAAAAAAAAAAAAAAA', createdAt: 1 });
 
 const node = (id: string, rev: number, root: string, prev?: string): PlanInput =>
-  ({ kind: 'note', id, record: rec(id), topology: { root, rev, prev } });
+  ({ kind: 'note', id, record: rec(id), state: 'readable', topology: { root, rev, prev } });
+
+/** A record stage A could not place, with the verdict it refused it under. */
+const refused = (id: string, state: 'unsupported' | 'malformed' | 'damaged' = 'unsupported'): PlanInput =>
+  ({ kind: 'note', id, record: rec(id), state });
 
 const chain = (prefix: string, length: number): PlanInput[] =>
   Array.from({ length }, (_, i) =>
@@ -98,7 +102,7 @@ describe('counting', () => {
     const h = harness();
     const plan = planBackupImport([
       node('a1', 1, 'a1'),
-      { kind: 'note', id: 'opaque', record: rec('opaque') },
+      refused('opaque'),
     ]);
 
     const report = await applyBackupImport(h.deps, plan, true);
@@ -365,7 +369,7 @@ describe('what the report is, and what it is not', () => {
     const h = harness();
     const plan = planBackupImport([
       node('a1', 1, 'a1'),
-      { kind: 'note', id: 'a2', record: rec('a2') },
+      refused('a2'),
       node('a3', 3, 'a1', 'a2'),
     ]);
 
@@ -374,5 +378,25 @@ describe('what the report is, and what it is not', () => {
     expect(h.merged).toEqual(['a1']);
     expect(report.counters.unsupported).toBe(2);
     expect(report.allFileRecordsApplied).toBe(false);
+  });
+});
+
+describe('the counters stage A decided are the counters the report carries', () => {
+  it('a broken record is `skipped`, not `unsupported`', async () => {
+    // `unsupported` is the line that says «a newer version of the app may be
+    // able to restore this». For a record whose shape is broken that is a
+    // false lead, and the two must not share a counter.
+    const h = harness();
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      refused('broken', 'malformed'),
+      refused('older', 'unsupported'),
+    ]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(report.counters.skipped).toBe(1);
+    expect(report.counters.unsupported).toBe(1);
+    expect(h.merged).toEqual(['a1']);
   });
 });
