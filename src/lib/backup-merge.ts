@@ -121,6 +121,16 @@ const needsPayload = (state: LocalPayloadState) => state === 'absent' || state =
  *
  * The outcome is `skipped` rather than a silent no-op: nothing was applied,
  * and «осталось непримененным» is exactly what that counter is for (§4).
+ *
+ * SCOPE, because it is easy to read this as broader than it is: the barrier
+ * gates the WRITE. Branches that write nothing are decided by the LOCAL row
+ * and are not affected by the file's shape — `quarantineStale` lifts a
+ * quarantine because the local payload reads and passes the barrier, not
+ * because of anything in the file. Running the check before the rules instead
+ * would turn «the local record is present and publication-equivalent» into
+ * `skipped` whenever the file's copy differs in a field that never reaches the
+ * chain — and a complete, correctly applied import would report itself
+ * incomplete, which is the one thing §4 spends a paragraph forbidding.
  */
 export function decideBackupMerge(input: BackupMergeInput): BackupMergeDecision {
   const decision = decide(input);
