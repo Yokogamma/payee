@@ -6,13 +6,18 @@
  * reading, and keeping them pure makes the whole table testable without
  * IndexedDB — the same reason `sync-transitions.ts` exists.
  *
- * Two things this function will never do, whatever the input:
+ * Three things this function will never do, whatever the input:
  *  - write a `txId`. A file cannot prove «these bytes were published by that
  *    transaction», so the link to a publication is established by the server
  *    and by nothing else;
  *  - create a quarantine. The container carries no sync store, so a
  *    `terminalError` from a file does not exist as a phenomenon. Only the fate
- *    of a LOCAL quarantine is decided, and only by its reason.
+ *    of a LOCAL quarantine is decided, and only by its reason. That promise
+ *    extends to quarantines created INDIRECTLY, which is why the file's bytes
+ *    must pass the upload shape barrier before they are written at all;
+ *  - report a repair it did not make. Lifting a quarantine and writing bytes
+ *    the queue will refuse is worse than doing nothing: the user is told the
+ *    record is back while it is on its way to being quarantined again.
  *
  * The order below is the rule order, and it is load-bearing.
  */
@@ -24,7 +29,7 @@ import { publicationEquivalent, type PublicationSubject } from './publication-eq
 // reject it?». Reusing that barrier keeps ONE definition of a well-formed
 // record; a second one here would drift and re-quarantine what this module
 // just declared repaired.
-import { assertUploadableItem, type UploadItem } from './upload-flow';
+import { isUploadableItem, type UploadItem } from './upload-flow';
 
 /** What this build can make of the LOCAL payload. Determined by actually
  *  trying to decrypt it — which is asynchronous, and therefore happens BEFORE
@@ -97,7 +102,33 @@ const isOpaque = (state: LocalPayloadState) => state === 'opaque';
  *  better than what is on disk. */
 const needsPayload = (state: LocalPayloadState) => state === 'absent' || state === 'corrupt';
 
+/**
+ * The rules, plus the one refusal that is not a rule: bytes from the FILE must
+ * pass the same shape barrier the upload path applies before signing (D14b).
+ *
+ * It sits here, over the whole decision, rather than at each write site, so no
+ * later branch can quietly escape it — and it is applied even though stage A
+ * classified the file already, because this writer does not trust its caller,
+ * for the same reason the worker does not trust the client.
+ *
+ * Why it is not a mis-count. A record that decrypts but violates the shape is
+ * not healthy: the queue quarantines it as `malformed_record` on its very next
+ * pass, so writing it would make the import CREATE a quarantine — which D8 (2)
+ * forbids outright. Worse in the D5a cell where a damaged local payload is
+ * repaired from the file: that same write also LIFTS the existing quarantine
+ * and reports `quarantinedRepaired`, a repair that did not happen, announced
+ * to a user who is deciding whether the file is still needed.
+ *
+ * The outcome is `skipped` rather than a silent no-op: nothing was applied,
+ * and «осталось непримененным» is exactly what that counter is for (§4).
+ */
 export function decideBackupMerge(input: BackupMergeInput): BackupMergeDecision {
+  const decision = decide(input);
+  if (!decision.writePayload) return decision;
+  return passesUploadShape(input.kind, input.incoming) ? decision : leave('skipped');
+}
+
+function decide(input: BackupMergeInput): BackupMergeDecision {
   const { id, kind, incoming, local, localState, sync, now } = input;
 
   // ── The conflict check is ORTHOGONAL to everything below ────────────
@@ -222,12 +253,7 @@ function passesUploadShape(
   record: EncryptedNote | EncryptedSafeboxEntry | undefined,
 ): boolean {
   if (record === undefined) return false;
-  try {
-    assertUploadableItem({ kind, record } as UploadItem);
-    return true;
-  } catch {
-    return false;
-  }
+  return isUploadableItem({ kind, record } as UploadItem);
 }
 
 /** `publicationEquivalent` over the pair, with the kind supplied by the caller

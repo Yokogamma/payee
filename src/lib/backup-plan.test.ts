@@ -114,3 +114,61 @@ describe('which outcomes poison the rest of a chain', () => {
     }
   });
 });
+
+describe('a descendant whose predecessor is not in the plan', () => {
+  it('is set aside with it, not applied on its own', () => {
+    // The cascade in `runPlan` cannot see this case: a record this build could
+    // not read has no topology, so it belongs to no chain and stops nothing.
+    // Applied alone, `a3` would land in the store pointing at a `prev` the
+    // store does not have — the hole D12a exists to prevent.
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      { kind: 'note', id: 'a2', record: rec('a2') }, // unreadable: no topology
+      node('a3', 3, 'a1', 'a2'),
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
+    expect(plan.unsupported).toEqual([
+      { kind: 'note', id: 'a2' },
+      { kind: 'note', id: 'a3' },
+    ]);
+  });
+
+  it('and so is everything behind IT', () => {
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      { kind: 'note', id: 'a2', record: rec('a2') },
+      node('a3', 3, 'a1', 'a2'),
+      node('a4', 4, 'a1', 'a3'),
+      node('a5', 5, 'a1', 'a4'),
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
+    expect(plan.unsupported.map(r => r.id)).toEqual(['a2', 'a3', 'a4', 'a5']);
+  });
+
+  it('a chain of its own is unaffected', () => {
+    const plan = planBackupImport([
+      { kind: 'note', id: 'a1', record: rec('a1') },
+      node('b1', 1, 'b1'),
+      node('b2', 2, 'b1', 'b1'),
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['b1', 'b2']);
+    expect(plan.unsupported.map(r => r.id)).toEqual(['a1']);
+  });
+
+  it('a link stage A would have rejected is set aside fail-closed', () => {
+    // `prev` in ANOTHER chain: stage A refuses such a container outright, so
+    // reaching here means something is already wrong. The plan does not try to
+    // rescue it — it declines to write a record it cannot place.
+    const plan = planBackupImport([
+      node('z1', 1, 'z1'),
+      node('a1', 1, 'a1'),
+      node('a2', 2, 'a1', 'z1'), // ordered BEFORE z1: chain «a» sorts first
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'z1']);
+    expect(plan.unsupported).toEqual([{ kind: 'note', id: 'a2' }]);
+  });
+});

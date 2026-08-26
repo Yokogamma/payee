@@ -18,6 +18,7 @@ import {
   INCOMPLETE_RESTORE_META_KEY,
   STALE_UPLOADING_MS,
   BackupMergeContractError,
+  StorageResetError,
   type SyncRecord,
 } from './storage';
 import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
@@ -36,10 +37,13 @@ const ID = '11111111-2222-4333-8444-555555555555';
 const IV = 'AAAAAAAAAAAAAAAA';
 const BIG_BUDGET = 32 * 1024 * 1024;
 
+// 16-byte ciphertexts, not toy ones: the writer re-applies the upload shape
+// barrier to the incoming record (D14b), and a 4-byte fixture would be refused
+// for a reason no test here is about.
 const note = (over: Partial<EncryptedNote> = {}): EncryptedNote =>
-  ({ noteId: ID, ciphertext: 'QUFBQQ==', iv: IV, createdAt: NOW - 5000, ...over });
+  ({ noteId: ID, ciphertext: 'QUFBQUFBQUFBQUFBQUFBQQ==', iv: IV, createdAt: NOW - 5000, ...over });
 
-const other = note({ ciphertext: 'QkJCQg==' });
+const other = note({ ciphertext: 'QkJCQkJCQkJCQkJCQkJCQg==' });
 
 beforeEach(async () => {
   await initStorage();
@@ -51,8 +55,8 @@ describe('readBackupSnapshot', () => {
     await saveNote(note());
     await mergeRestoredSafeboxEntry({
       entryId: '88888888-9999-8aaa-baaa-cccccccccccc',
-      metaCiphertext: 'QUFBQQ==', metaIv: IV,
-      secretCiphertext: 'QkJCQg==', secretIv: IV,
+      metaCiphertext: 'QUFBQUFBQUFBQUFBQUFBQQ==', metaIv: IV,
+      secretCiphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', secretIv: IV,
       createdAt: NOW, v: 4,
     }, 'tx-A', NOW, getDbGeneration());
 
@@ -118,10 +122,11 @@ describe('mergeBackupRecord — rule 0: a live attempt is untouchable', () => {
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('deferred');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ==');
     expect(await getSyncRecord(ID)).toEqual(live);
   });
 
@@ -134,10 +139,11 @@ describe('mergeBackupRecord — rule 0: a live attempt is untouchable', () => {
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('repaired');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQg==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQkJCQkJCQkJCQkJCQg==');
     // The hung attempt no longer owns the row: its answer will not match.
     expect((await getSyncRecord(ID))?.attemptId).toBeUndefined();
   });
@@ -152,12 +158,13 @@ describe('mergeBackupRecord — D13: the classification must still describe the 
     await saveNote(other);
 
     const outcome = await mergeBackupRecord({
-      kind: 'note', incoming: note({ ciphertext: 'Q0NDQw==' }), local: { state: 'corrupt', record: before }, now: NOW,
+      kind: 'note', incoming: note({ ciphertext: 'Q0NDQ0NDQ0NDQ0NDQ0NDQw==' }), local: { state: 'corrupt', record: before }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('concurrentChange');
     // Nothing applied: every conclusion about that record was stale.
-    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQg==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQkJCQkJCQkJCQkJCQg==');
     expect(await getSyncRecord(ID)).toBeUndefined();
   });
 
@@ -166,10 +173,11 @@ describe('mergeBackupRecord — D13: the classification must still describe the 
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'absent' }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('concurrentChange');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ==');
   });
 
   it('a re-ordered but identical record is NOT a change', async () => {
@@ -177,11 +185,12 @@ describe('mergeBackupRecord — D13: the classification must still describe the 
     // value. Comparing raw JSON would report a false conflict here.
     await saveNote(note());
     const reordered = {
-      createdAt: NOW - 5000, iv: IV, ciphertext: 'QUFBQQ==', noteId: ID,
+      createdAt: NOW - 5000, iv: IV, ciphertext: 'QUFBQUFBQUFBQUFBQUFBQQ==', noteId: ID,
     } as EncryptedNote;
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'corrupt', record: reordered }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('repaired');
@@ -192,10 +201,11 @@ describe('mergeBackupRecord — the pair is written atomically', () => {
   it('added: payload written, no sync row invented', async () => {
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: note(), local: { state: 'absent' }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('added');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ==');
     expect(await getSyncRecord(ID)).toBeUndefined();
   });
 
@@ -208,10 +218,11 @@ describe('mergeBackupRecord — the pair is written atomically', () => {
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('repaired');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQg==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQkJCQkJCQkJCQkJCQg==');
     const row = await getSyncRecord(ID);
     expect(row).toEqual({ noteId: ID, kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW });
     expect(row?.txId).toBeUndefined();
@@ -225,6 +236,7 @@ describe('mergeBackupRecord — the pair is written atomically', () => {
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: note(), local: { state: 'readable', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('noop');
@@ -241,10 +253,11 @@ describe('mergeBackupRecord — the pair is written atomically', () => {
 
     const outcome = await mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('quarantinedDataRepaired');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQg==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QkJCQkJCQkJCQkJCQkJCQg==');
     expect(await getSyncRecord(ID)).toEqual(quarantined); // block and evidence intact
   });
 });
@@ -258,6 +271,7 @@ describe('mergeBackupRecord — the contract is checked before anything is read'
       const broken = { ...note(), noteId } as unknown as EncryptedNote;
       await expect(mergeBackupRecord({
         kind: 'note', incoming: broken, local: { state: 'absent' }, now: NOW,
+        expectedDbGeneration: getDbGeneration(),
       }), String(noteId)).rejects.toBeInstanceOf(BackupMergeContractError);
     }
     expect(await getNoteById(ID)).toEqual(before);
@@ -275,9 +289,10 @@ describe('mergeBackupRecord — the contract is checked before anything is read'
 
     await expect(mergeBackupRecord({
       kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     })).rejects.toBeInstanceOf(BackupMergeContractError);
 
-    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ=='); // untouched
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ=='); // untouched
   });
 
   it('the key written is the one the CAS checked — it comes from `incoming`', async () => {
@@ -289,10 +304,11 @@ describe('mergeBackupRecord — the contract is checked before anything is read'
 
     await mergeBackupRecord({
       kind: 'note', incoming: note(), local: { state: 'absent' }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect((await getNoteById(unrelated))?.ciphertext).toBe('SEVBTFRIWQ==');
-    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ==');
   });
 });
 
@@ -333,6 +349,7 @@ describe('mergeBackupRecord — safebox entries land in their OWN store', () => 
     // safebox entry into the notes list, where it would decrypt as garbage.
     const outcome = await mergeBackupRecord({
       kind: 'safebox', incoming: entry(), local: { state: 'absent' }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('added');
@@ -344,6 +361,7 @@ describe('mergeBackupRecord — safebox entries land in their OWN store', () => 
   it('repaired: both halves and a SAFEBOX-kinded retryable row land together', async () => {
     await mergeBackupRecord({
       kind: 'safebox', incoming: entry(), local: { state: 'absent' }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
     await setSyncRecord({
       noteId: ENTRY_ID, kind: 'safebox', status: 'confirmed',
@@ -355,6 +373,7 @@ describe('mergeBackupRecord — safebox entries land in their OWN store', () => 
       incoming: entry({ secretCiphertext: 'Q0NDQ0NDQ0NDQ0NDQ0NDQw==' }),
       local: { state: 'corrupt', record: entry() },
       now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('repaired');
@@ -367,6 +386,7 @@ describe('mergeBackupRecord — safebox entries land in their OWN store', () => 
   it('the TOCTOU check reads the safebox store too', async () => {
     await mergeBackupRecord({
       kind: 'safebox', incoming: entry(), local: { state: 'absent' }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     const outcome = await mergeBackupRecord({
@@ -374,6 +394,7 @@ describe('mergeBackupRecord — safebox entries land in their OWN store', () => 
       incoming: entry({ secretCiphertext: 'Q0NDQ0NDQ0NDQ0NDQ0NDQw==' }),
       local: { state: 'absent' }, // stale: an entry exists now
       now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     });
 
     expect(outcome).toBe('concurrentChange');
@@ -402,9 +423,41 @@ describe('mergeBackupRecord — a failing write leaves nothing behind', () => {
 
     await expect(mergeBackupRecord({
       kind: 'note', incoming: unclonable, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
     })).rejects.toBeDefined();
 
-    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQQ==');
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ==');
     expect(await getSyncRecord(ID)).toEqual(priorRow);
+  });
+});
+
+describe('mergeBackupRecord — the reset invariant belongs to the WRITER', () => {
+  it('refuses a stale generation and writes nothing', async () => {
+    await saveNote(note());
+    const stale = getDbGeneration();
+
+    // Another tab wipes the vault while this import is between records, and
+    // the user starts over. The classification this merge is carrying was
+    // computed against a database that no longer exists.
+    await resetAll();
+    await saveNote(note());
+
+    await expect(mergeBackupRecord({
+      kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: stale,
+    })).rejects.toThrow(StorageResetError);
+
+    // Not «mostly refused»: the fresh vault is untouched.
+    expect((await getNoteById(ID))?.ciphertext).toBe('QUFBQUFBQUFBQUFBQUFBQQ==');
+    expect(await getSyncRecord(ID)).toBeUndefined();
+  });
+
+  it('accepts the current generation — the guard is a guard, not a wall', async () => {
+    await saveNote(note());
+    const outcome = await mergeBackupRecord({
+      kind: 'note', incoming: other, local: { state: 'corrupt', record: note() }, now: NOW,
+      expectedDbGeneration: getDbGeneration(),
+    });
+    expect(outcome).toBe('repaired');
   });
 });
