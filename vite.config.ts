@@ -65,7 +65,14 @@ export default defineConfig(({ command, mode }) => {
           globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
           // The manifest icons are auto-added by the plugin — excluding them
           // from the glob keeps every precache URL unique (round-15 LOW).
-          globIgnores: ["**/icon-*.png"],
+          //
+          // The standalone backup viewer is excluded for a different reason: it
+          // is an ARTIFACT the app hands the user and then verifies against a
+          // compiled-in SHA-256 (D19), not a page the app navigates to. A
+          // precached copy could be served in place of the freshly built one,
+          // and the check would then be comparing the app's own stale cache
+          // against its own constant — passing while telling the user nothing.
+          globIgnores: ["**/icon-*.png", "backup-viewer.html"],
           // SPA offline navigation falls back to the precached shell.
           navigateFallback: `${base}index.html`,
           // No runtimeCaching entries: proxy/Arweave requests stay network-only.
