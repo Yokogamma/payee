@@ -10,6 +10,7 @@ import {
 } from './upload-flow';
 import { toUploading } from './sync-transitions';
 import type { UploadResult } from './arweave';
+import { UnsupportedSafeboxVersionError } from './arweave';
 import type { SyncRecord } from './storage';
 import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 import { UnsupportedNoteVersionError } from './crypto';
@@ -189,7 +190,8 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
   it('assertUploadableItem enforces the whole shape', () => {
     expect(() => assertUploadableItem(SB_ITEM)).not.toThrow();
     const bad: Array<Partial<EncryptedSafeboxEntry>> = [
-      { v: 3 as unknown as 4 },
+      // NOTE: an unrecognized `v` is deliberately absent from this list — it is
+      // an OPAQUE record, not a malformed one. See the dedicated test below.
       { entryId: 'not-a-uuid' },
       { entryId: '11111111-2222-4333-8444-555555555555' }, // UUIDv4 → wrong namespace
       { metaCiphertext: '' },
@@ -281,7 +283,26 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
     })).not.toThrow();
   });
 
-  it('an UNRECOGNIZED version is NOT judged by the namespace rule', async () => {
+  it('an unknown SAFEBOX version is opaque, not malformed — no signature, no HTTP', async () => {
+    // The distinction D14b calls load-bearing, on the half that used to get it
+    // wrong: `v: 5` was collapsed into MalformedRecordError, which maps to
+    // `malformed_record` — the verdict under which D5a lets a backup REPLACE
+    // the bytes. A record written by a NEWER build would then be overwritten by
+    // an older copy of itself. It must surface as UnsupportedSafeboxVersionError
+    // → `unsupported_version`, the verdict that never replaces.
+    for (const v of [5, 3, undefined, 'garbage']) {
+      const record = { ...SB, v } as unknown as EncryptedSafeboxEntry;
+      expect(() => assertUploadableItem({ kind: 'safebox', record }), String(v)).not.toThrow();
+
+      const h = harness();
+      await expect(runUploadAttempt({ kind: 'safebox', record }, KEYS, 1, h.deps), String(v))
+        .rejects.toBeInstanceOf(UnsupportedSafeboxVersionError);
+      expect(h.calls(), String(v)).toBe(0);
+      expect(h.writes, String(v)).toEqual([]);
+    }
+  });
+
+  it('an UNRECOGNIZED note version is NOT judged by the namespace rule', async () => {
     // It must surface as UnsupportedNoteVersionError, not MalformedRecordError.
     // The distinction is load-bearing: D5a treats an OPAQUE record — one a
     // NEWER build wrote — differently from a malformed one and must never
