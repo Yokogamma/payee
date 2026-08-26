@@ -11,7 +11,8 @@ import {
 import { toUploading } from './sync-transitions';
 import type { UploadResult } from './arweave';
 import type { SyncRecord } from './storage';
-import type { EncryptedSafeboxEntry } from './crypto';
+import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
+import { UnsupportedNoteVersionError } from './crypto';
 
 // The queue is kind-tagged: the payload builder and the pause marker are chosen
 // from the ITEM, never sniffed off a record read back from IndexedDB. And every
@@ -30,7 +31,7 @@ const SB: EncryptedSafeboxEntry = {
 const SB_ITEM: UploadItem = { kind: 'safebox', record: SB };
 const NOTE_ITEM: UploadItem = {
   kind: 'note',
-  record: { noteId: 'n1', ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: IV12, createdAt: NOW - 1000, v: 3 },
+  record: { noteId: '66666666-7777-8333-9444-555555555555', ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: IV12, createdAt: NOW - 1000, v: 3 },
 };
 
 const KEYS: UploadKeys = {
@@ -91,7 +92,7 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
 
 describe('uploadItemId', () => {
   it('reads the right primary key per kind', () => {
-    expect(uploadItemId(NOTE_ITEM)).toBe('n1');
+    expect(uploadItemId(NOTE_ITEM)).toBe(NOTE_ITEM.record.noteId);
     expect(uploadItemId(SB_ITEM)).toBe(SB.entryId);
   });
 });
@@ -210,8 +211,75 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
 
   it('also guards note rows (a corrupted iv can never be posted)', () => {
     expect(() => assertUploadableItem({
-      kind: 'note', record: { noteId: 'n', ciphertext: 'AAAA', iv: 'AAAA', createdAt: 1 },
+      kind: 'note', record: { noteId: '11111111-2222-4333-8444-555555555555', ciphertext: 'AAAA', iv: 'AAAA', createdAt: 1 },
     })).toThrow(MalformedRecordError);
+  });
+
+  it('an id from the WRONG namespace is quarantined before anything is signed', () => {
+    // v1/v2 ids are UUIDv4, v3/v4 ids are UUIDv8 — disjoint namespaces the
+    // worker enforces with a plain 400. A plain 400 is untyped, so the client
+    // would turn it into a RETRYABLE error and re-enqueue the row on every
+    // queue pass: one corrupted record becomes an endless request loop that
+    // burns the shared IP rate limit. Caught here instead, with no HTTP.
+    const iv = 'AAAAAAAAAAAAAAAA';
+    const ciphertext = 'AAAAAAAAAAAAAAAAAAAAAA==';
+    const V4 = '11111111-2222-4333-8444-555555555555';
+    const V8 = '66666666-7777-8333-9444-555555555555';
+
+    const bad: Array<[string, Partial<EncryptedNote>]> = [
+      ['v1 with a UUIDv8 id', { noteId: V8 }],
+      ['v2 with a UUIDv8 id', { noteId: V8, v: 2 }],
+      ['v3 with a UUIDv4 id', { noteId: V4, v: 3 }],
+      ['an arbitrary non-empty string', { noteId: 'note-1' }],
+      ['an empty id', { noteId: '' }],
+      ['a UUID-shaped string with a bad variant nibble', { noteId: '11111111-2222-4333-0444-555555555555' }],
+    ];
+    for (const [name, patch] of bad) {
+      expect(() => assertUploadableItem({
+        kind: 'note', record: { noteId: V4, ciphertext, iv, createdAt: 1, ...patch },
+      }), name).toThrow(MalformedRecordError);
+    }
+
+    // ...and the two legitimate namespaces pass.
+    expect(() => assertUploadableItem({
+      kind: 'note', record: { noteId: V4, ciphertext, iv, createdAt: 1 },
+    })).not.toThrow();
+    expect(() => assertUploadableItem({
+      kind: 'note', record: { noteId: V8, ciphertext, iv, createdAt: 1, v: 3 },
+    })).not.toThrow();
+  });
+
+  it('an UNRECOGNIZED version is NOT judged by the namespace rule', async () => {
+    // It must surface as UnsupportedNoteVersionError, not MalformedRecordError.
+    // The distinction is load-bearing: D5a treats an OPAQUE record — one a
+    // NEWER build wrote — differently from a malformed one and must never
+    // replace it. Mislabelling it here would throw that protection away.
+    const opaque = {
+      noteId: '66666666-7777-8333-9444-555555555555',
+      ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: 'AAAAAAAAAAAAAAAA',
+      createdAt: 1, v: 9,
+    } as unknown as EncryptedNote;
+
+    expect(() => assertUploadableItem({ kind: 'note', record: opaque })).not.toThrow();
+
+    const h = harness();
+    await expect(runUploadAttempt({ kind: 'note', record: opaque }, KEYS, 1, h.deps))
+      .rejects.toBeInstanceOf(UnsupportedNoteVersionError);
+    expect(h.calls()).toBe(0);
+    expect(h.writes).toEqual([]);
+  });
+
+  it('a wrong-namespace id never reaches the network', async () => {
+    const h = harness();
+    await expect(runUploadAttempt({
+      kind: 'note',
+      record: {
+        noteId: '66666666-7777-8333-9444-555555555555', // v8 id on a v1 record
+        ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: 'AAAAAAAAAAAAAAAA', createdAt: 1,
+      },
+    }, KEYS, 1, h.deps)).rejects.toBeInstanceOf(MalformedRecordError);
+    expect(h.calls()).toBe(0);
+    expect(h.writes).toEqual([]); // no stranded 'uploading'
   });
 
   it('a ciphertext shorter than the GCM tag is quarantined, never published', () => {
@@ -222,12 +290,12 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
     const iv = 'AAAAAAAAAAAAAAAA';
     for (const ciphertext of ['AAAA', 'AAAAAAAA', 'AAAAAAAAAAAAAAAAAAAA']) {
       expect(() => assertUploadableItem({
-        kind: 'note', record: { noteId: 'n', ciphertext, iv, createdAt: 1 },
+        kind: 'note', record: { noteId: '11111111-2222-4333-8444-555555555555', ciphertext, iv, createdAt: 1 },
       }), ciphertext).toThrow(MalformedRecordError);
     }
     // ...and exactly 16 bytes (an empty plaintext plus the tag) passes.
     expect(() => assertUploadableItem({
-      kind: 'note', record: { noteId: 'n', ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv, createdAt: 1 },
+      kind: 'note', record: { noteId: '11111111-2222-4333-8444-555555555555', ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv, createdAt: 1 },
     })).not.toThrow();
   });
 });
