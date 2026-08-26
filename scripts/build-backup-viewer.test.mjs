@@ -132,7 +132,13 @@ describe('the committed hash module', () => {
     // passing while telling the user nothing.
     const swPath = fileURLToPath(new URL('../dist/sw.js', import.meta.url));
     if (!existsSync(swPath)) return; // nothing built in this checkout
-    expect(readFileSync(swPath, 'utf8')).not.toContain('backup-viewer');
+    const sw = readFileSync(swPath, 'utf8');
+    // The PRECACHE MANIFEST specifically, not any mention of the name: the
+    // navigation-fallback denylist legitimately carries the same string as a
+    // pattern, and a bare substring check would call that a precache entry.
+    const precached = [...sw.matchAll(/url:"([^"]+)"/g)].map(m => m[1]);
+    expect(precached.length).toBeGreaterThan(0); // the scan really found the manifest
+    expect(precached).not.toContain('backup-viewer.html');
   });
 
   it('the placeholder renders as invalid and a real hash renders as valid', () => {
