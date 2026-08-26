@@ -85,6 +85,17 @@ export interface VerifyReport {
    *  container can be perfectly intact and still not be a complete backup —
    *  two different questions that must never be merged into one verdict. */
   incompleteRestore: boolean;
+  /**
+   * Records THIS READER could not understand — computed, never copied from the
+   * header (D11a).
+   *
+   * The header is the WRITER's claim, and the check against it is asymmetric
+   * on purpose: `true` while this reader understands everything is the normal
+   * forward-compatible case, and the warning is dropped. Returning the raw
+   * claim instead would have a consumer show «some records cannot be restored»
+   * about a file this build restores in full — which is exactly the reading
+   * the asymmetry exists to prevent.
+   */
   containsUnsupportedRecords: boolean;
   /** Records this build could not read, and broken chain links. Ids and
    *  verdicts only — never content. */
@@ -188,6 +199,9 @@ export async function verifyBackupFile(
   const text = await file.text();
   deps.assertAlive();
   const sha256 = await deps.sha256Hex(text);
+  // Hashing a near-cap file is not instant, and a lock or a page hide during
+  // it must stop the run BEFORE the first decryption — not after (D15).
+  deps.assertAlive();
 
   const { header, body } = await decodeBackup(text, deps.keys.container);
   deps.assertAlive();
@@ -217,7 +231,8 @@ export async function verifyBackupFile(
     issues.push({ kind: issue.kind, id: issue.id, problem: 'chain', detail: issue.problem });
   }
 
-  assertHeaderHonest(header, issues);
+  const sawUnsupported = issues.some(i => i.problem === 'unsupported_version');
+  assertHeaderHonest(header, sawUnsupported);
 
   return {
     // Green requires all three: nothing unreadable, no broken chain, and a
@@ -229,7 +244,7 @@ export async function verifyBackupFile(
     createdAt: header.createdAt,
     counts: body.counts,
     incompleteRestore: body.incompleteRestore,
-    containsUnsupportedRecords: header.containsUnsupportedRecords,
+    containsUnsupportedRecords: sawUnsupported,
     issues,
   };
 }
@@ -250,8 +265,7 @@ const PROBLEM_OF: Record<Exclude<BackupRecordState, 'readable'>, VerifyProblem> 
   damaged: 'undecryptable',
 };
 
-function assertHeaderHonest(header: BackupHeader, issues: VerifyIssue[]): void {
-  const sawUnsupported = issues.some(i => i.problem === 'unsupported_version');
+function assertHeaderHonest(header: BackupHeader, sawUnsupported: boolean): void {
   if (sawUnsupported && !header.containsUnsupportedRecords) {
     throw new BackupError(
       'corrupt',
