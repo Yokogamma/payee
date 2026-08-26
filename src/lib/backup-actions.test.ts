@@ -339,3 +339,79 @@ async function forgeHeaderFlag(text: string, key: CryptoKey, flag: boolean): Pro
     createdAt: original.createdAt,
   }, key);
 }
+
+describe('verifyBackupFile — the four verdicts, in the order D14b fixes (D11)', () => {
+  async function containerOf(notes: EncryptedNote[], safebox: EncryptedSafeboxEntry[]) {
+    const deps = await makeDeps({
+      readSnapshot: async () => ({ ok: true, snapshot: { notes, safebox, incompleteRestore: false } }),
+    });
+    return { deps, exported: await exportBackup(deps) };
+  }
+
+  /** A NOTE-space (UUIDv4) identifier — wrong for a v3 note and wrong for any
+   *  safebox entry, both of which live in the v8 space. */
+  const NOTE_SPACE_ID = '11111111-2222-4333-8444-555555555555';
+
+  it('a record that decrypts but could never be SENT is «malformed», and the file is not green', async () => {
+    // The barrier the upload path applies before signing, applied to the FILE.
+    // Restoring this record would earn it a `malformed_record` quarantine on
+    // the queue's very next pass — the import creating a quarantine, which
+    // D8 (2) forbids — and the dry-run would have called the file healthy.
+    const wrongSpace = { ...(await makeNote()), noteId: NOTE_SPACE_ID } as EncryptedNote;
+    const { deps, exported } = await containerOf([wrongSpace], []);
+
+    const report = await verifyBackupFile(deps, asFile(exported.text));
+
+    expect(report.issues).toEqual([{ kind: 'note', id: NOTE_SPACE_ID, problem: 'malformed' }]);
+    expect(report.ok).toBe(false);
+    // NOT «unsupported»: that verdict is a promise never to replace the
+    // record, which a provably broken one must not be given (D5a/D14b).
+    expect(report.containsUnsupportedRecords).toBe(false);
+  });
+
+  it('an unknown version with a usable id stays «unsupported» — untouchable, not broken', async () => {
+    const opaque = { ...(await makeEntry()), v: 9 } as unknown as EncryptedSafeboxEntry;
+    const { deps, exported } = await containerOf([], [opaque]);
+
+    const report = await verifyBackupFile(deps, asFile(exported.text));
+
+    expect(report.issues).toEqual([
+      { kind: 'safebox', id: opaque.entryId, problem: 'unsupported_version' },
+    ]);
+  });
+
+  it('the STABLE field is judged before the version — an unknown version with a foreign id is malformed', async () => {
+    // The cross case D14b names explicitly: `entryId` belongs to the safebox
+    // id space whatever the version says, so a record that is BOTH of an
+    // unknown version AND missing a usable id is provably broken. Sealing it
+    // as opaque would promise never to replace it — that is, never to repair
+    // it from a backup either.
+    const both = {
+      ...(await makeEntry()), v: 9, entryId: NOTE_SPACE_ID,
+    } as unknown as EncryptedSafeboxEntry;
+    const { deps, exported } = await containerOf([], [both]);
+
+    const report = await verifyBackupFile(deps, asFile(exported.text));
+
+    expect(report.issues).toEqual([{ kind: 'safebox', id: NOTE_SPACE_ID, problem: 'malformed' }]);
+    // The header still says «I hold records you may not understand», and the
+    // asymmetric check accepts that — it only fails the other way round.
+    expect(report.containsUnsupportedRecords).toBe(true);
+  });
+
+  it('the three failing verdicts stay distinct in one file', async () => {
+    const healthy = await makeNote();
+    const note = await makeNote('another');
+    const damaged = { ...note, noteId: note.noteId, ciphertext: `${note.ciphertext.slice(0, -4)}AAAA` };
+    const malformed = { ...(await makeNote('third')), noteId: NOTE_SPACE_ID } as EncryptedNote;
+    const opaque = { ...(await makeNote('fourth')), v: 9 } as unknown as EncryptedNote;
+
+    const { deps, exported } = await containerOf([healthy, damaged, malformed, opaque], []);
+    const report = await verifyBackupFile(deps, asFile(exported.text));
+
+    expect(report.issues.map(i => i.problem).sort()).toEqual(
+      ['malformed', 'undecryptable', 'unsupported_version'],
+    );
+    expect(report.issues.some(i => i.id === healthy.noteId)).toBe(false);
+  });
+});

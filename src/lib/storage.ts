@@ -1197,8 +1197,14 @@ export type LocalPayload<T> =
  * else, and `kind` is what selects which field that is.
  */
 export type MergeBackupRecordInput =
-  | { kind: 'note'; incoming: EncryptedNote; local: LocalPayload<EncryptedNote>; now: number }
-  | { kind: 'safebox'; incoming: EncryptedSafeboxEntry; local: LocalPayload<EncryptedSafeboxEntry>; now: number };
+  | {
+    kind: 'note'; incoming: EncryptedNote; local: LocalPayload<EncryptedNote>;
+    now: number; expectedDbGeneration: number;
+  }
+  | {
+    kind: 'safebox'; incoming: EncryptedSafeboxEntry; local: LocalPayload<EncryptedSafeboxEntry>;
+    now: number; expectedDbGeneration: number;
+  };
 
 /** The caller handed this writer something self-contradictory. Thrown BEFORE
  *  any read or write, so a broken call can never leave a partial state. */
@@ -1227,9 +1233,17 @@ export class BackupMergeContractError extends Error {
  *
  * Rule 0 lives here rather than in the pure decision, because it needs the
  * freshness window and it is a full no-op — the payload is not touched either.
+ *
+ * CONTRACT, same as every other mutating writer here: `assertDbGeneration` and
+ * the transaction creation are adjacent and synchronous. The generation is a
+ * PARAMETER rather than something the caller checks before calling, because an
+ * import is the longest-running mutation in the app — it interleaves with
+ * locks, resets and other tabs for as long as the file takes — and an
+ * invariant that holds only while every caller keeps its own `await`s out of
+ * the way is an invariant the next caller silently repeals.
  */
 export async function mergeBackupRecord(input: MergeBackupRecordInput): Promise<BackupMergeResult> {
-  const { kind, incoming, local, now } = input;
+  const { kind, incoming, local, now, expectedDbGeneration } = input;
   // The one identity, taken from the record that will be written.
   const id = kind === 'note' ? incoming.noteId : incoming.entryId;
   if (typeof id !== 'string' || id.length === 0) {
@@ -1239,6 +1253,7 @@ export async function mergeBackupRecord(input: MergeBackupRecordInput): Promise<
   const localRecord = local.state === 'absent' ? undefined : local.record;
 
   const payloadStore = kind === 'note' ? 'notes' : 'safebox';
+  assertDbGeneration(expectedDbGeneration);
   const tx = getDB().transaction([payloadStore, 'sync'], 'readwrite');
   try {
     const syncStore = tx.objectStore('sync');
