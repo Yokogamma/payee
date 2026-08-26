@@ -308,9 +308,17 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
     // version and missing a usable id is provably broken — sealing it as
     // 'unsupported_version' would promise never to replace it, which for a
     // corrupted row means never repairing it from a backup either (D5a).
-    for (const entryId of ['', 'not-a-uuid', '11111111-2222-4333-8444-555555555555']) {
+    const brokenIds: unknown[] = [
+      '',                                       // empty
+      'not-a-uuid',                             // arbitrary string
+      '11111111-2222-4333-8444-555555555555',   // the WRONG namespace (UUIDv4)
+      42,                                       // not a string at all
+      null,
+      undefined,
+    ];
+    for (const entryId of brokenIds) {
       const record = { ...SB, v: 5, entryId } as unknown as EncryptedSafeboxEntry;
-      expect(() => assertUploadableItem({ kind: 'safebox', record }), entryId)
+      expect(() => assertUploadableItem({ kind: 'safebox', record }), String(entryId))
         .toThrow(MalformedRecordError);
     }
     // ...while an unknown version with a VALID id stays opaque.
