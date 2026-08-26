@@ -767,6 +767,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (cipherBytes.length < 16) {
       return error(`Invalid data: ${cName} must be at least 16 bytes (GCM tag)`, 400);
     }
+    // CANONICAL base64, not merely decodable: `atob` accepts missing padding,
+    // embedded whitespace and non-zero trailing bits, so one byte string has
+    // many accepted spellings. The spelling is what goes on chain — `data` is a
+    // JSON string — so accepting a variant would publish a different record for
+    // the same bytes, permanently, under the same idempotent id.
+    if (bytesToBase64(cipherBytes) !== cVal || bytesToBase64(bytes) !== ivVal) {
+      return error(`Invalid data: ${cName} and ${ivName} must be canonical base64`, 400);
+    }
     if (bytes.length !== 12) return error(`Invalid data: ${ivName} must be 12 bytes`, 400);
     return null;
   };

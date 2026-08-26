@@ -248,6 +248,30 @@ describe('upload validation: version contract (v1/v2)', () => {
     expect(r.status).not.toBe(400);
   });
 
+  it('rejects a NON-CANONICAL base64 spelling of otherwise valid bytes', async () => {
+    // Each of these decodes to the same 16 valid bytes; only the spelling
+    // differs. The spelling is what goes on chain, so accepting a variant would
+    // publish a different record for the same bytes under the same permanent
+    // idempotent id. Checked here independently of the client.
+    for (const c of ['AAAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAB==']) {
+      const r = await upload(v2Tags(), { id: NOTE_ID, c, iv: IV }, nextIp());
+      expect(r.status, c).toBe(400);
+      expect(await r.text()).toMatch(/canonical base64/);
+    }
+    // The IV is held to the same rule. A 12-byte IV has no spare bits (16
+    // base64 chars, no padding), so its non-canonical spellings are
+    // superfluous padding and whitespace. Which guard catches them is not the
+    // invariant: workerd's own `atob` refuses the padded form outright, before
+    // the canonical comparison is reached. What matters is that neither
+    // spelling can ever be published.
+    const NEWLINE = String.fromCharCode(10);
+    for (const iv of ['AAAAAAAAAAAAAAAA==', `AAAAAAAAAAAAAAAA${NEWLINE}`]) {
+      const r = await upload(v2Tags(), { id: NOTE_ID, c: 'AAAAAAAAAAAAAAAAAAAAAA==', iv }, nextIp());
+      expect(r.status, JSON.stringify(iv)).toBe(400);
+      expect(await r.text()).toMatch(/base64/);
+    }
+  });
+
   it('rejects null data', async () => {
     const r = await upload(v2Tags(), null, nextIp());
     expect(r.status).toBe(400);
