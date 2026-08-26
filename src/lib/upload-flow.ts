@@ -234,6 +234,23 @@ export function assertUploadableItem(item: UploadItem): void {
   assertIv12(e.secretIv, 'secretIv');
 }
 
+/**
+ * The same barrier, asked as a question rather than thrown.
+ *
+ * Callers that must DECIDE something about a record — the backup classifier,
+ * the merge writer — need a boolean, and each writing its own try/catch is how
+ * a second definition of «a well-formed record» starts. There is one barrier;
+ * this is the one way to consult it without catching.
+ */
+export function isUploadableItem(item: UploadItem): boolean {
+  try {
+    assertUploadableItem(item);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export type UploadAttemptOutcome =
   /** Lock happened before the point of no return: no HTTP, no writes. */
   | { kind: 'cancelled' }

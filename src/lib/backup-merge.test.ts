@@ -301,3 +301,92 @@ describe('safebox entries follow the same table', () => {
     expect(d.sync?.txId).toBeUndefined();
   });
 });
+
+describe('bytes from the FILE meet the same barrier as bytes about to be signed (D14b)', () => {
+  /**
+   * A record can decrypt perfectly and still be unsendable: the barrier judges
+   * SHAPE — the id namespace, canonical base64, a 12-byte IV, a ciphertext at
+   * least as long as the GCM tag — and a successful decryption disproves none
+   * of it.
+   *
+   * Writing such a record would have the queue quarantine it as
+   * `malformed_record` on its next pass, which is the import CREATING a
+   * quarantine (D8 (2) forbids it); and in the cell below it would ALSO lift
+   * the quarantine that is already there and report `quarantinedRepaired` — a
+   * repair announced to a user who is deciding whether the file is still
+   * needed.
+   */
+  const badNamespace: EncryptedNote = { ...localNote, v: 3 }; // v3 lives in the UUIDv8 space
+  const shortCiphertext: EncryptedNote = { ...localNote, ciphertext: 'QUFBQQ==' }; // 4 bytes
+
+  it('a damaged local payload is NOT «repaired» from a malformed file record', () => {
+    const d = decide({
+      incoming: badNamespace, local: localNote, localState: 'corrupt',
+      sync: row({ terminalError: 'malformed_record' }),
+    });
+    expect(d.outcome).toBe('skipped');
+    expect(d.writePayload).toBe(false);
+    // The quarantine stays exactly where it was: nothing was proved about it.
+    expect(d.sync).toBeNull();
+  });
+
+  it('a record this device does not have at all is not «added» from one either', () => {
+    const d = decide({ incoming: shortCiphertext, local: undefined, localState: 'absent' });
+    expect(d).toEqual({ writePayload: false, sync: null, outcome: 'skipped' });
+  });
+
+  it('the two blocking reasons gain no repair from malformed bytes', () => {
+    for (const reason of ['publication_conflict', 'recovery_invalidated'] as const) {
+      const d = decide({
+        incoming: badNamespace, local: localNote, localState: 'corrupt',
+        sync: row({ terminalError: reason, txId: 'TX-OLD' }),
+      });
+      expect(d.outcome, reason).toBe('skipped');
+      expect(d.writePayload, reason).toBe(false);
+      expect(d.sync, reason).toBeNull();
+    }
+  });
+
+  it('a well-formed file record still repairs — the barrier is not a blanket refusal', () => {
+    const d = decide({
+      incoming: incomingOther, local: localNote, localState: 'corrupt',
+      sync: row({ terminalError: 'malformed_record' }),
+    });
+    expect(d.outcome).toBe('quarantinedRepaired');
+    expect(d.writePayload).toBe(true);
+    expect(d.sync?.terminalError).toBeUndefined();
+  });
+
+  it('a safebox entry is judged in ITS id space, and the stable field comes first', () => {
+    const good = {
+      entryId: '88888888-9999-8aaa-baaa-cccccccccccc',
+      metaCiphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', metaIv: IV,
+      secretCiphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', secretIv: IV,
+      createdAt: NOW - 5000, v: 4,
+    } satisfies EncryptedSafeboxEntry;
+    // A note-shaped id: refused whatever the version says, because `entryId`
+    // is stable across versions and is judged before the version is.
+    const wrongSpace: EncryptedSafeboxEntry = { ...good, entryId: ID };
+
+    const refused = decideBackupMerge({
+      id: wrongSpace.entryId, kind: 'safebox', incoming: wrongSpace,
+      local: undefined, localState: 'absent', sync: undefined, now: NOW,
+    });
+    expect(refused).toEqual({ writePayload: false, sync: null, outcome: 'skipped' });
+
+    const accepted = decideBackupMerge({
+      id: good.entryId, kind: 'safebox', incoming: good,
+      local: undefined, localState: 'absent', sync: undefined, now: NOW,
+    });
+    expect(accepted.outcome).toBe('added');
+  });
+
+  it('the refusal is counted, never a silent no-op', () => {
+    // `skipped` and `noop` differ in exactly one way that matters: the first
+    // is visible in «Не восстановлено: K», the second is not. Something WAS
+    // left unapplied here, so it has to be the first.
+    const d = decide({ incoming: shortCiphertext, local: undefined, localState: 'absent' });
+    expect(d.outcome).not.toBe('noop');
+    expectNeverPublishesOrQuarantines(d);
+  });
+});

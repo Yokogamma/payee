@@ -55,8 +55,16 @@ export const SKIP_COUNTERS = [
 
 export interface ImportReport {
   counters: ImportCounters;
-  /** Every skip counter is zero. The ONLY state a success may be shown for. */
-  complete: boolean;
+  /**
+   * Every skip counter is zero — nothing the file carried went unapplied.
+   *
+   * NOT a verdict, and named so it cannot be mistaken for one: a success may
+   * be shown only when this holds AND `incompleteRestore` is false. A field
+   * called `complete` sitting next to `incompleteRestore: true` would be read
+   * as the overall answer and would show green over a restore that is known to
+   * be narrower than the one it came from (§4).
+   */
+  allFileRecordsApplied: boolean;
   /** The marker's value after this import — what the next export will carry. */
   incompleteRestore: boolean;
 }
@@ -92,6 +100,20 @@ const emptyCounters = (): ImportCounters => ({
 
 const isQuotaError = (e: unknown): boolean =>
   e instanceof Error && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED');
+
+/**
+ * The writer refusing ONE record because the local store contradicts itself
+ * about that id — a sync row of the other kind, an id it cannot key by.
+ *
+ * It is one record's problem, so it is counted and cascaded like any other
+ * skip. Letting it escape would discard the report for the whole file, telling
+ * a user who just imported half a vault nothing at all about which half.
+ *
+ * Matched by NAME, like the quota error above: the executor stays free of
+ * IndexedDB imports, which is what keeps it testable without a database.
+ */
+const isContractError = (e: unknown): boolean =>
+  e instanceof Error && e.name === 'BackupMergeContractError';
 
 /**
  * Apply a planned container.
@@ -132,9 +154,15 @@ export async function applyBackupImport(
     // the mark there would hide a record that was lost long before.
     const nothingSkipped = SKIP_COUNTERS.every(name => counters[name] === 0);
     const incompleteRestore = !(!startedIncomplete && fileIsComplete && nothingSkipped);
-    if (!incompleteRestore) await deps.writeIncompleteMarker(false);
+    if (!incompleteRestore) {
+      // Clearing the mark is itself a mutation, and the vault may have been
+      // reset or locked while the plan was running: check before writing, not
+      // after (D15).
+      deps.assertAlive();
+      await deps.writeIncompleteMarker(false);
+    }
 
-    return { counters, complete: nothingSkipped, incompleteRestore };
+    return { counters, allFileRecordsApplied: nothingSkipped, incompleteRestore };
   });
 }
 
@@ -167,13 +195,16 @@ async function runPlan(deps: ImportDeps, plan: ImportPlan, counters: ImportCount
     try {
       outcome = await applyOne(deps, planned);
     } catch (e) {
-      if (!isQuotaError(e)) throw e;
-      // Out of space. What is already written stays — it is an additive
-      // prefix, and a valid graph. Everything left, including this record,
-      // is reported as stopped by quota.
-      quotaStop = true;
-      counters.quotaStopped++;
-      continue;
+      if (isQuotaError(e)) {
+        // Out of space. What is already written stays — it is an additive
+        // prefix, and a valid graph. Everything left, including this record,
+        // is reported as stopped by quota.
+        quotaStop = true;
+        counters.quotaStopped++;
+        continue;
+      }
+      if (!isContractError(e)) throw e;
+      outcome = 'skipped';
     }
     deps.assertAlive();
 

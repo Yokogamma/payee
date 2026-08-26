@@ -91,7 +91,7 @@ describe('counting', () => {
     expect(report.counters.added).toBe(1);
     expect(report.counters.repaired).toBe(1);
     expect(SKIP_COUNTERS.every(name => report.counters[name] === 0)).toBe(true);
-    expect(report.complete).toBe(true);
+    expect(report.allFileRecordsApplied).toBe(true);
   });
 
   it('a file record this build cannot read is counted without being written', async () => {
@@ -105,7 +105,7 @@ describe('counting', () => {
 
     expect(report.counters.unsupported).toBe(1);
     expect(h.merged).toEqual(['a1']); // never attempted
-    expect(report.complete).toBe(false);
+    expect(report.allFileRecordsApplied).toBe(false);
   });
 
   it('no record is counted twice', async () => {
@@ -178,7 +178,7 @@ describe('running out of space', () => {
 
     expect(report.counters.added).toBe(2);        // chain a landed
     expect(report.counters.quotaStopped).toBe(5); // b1,b2 and all of c
-    expect(report.complete).toBe(false);
+    expect(report.allFileRecordsApplied).toBe(false);
   });
 
   it('any other error is not swallowed', async () => {
@@ -210,7 +210,7 @@ describe('a record that moved under us', () => {
 
     expect(h.merged).toHaveLength(2);
     expect(report.counters.concurrentChange).toBe(1);
-    expect(report.complete).toBe(false);
+    expect(report.allFileRecordsApplied).toBe(false);
   });
 });
 
@@ -320,5 +320,59 @@ describe('cancellation', () => {
     h.deps.assertAlive = alive;
 
     await expect(applyBackupImport(h.deps, planBackupImport(chain('a', 1)), true)).rejects.toBe(boom);
+  });
+});
+
+describe('what the report is, and what it is not', () => {
+  it('«everything applied» is not «this is a complete backup»', () => {
+    // The two questions are orthogonal (D11a), and the field name has to keep
+    // them apart: a clean import of a file that was ITSELF made by a partial
+    // restore applies every record it carries and still leaves the device
+    // marked incomplete. A field called `complete` here would be shown green.
+    return harnessedFullImport().then(report => {
+      expect(report.allFileRecordsApplied).toBe(true);
+      expect(report.incompleteRestore).toBe(true);
+    });
+  });
+
+  async function harnessedFullImport() {
+    const h = harness();
+    const plan = planBackupImport([node('a1', 1, 'a1')]);
+    return applyBackupImport(h.deps, plan, false); // the FILE was incomplete
+  }
+
+  it('a record the store contradicts itself about is skipped, not thrown away with the report', async () => {
+    // One record's problem: the local sync row says «safebox» under a note's
+    // id. Letting it escape would discard the counters for the whole file —
+    // telling a user who just imported half a vault nothing about which half.
+    const contract = Object.assign(new Error('sync row is a safebox, not a note'), {
+      name: 'BackupMergeContractError',
+    });
+    const h = harness({ throwOnMerge: id => (id === 'a2' ? contract : undefined) });
+    const plan = planBackupImport([...chain('a', 3), ...chain('b', 1)]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(report.counters.added).toBe(2);      // a1 and b1
+    expect(report.counters.skipped).toBe(2);    // a2, and a3 behind it
+    // a2 was attempted and refused (the harness records only merges that
+    // return); a3 was never attempted at all — the cascade stopped its chain.
+    expect(h.merged).toEqual(['a1', 'b1']);
+    expect(report.allFileRecordsApplied).toBe(false);
+  });
+
+  it('a descendant stranded behind an unreadable record is counted, never attempted', async () => {
+    const h = harness();
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      { kind: 'note', id: 'a2', record: rec('a2') },
+      node('a3', 3, 'a1', 'a2'),
+    ]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(h.merged).toEqual(['a1']);
+    expect(report.counters.unsupported).toBe(2);
+    expect(report.allFileRecordsApplied).toBe(false);
   });
 });

@@ -74,12 +74,12 @@ describe('links that point at nothing', () => {
 });
 
 describe('revisions', () => {
-  it('a gap in the middle of a chain', () => {
+  it('a chain that skips a version — caught by the LINK, without scanning positions', () => {
     const nodes = [
       ...chain('a', 1),
       node({ id: 'a-3', rev: 3, root: 'a-1', prev: 'a-1' }),
     ];
-    expect(problems(nodes)).toContain('bad_rev');
+    expect(problems(nodes)).toEqual(['broken_link']);
   });
 
   it('two records claiming the same position', () => {
@@ -126,18 +126,90 @@ describe('links across the collection boundary', () => {
   });
 });
 
-describe('cycles', () => {
-  it('a chain that loops back on itself is reported, not walked forever', () => {
+describe('links that point somewhere real, but wrong', () => {
+  it('a prev in ANOTHER chain of the same kind', () => {
+    // The one the old validator let through: `prev` existed, so it passed —
+    // and after that, ordering by `rev` was no longer topological, because
+    // the record it depends on lives in a chain that may be written later.
+    const nodes = [
+      ...chain('a', 1),
+      ...chain('z', 1),
+      node({ id: 'a-2', rev: 2, root: 'a-1', prev: 'z-1' }),
+    ];
+    expect(problems(nodes)).toEqual(['broken_link']);
+  });
+
+  it('a prev that is not the immediately preceding revision', () => {
+    const nodes = [...chain('a', 3), node({ id: 'a-4', rev: 4, root: 'a-1', prev: 'a-2' })];
+    expect(problems(nodes)).toEqual(['broken_link']);
+  });
+
+  it('a loop is reported by the link check, and RETURNS', () => {
+    // No walk, no colouring: `rev` must fall by exactly one along `prev`, so a
+    // loop cannot pass. The assertion that matters is that this terminates.
     const nodes: ChainNode[] = [
       { kind: 'note', id: 'a', rev: 2, root: 'a', prev: 'b' },
       { kind: 'note', id: 'b', rev: 3, root: 'a', prev: 'a' },
     ];
-    // The assertion that matters is that this RETURNS.
-    expect(problems(nodes)).toContain('cycle');
+    expect(problems(nodes)).toEqual(['broken_link']);
   });
 
   it('a record pointing at itself', () => {
-    expect(problems([node({ id: 'a', rev: 2, root: 'a', prev: 'a' })])).toContain('cycle');
+    expect(problems([node({ id: 'a', rev: 2, root: 'a', prev: 'a' })])).toEqual(['broken_link']);
+  });
+});
+
+describe('the work is bounded by the FILE, never by the values in it', () => {
+  const BUDGET = 100;
+
+  /**
+   * The old implementation walked positions `1…max`, so its cost came from the
+   * VALUE of `rev` — a container of two records could hang the tab for years.
+   *
+   * The budget is deterministic on purpose. A wall-clock assertion is flaky on
+   * a loaded CI, and at `MAX_SAFE_INTEGER` a regression would hang the runner
+   * itself, timer included — so the guard has to fire from INSIDE the loop.
+   */
+  it('a far-away rev costs no more lookups than a nearby one', () => {
+    const nodes = [
+      ...chain('a', 1),
+      node({ id: 'a-far', rev: 5_000_000, root: 'a-1', prev: 'a-1' }),
+    ];
+
+    type Lookup = (this: Map<unknown, unknown>, key: unknown) => unknown;
+    const proto = Map.prototype as unknown as { has: Lookup; get: Lookup };
+    const original = { has: proto.has, get: proto.get };
+    let lookups = 0;
+    const counted = (fn: Lookup): Lookup => function (this: Map<unknown, unknown>, key: unknown) {
+      if (++lookups > BUDGET) {
+        throw new Error(`chain validation made more than ${BUDGET} map lookups`);
+      }
+      return fn.call(this, key);
+    };
+
+    let found: string[];
+    try {
+      proto.has = counted(original.has);
+      proto.get = counted(original.get);
+      found = problems(nodes);
+    } finally {
+      // Restore BEFORE asserting: `expect` uses maps of its own.
+      proto.has = original.has;
+      proto.get = original.get;
+    }
+
+    expect(found).toEqual(['broken_link']);
+    // Two-sided: a counter that observed nothing would pass in any
+    // implementation, including one that never looks a predecessor up.
+    expect(lookups).toBeGreaterThan(0);
+  });
+
+  it('a revision at the top of the integer range is a typed problem, not a hang', () => {
+    const nodes = [
+      ...chain('a', 1),
+      node({ id: 'a-max', rev: Number.MAX_SAFE_INTEGER, root: 'a-1', prev: 'a-1' }),
+    ];
+    expect(problems(nodes)).toEqual(['broken_link']);
   });
 });
 
@@ -157,7 +229,7 @@ describe('reporting', () => {
 
   it('names the record the user actually has when a version is missing', () => {
     const nodes = [...chain('a', 1), node({ id: 'a-3', rev: 3, root: 'a-1', prev: 'a-1' })];
-    const gap = validateChains(nodes).find(i => i.problem === 'bad_rev');
+    const gap = validateChains(nodes).find(i => i.problem === 'broken_link');
     expect(gap?.id).toBe('a-3'); // not the absent 'a-2'
   });
 });
