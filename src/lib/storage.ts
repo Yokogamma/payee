@@ -1112,6 +1112,7 @@ export type BackupSnapshotResult =
  */
 export async function readBackupSnapshot(maxPlaintextBytes: number): Promise<BackupSnapshotResult> {
   const tx = getDB().transaction(['notes', 'safebox', 'meta'], 'readonly');
+  try {
 
   const rawMarker: unknown = await tx.objectStore('meta').get(INCOMPLETE_RESTORE_META_KEY);
   // Anything that is not exactly `false` reads as «incomplete»: a corrupted or
@@ -1123,8 +1124,19 @@ export async function readBackupSnapshot(maxPlaintextBytes: number): Promise<Bac
   let readBytes = 0;
   let overCap = false;
 
+  const encoder = new TextEncoder();
   const collect = (record: unknown): boolean => {
-    readBytes += approximateJsonBytes(record) + 1; // +1 for the array separator
+    // The bytes the container will actually carry: the CANONICAL serialization,
+    // measured in UTF-8. `JSON.stringify(...).length` was neither — it counts
+    // UTF-16 code units, so any non-ASCII text undercounts (an emoji costs one
+    // or two units but four bytes), and it silently renders values IndexedDB
+    // accepts but JSON cannot carry (`Blob`, `ArrayBuffer`) as `{}` or drops
+    // them. Both errors point the same way: a store well past the cap would
+    // measure as fitting, which is exactly the memory blow-up this early stop
+    // exists to prevent. `canonicalJson` refuses such a value outright, and
+    // that refusal propagates — the export must fail loudly rather than write
+    // a file with a record quietly flattened to nothing.
+    readBytes += encoder.encode(canonicalJson(record)).length + 1; // +1 separator
     if (readBytes > maxPlaintextBytes) {
       overCap = true;
       return false;
@@ -1151,34 +1163,50 @@ export async function readBackupSnapshot(maxPlaintextBytes: number): Promise<Bac
   }
 
   await tx.done;
-  if (overCap) return { ok: false, reason: 'over_cap', readBytes };
-  return { ok: true, snapshot: { notes, safebox, incompleteRestore } };
-}
-
-/** Size of a record as the container will carry it. `JSON.stringify` is used
- *  for the MEASUREMENT only — the container's own canonical serializer decides
- *  what is actually written, and rejects anything JSON would mangle. A value
- *  that cannot be stringified at all is charged the budget's whole remainder,
- *  so it stops the read instead of being silently counted as zero. */
-function approximateJsonBytes(record: unknown): number {
-  try {
-    return JSON.stringify(record)?.length ?? Number.MAX_SAFE_INTEGER;
-  } catch {
-    return Number.MAX_SAFE_INTEGER;
+    if (overCap) return { ok: false, reason: 'over_cap', readBytes };
+    return { ok: true, snapshot: { notes, safebox, incompleteRestore } };
+  } catch (e) {
+    // A value the canonical serializer refuses ends the read here. The typed
+    // BackupError travels to the caller unchanged: «this store cannot be
+    // exported yet» is a different message from «the file is too large».
+    tx.done.catch(() => {});
+    throw e;
   }
 }
 
 /** The merge outcome, plus the one verdict only the transaction can reach. */
 export type BackupMergeResult = BackupMergeOutcome | 'concurrentChange';
 
-export interface MergeBackupRecordInput {
-  id: string;
-  kind: SyncRecord['kind'];
-  incoming: EncryptedNote | EncryptedSafeboxEntry;
-  /** The local payload the caller's classification was computed against. */
-  local: EncryptedNote | EncryptedSafeboxEntry | undefined;
-  localState: LocalPayloadState;
-  now: number;
+/** The classification, shaped so the impossible combinations cannot be
+ *  written down: `absent` carries no record, and every other state must carry
+ *  the one it was computed from. */
+export type LocalPayload<T> =
+  | { state: 'absent' }
+  // Derived from the rule module's enum rather than restated: adding a state
+  // there must force a decision here, not silently bypass this shape.
+  | { state: Exclude<LocalPayloadState, 'absent'>; record: T };
+
+/**
+ * One record to merge. There is deliberately NO separate `id` field.
+ *
+ * An id passed alongside `incoming` is an invitation to disagree with it, and
+ * the consequence is not cosmetic: the CAS would verify the row under the
+ * passed id while `put` stores under the record's own keyPath, so a caller
+ * with a mismatched pair could overwrite a healthy, unrelated record that was
+ * never checked. The key is therefore derived from `incoming` and from nothing
+ * else, and `kind` is what selects which field that is.
+ */
+export type MergeBackupRecordInput =
+  | { kind: 'note'; incoming: EncryptedNote; local: LocalPayload<EncryptedNote>; now: number }
+  | { kind: 'safebox'; incoming: EncryptedSafeboxEntry; local: LocalPayload<EncryptedSafeboxEntry>; now: number };
+
+/** The caller handed this writer something self-contradictory. Thrown BEFORE
+ *  any read or write, so a broken call can never leave a partial state. */
+export class BackupMergeContractError extends Error {
+  constructor(why: string) {
+    super(`Backup merge contract violated: ${why}`);
+    this.name = 'BackupMergeContractError';
+  }
 }
 
 /**
@@ -1201,12 +1229,30 @@ export interface MergeBackupRecordInput {
  * freshness window and it is a full no-op — the payload is not touched either.
  */
 export async function mergeBackupRecord(input: MergeBackupRecordInput): Promise<BackupMergeResult> {
-  const { id, kind, incoming, local, localState, now } = input;
+  const { kind, incoming, local, now } = input;
+  // The one identity, taken from the record that will be written.
+  const id = kind === 'note' ? incoming.noteId : incoming.entryId;
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new BackupMergeContractError(`${kind} record without a usable id`);
+  }
+  const localState = local.state;
+  const localRecord = local.state === 'absent' ? undefined : local.record;
+
   const payloadStore = kind === 'note' ? 'notes' : 'safebox';
   const tx = getDB().transaction([payloadStore, 'sync'], 'readwrite');
   try {
     const syncStore = tx.objectStore('sync');
     const sync = normalizeSyncRecord(await syncStore.get(id) as SyncRecord | undefined);
+
+    // The id spaces of notes and safebox entries are disjoint (D10), so a row
+    // of the other kind under this id means the store disagrees with itself.
+    // Refuse without writing: guessing which one is right is how a merge
+    // destroys the half it guessed against.
+    if (sync !== undefined && sync.kind !== kind) {
+      tx.done.catch(() => {});
+      try { tx.abort(); } catch { /* already aborting */ }
+      throw new BackupMergeContractError(`sync row for ${id} is a ${sync.kind}, not a ${kind}`);
+    }
 
     // Rule 0: a live attempt owns these bytes. Not «probably» — the payload is
     // what it signed, and the answer is still in flight.
@@ -1217,13 +1263,15 @@ export async function mergeBackupRecord(input: MergeBackupRecordInput): Promise<
 
     const fresh = await tx.objectStore(payloadStore).get(id) as
       EncryptedNote | EncryptedSafeboxEntry | undefined;
-    if (!sameStoredRecord(fresh, local)) {
+    if (!sameStoredRecord(fresh, localRecord)) {
       tx.done.catch(() => {});
       try { tx.abort(); } catch { /* already aborting */ }
       return 'concurrentChange';
     }
 
-    const decision = decideBackupMerge({ id, kind, incoming, local, localState, sync, now });
+    const decision = decideBackupMerge({
+      id, kind, incoming, local: localRecord, localState, sync, now,
+    });
     if (decision.writePayload) await tx.objectStore(payloadStore).put(incoming);
     if (decision.sync !== null) await syncStore.put(decision.sync);
     await tx.done;

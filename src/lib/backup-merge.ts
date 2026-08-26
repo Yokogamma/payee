@@ -20,6 +20,11 @@
 import type { SyncRecord } from './storage';
 import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 import { publicationEquivalent, type PublicationSubject } from './publication-equivalent';
+// The question «is this record still malformed?» IS «would the upload barrier
+// reject it?». Reusing that barrier keeps ONE definition of a well-formed
+// record; a second one here would drift and re-quarantine what this module
+// just declared repaired.
+import { assertUploadableItem, type UploadItem } from './upload-flow';
 
 /** What this build can make of the LOCAL payload. Determined by actually
  *  trying to decrypt it — which is asynchronous, and therefore happens BEFORE
@@ -44,6 +49,7 @@ export type LocalPayloadState =
  */
 export type BackupMergeOutcome =
   | 'added'
+  | 'skipped'
   | 'repaired'
   | 'quarantinedRepaired'
   | 'quarantinedDataRepaired'
@@ -110,22 +116,44 @@ export function decideBackupMerge(input: BackupMergeInput): BackupMergeDecision 
     // quarantine and the bytes both stay exactly as they are.
     if (isOpaque(localState)) return leave('unsupportedLocal');
 
-    if (reason === 'unsupported_version' || reason === 'malformed_record') {
+    // The two «version» reasons look alike but expire on DIFFERENT evidence.
+    if (reason === 'unsupported_version') {
       if (localState === 'readable') {
-        // The sentence has expired: it said «this build cannot handle such a
-        // record», and this build just read it. Lifting it is honest, and the
-        // readable payload is NOT touched.
+        // The sentence has expired on its own terms: it said «this build
+        // cannot handle such a record», and this build just read it. Lifting
+        // it is honest, and the readable payload is NOT touched.
         return { writePayload: false, sync: retryable(id, kind, now), outcome: 'quarantineStale' };
       }
-      if (reason === 'malformed_record' && needsPayload(localState)) {
+      // Damaged or missing bytes under this reason is a state the table calls
+      // impossible (it cannot produce an AEAD failure). If it happens anyway,
+      // fail closed: never replace, never lift.
+      return leave('unsupportedLocal');
+    }
+
+    if (reason === 'malformed_record') {
+      if (localState === 'readable') {
+        // «Readable» is NOT the evidence this reason expires on. It is set for
+        // SHAPE violations — a negative createdAt, an id from the wrong UUID
+        // namespace, non-canonical base64, a ciphertext shorter than the GCM
+        // tag — and none of those is disproved by a successful decryption. A
+        // record can decrypt perfectly and still be unsendable.
+        //
+        // So the quarantine is lifted only if the record now passes the very
+        // barrier that set it. Otherwise it stays, and the outcome is
+        // `skipped` rather than a silent no-op: reporting a repair that did
+        // not happen would be worse than reporting nothing, because the next
+        // queue pass quarantines it again and the user is left with a
+        // «restored» record that never sends.
+        return passesUploadShape(kind, local)
+          ? { writePayload: false, sync: retryable(id, kind, now), outcome: 'quarantineStale' }
+          : leave('skipped');
+      }
+      if (needsPayload(localState)) {
         // Provably damaged bytes, repaired from the file. Safe precisely
         // because they are damaged rather than newer — and txId/recovery go
         // with them, because they described the bytes that are gone.
         return { writePayload: true, sync: retryable(id, kind, now), outcome: 'quarantinedRepaired' };
       }
-      // 'unsupported_version' with damaged or missing bytes is a state the
-      // table calls impossible (that reason cannot produce an AEAD failure).
-      // If it happens anyway, fail closed: never replace, never lift.
       return leave('unsupportedLocal');
     }
 
@@ -166,6 +194,22 @@ export function decideBackupMerge(input: BackupMergeInput): BackupMergeDecision 
     sync: sync === undefined ? null : retryable(id, kind, now),
     outcome: localState === 'absent' ? 'added' : 'repaired',
   };
+}
+
+/** Would the upload path accept this record as it stands? Total by
+ *  construction: any refusal — including a version this build cannot serialize
+ *  — reads as «no». */
+function passesUploadShape(
+  kind: SyncRecord['kind'],
+  record: EncryptedNote | EncryptedSafeboxEntry | undefined,
+): boolean {
+  if (record === undefined) return false;
+  try {
+    assertUploadableItem({ kind, record } as UploadItem);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** `publicationEquivalent` over the pair, with the kind supplied by the caller
