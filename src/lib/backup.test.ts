@@ -408,6 +408,34 @@ describe('body consistency', () => {
     }));
   });
 
+  it.each([
+    ['an empty note id', (b: BackupBody) => { b.notes = [{ ...NOTE, noteId: '' }]; }],
+    ['a non-string note id', (b: BackupBody) => { b.notes = [{ ...NOTE, noteId: 42 }]; }],
+    ['a safebox entry without a version', (b: BackupBody) => {
+      const rest = { ...ENTRY };
+      delete rest.v;
+      b.safebox = [rest];
+    }],
+  ])('%s is refused on the way IN as well as on the way OUT', async (_name, mutate) => {
+    // Symmetry, asserted on the ROUTE and not merely on the shared function:
+    // the same defect is refused by the encoder AND by the decoder reading a
+    // properly authenticated container that carries it. An encoder laxer than
+    // its decoder would produce a file that only fails at restore time, on
+    // another device, possibly after the original data is gone.
+    const key = await deriveBackupKey(MNEMONIC);
+    const exported = { ...input() } as unknown as BackupBody;
+    mutate(exported);
+    await expect(encodeBackup({
+      notes: exported.notes,
+      safebox: exported.safebox,
+      incompleteRestore: false,
+      containsUnsupportedRecords: false,
+      createdAt: CREATED_AT,
+    }, key)).rejects.toMatchObject({ code: 'corrupt' });
+
+    await expectCorrupt(tamperBody(mutate));
+  });
+
   it('an unexpected body key is corruption — no smuggling a sync section in', async () => {
     await expectCorrupt(tamperBody(b => {
       (b as unknown as Record<string, unknown>).sync = [{ noteId: 'x', txId: 'TX' }];
@@ -426,14 +454,6 @@ describe('export-side stable fields — an export cannot write what its own impo
   ])('refuses to encode %s', async (_name, patch) => {
     const key = await deriveBackupKey(MNEMONIC);
     await expect(encodeBackup(input(patch as Partial<EncodeBackupInput>), key))
-      .rejects.toMatchObject({ code: 'corrupt' });
-  });
-
-  it('the same invariants are enforced on the way IN', async () => {
-    // The point of sharing one validator: a container that would fail here can
-    // never have been written in the first place.
-    const key = await deriveBackupKey(MNEMONIC);
-    await expect(encodeBackup(input({ notes: [{ ...NOTE, noteId: '' }] }), key))
       .rejects.toMatchObject({ code: 'corrupt' });
   });
 });
