@@ -29,7 +29,7 @@ import { publicationEquivalent, type PublicationSubject } from './publication-eq
 // reject it?». Reusing that barrier keeps ONE definition of a well-formed
 // record; a second one here would drift and re-quarantine what this module
 // just declared repaired.
-import { assertUploadableItem, type UploadItem } from './upload-flow';
+import { isUploadableItem, type UploadItem } from './upload-flow';
 
 /** What this build can make of the LOCAL payload. Determined by actually
  *  trying to decrypt it — which is asynchronous, and therefore happens BEFORE
@@ -253,12 +253,7 @@ function passesUploadShape(
   record: EncryptedNote | EncryptedSafeboxEntry | undefined,
 ): boolean {
   if (record === undefined) return false;
-  try {
-    assertUploadableItem({ kind, record } as UploadItem);
-    return true;
-  } catch {
-    return false;
-  }
+  return isUploadableItem({ kind, record } as UploadItem);
 }
 
 /** `publicationEquivalent` over the pair, with the kind supplied by the caller

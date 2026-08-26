@@ -11,17 +11,15 @@
  *
  * Verification is a FULL dry-run: every note and BOTH halves of every safebox
  * entry are actually decrypted, because a green tick that only proves the
- * outer shell is intact would be a lie in the one moment it matters. That
- * means this module holds every secret the vault has, briefly.
+ * outer shell is intact would be a lie in the one moment it matters.
  *
- * So the contract is `decrypt → validate → extract only non-secret topology
- * and a verdict → discard`. What may leave the loop: ids, versions,
- * `root/prev/rev`, counts and «readable / damaged / unsupported». What may
- * never leave it, in a report, an error message, a log line or a returned
- * object: note text, titles, logins, passwords, attachment bytes, or any key.
- * Clearing references afterwards is best effort and is not claimed as
- * zeroization — the guarantee here is that the secret never leaves this
- * function, not that it is scrubbed after it does.
+ * The decryption itself lives in `backup-classify.ts`, and so does every
+ * plaintext it produces: this module never holds one. What crosses the border
+ * is a verdict — `readable / unsupported / malformed / damaged` — plus ids and
+ * `root/prev/rev`. What may never cross it, in a report, an error message, a
+ * log line or a returned object: note text, titles, logins, passwords,
+ * attachment bytes, or any key. That the secret never leaves the classifier is
+ * the guarantee; scrubbing afterwards is not claimed and is not the point.
  */
 
 import {
@@ -35,12 +33,12 @@ import {
 } from './backup';
 import { validateChains, type ChainIssue, type ChainNode } from './backup-chains';
 import {
-  decryptNote,
-  decryptSafeboxMeta,
-  decryptSafeboxSecret,
-  type EncryptedNote,
-  type EncryptedSafeboxEntry,
-} from './crypto';
+  classifyBackupRecord,
+  isOpaqueEntry,
+  isOpaqueNote,
+  type BackupRecordState,
+} from './backup-classify';
+import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 import type { BackupSnapshotResult } from './storage';
 
 /** Which file an artifact marker refers to. The SHA is what makes the marker
@@ -58,6 +56,13 @@ export type VerifyProblem =
   /** A version this build cannot read. Expected in a forward-compatible file;
    *  it is a WARNING about completeness, not damage. */
   | 'unsupported_version'
+  /** Decryptable, perhaps, but the SHAPE is wrong: the upload path would
+   *  refuse it. Kept apart from `undecryptable` because the two mean opposite
+   *  things to a person — «these bytes are gone» versus «this record could
+   *  never be sent» — and apart from `unsupported_version` because that one is
+   *  a promise never to replace the record, which a provably broken one must
+   *  not be given (D5a/D14b). */
+  | 'malformed'
   /** Chain topology — see `backup-chains.ts`. */
   | 'chain';
 
@@ -157,10 +162,6 @@ export async function exportBackup(deps: BackupActionDeps): Promise<ExportedBack
   };
 }
 
-const isOpaqueNote = (n: EncryptedNote): boolean =>
-  n.v !== undefined && n.v !== 1 && n.v !== 2 && n.v !== 3;
-const isOpaqueEntry = (e: EncryptedSafeboxEntry): boolean => e.v !== 4;
-
 /** A file, in the only two aspects this module needs. Narrow on purpose: the
  *  size must be readable WITHOUT pulling the contents into memory (D17). */
 export interface BackupFileLike {
@@ -194,49 +195,23 @@ export async function verifyBackupFile(
   const issues: VerifyIssue[] = [];
   const nodes: ChainNode[] = [];
 
-  for (const record of body.notes) {
-    const note = record as unknown as EncryptedNote;
-    const id = String(note.noteId);
-    if (isOpaqueNote(note)) {
-      // Decided by the declared VERSION, never by which error a decrypt threw.
-      // «Too new for this build» and «these bytes are damaged» lead to
-      // opposite advice — keep the file vs replace it — and the exception
-      // types do not separate them: the safebox envelope raises the same class
-      // for a wrong version and for tampering.
-      issues.push({ kind: 'note', id, problem: 'unsupported_version' });
-      continue;
-    }
-    try {
-      // The plaintext exists only inside this expression. Only the topology is
-      // kept; `text` and `createdAt` are deliberately not destructured.
-      const { meta } = await decryptNote(deps.keys.note, note);
-      nodes.push({ kind: 'note', id, rev: meta.rev, root: meta.root, prev: meta.prev });
-    } catch {
-      // Nothing from the error is carried out — its message can quote content.
-      issues.push({ kind: 'note', id, problem: 'undecryptable' });
-    }
+  // ONE classifier for both collections, and the same one stage A of the
+  // import uses (`backup-classify.ts`): a verdict that differs between «this
+  // file is fine» and «this record may be restored» is the defect, not a
+  // detail of two loops.
+  const classify = async (kind: 'note' | 'safebox', record: unknown) => {
+    const verdict = await classifyBackupRecord(
+      deps.keys,
+      kind,
+      record as EncryptedNote | EncryptedSafeboxEntry,
+    );
+    if (verdict.state === 'readable') nodes.push({ kind, id: verdict.id, ...verdict.topology });
+    else issues.push({ kind, id: verdict.id, problem: PROBLEM_OF[verdict.state] });
     deps.assertAlive();
-  }
+  };
 
-  for (const record of body.safebox) {
-    const entry = record as unknown as EncryptedSafeboxEntry;
-    const id = String(entry.entryId);
-    if (isOpaqueEntry(entry)) {
-      issues.push({ kind: 'safebox', id, problem: 'unsupported_version' });
-      continue;
-    }
-    try {
-      const meta = await decryptSafeboxMeta(deps.keys.safeboxMeta, entry);
-      // BOTH halves, always. A container whose meta opens and whose secret does
-      // not is a container that restores an entry with no password in it — and
-      // the user would find that out at the worst possible time.
-      await decryptSafeboxSecret(deps.keys.safeboxSecret, entry, meta.files);
-      nodes.push({ kind: 'safebox', id, rev: meta.rev, root: meta.root, prev: meta.prev });
-    } catch {
-      issues.push({ kind: 'safebox', id, problem: 'undecryptable' });
-    }
-    deps.assertAlive();
-  }
+  for (const record of body.notes) await classify('note', record);
+  for (const record of body.safebox) await classify('safebox', record);
 
   for (const issue of validateChains(nodes)) {
     issues.push({ kind: issue.kind, id: issue.id, problem: 'chain', detail: issue.problem });
@@ -269,6 +244,12 @@ export async function verifyBackupFile(
  * Strict equality here would reject a valid backup at exactly the build able
  * to restore it, which is the one case forward compatibility exists for.
  */
+const PROBLEM_OF: Record<Exclude<BackupRecordState, 'readable'>, VerifyProblem> = {
+  unsupported: 'unsupported_version',
+  malformed: 'malformed',
+  damaged: 'undecryptable',
+};
+
 function assertHeaderHonest(header: BackupHeader, issues: VerifyIssue[]): void {
   const sawUnsupported = issues.some(i => i.problem === 'unsupported_version');
   if (sawUnsupported && !header.containsUnsupportedRecords) {

@@ -14,7 +14,37 @@
  * Why a container with a broken graph must not read as healthy: restore and
  * the UI both group by `root` and order by `rev`. A version whose predecessor
  * is missing is not a small inconsistency — it is a chain the app will render
- * with a hole in it, or silently treat a middle version as the newest.
+ * with a hole in it, or silently treat a middle version as the newest. And the
+ * import applies records in `rev` order, which is only a TOPOLOGICAL order if
+ * `prev` really is the previous revision of the same chain.
+ *
+ * ── One pass, direct links, and what that makes unnecessary ──────────
+ *
+ * Every check below is local to a record and its immediate predecessor:
+ * `prev` exists, belongs to the SAME chain, and sits exactly one revision
+ * back. Existence alone was not enough — a link into another chain of the same
+ * kind passed it, after which ordering by `rev` stopped being topological and
+ * a descendant could be written before the record it points at (D12a).
+ *
+ * Two things follow from the direct link and are therefore NOT implemented
+ * here, deliberately:
+ *
+ *  - **no scan for gaps.** A record at `rev = k` requires a predecessor at
+ *    `k-1` in its chain, which requires one at `k-2`, down to 1 — so a hole
+ *    cannot exist among records that all pass. (Equivalently: the lowest
+ *    revision in a chain must be 1, or its own `prev` check fails.) The
+ *    previous implementation walked positions `1…max` instead, which is
+ *    bounded by the VALUE of `rev` rather than by the size of the file:
+ *    `rev` may be any safe integer, so a container of two records could hang
+ *    the tab for years — in the read-only operation a user runs when
+ *    something is already wrong.
+ *  - **no cycle detection.** `rev` strictly decreases by one along `prev` and
+ *    is bounded below by 1, so a loop cannot pass the link check at all. The
+ *    old walk was O(n²) and, on a long chain, slow enough to matter.
+ *
+ * What does NOT follow, and is kept: at most one record per position. Two
+ * records at `rev = k` both pointing at `k-1` is a fork, and the direct link
+ * says nothing against it.
  */
 
 export type ChainProblem =
@@ -23,12 +53,13 @@ export type ChainProblem =
   /** `root` names a version this container does not contain, or a rev-1
    *  record whose root is not itself. */
   | 'bad_root'
-  /** `rev` is not a positive integer, or the chain skips a position. */
+  /** `rev` is not a positive integer. */
   | 'bad_rev'
+  /** `prev` exists, but it is not the immediately preceding version of THIS
+   *  chain: another chain, or the wrong revision. A loop lands here too. */
+  | 'broken_link'
   /** Two records claim the same position in one chain. */
   | 'conflicting_rev'
-  /** Following `prev` returns to a version already visited. */
-  | 'cycle'
   /** A link points into the OTHER collection's id space. */
   | 'cross_kind';
 
@@ -51,6 +82,8 @@ export interface ChainIssue {
  * exhaustively, not first-failure: a verify report exists to tell the user
  * what is wrong with the file, and stopping at the first broken link would
  * make them fix and re-check one record at a time.
+ *
+ * Linear in the number of records, whatever the values inside them.
  */
 export function validateChains(nodes: readonly ChainNode[]): ChainIssue[] {
   const issues: ChainIssue[] = [];
@@ -63,11 +96,20 @@ export function validateChains(nodes: readonly ChainNode[]): ChainIssue[] {
   };
   for (const node of nodes) byKind[node.kind].set(node.id, node);
 
+  /** `kind:root:rev` → the record that claimed that position first. */
+  const positions = new Set<string>();
+
   for (const node of nodes) {
     const own = byKind[node.kind];
     const foreign = byKind[node.kind === 'note' ? 'safebox' : 'note'];
 
-    if (!Number.isSafeInteger(node.rev) || node.rev < 1) add(node, 'bad_rev');
+    if (!Number.isSafeInteger(node.rev) || node.rev < 1) {
+      // Without a usable position there is nothing to compare a link against,
+      // and reporting one defect twice helps nobody. A record pointing AT this
+      // one still fails its own link check, so the chain is not let through.
+      add(node, 'bad_rev');
+      continue;
+    }
 
     // A link into the other collection is its own problem, not a missing
     // record: the id spaces are disjoint (D10), so this is a container whose
@@ -76,84 +118,33 @@ export function validateChains(nodes: readonly ChainNode[]): ChainIssue[] {
     if (!own.has(node.root)) {
       add(node, foreign.has(node.root) ? 'cross_kind' : 'bad_root');
     }
-    if (node.prev !== undefined && !own.has(node.prev)) {
-      add(node, foreign.has(node.prev) ? 'cross_kind' : 'missing_prev');
-    }
+
+    const position = `${node.kind}:${node.root}:${node.rev}`;
+    if (positions.has(position)) add(node, 'conflicting_rev');
+    else positions.add(position);
 
     // A chain's first version names itself and has no predecessor. Getting
     // this wrong means the chain has no beginning, and every consumer that
     // walks it backwards runs off the end.
-    if (node.rev === 1 && (node.root !== node.id || node.prev !== undefined)) {
-      add(node, 'bad_root');
+    if (node.rev === 1) {
+      if (node.root !== node.id || node.prev !== undefined) add(node, 'bad_root');
+      continue;
     }
-    if (node.rev > 1 && node.prev === undefined) {
+
+    if (node.prev === undefined) {
       add(node, 'missing_prev');
+      continue;
     }
+    const prev = own.get(node.prev);
+    if (prev === undefined) {
+      add(node, foreign.has(node.prev) ? 'cross_kind' : 'missing_prev');
+      continue;
+    }
+    // The link must be DIRECT. This single comparison is what makes ordering
+    // by `rev` topological, what closes the gap scan, and what makes a loop
+    // impossible — see the module header.
+    if (prev.root !== node.root || prev.rev !== node.rev - 1) add(node, 'broken_link');
   }
 
-  validateChainPositions(nodes, add);
-  detectCycles(nodes, byKind, add);
   return issues;
-}
-
-/** Within one chain the revisions must be exactly 1…n, each once. A gap means
- *  a version is missing from the file; a repeat means two records claim the
- *  same position and no consumer can say which is newer. */
-function validateChainPositions(
-  nodes: readonly ChainNode[],
-  add: (node: ChainNode, problem: ChainProblem) => void,
-): void {
-  const chains = new Map<string, ChainNode[]>();
-  for (const node of nodes) {
-    const key = `${node.kind}:${node.root}`;
-    const bucket = chains.get(key);
-    if (bucket) bucket.push(node);
-    else chains.set(key, [node]);
-  }
-
-  for (const members of chains.values()) {
-    const seen = new Map<number, ChainNode>();
-    for (const node of members) {
-      const clash = seen.get(node.rev);
-      if (clash !== undefined) {
-        add(node, 'conflicting_rev');
-        continue;
-      }
-      seen.set(node.rev, node);
-    }
-    // Exactly 1…n, so the highest revision equals the number of distinct ones.
-    const highest = Math.max(...seen.keys());
-    if (Number.isFinite(highest) && highest !== seen.size) {
-      for (let rev = 1; rev <= highest; rev++) {
-        const gap = !seen.has(rev);
-        if (!gap) continue;
-        // Blame the version that points across the hole, so the report names a
-        // record the user actually has rather than one they do not.
-        const orphan = seen.get(rev + 1);
-        if (orphan) add(orphan, 'bad_rev');
-      }
-    }
-  }
-}
-
-/** Follow `prev` from every node. A cycle cannot be reached by an honest
- *  writer, but a crafted or damaged container can contain one, and a consumer
- *  that walks the chain would hang rather than fail. */
-function detectCycles(
-  nodes: readonly ChainNode[],
-  byKind: { note: Map<string, ChainNode>; safebox: Map<string, ChainNode> },
-  add: (node: ChainNode, problem: ChainProblem) => void,
-): void {
-  for (const start of nodes) {
-    const seen = new Set<string>([start.id]);
-    let current: ChainNode | undefined = start;
-    while (current?.prev !== undefined) {
-      if (seen.has(current.prev)) {
-        add(start, 'cycle');
-        break;
-      }
-      seen.add(current.prev);
-      current = byKind[start.kind].get(current.prev);
-    }
-  }
 }
