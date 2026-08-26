@@ -24,7 +24,13 @@
  */
 
 import { buildUploadPayload, buildSafeboxUploadPayload, type UploadResult } from './arweave';
-import { bufferToBase64, base64ToBuffer, type EncryptedNote, type EncryptedSafeboxEntry } from './crypto';
+import {
+  bufferToBase64,
+  base64ToBuffer,
+  isCanonicalBase64,
+  type EncryptedNote,
+  type EncryptedSafeboxEntry,
+} from './crypto';
 import type { BeginUploadOutcome, SyncRecord } from './storage';
 import {
   toAccepted,
@@ -145,14 +151,21 @@ function assertIdNamespace(id: unknown, expected: '4' | '8', field: string): voi
   if (match[1].toLowerCase() !== expected) throw new MalformedRecordError(`${field} namespace`);
 }
 
-function assertIv12(value: unknown, field: string): void {
+/**
+ * Canonical base64, not merely decodable (D14b). `atob` accepts missing
+ * padding, embedded whitespace and non-zero trailing bits, so the SAME bytes
+ * have many accepted spellings — and the spelling is what gets published: the
+ * outer `data` is a JSON string, so two spellings are two different
+ * publications with two different fingerprints under one permanent id.
+ */
+function assertCanonicalBase64(value: unknown, field: string): Uint8Array {
   if (typeof value !== 'string' || value.length === 0) throw new MalformedRecordError(field);
-  let bytes: Uint8Array;
-  try {
-    bytes = base64ToBuffer(value);
-  } catch {
-    throw new MalformedRecordError(`${field} base64`);
-  }
+  if (!isCanonicalBase64(value)) throw new MalformedRecordError(`${field} base64`);
+  return base64ToBuffer(value);
+}
+
+function assertIv12(value: unknown, field: string): void {
+  const bytes = assertCanonicalBase64(value, field);
   if (bytes.byteLength !== 12) throw new MalformedRecordError(`${field} length`);
 }
 
@@ -162,13 +175,7 @@ function assertIv12(value: unknown, field: string): void {
 const GCM_TAG_BYTES = 16;
 
 function assertCiphertext(value: unknown, field: string): void {
-  if (typeof value !== 'string' || value.length === 0) throw new MalformedRecordError(field);
-  let bytes: Uint8Array;
-  try {
-    bytes = base64ToBuffer(value);
-  } catch {
-    throw new MalformedRecordError(`${field} base64`);
-  }
+  const bytes = assertCanonicalBase64(value, field);
   // Shorter than the tag = provably not something AES-GCM produced. Without
   // this the row passes validation and gets PUBLISHED under a permanent,
   // per-id idempotency — paid, irreversible, and undecryptable forever. Being

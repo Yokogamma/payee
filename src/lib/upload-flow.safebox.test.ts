@@ -25,7 +25,7 @@ const SB: EncryptedSafeboxEntry = {
   entryId: '11111111-2222-8333-8444-555555555555',
   // 16 bytes each: the GCM tag floor assertUploadableItem now enforces.
   metaCiphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', metaIv: IV12,
-  secretCiphertext: 'BBBBBBBBBBBBBBBBBBBBBB==', secretIv: IV12,
+  secretCiphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', secretIv: IV12,
   createdAt: NOW - 60_000, v: 4,
 };
 const SB_ITEM: UploadItem = { kind: 'safebox', record: SB };
@@ -213,6 +213,38 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
     expect(() => assertUploadableItem({
       kind: 'note', record: { noteId: '11111111-2222-4333-8444-555555555555', ciphertext: 'AAAA', iv: 'AAAA', createdAt: 1 },
     })).toThrow(MalformedRecordError);
+  });
+
+  it('a NON-CANONICAL base64 spelling is quarantined, though it decodes fine', () => {
+    // All three below are accepted by `atob` and decode to the same 16 valid
+    // bytes — they differ only in spelling: missing padding, non-zero trailing
+    // bits, trailing whitespace. The spelling is what gets published (`data` is
+    // a JSON string), so a variant would go on chain as a DIFFERENT record for
+    // the same bytes, permanently, under the same idempotent id.
+    const V4 = '11111111-2222-4333-8444-555555555555';
+    const iv = 'AAAAAAAAAAAAAAAA';
+    const variants = [
+      'AAAAAAAAAAAAAAAAAAAAAA',    // no padding
+      'AAAAAAAAAAAAAAAAAAAAAB==',  // non-zero trailing bits
+      'AAAAAAAAAAAAAAAAAAAAAA==\n', // trailing whitespace
+    ];
+    for (const ciphertext of variants) {
+      expect(() => assertUploadableItem({
+        kind: 'note', record: { noteId: V4, ciphertext, iv, createdAt: 1 },
+      }), ciphertext).toThrow(MalformedRecordError);
+    }
+    // The IV is held to the same rule. Note that a 12-byte IV has NO spare
+    // bits — 16 base64 chars, no padding — so its only non-canonical spellings
+    // are superfluous padding and whitespace.
+    expect(() => assertUploadableItem({
+      kind: 'note',
+      record: { noteId: V4, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: 'AAAAAAAAAAAAAAAA==', createdAt: 1 },
+    })).toThrow(MalformedRecordError);
+    // ...and the canonical spelling passes.
+    expect(() => assertUploadableItem({
+      kind: 'note',
+      record: { noteId: V4, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==', iv, createdAt: 1 },
+    })).not.toThrow();
   });
 
   it('an id from the WRONG namespace is quarantined before anything is signed', () => {

@@ -583,8 +583,14 @@ export class SafeboxEnvelopeError extends Error {
 
 /** Base64 that round-trips EXACTLY — a non-canonical spelling of the same bytes
  *  must not pass (it would break the size cross-check and the wire contract).
- *  Exported so the backup container validates its envelope with THIS check
- *  rather than growing a second, subtly different one. */
+ *
+ *  Exported because two other fail-closed boundaries need EXACTLY this check and
+ *  must not grow their own subtly different one: the pre-signature upload
+ *  barrier (upload-flow.ts, D14b) and the backup container envelope
+ *  (backup.ts). `atob` is lenient — it accepts missing padding, embedded
+ *  whitespace and non-zero trailing bits — so «decodes» and «is the canonical
+ *  spelling» are different questions, and only the second one is stable enough
+ *  to publish under a permanent id. */
 export function isCanonicalBase64(s: unknown): s is string {
   if (typeof s !== 'string') return false;
   try {
