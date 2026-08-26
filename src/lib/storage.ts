@@ -24,6 +24,13 @@ import { toUploading } from './sync-transitions';
 // — «would these two records publish identically?» — so it must not grow a
 // second, subtly different comparison of its own.
 import { publicationEquivalent, type PublicationSubject } from './publication-equivalent';
+// Cycle-safe: both import crypto/arweave types only, never storage at runtime.
+import { canonicalJson } from './backup';
+import {
+  decideBackupMerge,
+  type BackupMergeOutcome,
+  type LocalPayloadState,
+} from './backup-merge';
 import {
   QUICK_UNLOCK_META_KEY,
   judgeQuickUnlock,
@@ -93,6 +100,13 @@ export interface SyncRecord {
    * 'malformed_record': the stored row failed runtime validation right before
    * serialization (IndexedDB is an untrusted boundary) — retrying can only
    * ever produce the same rejection.
+   * 'publication_conflict': the SERVER answered 409 {code:'id_payload_conflict'}
+   * — this id is already published with DIFFERENT bytes. Terminal on purpose:
+   * retrying can only reproduce the same answer, and the conflicting txId is
+   * NOT stored (it describes someone else's bytes; it is shown in diagnostics
+   * only). The local data is intact; what is blocked is publishing, not
+   * reading — which is why the backup import may still repair the payload
+   * under this reason while leaving the block in place.
    * 'recovery_invalidated': the SERVER rejected the signed recovery proof
    * (400 {code:'recovery_invalid'} — e.g. the HMAC secret was rotated after a
    * compromise). The local row is intact — txId and the recovery hint are
@@ -109,7 +123,11 @@ export interface SyncRecord {
    * quarantine was waiting for. Other reasons survive even restore.
    * Still counted by reset-safety (a newer build might read it).
    */
-  terminalError?: 'unsupported_version' | 'malformed_record' | 'recovery_invalidated';
+  terminalError?:
+    | 'unsupported_version'
+    | 'malformed_record'
+    | 'publication_conflict'
+    | 'recovery_invalidated';
 }
 
 /**
@@ -1051,6 +1069,184 @@ export async function commitUploadResultIfAttempt(
   await store.put(next);
   await tx.done;
   return 'applied';
+}
+
+// ─── Backup: snapshot and merge ──────────────────────────────────────
+
+/** Device-local marker: this store was last rebuilt from a restore that did
+ *  NOT apply everything. It is sticky, it lives in `meta`, and only its
+ *  normalized boolean is ever projected into a container (D6a/D11a). */
+export const INCOMPLETE_RESTORE_META_KEY = 'incomplete-restore';
+
+export interface BackupSnapshot {
+  notes: EncryptedNote[];
+  safebox: EncryptedSafeboxEntry[];
+  incompleteRestore: boolean;
+}
+
+export type BackupSnapshotResult =
+  | { ok: true; snapshot: BackupSnapshot }
+  | { ok: false; reason: 'over_cap'; readBytes: number };
+
+/**
+ * The export's consistent snapshot: notes, safebox entries AND the
+ * `incompleteRestore` marker, in ONE readonly transaction (D5).
+ *
+ * The marker travels with the data because the two must agree. Read
+ * separately, an import running concurrently could set it between the two
+ * reads, and the file would claim completeness for a snapshot taken while the
+ * store was half-rebuilt. Inside one transaction the export either sees the
+ * state before that import or the state after it — and during an import the
+ * marker is already `true`, so such an export is honestly marked incomplete.
+ *
+ * Read with CURSORS and an early stop rather than `getAll()`: on a store past
+ * the cap, materializing everything kills the tab before any size check could
+ * fire, so the refusal has to happen while reading. `maxPlaintextBytes` is the
+ * caller's budget — the container cap translated back through base64 and the
+ * envelope — which keeps the format's arithmetic in `backup.ts` where it
+ * belongs and lets tests use a tiny budget.
+ *
+ * The measure is deliberately an OVER-estimate of the plaintext (per-record
+ * JSON length plus a separator), because being wrong in the other direction
+ * means producing a file the import then refuses.
+ */
+export async function readBackupSnapshot(maxPlaintextBytes: number): Promise<BackupSnapshotResult> {
+  const tx = getDB().transaction(['notes', 'safebox', 'meta'], 'readonly');
+
+  const rawMarker: unknown = await tx.objectStore('meta').get(INCOMPLETE_RESTORE_META_KEY);
+  // Anything that is not exactly `false` reads as «incomplete»: a corrupted or
+  // half-written marker must never downgrade a warning about missing data.
+  const incompleteRestore = rawMarker !== undefined && rawMarker !== false;
+
+  const notes: EncryptedNote[] = [];
+  const safebox: EncryptedSafeboxEntry[] = [];
+  let readBytes = 0;
+  let overCap = false;
+
+  const collect = (record: unknown): boolean => {
+    readBytes += approximateJsonBytes(record) + 1; // +1 for the array separator
+    if (readBytes > maxPlaintextBytes) {
+      overCap = true;
+      return false;
+    }
+    return true;
+  };
+
+  let noteCursor = await tx.objectStore('notes').openCursor();
+  while (noteCursor) {
+    const record = noteCursor.value as EncryptedNote;
+    if (!collect(record)) break;
+    notes.push(record);
+    noteCursor = await noteCursor.continue();
+  }
+
+  if (!overCap) {
+    let entryCursor = await tx.objectStore('safebox').openCursor();
+    while (entryCursor) {
+      const record = entryCursor.value as EncryptedSafeboxEntry;
+      if (!collect(record)) break;
+      safebox.push(record);
+      entryCursor = await entryCursor.continue();
+    }
+  }
+
+  await tx.done;
+  if (overCap) return { ok: false, reason: 'over_cap', readBytes };
+  return { ok: true, snapshot: { notes, safebox, incompleteRestore } };
+}
+
+/** Size of a record as the container will carry it. `JSON.stringify` is used
+ *  for the MEASUREMENT only — the container's own canonical serializer decides
+ *  what is actually written, and rejects anything JSON would mangle. A value
+ *  that cannot be stringified at all is charged the budget's whole remainder,
+ *  so it stops the read instead of being silently counted as zero. */
+function approximateJsonBytes(record: unknown): number {
+  try {
+    return JSON.stringify(record)?.length ?? Number.MAX_SAFE_INTEGER;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+/** The merge outcome, plus the one verdict only the transaction can reach. */
+export type BackupMergeResult = BackupMergeOutcome | 'concurrentChange';
+
+export interface MergeBackupRecordInput {
+  id: string;
+  kind: SyncRecord['kind'];
+  incoming: EncryptedNote | EncryptedSafeboxEntry;
+  /** The local payload the caller's classification was computed against. */
+  local: EncryptedNote | EncryptedSafeboxEntry | undefined;
+  localState: LocalPayloadState;
+  now: number;
+}
+
+/**
+ * Apply the four merge rules to ONE record, in one transaction.
+ *
+ * The split is forced by D13: readability is decided by Web Crypto, which is
+ * asynchronous, and an `await` inside an IndexedDB transaction makes it
+ * inactive. So the caller classifies FIRST, outside; here the row is re-read
+ * and compared SYNCHRONOUSLY against the snapshot that classification was
+ * computed from. If the two disagree, another writer moved the record while we
+ * were decrypting, every conclusion about it is stale, and the transaction is
+ * aborted rather than applied to a record it was never about.
+ *
+ * `concurrentChange` is that abort. The caller retries the whole classify →
+ * merge cycle EXACTLY ONCE and counts the second failure: one retry absorbs an
+ * ordinary interleaving, while looping would let a busy other tab hold the
+ * import open indefinitely.
+ *
+ * Rule 0 lives here rather than in the pure decision, because it needs the
+ * freshness window and it is a full no-op — the payload is not touched either.
+ */
+export async function mergeBackupRecord(input: MergeBackupRecordInput): Promise<BackupMergeResult> {
+  const { id, kind, incoming, local, localState, now } = input;
+  const payloadStore = kind === 'note' ? 'notes' : 'safebox';
+  const tx = getDB().transaction([payloadStore, 'sync'], 'readwrite');
+  try {
+    const syncStore = tx.objectStore('sync');
+    const sync = normalizeSyncRecord(await syncStore.get(id) as SyncRecord | undefined);
+
+    // Rule 0: a live attempt owns these bytes. Not «probably» — the payload is
+    // what it signed, and the answer is still in flight.
+    if (isFreshUploading(sync, now)) {
+      await tx.done;
+      return 'deferred';
+    }
+
+    const fresh = await tx.objectStore(payloadStore).get(id) as
+      EncryptedNote | EncryptedSafeboxEntry | undefined;
+    if (!sameStoredRecord(fresh, local)) {
+      tx.done.catch(() => {});
+      try { tx.abort(); } catch { /* already aborting */ }
+      return 'concurrentChange';
+    }
+
+    const decision = decideBackupMerge({ id, kind, incoming, local, localState, sync, now });
+    if (decision.writePayload) await tx.objectStore(payloadStore).put(incoming);
+    if (decision.sync !== null) await syncStore.put(decision.sync);
+    await tx.done;
+    return decision.outcome;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/** Synchronous, order-independent identity of two stored records. Canonical
+ *  JSON rather than `JSON.stringify`, because IndexedDB returns a structured
+ *  clone whose key order is not part of the value — a re-ordered but identical
+ *  record must not read as «someone changed it». Anything the canonical
+ *  serializer refuses counts as changed: fail closed. */
+function sameStoredRecord(a: unknown, b: unknown): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  try {
+    return canonicalJson(a) === canonicalJson(b);
+  } catch {
+    return false;
+  }
 }
 
 export async function getRecordsByStatus(status: SyncRecord['status']): Promise<SyncRecord[]> {
