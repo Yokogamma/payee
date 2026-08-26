@@ -302,6 +302,22 @@ describe('malformed-record quarantine (no HTTP, no writes)', () => {
     }
   });
 
+  it('unknown version AND a broken entryId is MALFORMED, not opaque — the stable field wins', async () => {
+    // Priority, stated as behaviour: `entryId` is stable across every version of
+    // a safebox record, so it is judged first. A row that is both of an unknown
+    // version and missing a usable id is provably broken — sealing it as
+    // 'unsupported_version' would promise never to replace it, which for a
+    // corrupted row means never repairing it from a backup either (D5a).
+    for (const entryId of ['', 'not-a-uuid', '11111111-2222-4333-8444-555555555555']) {
+      const record = { ...SB, v: 5, entryId } as unknown as EncryptedSafeboxEntry;
+      expect(() => assertUploadableItem({ kind: 'safebox', record }), entryId)
+        .toThrow(MalformedRecordError);
+    }
+    // ...while an unknown version with a VALID id stays opaque.
+    const opaque = { ...SB, v: 5 } as unknown as EncryptedSafeboxEntry;
+    expect(() => assertUploadableItem({ kind: 'safebox', record: opaque })).not.toThrow();
+  });
+
   it('an UNRECOGNIZED note version is NOT judged by the namespace rule', async () => {
     // It must surface as UnsupportedNoteVersionError, not MalformedRecordError.
     // The distinction is load-bearing: D5a treats an OPAQUE record — one a
