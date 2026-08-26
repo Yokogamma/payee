@@ -283,6 +283,10 @@ describe('verifyBackupFile — the verdict', () => {
 
     const report = await verifyBackupFile(deps, asFile(forged));
     expect(report.ok).toBe(true); // a newer reader, and the warning simply drops
+    // The report carries what THIS reader saw, not what the writer claimed.
+    // Returning the raw claim would have a consumer warn «some records cannot
+    // be restored» about a file this build restores in full.
+    expect(report.containsUnsupportedRecords).toBe(false);
   });
 });
 
@@ -394,9 +398,30 @@ describe('verifyBackupFile — the four verdicts, in the order D14b fixes (D11)'
     const report = await verifyBackupFile(deps, asFile(exported.text));
 
     expect(report.issues).toEqual([{ kind: 'safebox', id: NOTE_SPACE_ID, problem: 'malformed' }]);
-    // The header still says «I hold records you may not understand», and the
-    // asymmetric check accepts that — it only fails the other way round.
-    expect(report.containsUnsupportedRecords).toBe(true);
+    // The header says «I hold records you may not understand» and the
+    // asymmetric check accepts that — it only fails the other way round. But
+    // the REPORT says what this reader actually found, and it found a broken
+    // record, not an unreadable version.
+    expect(report.containsUnsupportedRecords).toBe(false);
+  });
+
+  it('a lock DURING hashing stops the run before the first decryption (D15)', async () => {
+    // Hashing a near-cap file is not instant. The guard has to sit between the
+    // hash and the decrypt, not only before the hash: otherwise a vault locked
+    // while the SHA was being computed still gets its whole contents opened.
+    const { deps, exported } = await containerOf([await makeNote()], []);
+    let checks = 0;
+    const cancelling: BackupActionDeps = {
+      ...deps,
+      // 1) before the size check, 2) after `text()`, 3) after the SHA.
+      assertAlive: () => { if (++checks >= 3) throw new Error('vault locked'); },
+    };
+
+    const decrypt = vi.spyOn(crypto.subtle, 'decrypt');
+    await expect(verifyBackupFile(cancelling, asFile(exported.text)))
+      .rejects.toThrow('vault locked');
+    expect(decrypt).not.toHaveBeenCalled();
+    decrypt.mockRestore();
   });
 
   it('the three failing verdicts stay distinct in one file', async () => {

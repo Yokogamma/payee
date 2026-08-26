@@ -390,3 +390,50 @@ describe('bytes from the FILE meet the same barrier as bytes about to be signed 
     expectNeverPublishesOrQuarantines(d);
   });
 });
+
+describe('the barrier gates the WRITE, not the rules', () => {
+  /**
+   * The case that makes the placement load-bearing rather than stylistic: a
+   * record that is MALFORMED and publication-EQUIVALENT at the same time.
+   *
+   * A v3 note does not publish its outer `createdAt` (`arweave.ts` — no `t` in
+   * `data`, no Timestamp tag), so a negative one fails the shape barrier while
+   * changing nothing about what would go on-chain. Checking the file's shape
+   * before the rules would turn every case below into `skipped` — and a
+   * complete, correctly applied import would report itself incomplete (§4).
+   */
+  const V8_ID = '11111111-2222-8333-8444-555555555555';
+  const v3Local: EncryptedNote = { ...localNote, noteId: V8_ID, v: 3 };
+  const v3Malformed: EncryptedNote = { ...v3Local, createdAt: -1 };
+  const v3 = (over: Partial<BackupMergeInput> = {}) =>
+    decide({ id: V8_ID, incoming: v3Malformed, local: v3Local, localState: 'readable', ...over });
+
+  it('the fixture really is both malformed and equivalent', () => {
+    // Otherwise the three tests below would be proving something else.
+    expect(decide({
+      id: V8_ID, incoming: v3Malformed, local: v3Local, localState: 'absent',
+    }).outcome).toBe('skipped');                       // the barrier does refuse it
+    expect(v3().outcome).not.toBe('conflicts');        // ...and it IS equivalent
+  });
+
+  it('a readable, equivalent local record stays an UNCOUNTED no-op', () => {
+    // Nothing was left unapplied — an equivalent record is already here.
+    expect(v3()).toEqual({ writePayload: false, sync: null, outcome: 'noop' });
+  });
+
+  it('a stale «version» quarantine is still lifted — that verdict is about the LOCAL row', () => {
+    // `unsupported_version` said «this build cannot handle such a record», and
+    // this build just read the local one. The file's shape has no bearing on
+    // that sentence expiring, and no bytes are written either way.
+    const d = v3({ sync: row({ noteId: V8_ID, terminalError: 'unsupported_version' }) });
+    expect(d.outcome).toBe('quarantineStale');
+    expect(d.writePayload).toBe(false);
+    expect(d.sync?.terminalError).toBeUndefined();
+  });
+
+  it('a DIFFERING local record is still a conflict, not a shape refusal', () => {
+    const d = v3({ local: { ...v3Local, ciphertext: incomingOther.ciphertext } });
+    expect(d.outcome).toBe('conflicts');
+    expect(d.writePayload).toBe(false);
+  });
+});
