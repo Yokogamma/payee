@@ -143,7 +143,13 @@ export async function applyBackupImport(
     deps.assertAlive();
 
     const counters = emptyCounters();
-    counters.unsupported = plan.unsupported.length;
+    // Each refused record carries the counter stage A decided for it: an
+    // unknown VERSION is `unsupported` (D11a — a newer build may read it), a
+    // broken shape or damaged bytes are `skipped`, and a stranded descendant
+    // inherits its ancestor's. Collapsing all of them into `unsupported` would
+    // tell the user to go find a newer build for a record that is simply
+    // broken.
+    for (const record of plan.notApplied) counters[record.counter]++;
 
     await runPlan(deps, plan, counters);
 
@@ -227,6 +233,9 @@ async function applyOne(deps: ImportDeps, planned: PlannedRecord): Promise<Backu
     const local = await deps.classifyLocal(planned.kind, planned.id);
     deps.assertAlive();
     const outcome = await deps.mergeRecord(planned.kind, planned.record, local, deps.now());
+    // Before the RETRY as well, not only on the way out: a vault locked while
+    // the merge was running must not be re-classified against (D15).
+    deps.assertAlive();
     if (outcome !== 'concurrentChange') return outcome;
   }
   return 'concurrentChange';

@@ -20,7 +20,14 @@ const node = (
   root: string,
   prev?: string,
   kind: 'note' | 'safebox' = 'note',
-): PlanInput => ({ kind, id, record: rec(id), topology: { root, rev, prev } });
+): PlanInput => ({ kind, id, record: rec(id), state: 'readable', topology: { root, rev, prev } });
+
+/** A record stage A refused, with the verdict it refused it under. */
+const refused = (
+  id: string,
+  state: 'unsupported' | 'malformed' | 'damaged' = 'unsupported',
+  kind: 'note' | 'safebox' = 'note',
+): PlanInput => ({ kind, id, record: rec(id), state });
 
 describe('order', () => {
   it('applies a chain from its first version upwards, whatever order it arrives in', () => {
@@ -80,21 +87,21 @@ describe('records this build cannot read', () => {
     // is irreversible. It is counted, warned about, and left in the file.
     const plan = planBackupImport([
       node('a1', 1, 'a1'),
-      { kind: 'note', id: 'opaque', record: rec('opaque') },
-      { kind: 'safebox', id: 'opaque-entry', record: rec('opaque-entry') },
+      refused('opaque'),
+      refused('opaque-entry', 'unsupported', 'safebox'),
     ]);
 
     expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
-    expect(plan.unsupported).toEqual([
-      { kind: 'note', id: 'opaque' },
-      { kind: 'safebox', id: 'opaque-entry' },
+    expect(plan.notApplied).toEqual([
+      { kind: 'note', id: 'opaque', counter: 'unsupported' },
+      { kind: 'safebox', id: 'opaque-entry', counter: 'unsupported' },
     ]);
   });
 
   it('an empty container plans nothing', () => {
     const plan = planBackupImport([]);
     expect(plan.ordered).toEqual([]);
-    expect(plan.unsupported).toEqual([]);
+    expect(plan.notApplied).toEqual([]);
   });
 });
 
@@ -123,39 +130,41 @@ describe('a descendant whose predecessor is not in the plan', () => {
     // store does not have — the hole D12a exists to prevent.
     const plan = planBackupImport([
       node('a1', 1, 'a1'),
-      { kind: 'note', id: 'a2', record: rec('a2') }, // unreadable: no topology
+      refused('a2'), // unreadable: stage A could not place it
       node('a3', 3, 'a1', 'a2'),
     ]);
 
     expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
-    expect(plan.unsupported).toEqual([
-      { kind: 'note', id: 'a2' },
-      { kind: 'note', id: 'a3' },
+    expect(plan.notApplied).toEqual([
+      { kind: 'note', id: 'a2', counter: 'unsupported' },
+      // Missing for its ANCESTOR's reason, not for one of its own.
+      { kind: 'note', id: 'a3', counter: 'unsupported' },
     ]);
   });
 
   it('and so is everything behind IT', () => {
     const plan = planBackupImport([
       node('a1', 1, 'a1'),
-      { kind: 'note', id: 'a2', record: rec('a2') },
+      refused('a2'),
       node('a3', 3, 'a1', 'a2'),
       node('a4', 4, 'a1', 'a3'),
       node('a5', 5, 'a1', 'a4'),
     ]);
 
     expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
-    expect(plan.unsupported.map(r => r.id)).toEqual(['a2', 'a3', 'a4', 'a5']);
+    expect(plan.notApplied.map(r => r.id)).toEqual(['a2', 'a3', 'a4', 'a5']);
+    expect(plan.notApplied.every(r => r.counter === 'unsupported')).toBe(true);
   });
 
   it('a chain of its own is unaffected', () => {
     const plan = planBackupImport([
-      { kind: 'note', id: 'a1', record: rec('a1') },
+      refused('a1'),
       node('b1', 1, 'b1'),
       node('b2', 2, 'b1', 'b1'),
     ]);
 
     expect(plan.ordered.map(r => r.id)).toEqual(['b1', 'b2']);
-    expect(plan.unsupported.map(r => r.id)).toEqual(['a1']);
+    expect(plan.notApplied.map(r => r.id)).toEqual(['a1']);
   });
 
   it('a link stage A would have rejected is set aside fail-closed', () => {
@@ -169,6 +178,80 @@ describe('a descendant whose predecessor is not in the plan', () => {
     ]);
 
     expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'z1']);
-    expect(plan.unsupported).toEqual([{ kind: 'note', id: 'a2' }]);
+    // No ancestor to inherit from: «left unapplied» is all that can be said.
+    expect(plan.notApplied).toEqual([{ kind: 'note', id: 'a2', counter: 'skipped' }]);
   });
 });
+
+describe('the counter a refused record lands in', () => {
+  it('an unknown VERSION is `unsupported`; a broken shape or damaged bytes are not', () => {
+    // `unsupported` means «this build does not know this version» and nothing
+    // else — it is the line that tells the user a NEWER build might restore the
+    // record. Saying it about a provably broken one sends them looking for a
+    // build that does not exist.
+    const plan = planBackupImport([
+      refused('older', 'unsupported'),
+      refused('broken', 'malformed'),
+      refused('gone', 'damaged'),
+    ]);
+
+    expect(plan.notApplied).toEqual([
+      { kind: 'note', id: 'older', counter: 'unsupported' },
+      { kind: 'note', id: 'broken', counter: 'skipped' },
+      { kind: 'note', id: 'gone', counter: 'skipped' },
+    ]);
+  });
+
+  it('a descendant inherits the counter of the record that stranded it', () => {
+    const plan = planBackupImport([
+      refused('b1', 'damaged'),
+      node('b2', 2, 'b1', 'b1'),
+    ]);
+    expect(plan.notApplied).toEqual([
+      { kind: 'note', id: 'b1', counter: 'skipped' },
+      { kind: 'note', id: 'b2', counter: 'skipped' },
+    ]);
+  });
+});
+
+describe('the predecessor test does not depend on sort order', () => {
+  it('a prev in a chain that sorts EARLIER is still not a predecessor', () => {
+    // The trap in a set-of-accepted-ids check: chain «a» is ordered first, so
+    // `a1` is already accepted by the time `z2` is considered, and `z2` would
+    // be written — leaving chain «z» with a rev 2 whose rev 1 may never arrive.
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      node('z1', 1, 'z1'),
+      node('z2', 2, 'z1', 'a1'), // prev is real, accepted, and NOT its predecessor
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'z1']);
+    expect(plan.notApplied).toEqual([{ kind: 'note', id: 'z2', counter: 'skipped' }]);
+  });
+
+  it('a later revision with no prev at all is refused, not silently applied', () => {
+    const plan = planBackupImport([node('a1', 1, 'a1'), node('a2', 2, 'a1')]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
+    expect(plan.notApplied).toEqual([{ kind: 'note', id: 'a2', counter: 'skipped' }]);
+  });
+
+  it('a rev-1 record that still claims a predecessor is refused', () => {
+    const plan = planBackupImport([node('a1', 1, 'a1'), node('b1', 1, 'b1', 'a1')]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
+    expect(plan.notApplied.map(r => r.id)).toEqual(['b1']);
+  });
+
+  it('a healthy chain is untouched by any of it', () => {
+    const plan = planBackupImport([...chainOf('a', 3), ...chainOf('b', 2)]);
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'a2', 'a3', 'b1', 'b2']);
+    expect(plan.notApplied).toEqual([]);
+  });
+});
+
+/** A well-formed chain, as stage A would hand it over. */
+function chainOf(prefix: string, length: number): PlanInput[] {
+  return Array.from({ length }, (_, i) =>
+    node(`${prefix}${i + 1}`, i + 1, `${prefix}1`, i === 0 ? undefined : `${prefix}${i}`));
+}
