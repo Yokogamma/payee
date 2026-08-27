@@ -243,6 +243,34 @@ describe('the predecessor test does not depend on sort order', () => {
     expect(plan.notApplied.map(r => r.id)).toEqual(['b1']);
   });
 
+  it('a rev-1 record that does not name ITSELF as its chain is refused', () => {
+    // It would be a second «first version» of someone else's chain — and the
+    // link check alone cannot see that, because such a record claims no
+    // predecessor at all.
+    const plan = planBackupImport([node('a1', 1, 'a1'), node('x1', 1, 'zzz')]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
+    expect(plan.notApplied).toEqual([{ kind: 'note', id: 'x1', counter: 'skipped' }]);
+  });
+
+  it('a FORK is refused: two records cannot hold one position', () => {
+    // Both have a perfectly good predecessor, so the link check passes for
+    // each of them — and the store would end up with two records claiming to
+    // be revision 2, after which «which one is current» has no answer.
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      node('a2', 2, 'a1', 'a1'),
+      node('a2b', 2, 'a1', 'a1'),
+      node('a3b', 3, 'a1', 'a2b'), // and everything behind the loser goes too
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'a2']);
+    expect(plan.notApplied).toEqual([
+      { kind: 'note', id: 'a2b', counter: 'skipped' },
+      { kind: 'note', id: 'a3b', counter: 'skipped' },
+    ]);
+  });
+
   it('a healthy chain is untouched by any of it', () => {
     const plan = planBackupImport([...chainOf('a', 3), ...chainOf('b', 2)]);
     expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'a2', 'a3', 'b1', 'b2']);

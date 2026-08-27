@@ -169,6 +169,25 @@ describe('exportBackup', () => {
     const deps = await makeDeps({ assertAlive: () => { throw boom; } });
     await expect(exportBackup(deps)).rejects.toBe(boom);
   });
+
+  it('a lock DURING the SHA stops it too — nothing is handed back to download (D15)', async () => {
+    // What this function returns is downloaded and written to
+    // `last-export-artifact`. Hashing a near-cap container is not instant, so
+    // the guard has to sit AFTER the hash as well: otherwise a vault locked
+    // while it ran still produces a file and a freshness marker for it.
+    let checks = 0;
+    const deps = await makeDeps({
+      readSnapshot: async () => ({
+        ok: true,
+        snapshot: { notes: [await makeNote()], safebox: [], incompleteRestore: false },
+      }),
+      // 1) before the snapshot, 2) after it, 3) after the encryption,
+      // 4) after the SHA.
+      assertAlive: () => { if (++checks >= 4) throw new Error('vault locked'); },
+    });
+
+    await expect(exportBackup(deps)).rejects.toThrow('vault locked');
+  });
 });
 
 describe('verifyBackupFile — the verdict', () => {
