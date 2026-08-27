@@ -13,6 +13,10 @@ import remarkGfm from 'remark-gfm';
  *    are all stripped;
  *  - images are never fetched (CSP img-src stays 'self' data:) — an image
  *    renders as a safe link chip instead.
+ *
+ * The one rehype plugin below is layout, not policy: it removes the newline
+ * text nodes `mdast-util-to-hast` synthesizes between block children. It never
+ * adds, rewrites or unwraps an element, so it cannot widen anything above.
  */
 
 const ALLOWED_ELEMENTS = [
@@ -33,6 +37,88 @@ function httpOnly(url: string): string {
   const sanitized = defaultUrlTransform(url);
   if (/^https?:\/\//i.test(sanitized)) return sanitized;
   return '';
+}
+
+/**
+ * Block containers whose children `mdast-util-to-hast` separates with
+ * synthesized newline text nodes. `.note-text` renders markdown under
+ * `white-space: pre-wrap` (it has to: the plain-text and search paths in the
+ * same box carry real newlines), so every one of those separators printed as a
+ * REAL blank line. Four constructs were disfigured by it:
+ *
+ *   - a list written with blank lines between items: three empty lines per item
+ *     (one after `<li>`, one before `</li>`, one between items);
+ *   - any list: one empty line between items;
+ *   - a blockquote: an empty line above and below its paragraph;
+ *   - a GFM table: `\n` inside `<tr>`, which a preserving `white-space` wraps
+ *     into an anonymous table cell instead of discarding;
+ *   - a HARD line break: `to-hast` emits `<br>` FOLLOWED by a `"\n"`, so the
+ *     break printed doubled.
+ *
+ * `p` is in the set for that last one; `td`/`th`/`code`/`pre` deliberately are
+ * not — whitespace between phrasing content there is the author's.
+ *
+ * Inline elements are in the set ONLY because a hard break can sit inside one.
+ * That is safe because of condition 3 below: a space the author typed between
+ * `**foo**` and `*bar*` carries a source position and is never touched.
+ */
+const BLOCK_CONTAINERS = new Set([
+  'p', 'ul', 'ol', 'li', 'blockquote', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'dl',
+  // A hard break inside emphasis or a link carries the same trailing "\n", and
+  // so does one in a setext heading — measured, not assumed.
+  'strong', 'em', 'del', 'a',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  // GFM footnotes. `section` is NOT in ALLOWED_ELEMENTS, so `unwrapDisallowed`
+  // lifts its children into the root — AFTER this plugin has run. Its two
+  // separators would arrive in the body as real blank lines.
+  'section',
+]);
+
+/** The shape this plugin needs. Declared locally rather than imported from
+ *  `@types/hast`, which is only a transitive dependency here. */
+interface HastNode {
+  type: string;
+  tagName?: string;
+  value?: string;
+  position?: unknown;
+  children?: HastNode[];
+}
+
+/**
+ * A separator is only removable when ALL FOUR hold, and each condition earns
+ * its place — measured on the real tree, not assumed:
+ *
+ *   parent            position   value   verdict
+ *   ------            --------   -----   -------
+ *   ul (between li)   absent     "\n"    remove
+ *   p (after <br>)    absent     "\n"    remove
+ *   li in `- **a** *b*`  PRESENT  " "    KEEP — else the words fuse into «ab»
+ *   li in a task item    absent   " "    KEEP — else the box abuts its label
+ *
+ * Dropping on `!position` alone breaks task lists; dropping on «whitespace
+ * only» alone fuses inline emphasis. Both failures are silent.
+ */
+function isStructuralWhitespace(node: HastNode): boolean {
+  return node.type === 'text'
+    && node.position === undefined
+    && typeof node.value === 'string'
+    && node.value.includes('\n')
+    && /^\s*$/.test(node.value);
+}
+
+/** Rehype plugin: drop the separators described above. No new dependency —
+ *  the walk is short enough to own, and it keeps `white-space` untouched, so
+ *  the plain-text, search and version-history paths are unaffected BY
+ *  CONSTRUCTION rather than by argument. */
+function stripStructuralWhitespace() {
+  return function transform(tree: HastNode): void {
+    const isContainer = tree.type === 'root'
+      || (tree.type === 'element' && tree.tagName !== undefined && BLOCK_CONTAINERS.has(tree.tagName));
+    if (isContainer && tree.children) {
+      tree.children = tree.children.filter(child => !isStructuralWhitespace(child));
+    }
+    for (const child of tree.children ?? []) transform(child);
+  };
 }
 
 const components: Components = {
@@ -61,6 +147,7 @@ export const NoteMarkdown = memo(function NoteMarkdown({ text }: { text: string 
     <div className="note-md">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[stripStructuralWhitespace]}
         skipHtml
         allowedElements={ALLOWED_ELEMENTS}
         unwrapDisallowed

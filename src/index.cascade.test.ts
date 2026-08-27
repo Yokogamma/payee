@@ -485,6 +485,105 @@ describe('base layer, as the browser resolves it', () => {
     expect(declaresIn('.section-label', /font-family:\s*var\(--mono\)/)).toBe(true);
   });
 
+  it('markdown keeps ONE rhythm, and the loose-list normaliser is what does it', () => {
+    // A list written with blank lines between items becomes <li><p>…</p></li>.
+    // Stripping that paragraph's margins is the single declaration that makes
+    // «how the author typed it» stop being visible; without it the CSS above is
+    // just spacing and the two forms drift apart again.
+    expect(declaresIn('.note-md li > p', /margin:\s*0/)).toBe(true);
+    expect(declaresIn('.note-md li > p + p', /margin-top/)).toBe(true);
+
+    // Heading sizes stay in px. In `em` they would need a RELATIVE_PARENT entry
+    // (see the floor scan above); in `rem` h3 resolved to 16.8px against an
+    // 18px body — a heading smaller than the text it introduces.
+    expect(declaresIn('.note-md h3', /font-size:\s*18\.5px/)).toBe(true);
+    expect(declaresIn('.note-md h4', /font-size:\s*18px/)).toBe(true);
+
+    // The table is drawn in rules. A filled header is a surface, and a feed
+    // entry has none — the same rule `.note-card` lost its box for. (What the
+    // header may and may not declare is pinned separately below.)
+    expect(declaresIn('.note-md th', /background/)).toBe(false);
+    expect(declaresIn('.note-md td', /border-bottom:\s*1px solid var\(--border-inner\)/)).toBe(true);
+  });
+
+  it('the task-list box is sized by the NOTE, not by the form control', () => {
+    const box = '.note-md .task-list-item > input[type="checkbox"]';
+    expect(declaresIn(box, /appearance:\s*none/)).toBe(true);
+
+    // A form control does not inherit font-size, so an `em` box resolved
+    // against the UA's own ~13.3px and rendered 13px inside an 18px note.
+    // `font-size: inherit` is not the way out either — the floor scan above
+    // parses px/rem/em/% and reports a keyword as unreadable. So the box is
+    // resolved by hand, and THESE TWO ASSERTIONS ARE ONE: 19px is 1.05 × the
+    // reading size, and the reading size is pinned right here beside it, so a
+    // future change to `.note-text` cannot silently shrink the box again.
+    expect(declaresIn(box, /width:\s*19px/)).toBe(true);
+    expect(resolved('note-text', 'font-size')).toBe('18px');
+    // …and no em anywhere in the box or its tick, which is what regressed.
+    expect(declaresIn(box, /em\b/)).toBe(false);
+    expect(declaresIn(`${box}:checked::after`, /em\b/)).toBe(false);
+  });
+
+  it('a done task-list item dims whole, and an open one does not', () => {
+    const done = '.note-md .task-list-item:has(> input[type="checkbox"]:checked)';
+    expect(declaresIn(done, /color:\s*var\(--text-dim\)/)).toBe(true);
+    // No strikethrough: struck text stops being readable, and a done item is
+    // still the record of what was done.
+    expect(declaresIn(done, /text-decoration/)).toBe(false);
+    // The open item carries no colour of its own — it is body text.
+    expect(declaresIn('.note-md .task-list-item', /color:/)).toBe(false);
+    // …and a DONE parent must not dim its still-open children: colour inherits,
+    // so a nested list restarts at body ink.
+    expect(declaresIn('.note-md .task-list-item > ul', /color:\s*var\(--text\)/)).toBe(true);
+
+    // The tick is drawn in `currentColor`, and these inputs are `disabled` —
+    // Chromium's UA sheet gives a disabled control its own #545454, which the
+    // tick then inherited (2.24:1 on the dark ground, measured in a browser).
+    // A STATIC pin on purpose: jsdom carries no such UA rule, so nothing in
+    // this suite can observe the failure it prevents.
+    expect(declaresIn('.note-md .task-list-item > input[type="checkbox"]', /color:\s*inherit/)).toBe(true);
+  });
+
+  it('the task list survives BOTH markdown forms and a mixed list', () => {
+    // A loose task list wraps the item's content in <p>, so the box is a
+    // grandchild. Without the second selector the item falls back to the raw OS
+    // checkbox, in flow, inside the gutter reserved for the drawn one — while
+    // `li > p { margin: 0 }` has already made the two forms vertically
+    // identical, leaving a broken control as the only visible difference.
+    const loose = '.note-md .task-list-item > p > input[type="checkbox"]';
+    expect(declaresIn(loose, /appearance:\s*none/)).toBe(true);
+    expect(declaresIn(`${loose}:checked::after`, /content/)).toBe(true);
+    expect(declaresIn('.note-md .task-list-item:has(> p > input[type="checkbox"]:checked)', /color:\s*var\(--text-dim\)/)).toBe(true);
+
+    // ONE task item stamps `contains-task-list` on the WHOLE list, so the
+    // marker must be dropped per ITEM. Dropping it on the container stripped
+    // the bullet — and in an <ol> the number — from every ordinary sibling.
+    expect(declaresIn('.note-md .contains-task-list', /list-style/)).toBe(false);
+    expect(declaresIn('.note-md .contains-task-list', /padding-left/)).toBe(false);
+    expect(declaresIn('.note-md .task-list-item', /list-style:\s*none/)).toBe(true);
+  });
+
+  it('a table header does not re-parent relative sizes or re-case the author', () => {
+    // `font-size` here would make the cell the parent of `.note-md code`'s
+    // 0.88em — 11.44px against a 13px header, under the project's own floor —
+    // while the floor scan stays green, because RELATIVE_PARENT still measures
+    // that selector against `.note-text`. The header is a weight and a rule.
+    expect(declaresIn('.note-md th', /font-size/)).toBe(false);
+    expect(declaresIn('.note-md th', /text-transform/)).toBe(false);
+    expect(declaresIn('.note-md th', /font-family/)).toBe(false);
+    expect(declaresIn('.note-md th', /border-bottom:\s*1px solid var\(--border-control\)/)).toBe(true);
+  });
+
+  it('the plain-text and search paths keep their preserved newlines', () => {
+    // LOAD-BEARING. The blank-line bug was fixed in the element tree, not here
+    // (stripStructuralWhitespace in NoteMarkdown.tsx). `.note-text` also renders
+    // unformatted notes and search results as raw strings — VersionHistoryModal
+    // prints `{version.text}` bare — and both depend on this declaration. Any
+    // future attempt to fix markdown spacing by touching it breaks them
+    // silently.
+    expect(resolved('note-text', 'white-space')).toBe('pre-wrap');
+  });
+
   it('sync state is words without a capsule — except the retry, which is a button', () => {
     expect(declaresIn('.sync-state', /border:\s*none/)).toBe(true);
 
