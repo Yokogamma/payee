@@ -166,10 +166,17 @@ export async function exportBackup(deps: BackupActionDeps): Promise<ExportedBack
   }, deps.keys.container);
   deps.assertAlive();
 
+  const sha256 = await deps.sha256Hex(text);
+  // Hashing a near-cap container is not instant, and what comes back from here
+  // is handed to a download and written to `last-export-artifact`. A vault
+  // locked or reset while the SHA was being computed must not produce either
+  // (D15) — the same boundary the dry-run guards after ITS hash.
+  deps.assertAlive();
+
   return {
     text,
     fileName: backupFileName(new Date(createdAt)),
-    artifact: { createdAt, sha256: await deps.sha256Hex(text), at: deps.now() },
+    artifact: { createdAt, sha256, at: deps.now() },
   };
 }
 
