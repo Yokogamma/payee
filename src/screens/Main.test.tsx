@@ -915,3 +915,38 @@ describe('Main — фокус следует за разделом', () => {
     expect(document.activeElement).toBe(document.body);
   });
 });
+
+/**
+ * The rollback half of the reading view.
+ *
+ * `flags.ts` states it as a contract, not as a style: with the writer off
+ * `editNote` THROWS, and «edit/history controls are hidden» — while «readers
+ * are never gated». So the note still opens and still reads; only the two
+ * write-adjacent controls are absent.
+ */
+describe('Main — чтение при выключенном писателе', () => {
+  const openFirstNote = () => {
+    fireEvent.click(screen.getByRole('button', { name: /^Открыть заметку от/ }));
+  };
+
+  it('заметка открывается и читается', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(document.querySelector('.note-reader-body')).toBeTruthy();
+    expect(document.querySelector('.note-reading')?.textContent).toContain('привет мир');
+    expect(document.querySelector('.notes-feed')).toBeNull();
+  });
+
+  it('но правки нет — ни кнопкой, ни пунктом меню', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(screen.queryByRole('button', { name: 'Редактировать заметку' })).toBeNull();
+    expect(document.querySelector('.note-reader-body .fab')).toBeNull();
+
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    expect(screen.queryByText('Редактировать')).toBeNull();
+    expect(screen.queryByText(/История версий/)).toBeNull();
+    // Copying is writer-independent and stays.
+    expect(screen.getByText('Копировать текст')).toBeTruthy();
+  });
+});

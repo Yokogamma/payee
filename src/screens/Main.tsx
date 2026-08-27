@@ -1,21 +1,22 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { useNotes } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import { SettingsSection } from './SettingsSection';
 import { NoteComposer } from '../components/NoteComposer';
 import { Fab } from '../components/Fab';
 import { NoteMarkdown } from '../components/NoteMarkdown';
+import { NotePreview } from '../components/NotePreview';
 import { EditNoteModal } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { SyncStateBadge } from '../components/SyncStateBadge';
 import { CardMenu } from '../components/CardMenu';
-import { formatNoteDate } from '../lib/format-date';
+import { formatNoteDate, formatNoteDateFull } from '../lib/format-date';
 import { noteSearchText } from '../lib/note-search-text';
 import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
-import { useRoute, navigate, canonicalHash } from '../lib/route';
+import { useRoute, navigate, canonicalHash, type RouteHistoryState } from '../lib/route';
 import { AppNav } from '../components/AppNav';
 import { StatusLine } from '../components/StatusLine';
 import type { ThemePref } from '../lib/theme';
@@ -29,10 +30,12 @@ import type { NoteData } from '../lib/crypto';
 // The feed shows one card per version CHAIN (chains/filteredChains); the raw
 // per-version list still backs search counters and reset accounting.
 
-/** Long-content clamp heuristic for feed cards. */
-function isLongNote(text: string): boolean {
-  return text.length > 600 || text.split('\n').length > 12;
-}
+/* The long-note heuristic that used to live here is gone. It guessed from the
+   raw markdown source (`length > 600 || lines > 12`), which is wrong in both
+   directions — a note long only because of table pipes clamped though it
+   rendered short. The preview now MEASURES its rendered height; see
+   `useTruncation`. `expandedCards` went with it: there is nothing to expand in
+   the feed any more, the note opens. */
 
 interface MainProps {
   theme: ThemePref;
@@ -60,6 +63,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
     safeboxDataPresent,
     v3Paused,
     safeboxLockGeneration,
+    restoring,
   } = useNotes();
 
   // The section lives in the address, not in local state: the Android system
@@ -67,7 +71,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // kept alongside `view` because the canonicaliser below needs to see a
   // change that `view` alone would hide (`#/notes` → `#/garbage` parses to the
   // same section).
-  const { hash, section: view } = useRoute();
+  const { hash, section: view, param } = useRoute();
   // The safebox item is ALWAYS in the nav — the visibility formula is gone.
   // A section that appears and disappears makes the layout jump the moment a
   // user activates it, and it hid the only route to activation. It is dimmed
@@ -87,6 +91,24 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // screen permanently, competing with the feed for the only vertical space a
   // phone has.
   const [composerOpen, setComposerOpen] = useState(false);
+  /**
+   * The note being read, resolved from the ADDRESS.
+   *
+   * Against `chains`, never `filteredChains`: an active search must not close
+   * a note that is already open. A param that resolves to nothing (a stale
+   * link, a chain quarantined while it was open) simply leaves `readingRoot`
+   * null, and the canonicaliser below strips it from the bar — no second
+   * redirect effect.
+   */
+  const readingChain = param && view === 'notes' ? chains.find(c => c.root === param) ?? null : null;
+  const readingRoot = readingChain?.root ?? null;
+  const reading = readingChain !== null;
+  /* Derived at the top level, not inside the JSX: reading `chain.current`
+     inside a callback is what react-hooks/refs flags by property name. */
+  const readingNote = readingChain?.current ?? null;
+  const readingInfo = readingNote
+    ? syncStatuses[readingNote.id] ?? { status: 'queued' as const }
+    : null;
   // FULL SCREEN, and by UNMOUNTING the rest — not by hiding it.
   //
   // The mockup gives writing the whole screen: no status line, no search, no
@@ -97,7 +119,13 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // It is a GRID STATE, not an overlay. `.lock-gate` sits at z-index 100 and
   // beats every modal on source order; a composer layered above it would put
   // plaintext over the privacy gate — see the note in AppNav.
-  const composing = view === 'notes' && composerOpen;
+  //
+  // READING WINS OVER WRITING. Both are fullscreen grid states, and without
+  // the `!reading` guard they can be true at once: a cold start on
+  // `#/notes/<root>` with a stored draft renders the composer (the auto-expand
+  // effect fires on hydration) AND the reader, both subtrees at the same time.
+  // The composer is restored, draft intact, on the way back.
+  const composing = view === 'notes' && composerOpen && !reading;
   // Set by an explicit «Свернуть». Blocks auto-expansion until the user LEAVES
   // and re-enters the section; without it a manually collapsed composer would
   // re-open by itself as soon as hydration resolves.
@@ -108,7 +136,6 @@ export function Main({ theme, onThemeChange }: MainProps) {
   const [copyFeedback, setCopyFeedback] = useState<'ok' | 'fail' | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
 
   // Edit/history/restore UI (W3). Only ONE aria-modal layer at a time: opening
   // the restore confirm CLOSES the history modal; cancelling reopens history
@@ -138,6 +165,41 @@ export function Main({ theme, onThemeChange }: MainProps) {
     }
     return ref;
   }
+
+  /** Same pattern, same reason, for the card's open control: leaving a note
+   *  lands focus back on the card it came from. */
+  const previewBtnRefs = useRef(new Map<string, React.RefObject<HTMLButtonElement | null>>());
+  function previewTriggerRef(root: string) {
+    let ref = previewBtnRefs.current.get(root);
+    if (!ref) {
+      ref = { current: null };
+      previewBtnRefs.current.set(root, ref);
+    }
+    return ref;
+  }
+
+  /**
+   * Generation token for the restore flow.
+   *
+   * `confirmRestore` awaits `editNote` and then, unconditionally, closes the
+   * dialogs and moves focus. If the user left in the meantime — Back out of the
+   * note, or a section switch — the feed is mounted again by the time that
+   * resolves, so the late tail would yank focus off the card and onto its ⋯
+   * button. The WRITE is never cancelled; only its tail is invalidated.
+   */
+  const restoreOpRef = useRef(0);
+
+  /** The feed's scroll position across a trip into a note (it unmounts). */
+  const feedElRef = useRef<HTMLDivElement | null>(null);
+  const feedScrollRef = useRef(0);
+  /**
+   * Armed by `openNote`, disarmed by the restore. WITHOUT IT the position is
+   * replayed on every composer close as well — the feed unmounts for the
+   * composer too — so saving a note dropped the user back at the offset some
+   * earlier note-open had recorded, while the note they just wrote sat at the
+   * top of the list off-screen.
+   */
+  const restoreFeedScrollRef = useRef(false);
 
   // The «Получено с других устройств» toast and its handled-run bookkeeping are
   // gone. They existed for ONE reason, stated in their own comment: the result
@@ -237,11 +299,79 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // A DOM query rather than three threaded refs: the sections are independent
   // components and the shared class is the contract between them.
   const firstSectionRender = useRef(true);
+  const prevReadingRootRef = useRef<string | null>(null);
   useEffect(() => {
-    // Not on the very first render — that would steal focus at app start.
+    const leftReading = prevReadingRootRef.current;
+    prevReadingRootRef.current = readingRoot;
+    // Not on the very first render — that would steal focus at app start,
+    // including a cold start straight into a note.
     if (firstSectionRender.current) { firstSectionRender.current = false; return; }
+    // Coming BACK from a note: focus the card it was opened from, not the
+    // section title. Same contract as the modal stack — the control that
+    // started the trip gets the focus that ends it.
+    if (!readingRoot && leftReading) {
+      const back = previewBtnRefs.current.get(leftReading)?.current;
+      if (back) { back.focus(); return; }
+    }
     (document.querySelector('.main-content .section-title') as HTMLElement | null)?.focus();
-  }, [view]);
+  }, [view, readingRoot]);
+
+  /**
+   * A route transition closes every modal and DISCARDS its unwritten buffer.
+   *
+   * The three dialogs render as unconditional siblings at the end of this
+   * component, outside the routed section, and none of them listens to
+   * `popstate`. Without this, Back out of a note would leave an edit dialog
+   * standing over the restored feed — and today the same thing already happens
+   * when the section changes, which this closes too.
+   *
+   * `useLayoutEffect`, not `useEffect`: a passive one would let a frame paint
+   * with the dialog still on top of the feed.
+   */
+  const routeKey = `${view}|${readingRoot ?? ''}`;
+  const [modalRouteKey, setModalRouteKey] = useState(routeKey);
+  if (modalRouteKey !== routeKey) {
+    // ADJUSTED DURING RENDER, not in an effect — the same shape EditNoteModal
+    // uses to re-prefill per chain. An effect would paint one frame with the
+    // dialog still standing over the restored feed, and React flags the
+    // cascading re-render it causes.
+    setModalRouteKey(routeKey);
+    setEditChainRoot(null);
+    setHistoryChainRoot(null);
+    setHistoryFocusVersionId(null);
+    setRestoreTarget(null);
+    setOpenMenuId(null);
+  }
+
+  // Invalidate any restore still in flight: the WRITE is never cancelled, but
+  // its UI tail must not steal focus after we have left. See `confirmRestore`.
+  // In an effect rather than in the block above, because a ref may not be
+  // touched during render — and an effect is early enough regardless: the tail
+  // it guards resolves on a later task, never between render and effect.
+  useEffect(() => {
+    restoreOpRef.current++;
+  }, [view, readingRoot]);
+
+  /**
+   * Put the feed back where it was standing.
+   *
+   * The feed UNMOUNTS while a note is open, so its scroll position is not
+   * preserved for us. A layout effect, not `requestAnimationFrame`: the jump
+   * is visible for one frame otherwise. The card heights it scrolls against
+   * are already final — `useTruncation` measures in a layout effect of its
+   * own, and children run before parents.
+   */
+  useLayoutEffect(() => {
+    // Not mounted yet — and the arming flag is deliberately left alone, so a
+    // Back that lands in the composer (a stored draft re-expands it) still
+    // restores once the composer closes.
+    if (reading || composing) return;
+    const el = feedElRef.current;
+    if (el && restoreFeedScrollRef.current && feedScrollRef.current > 0) {
+      el.scrollTop = feedScrollRef.current;
+    }
+    restoreFeedScrollRef.current = false;
+  }, [reading, composing]);
 
   // Canonicalise the address. An empty hash (first load, or an old build that
   // never wrote one) and an unknown hash (typo, or a section a newer build had
@@ -253,9 +383,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
   //
   // `replace`, not push: a junk entry the user never chose must not become a
   // stop on the way back.
+  //
+  // It is also the ONLY place a bad note id is dealt with: `readingRoot` is
+  // null for a param that resolves to nothing, so the same line strips it.
+  // While a restore sweep is still filling the store, though, an id that has
+  // not arrived YET is not the same as a bad one — the address is held until
+  // the sweep ends, or the deep link would bounce out from under the user.
   useEffect(() => {
-    if (hash !== canonicalHash(view)) navigate(view, { replace: true });
-  }, [hash, view]);
+    if (restoring && param && !readingRoot) return;
+    const wanted = view === 'notes' ? readingRoot : null;
+    if (hash !== canonicalHash(view, wanted)) navigate(view, { replace: true, param: wanted });
+  }, [hash, view, param, readingRoot, restoring]);
 
   // Hydrate the encrypted draft on mount — dirty-guarded (§2): it only fills a
   // composer the user has NOT touched (typing and deleting counts as touched),
@@ -341,13 +479,28 @@ export function Main({ theme, onThemeChange }: MainProps) {
     return parts;
   }
 
-  function toggleExpanded(root: string) {
-    setExpandedCards(prev => {
-      const next = new Set(prev);
-      if (next.has(root)) next.delete(root);
-      else next.add(root);
-      return next;
-    });
+  /** Open a note: push an entry so the system Back gesture closes it, and
+   *  remember where the feed was standing. */
+  function openNote(root: string) {
+    feedScrollRef.current = feedElRef.current?.scrollTop ?? 0;
+    restoreFeedScrollRef.current = true;
+    navigate('notes', { param: root });
+  }
+
+  /**
+   * Leave the note.
+   *
+   * NOT a bare `history.back()`: on a cold start into `#/notes/<root>` the
+   * entry behind us belongs to another site, and Back would leave the app.
+   * NOT a bare `navigate` either: over an entry WE pushed that would grow the
+   * stack the user then has to Back through twice. `enSection` — written on
+   * every entry this app creates since before the reader existed — is what
+   * tells the two apart, and this is its first real reader.
+   */
+  function closeNote() {
+    const state = window.history.state as RouteHistoryState | null;
+    if (state?.enSection === true) window.history.back();
+    else navigate('notes', { replace: true });
   }
 
   const editChain = editChainRoot ? chains.find(c => c.root === editChainRoot) ?? null : null;
@@ -370,25 +523,33 @@ export function Main({ theme, onThemeChange }: MainProps) {
 
   async function confirmRestore() {
     if (!restoreTarget) return;
+    const op = ++restoreOpRef.current;
     // Preserve the SOURCE version's fmt: restoring a plain note must not
     // re-interpret its literal *stars* as markdown forever.
     await editNote(restoreTarget.root, restoreTarget.version.text, { fmt: restoreTarget.version.fmt });
     // Success: close the whole stack, focus the card's stable ⋯ trigger (the
     // «Восстановить» button that opened this no longer exists in the DOM).
     const root = restoreTarget.root;
+    // The write is done and permanent. Everything below is UI, and it belongs
+    // to a flow the user may already have left — see `restoreOpRef`.
+    if (op !== restoreOpRef.current) return;
     setRestoreTarget(null);
     setHistoryFocusVersionId(null);
-    requestAnimationFrame(() => menuBtnRefs.current.get(root)?.current?.focus());
+    requestAnimationFrame(() => {
+      // Re-checked inside the frame: the cleanup effect can fire between the
+      // state updates above and this callback.
+      if (op === restoreOpRef.current) menuBtnRefs.current.get(root)?.current?.focus();
+    });
   }
 
 
   return (
-    <div className={`main-screen${composing ? ' main-screen--composing' : ''}`}>
+    <div className={`main-screen${composing ? ' main-screen--composing' : ''}${reading ? ' main-screen--reading' : ''}`}>
       {/* Grid areas, not a flat flex column: on a wide screen the nav becomes a
           full-height left rail, and three loose siblings would each turn into a
           column instead. Toasts and modal overlays are position:fixed, so they
           never become grid items. */}
-      {!composing && (
+      {!composing && !reading && (
       <div className="main-top">
         {/* One line replaces the restore banners, both pause banners, the
             offline banner, the Arweave badge, the note count and the ↻
@@ -444,11 +605,19 @@ export function Main({ theme, onThemeChange }: MainProps) {
           list, within thumb reach, and gives the header back to the title. */}
       <div className="notes-topbar">
         <h2 className="section-title" tabIndex={-1}>
-          {composing ? 'Новая заметка' : 'Заметки'}
+          {composing ? 'Новая заметка' : reading ? 'Заметка' : 'Заметки'}
         </h2>
         {composing && (
           <button className="btn btn-ghost" onClick={collapseComposer}>
             Свернуть
+          </button>
+        )}
+        {/* Mirrors «Свернуть»: the same slot, the same shape, the in-app way
+            out of a fullscreen state. The system Back gesture is the other
+            one, and it is why this state lives in the address at all. */}
+        {reading && (
+          <button className="btn btn-ghost" onClick={closeNote}>
+            Назад
           </button>
         )}
       </div>
@@ -470,7 +639,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
 
       {/* The composer takes the whole screen, so the search field goes with the
           feed it filters. */}
-      {!composing && (
+      {!composing && !reading && (
       <div className="search-bar">
         <input
           type="text"
@@ -515,9 +684,100 @@ export function Main({ theme, onThemeChange }: MainProps) {
       </div>
       )}
 
+      {/* Reading one note, full screen. The chain is re-resolved on every
+          render rather than snapshotted into state, so a version arriving from
+          sync — or a restore performed right here — updates the text and the
+          version count under the reader instead of going stale. */}
+      {reading && readingChain && readingNote && readingInfo && (
+          <>
+            <div className="note-reader-meta">
+              <span className="note-date section-label">{formatNoteDate(readingNote.createdAt)}</span>
+              <SyncStateBadge
+                badge={badgeFor(readingInfo, arweave.enabled && arweave.registered)}
+                onRetry={
+                  readingInfo.status === 'error' && arweave.enabled && arweave.registered
+                    ? retrySync
+                    : undefined
+                }
+              />
+              {readingChain.versions.length > 1 && (
+                <span className="state state--quiet">
+                  {readingChain.versions.length}-я версия
+                </span>
+              )}
+              <span className="note-meta-gap" />
+              <CardMenu
+                open={openMenuId === readingChain.root}
+                onOpenChange={next => setOpenMenuId(next ? readingChain.root : null)}
+                label="Меню заметки"
+                id={`note-menu-${readingChain.root}`}
+                /* The SAME ref map as the feed. A second one would leave
+                   `confirmRestore` focusing a button that is not on screen.
+                   The map is written during render here, as it is in the
+                   feed's map callback — it is a cache keyed by chain root,
+                   not React state. */
+                // eslint-disable-next-line react-hooks/refs -- lazily-created ref cache, not a read of rendered state
+                triggerRef={menuTriggerRef(readingChain.root)}
+                items={[
+                  {
+                    key: 'copy',
+                    icon: <IconCopy />,
+                    label: 'Копировать текст',
+                    onSelect: () => handleCopyNote(readingNote.text),
+                  },
+                  ...(V3_WRITER_ENABLED && readingChain.versions.length > 1
+                    ? [{
+                        key: 'history',
+                        icon: <IconHistory />,
+                        label: `История версий (${readingChain.versions.length})`,
+                        onSelect: () => {
+                          setHistoryFocusVersionId(null);
+                          setHistoryChainRoot(readingChain.root);
+                        },
+                      }]
+                    : []),
+                  ...(readingInfo.status === 'confirmed' && readingInfo.txId
+                    ? [{
+                        key: 'tx',
+                        icon: <IconLink />,
+                        label: 'Транзакция в блокчейне',
+                        href: `https://viewblock.io/arweave/tx/${readingInfo.txId}`,
+                      }]
+                    : []),
+                ]}
+                hint={V3_WRITER_ENABLED
+                  ? 'Редактирование добавляет новую версию — старые остаются в истории. Версию, уже опубликованную в блокчейне, изменить или удалить невозможно.'
+                  : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
+              />
+            </div>
+            <div className="note-reader-body">
+              {/* `.note-text` is the wrapper here too — it carries the 18px
+                  reading size AND the `pre-wrap` that unformatted notes depend
+                  on. `.note-reading` only opens the line-height and sets the
+                  measure. */}
+              <div className="note-text note-reading">
+                {readingNote.fmt === 'md'
+                  ? <NoteMarkdown text={readingNote.text} />
+                  : readingNote.text}
+              </div>
+              {/* Editing sits where creation sits in the feed: same corner,
+                  same thumb. Gated on the writer flag — with it off `editNote`
+                  throws, and the rollback contract says the control is hidden,
+                  not merely inert. The reader itself is never gated. */}
+              {V3_WRITER_ENABLED && (
+                <Fab
+                  label="Редактировать заметку"
+                  icon={<IconEdit />}
+                  onClick={() => setEditChainRoot(readingChain.root)}
+                />
+              )}
+            </div>
+          </>
+      )}
+
       {/* Feed — one card per version chain; fields come from chain.current. */}
-      {!composing && (
-      <div className="notes-feed">
+      {!composing && !reading && (
+      <div className="notes-feed" ref={feedElRef}>
         {filteredChains.length === 0 && !searchQuery ? (
           <div className="empty-state">
             <div className="empty-icon"><IconNote /></div>
@@ -542,17 +802,27 @@ export function Main({ theme, onThemeChange }: MainProps) {
             // enabled flag gates only the live status badge.
             const info = syncStatuses[note.id] ?? { status: 'queued' as const };
             const badge = badgeFor(info, arweave.enabled && arweave.registered);
-            const long = isLongNote(note.text);
-            const expanded = expandedCards.has(chain.root);
-            const clamped = long && !expanded;
+            const rendersMarkdown = note.fmt === 'md' && !searchQuery.trim();
             return (
               <div className="note-card" key={chain.root}>
                 {/* The date leads the entry instead of trailing it. A line in
                     a ledger is found by when it was written; putting the date
                     under the text made every entry start with an unanchored
-                    sentence. */}
-                <div className="note-date section-label">{formatNoteDate(note.createdAt)}</div>
-                <div className={`note-text ${clamped ? 'note-text--clamped' : ''}`}>
+                    sentence. It is inside the open control now: the whole
+                    entry is one target, and the date is the first thing its
+                    accessible name says. */}
+                <NotePreview
+                  date={formatNoteDate(note.createdAt)}
+                  dateFull={formatNoteDateFull(note.createdAt)}
+                  /* The measurement's invalidator. `note.id` is the CURRENT
+                     version's id, so an edit or a version arriving from sync
+                     changes it; the render mode covers the markdown ⇄ search
+                     switch. Neither changes the width, and the observer
+                     ignores height-only changes. */
+                  contentKey={`${note.id}|${rendersMarkdown ? 'md' : 'plain'}`}
+                  onOpen={() => openNote(chain.root)}
+                  openRef={previewTriggerRef(chain.root)}
+                >
                   {/* While a query is active the card renders PLAIN text so the
                       matches can be wrapped in <mark> — but a markdown note's
                       plain text is its SOURCE, and typing a query turned
@@ -560,15 +830,10 @@ export function Main({ theme, onThemeChange }: MainProps) {
                       `noteSearchText` is what the STORE filtered on, so what is
                       highlighted here is exactly what was matched there; the
                       stored note is untouched either way. */}
-                  {note.fmt === 'md' && !searchQuery.trim()
-                    ? <NoteMarkdown text={note.text} />
+                  {rendersMarkdown
+                    ? <NoteMarkdown text={note.text} preview />
                     : highlight(noteSearchText(note), searchQuery)}
-                </div>
-                {long && (
-                  <button className="note-expand-btn" onClick={() => toggleExpanded(chain.root)}>
-                    {expanded ? 'Свернуть' : 'Развернуть'}
-                  </button>
-                )}
+                </NotePreview>
                 <div className="note-meta">
                   {/* Status in words. The 🔒 that used to sit here is gone with
                       the rest of the emoji: every note is encrypted, so a
@@ -652,7 +917,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
       </div>
       )}
 
-      {!composing && (
+      {!composing && !reading && (
         // The dot is the only thing standing between a collapsed composer and
         // silently hiding an unsaved draft.
         <Fab
@@ -738,7 +1003,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
       {/* Unmounted while composing. The composer is a place you finish or
           leave by «Свернуть», and a tab bar under it is both a distraction and
           a tab stop past the save button. */}
-      {!composing && <AppNav safeboxDimmed={safeboxDimmed} />}
+      {!composing && !reading && <AppNav safeboxDimmed={safeboxDimmed} />}
     </div>
   );
 }

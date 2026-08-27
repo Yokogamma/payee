@@ -39,6 +39,23 @@ const DAY = 24 * HOUR;
  *  «август», so the day has to be in the same format call to inflect it. */
 const dayMonth = new Intl.DateTimeFormat('ru', { day: 'numeric', month: 'long' });
 
+/**
+ * The same date, ALWAYS absolute — «19 августа», «19 августа 2025».
+ *
+ * For places that need a date rather than a relative bearing: the accessible
+ * name of the feed's open control reads «Открыть заметку от …», and «Открыть
+ * заметку от только что» is not a sentence. It is also time-dependent, so the
+ * name of a control would change while the user is on the page.
+ *
+ * No relative branch at all, which is why a FUTURE timestamp prints its date
+ * here instead of clamping to «только что» as the relative formatter does.
+ */
+export function formatNoteDateFull(ts: number, now: number = Date.now()): string {
+  const d = new Date(ts);
+  const text = dayMonth.format(d);
+  return d.getFullYear() === new Date(now).getFullYear() ? text : `${text} ${d.getFullYear()}`;
+}
+
 export function formatNoteDate(ts: number, now: number = Date.now()): string {
   const diff = now - ts;
 
