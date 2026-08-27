@@ -26,6 +26,7 @@
 
 import { mnemonicToSeedSync } from '@scure/bip39';
 import { bufferToBase64, base64ToBuffer, isCanonicalBase64 } from './crypto';
+import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -149,6 +150,22 @@ export interface BackupContainer {
   header: BackupHeader;
   body: BackupBody;
 }
+
+// ─── Which records THIS build cannot read ────────────────────────────
+//
+// A container-format concern, not a classifier one: `containsUnsupportedRecords`
+// is a header field (D11a), and the standalone viewer needs the same predicate
+// without dragging the upload path — and its gateway URLs — into an artifact
+// whose build refuses any `http(s)://`.
+
+/** `v` absent means v1 (crypto.ts «Absent/1 = v1»), which is legal and must
+ *  not read as unknown. */
+export const isOpaqueNote = (n: EncryptedNote): boolean =>
+  n.v !== undefined && n.v !== 1 && n.v !== 2 && n.v !== 3;
+
+/** Safebox entries have always carried a version, so an absent one is unknown
+ *  just like a wrong one. */
+export const isOpaqueEntry = (e: EncryptedSafeboxEntry): boolean => e.v !== 4;
 
 // ─── Key derivation ──────────────────────────────────────────────────
 

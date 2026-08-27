@@ -16,7 +16,16 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.mjs'],
+    // `viewer/` is included deliberately: the standalone artifact used to be
+    // covered only by checks on its BUILT TEXT, which cannot see what the page
+    // does when someone opens it — and its riskiest behaviour (what stays in
+    // the DOM after the tab is left) is runtime behaviour.
+    include: [
+      'src/**/*.test.ts',
+      'src/**/*.test.tsx',
+      'viewer/**/*.test.ts',
+      'scripts/**/*.test.mjs',
+    ],
     globals: false,
   },
 });

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -139,6 +140,30 @@ describe('the committed hash module', () => {
     const precached = [...sw.matchAll(/url:"([^"]+)"/g)].map(m => m[1]);
     expect(precached.length).toBeGreaterThan(0); // the scan really found the manifest
     expect(precached).not.toContain('backup-viewer.html');
+  });
+
+  it('the value in the COMMIT is the placeholder, whatever the working tree holds', () => {
+    // The test above is deliberately tolerant of a local build having rewritten
+    // this file — otherwise `npm test` would go red after every build, and the
+    // pressure would be to commit the generated value, which is the one outcome
+    // this arrangement exists to prevent. So: tolerant of the working tree,
+    // intolerant of the commit. Only git can tell those apart.
+    //
+    // Without this the tolerance has no floor: a hash generated on someone's
+    // machine could be committed and CI would never notice, because the test
+    // job runs on a clean checkout where the working tree IS the commit.
+    let committed;
+    try {
+      committed = execFileSync('git', ['show', 'HEAD:src/lib/backup-viewer-hash.ts'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return; // not a git checkout (a tarball) — there is no commit to judge
+    }
+
+    expect(committed).toContain(`BACKUP_VIEWER_SHA256 = '${PLACEHOLDER}'`);
+    expect(committed).toContain('BACKUP_VIEWER_HASH_IS_PLACEHOLDER = true;');
   });
 
   it('the placeholder renders as invalid and a real hash renders as valid', () => {
