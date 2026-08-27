@@ -129,26 +129,50 @@ export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
     return a.rev - b.rev;
   });
 
-  // One forward pass in that order decides who has a predecessor to stand on.
-  // A record that does not is set aside, and so is everything behind it — the
-  // memo carries the verdict down the chain without walking it again.
+  // One forward pass in that order decides who may be ordered at all. A record
+  // that may not is set aside, and so is everything behind it — the memo
+  // carries the verdict down the chain without walking it again.
   //
-  // The test is the SAME direct link stage A proves (`backup-chains.ts`), not
-  // «is some record with that id in the plan»: an id that happens to be accepted
-  // may belong to another chain entirely, and then whether THAT chain sorts
-  // earlier or later would decide whether a broken container gets written. A
-  // guard whose answer depends on sort order is not a guard.
+  // ── What this pass checks, and why exactly these three ──────────────
+  //
+  // This is not a second `validateChains`, and it must not become one. It is
+  // the set of preconditions THIS module's guarantee rests on — «every ordered
+  // record has its predecessor ordered before it, in a chain that is a line» —
+  // and nothing else:
+  //
+  //  1. a rev-1 record names ITSELF as its chain and claims no predecessor;
+  //  2. at most one record per position `(kind, root, rev)`;
+  //  3. `prev` is accepted, in the SAME chain, exactly one revision back.
+  //
+  // The rest of the graph verdict is stage A's and stays there, because these
+  // three already imply it for ordering purposes: a link into another
+  // collection cannot even be looked up (the key carries the kind); a chain
+  // whose root record is absent has no rev-1 to stand on, so (1) and (3) refuse
+  // it; and a non-integer or descending `rev` can never bottom out at a rev-1
+  // record, so the whole run of them is refused. What (3) alone could NOT
+  // catch is a fork — two records claiming one position, each with a perfectly
+  // good predecessor — which is why (2) is here rather than assumed.
+  //
+  // Checked here rather than trusted from the caller for the same reason the
+  // merge writer re-applies the upload barrier: the guarantee is this module's
+  // to make, and an invariant that holds only while every caller remembers to
+  // validate first is not an invariant.
   const accepted = new Map<string, PlannedRecord>();
   const refused = new Map<string, NotAppliedCounter>();
+  const taken = new Set<string>();
   for (const record of notApplied) refused.set(key(record.kind, record.id), record.counter);
 
   const ordered: PlannedRecord[] = [];
   for (const record of readable) {
     const prevKey = record.prev === undefined ? undefined : key(record.kind, record.prev);
     const prev = prevKey === undefined ? undefined : accepted.get(prevKey);
-    const stands = record.rev === 1
-      ? record.prev === undefined
+    const position = `${record.kind}:${record.root}:${record.rev}`;
+    const linked = record.rev === 1
+      // A chain's first version names itself: a rev-1 record pointing at
+      // someone else's chain would be a SECOND first version there.
+      ? record.root === record.id && record.prev === undefined
       : prev !== undefined && prev.root === record.root && prev.rev === record.rev - 1;
+    const stands = linked && !taken.has(position);
 
     if (!stands) {
       // A descendant is missing for its ANCESTOR's reason (D12a). A link stage
@@ -160,6 +184,7 @@ export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
       continue;
     }
     accepted.set(key(record.kind, record.id), record);
+    taken.add(position);
     ordered.push(record);
   }
 

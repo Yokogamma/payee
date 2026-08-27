@@ -400,3 +400,26 @@ describe('the counters stage A decided are the counters the report carries', () 
     expect(h.merged).toEqual(['a1']);
   });
 });
+
+describe('cancellation between the merge and the retry (D15)', () => {
+  it('a lock after a `concurrentChange` stops the import before re-classifying', async () => {
+    // The retry re-reads and re-decrypts the LOCAL record. A vault locked or
+    // reset while the merge was running must not be classified against — the
+    // guard has to sit between the merge and the second attempt, not only on
+    // the way out of a successful one.
+    const h = harness({ outcomes: { a1: ['concurrentChange', 'added'] } });
+    let classifications = 0;
+    let checks = 0;
+    const deps: ImportDeps = {
+      ...h.deps,
+      classifyLocal: async (...args) => { classifications++; return h.deps.classifyLocal(...args); },
+      // 1) marker read, 2) provisional write, 3) after classify, 4) after merge.
+      assertAlive: () => { if (++checks >= 4) throw new Error('vault locked'); },
+    };
+
+    await expect(applyBackupImport(deps, planBackupImport([node('a1', 1, 'a1')]), true))
+      .rejects.toThrow('vault locked');
+
+    expect(classifications).toBe(1); // the retry never happened
+  });
+});
