@@ -365,10 +365,13 @@ flip is a **raise** rather than a first filling:
 
 **What only the operator can do** (no PR can, and none should pretend to):
 
-1. **set `WORKER_FLOOR_SHA`** in the `dev` Environment to
-   `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`). Until this is
-   done the worker deploy refuses to run at all — deliberately: the floor
-   exists whether or not the variable does;
+1. ~~**set `WORKER_FLOOR_SHA`** in the `dev` Environment to
+   `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)~~ — **reported set
+   by the operator 2026-08-28** (not independently verified here: the variable
+   is protected and no repository check can read it; the first deploy dispatch
+   proves it either way, since without the value the run refuses outright).
+   Until it is set the worker deploy refuses to run at all — deliberately: the
+   floor exists whether or not the variable does;
 2. ~~restrict the Environment's **deployment branches** to the default
    branch~~ — **done** (verified 2026-08-28: policy is branch-only, `main`).
    That policy, not the guard step inside the workflow, is the real boundary:
@@ -393,14 +396,34 @@ all, and there is no SHA that both passes without a floor and is blocked by
 is done in the direction that deploys nothing dangerous:
 
 1. set `WORKER_FLOOR_SHA` to the `worker-r3` SHA above;
-2. dispatch the deploy for **`931949150f6145b6c79d36dbadc66b482c1cb6d1`
-   (`worker-r3`) itself** — it passes the gate (a commit is its own descendant)
-   and genuinely redeploys what is already live.
-   **NOT the head of `main`.** `main` carries 17 worker commits that have never
-   been deployed — the `@noble/ed25519` 2.x→3.1 migration on the upload
-   signature path, PR-2's metrics transport, the global `UPLOADS_ENABLED`
-   switch — so dispatching the head is a RELEASE, with the acceptance checklist
-   below and a release-tag entry, not a rehearsal step;
+2. dispatch the deploy for **the SHA that is currently live** — see «What is
+   actually deployed» below; as of 2026-08-28 that is
+   `45866b9bb9ae5c8c92d031f4e62e67be50d71949`. It passes the gate (a commit is
+   its own descendant) and genuinely redeploys what is already running, so the
+   rehearsal changes nothing.
+
+   > **Corrected 2026-08-28.** This step used to say «dispatch `worker-r3`
+   > itself — it redeploys what is already live», on the strength of a claim
+   > that `main` carried 17 undeployed worker commits. **Both halves were
+   > wrong, and the instruction was dangerous.** Those 17 commits are exactly
+   > what the 2026-08-22 deploy SHIPPED, so `worker-r3` is not what is live —
+   > it is 17 commits BEHIND it. Dispatching it would have been a silent
+   > production DOWNGRADE that passes the gate (`worker-r3` is an ancestor of
+   > the live SHA, and the gate checks ancestry from the floor, not distance
+   > from HEAD): the metrics transport of PR-2, the `@noble/ed25519` 2.x→3.1
+   > migration on the signature path and the global `UPLOADS_ENABLED` switch
+   > would all have been removed from the running worker by a step labelled
+   > «rehearsal».
+   >
+   > The error came from counting commits since the last release TAG instead
+   > of since the last DEPLOY. The two had drifted by four deploys — which is
+   > the second defect this correction fixes, below. **Read the deploy history,
+   > not the tag list, when you need to know what is running.**
+
+   **NOT the head of `main`** either — but for a smaller reason than the old
+   text gave: the head differs from the live worker by one devDependency bump
+   (`a9a2346`), so dispatching it is a (tiny) release with a registry entry,
+   not a rehearsal step;
 3. dispatch it for `cd7524e`'s full SHA (`worker-r2`, below the floor) — the
    run must stop at the gate, **before** the candidate is materialized, and
    nothing may reach Cloudflare;
@@ -471,6 +494,37 @@ client floor in force is still `client-r4`.
     **not to be used**. No repository script can intercept those two paths;
     they bypass the gate entirely, and they are exactly what a person reaches
     for at 2 a.m.
+  - **What is actually deployed (added 2026-08-28).** The tag list below is a
+    list of TAGS, and it stopped tracking deploys after `worker-r3`: four
+    successful worker deploys followed it and none of them was tagged or
+    recorded. The registry therefore said `worker-r3` while something 17
+    commits newer was running, and a correction elsewhere in this runbook had
+    already been built on that false reading (see the rehearsal above). The
+    deploys, reconstructed from the workflow's own run history:
+
+    | Date | SHA | Run | What it carried into the worker |
+    |---|---|---|---|
+    | 2026-08-20 | `b18762b` (#92) | 32409290370 | Node 24 contract, paid-smoke target classifier, dev-contour reclassification |
+    | 2026-08-20 | `d54dc78` (#96) | 32418386038 | §1.9 global `UPLOADS_ENABLED` switch + machine-readable `recovery_invalid` |
+    | 2026-08-22 | `158fa9e` (#106) | 32604302375 | PR-2 metrics transport + AE events + `/admin/metrics`; `@noble/ed25519` 2.x→3.1 on the signature path; `redrop_new_tx` fix for the recovery-hint branch |
+    | 2026-08-22 | `45866b9` (#107) | 32604479982 | `CF_ACCOUNT_ID` for `/admin/metrics` (PR-2 provisioning). **CURRENTLY LIVE.** |
+
+    Live `/health` (verified 2026-08-28):
+    `{"ok":true,"versions":["1","2","3","4"],"uploads":true,"v3Uploads":true,"v4Uploads":true}`.
+
+    Consequence worth stating for the Arweave track: **PR-2 «Метрики» is not
+    merely merged, it is deployed** — step 2 of that plan's execution order is
+    complete on the dev contour, and PR-3a is not waiting on it.
+
+    Why they went unrecorded is worth naming, because the fix is procedural:
+    the release tag is optional by design (D2a says the gate reads
+    `WORKER_FLOOR_SHA`, and a tag is «зеркало, не источник истины»), and an
+    optional artifact stops being written the moment nobody's build depends on
+    it. The floor gate is unaffected — it never consulted this list. What IS
+    affected is every human decision made by reading it, including the one
+    above. **Rule from here: a deploy without a tag still gets a row in the
+    table above, with its run id, on the day it happens.**
+
   - Allowed release tags (append on each deploy):
     - worker-r1 — 15b87d4cacbc19a3371a19b9141f1562b63781d8 (2026-07-23, first
       production worker deploy; recovery-protocol writer)
