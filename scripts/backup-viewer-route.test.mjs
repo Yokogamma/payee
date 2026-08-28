@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { requireDist } from './require-dist.mjs';
 import { fileURLToPath } from 'node:url';
 
@@ -30,6 +30,21 @@ describe('the route', () => {
     const splat = redirects.indexOf('/* /index.html');
     expect(viewer).toBeGreaterThanOrEqual(0);
     expect(splat).toBeGreaterThan(viewer);
+  });
+
+  it('sends `/backup-viewer.html` to the canonical URL, and does so before the splat', () => {
+    // The file existing in `dist` does not shield the path: Cloudflare follows
+    // redirects «regardless of whether or not an asset matches the incoming
+    // request», so without a rule of its own `.html` lands in the SPA fallback
+    // — the app shell under a URL that looks like the viewer's.
+    const lines = read('../public/_redirects')
+      .split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+    const html = lines.findIndex(line => line.startsWith('/backup-viewer.html '));
+    const splat = lines.findIndex(line => line.startsWith('/* '));
+
+    expect(html, '/backup-viewer.html has no rule of its own').toBeGreaterThanOrEqual(0);
+    expect(lines[html]).toBe('/backup-viewer.html /backup-viewer 301');
+    expect(splat).toBeGreaterThan(html);
   });
 });
 

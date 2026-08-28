@@ -38,9 +38,11 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
-      # The typecheck half of `npm run build` (`tsc -b`, noEmit in both projects).
-      # The deploys get it for free inside the build; CI cannot run the build
-      # (see below), so the gate is invoked directly — it needs no secrets.
+      # The typecheck half of `npm run build` (`tsc -b`, noEmit in both
+      # projects), invoked directly and early: it needs no secrets and no
+      # placeholders, so a type error surfaces here rather than inside the
+      # asset-gate build further down (which runs with placeholder VITE_* —
+      # see the note there).
       - run: npm run typecheck
       # The one forbidden pair of backup flags (D16): export ON while import is
       # OFF would ship a release producing files the same build can neither
@@ -83,15 +85,10 @@ jobs:
           VITE_PROXY_URL: https://ci-placeholder.invalid
           # NOT A WALLET — see the note above.
           VITE_TRUSTED_OWNERS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-      # The dist-reading assertions — the viewer's hash matching the built
-      # file, the viewer being absent from the precache manifest, the CSP unset
-      # actually reaching `_headers` — SKIP when there is no build. That is
-      # right for `npm test` above, which runs on a clean checkout, and it also
-      # means a green run so far has proved none of them. Here there is a
-      # build, so the skip is turned off and their absence is a failure.
-      - run: npx vitest run scripts/build-backup-viewer.test.mjs scripts/backup-viewer-route.test.mjs
-        env:
-          REQUIRE_DIST: '1'
+      # The dist-reading assertions skip without a build, which is right for
+      # `npm test` above and useless as proof. Same command as the deploy
+      # workflow runs on ITS build — see the script's header.
+      - run: node scripts/verify-viewer-dist.mjs
       - run: node scripts/check-bundle-budget.mjs
       - run: node scripts/check-no-inlined-fonts.mjs
       # Report only, no threshold — prints what users actually download so the

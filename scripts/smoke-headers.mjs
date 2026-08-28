@@ -83,27 +83,46 @@ if (!body.includes('просмотр резервной копии')) fail('view
 if (body.includes('id="root"')) fail('viewer: the SPA shell was served instead of the viewer');
 if (/https?:\/\//i.test(body)) fail('viewer: the served artifact references an http(s) URL');
 
-// ── `/backup-viewer.html`: not a contract, but not a trap either ─────
+// ── `/backup-viewer.html`: exactly two acceptable answers ────────────
 //
-// Cloudflare states that «redirects are always followed, regardless of whether
-// or not an asset matches the incoming request», so the catch-all may well
-// answer this path instead of the file next to it. Which of the two happens is
-// a fact about the deployment, and this is the only place it can be observed —
-// so it is observed rather than assumed.
+// `_redirects` sends this path to the canonical URL with a 301, because
+// Cloudflare follows redirects «regardless of whether or not an asset matches
+// the incoming request» — the file in `dist` does not shield it from the
+// splat. If a future Pages behaviour serves the asset first instead, the
+// answer is the viewer itself, which is equally fine.
 //
-// What is asserted is the only thing that matters to a person who typed the
-// path they saw in a folder: whatever comes back must not be the APP SHELL. A
-// page that looks like the viewer's URL and cannot open a backup, with no
-// explanation, is the failure mode this whole route exists to prevent.
-const alt = await fetch(new URL('/backup-viewer.html', url).toString(), { redirect: 'manual' });
-if (alt.status === 200) {
+// Everything else fails: the app shell under a viewer-looking URL is the
+// failure mode this route exists to prevent, and «some redirect somewhere» is
+// not an answer either — a 301 to `/`, to another origin, or back to itself
+// would each look like success at the status-code level.
+const altUrl = new URL('/backup-viewer.html', url);
+const alt = await fetch(altUrl.toString(), { redirect: 'manual' });
+if ([301, 302, 307, 308].includes(alt.status)) {
+  const location = alt.headers.get('location') ?? '';
+  const target = location === '' ? null : new URL(location, altUrl);
+  if (target === null) fail('viewer: /backup-viewer.html redirected with no Location');
+  else if (target.origin !== altUrl.origin) {
+    fail(`viewer: /backup-viewer.html redirected off-origin to ${target.origin}`);
+  } else if (target.pathname !== '/backup-viewer') {
+    fail(`viewer: /backup-viewer.html redirected to ${target.pathname}, not /backup-viewer`);
+  }
+} else if (alt.status === 200) {
+  // Served directly: then it must be the viewer AND carry the same guarantees
+  // the canonical route was just checked for — a second URL under a weaker
+  // policy is a second attack surface, not a convenience.
   const altBody = await alt.text();
   if (altBody.includes('id="root"') || !altBody.includes('просмотр резервной копии')) {
     fail('viewer: /backup-viewer.html answered 200 with something other than the viewer '
       + '(the app shell under a viewer URL is worse than a 404)');
   }
-} else if (![301, 302, 307, 308, 404].includes(alt.status)) {
-  fail(`viewer: /backup-viewer.html answered ${alt.status} — expected the viewer, a redirect, or 404`);
+  if (alt.headers.get('content-security-policy')) {
+    fail('viewer: /backup-viewer.html carries a CSP response header — the per-path unset did not apply there');
+  }
+  if (!/nosniff/i.test(alt.headers.get('x-content-type-options') ?? '')) {
+    fail('viewer: /backup-viewer.html is missing nosniff');
+  }
+} else {
+  fail(`viewer: /backup-viewer.html answered ${alt.status} — expected a redirect to /backup-viewer or the viewer itself`);
 }
 
 if (problems.length) {
