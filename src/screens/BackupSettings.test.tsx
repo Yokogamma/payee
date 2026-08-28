@@ -172,7 +172,7 @@ describe('export', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Скачать резервную копию' })); });
 
     expect(screen.getByText(/передан браузеру/)).toBeTruthy();
-    expect(screen.queryByText(/Файл сохранён/)).toBeNull();
+    expect(screen.queryByText(/Файл сохранён/)).toBeNull();
   });
 
   it('a marker that could not be written does NOT read as a failed export', async () => {
