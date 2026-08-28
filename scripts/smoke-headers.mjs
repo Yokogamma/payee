@@ -83,6 +83,29 @@ if (!body.includes('просмотр резервной копии')) fail('view
 if (body.includes('id="root"')) fail('viewer: the SPA shell was served instead of the viewer');
 if (/https?:\/\//i.test(body)) fail('viewer: the served artifact references an http(s) URL');
 
+// ── `/backup-viewer.html`: not a contract, but not a trap either ─────
+//
+// Cloudflare states that «redirects are always followed, regardless of whether
+// or not an asset matches the incoming request», so the catch-all may well
+// answer this path instead of the file next to it. Which of the two happens is
+// a fact about the deployment, and this is the only place it can be observed —
+// so it is observed rather than assumed.
+//
+// What is asserted is the only thing that matters to a person who typed the
+// path they saw in a folder: whatever comes back must not be the APP SHELL. A
+// page that looks like the viewer's URL and cannot open a backup, with no
+// explanation, is the failure mode this whole route exists to prevent.
+const alt = await fetch(new URL('/backup-viewer.html', url).toString(), { redirect: 'manual' });
+if (alt.status === 200) {
+  const altBody = await alt.text();
+  if (altBody.includes('id="root"') || !altBody.includes('просмотр резервной копии')) {
+    fail('viewer: /backup-viewer.html answered 200 with something other than the viewer '
+      + '(the app shell under a viewer URL is worse than a 404)');
+  }
+} else if (![301, 302, 307, 308, 404].includes(alt.status)) {
+  fail(`viewer: /backup-viewer.html answered ${alt.status} — expected the viewer, a redirect, or 404`);
+}
+
 if (problems.length) {
   console.error(`smoke-headers FAILED for ${url}:\n  - ${problems.join('\n  - ')}`);
   process.exit(1);

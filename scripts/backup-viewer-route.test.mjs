@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
+import { requireDist } from './require-dist.mjs';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -38,7 +39,27 @@ describe('the service worker', () => {
   it('excludes the viewer from the SPA navigation fallback', () => {
     // The `_redirects` rule governs the server; this governs the service
     // worker, which answers first for an installed PWA.
-    expect(config).toMatch(/navigateFallbackDenylist:\s*\[\/\\\/backup-viewer/);
+    expect(config).toMatch(/navigateFallbackDenylist:\s*\[\/\^\\\/backup-viewer/);
+  });
+
+  it('and does so for a query string too — Workbox matches path AND search', () => {
+    // Not a copy of the pattern: the one in the config is lifted out and RUN,
+    // because the defect this catches is a `$` in the wrong place, which any
+    // re-typed regex in a test would reproduce and then bless.
+    const source = /navigateFallbackDenylist:\s*\[\s*([^\]]+?)\s*,?\s*\]/.exec(config)?.[1];
+    expect(source, 'the denylist is no longer a single regex literal').toBeDefined();
+    const literal = /^\/(.*)\/([a-z]*)$/.exec(source.trim());
+    expect(literal, `not a regex literal: ${source}`).not.toBeNull();
+    const denylist = new RegExp(literal[1], literal[2]);
+
+    // Workbox: `denylist.some(re => re.test(url.pathname + url.search))`.
+    for (const path of ['/backup-viewer', '/backup-viewer.html', '/backup-viewer?utm=1',
+      '/backup-viewer.html?x=1', '/backup-viewer?']) {
+      expect(denylist.test(path), `${path} must be kept from the SPA fallback`).toBe(true);
+    }
+    for (const path of ['/', '/notes', '/backup-viewers', '/x/backup-viewer']) {
+      expect(denylist.test(path), `${path} must NOT be denied the SPA fallback`).toBe(false);
+    }
   });
 
   it('excludes the viewer from precache', () => {
@@ -64,7 +85,7 @@ describe('the headers', () => {
 
   it('the generated file carries the unset for both paths', () => {
     const headersPath = fileURLToPath(new URL('../dist/_headers', import.meta.url));
-    if (!existsSync(headersPath)) return; // nothing built in this checkout
+    if (!requireDist(headersPath, expect)) return;
     const headers = readFileSync(headersPath, 'utf8');
     for (const path of ['/backup-viewer', '/backup-viewer.html']) {
       const block = new RegExp(`^${path.replace('.', '\\.')}\\n\\s*! Content-Security-Policy`, 'm');

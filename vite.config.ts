@@ -80,7 +80,12 @@ export default defineConfig(({ command, mode }) => {
           // hand the user a page that cannot open a backup and does not say
           // why. Belt to the `_redirects` rule's braces: that one governs the
           // server, this one governs the service worker.
-          navigateFallbackDenylist: [/\/backup-viewer(\.html)?$/],
+          // Anchored at the start and open at the end for a query string:
+          // Workbox tests this against `pathname + search`, so a `$` here
+          // would let `/backup-viewer?anything` fall through to the SPA shell
+          // — the app answering, from precache, for the one URL that must not
+          // be the app.
+          navigateFallbackDenylist: [/^\/backup-viewer(?:\.html)?(?:$|\?)/],
           // No runtimeCaching entries: proxy/Arweave requests stay network-only.
         },
       }),

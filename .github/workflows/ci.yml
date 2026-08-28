@@ -83,6 +83,15 @@ jobs:
           VITE_PROXY_URL: https://ci-placeholder.invalid
           # NOT A WALLET — see the note above.
           VITE_TRUSTED_OWNERS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      # The dist-reading assertions — the viewer's hash matching the built
+      # file, the viewer being absent from the precache manifest, the CSP unset
+      # actually reaching `_headers` — SKIP when there is no build. That is
+      # right for `npm test` above, which runs on a clean checkout, and it also
+      # means a green run so far has proved none of them. Here there is a
+      # build, so the skip is turned off and their absence is a failure.
+      - run: npx vitest run scripts/build-backup-viewer.test.mjs scripts/backup-viewer-route.test.mjs
+        env:
+          REQUIRE_DIST: '1'
       - run: node scripts/check-bundle-budget.mjs
       - run: node scripts/check-no-inlined-fonts.mjs
       # Report only, no threshold — prints what users actually download so the

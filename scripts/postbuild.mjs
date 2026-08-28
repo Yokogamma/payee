@@ -40,8 +40,13 @@ try {
  * the viewer's inlined script — the page would silently fail to run, offline,
  * in the exact situation it exists for.
  *
- * Both paths are listed: the extensionless canonical route (served through a
- * 200 rewrite) and the file itself, which stays directly reachable.
+ * Both paths are listed, but only ONE is a contract. `/backup-viewer` is the
+ * canonical route, served through the 200 rewrite. `/backup-viewer.html` is
+ * listed defensively: Cloudflare states that «redirects are always followed,
+ * regardless of whether or not an asset matches the incoming request», so the
+ * catch-all may well answer that path with the app shell instead of the file.
+ * The header rule costs nothing if it never matches, and the live smoke checks
+ * what actually happens rather than trusting either reading of the docs.
  */
 const VIEWER_HEADERS = ['/backup-viewer', '/backup-viewer.html']
   .map(path => `${path}
