@@ -306,6 +306,99 @@ Every staging command (`deploy:staging`, `deploy:staging:check`) is gated by
 `npm run check:staging-config`, which fails with the checklist above while the
 KV placeholder is still in `wrangler.toml`.
 
+## Backup v1 — `client-b1` → import flip → export flip
+
+Three client releases, not one, and the reason is D16: the gate lives in the
+ACTIONS, so the code ships inert and each flip is a separate, revertible
+release. A hidden button is a layout decision, and layout decisions get
+reverted by accident.
+
+### Order (plan §9, D18)
+
+0. **Precondition, and it belongs to another track:** PR-3a with the D9
+   verification protocol. Until it ships, merging ANY PR of the backup stack
+   and ANY Pages deploy are blocked — not because the flags are off, but
+   because `/backup-viewer` is reachable regardless of both flags. From the
+   moment the route landed, the stack's inertness is guaranteed by the absence
+   of a deploy and by nothing else.
+1. **Worker** with `fp`, `deduped`, `409 id_payload_conflict`, the server-side
+   legacy backfill (snapshot-CAS) and `semanticIdempotency: 1` in `/health`
+   → smoke + soak. Environment restrictions are configured now;
+   **`WORKER_FLOOR_SHA` is NOT raised yet** — the rollback window stays open
+   for a release nothing depends on yet (D2a).
+2. **`client-b1`** — the client floor: D12 + D14 + D14a + D14b + `DB_VERSION` 3,
+   **both flags `false`**, plus the bundle-ceiling commit. This tag becomes the
+   minimum safe rollback target on DB3 and the **new client floor after
+   `client-r4`**.
+3. **Raise `WORKER_FLOOR_SHA`**, verify the gate now refuses the ancestor, then
+   flip `BACKUP_IMPORT_ENABLED`.
+4. Flip `BACKUP_EXPORT_ENABLED`.
+
+The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
+rejects the build, and the UI treats it as fail-closed anyway (the whole block
+goes dark rather than offering the half that misleads). An export the same
+build can neither verify nor import produces files that are worse than no
+files.
+
+### The flags are the kill switches
+
+- `BACKUP_IMPORT_ENABLED=false` — «Проверить файл копии» and «Импортировать из
+  файла» refuse in the action with a typed error, and the settings block hides
+  them. Existing files are unaffected: the container format is documented in
+  `docs/BACKUP_FORMAT_V1.md` and readable by the standalone viewer forever.
+- `BACKUP_EXPORT_ENABLED=false` — «Скачать резервную копию» and «Скачать
+  просмотрщик» likewise.
+- Both `false` — the block does not render at all, instruction included.
+
+Reverting a flip is a client redeploy of the previous tag. **Neither flip is a
+floor**: no schema change rides with them (the schema moved once, at
+`client-b1`).
+
+### What changes for EVERYONE at `client-b1`, with both flags off
+
+This release is not inert for existing users, and the runbook has to say so
+plainly — the flags gate the backup UI, not the writers underneath it:
+
+- **restore path (D12):** `mergeRestoredNote` writes the payload and its sync
+  row in ONE transaction, and a fresh `uploading` attempt is a no-op instead of
+  a race. Before this, a restore could pair recovered bytes with a txId that
+  described different bytes.
+- **upload path (D14/D14a):** the upload is checked against the payload it was
+  signed for (payload-CAS), and a result is applied only for the attempt that
+  produced it (`attemptId` CAS). `SyncRecord` gains `attemptId` — additive, and
+  the reason the `DB_VERSION` bump is free.
+- **`terminalError` gains `publication_conflict` (D9):** the server answered
+  `409 {code:'id_payload_conflict'}` for this id. Additive value — older builds
+  see «a non-empty quarantine» and exclude the record from the queue, which is
+  the safe degradation. The merge rules never clear it: an import repairs the
+  BYTES and leaves the publication block alone, because the block is about the
+  chain, not about the file.
+
+Rolling a client below `client-b1` is therefore **forbidden**: those builds
+reproduce the defects above with no worker involvement at all (D2b).
+
+### Acceptance (plan §9)
+
+- manual viewer smoke on `file://` in three browsers with no network,
+  attachment extraction included — **operator only** (one Chromium engine
+  available here, no Safari on Windows);
+- automatic route smoke: `scripts/smoke-headers.mjs` — 200, content-type,
+  signature, exactly ONE effective CSP identical to the `<meta>`, `nosniff`,
+  XFO, no SPA shell, no redirect loop;
+- near-cap measurements (desktop numbers below; the mobile number is the
+  operator's);
+- `id_payload_conflict` convergence — needs the deployed worker and paid
+  publications;
+- **mixed-version test**: an old tab against a new client, and a rollback to
+  release 1.
+
+### Viewer hash registry (D19)
+
+See «Backup viewer — a REGISTRY of released hashes» below. The registry is
+mirrored in `README.md`, and the settings screen shows the checksum of the
+build the user is running. Three places, because the one thing that must NOT
+be trusted is the checksum sitting next to the file it describes.
+
 ## Rollback rules
 
 - **Never roll back below the reader release R** once v2 writes are enabled: an
@@ -415,6 +508,35 @@ KV placeholder is still in `wrangler.toml`.
   | Release tag | Date | SHA-256 of `backup-viewer.html` |
   |---|---|---|
   | _(none released yet)_ | — | — |
+
+  **Verification is done by a command, not by eye (D19).** Sixty-four hex
+  characters compared by a human is a check that passes when it should fail —
+  and it is being asked for precisely when someone suspects the file. Both
+  blocks below rename the file on a mismatch, so «open it anyway» takes a
+  deliberate step outside the instructions. The reference comes from the row
+  above; digests are lowercase, as the build prints them.
+
+  Windows (PowerShell):
+
+  ```powershell
+  $E='<REFERENCE_SHA256>'
+  $F='eternal-notes-backup-viewer.html'
+  if ((Get-FileHash $F -Algorithm SHA256).Hash -eq $E) { "OK: $F is the released viewer" }
+  else { Rename-Item $F "$F.MISMATCH"; Write-Error 'HASH MISMATCH — do not open this file' }
+  ```
+
+  macOS / Linux (sh):
+
+  ```sh
+  E='<REFERENCE_SHA256>'
+  F=eternal-notes-backup-viewer.html
+  echo "$E  $F" | shasum -a 256 -c -     && echo "OK: $F is the released viewer"     || { mv "$F" "$F.MISMATCH"; echo 'HASH MISMATCH — do not open this file' >&2; }
+  ```
+
+  The same registry and the same two blocks are mirrored in `README.md` — the
+  only one of the three places reachable without the app and without this
+  repository. The third is the settings screen, which shows the checksum of the
+  build the user is running.
 
 - **CORS:** if the Pages origin changes, update `ALLOWED_ORIGINS` in
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
@@ -832,6 +954,69 @@ face**, because it ships six subsets (greek and vietnamese included) for what
 draws code spans and PIN fields. Narrowing it is a separate decision with its
 own measurement; it was deliberately left out of the font swap so that any
 visual regression there could only have one cause.
+
+**Re-measured 2026-08-29, on the backup stack (step 13).** The figures above are
+now history twice over: the fonts were swapped (`jetbrains-mono` + `manrope` →
+`literata` + `pt-mono`) and the backup feature landed. Read the block above as
+the state at the archive redesign, not as the current download.
+
+```
+fonts/literata         8 files    262.5 KB gz
+js                     4 files    198.6 KB gz
+fonts/pt-mono          4 files     79.1 KB gz
+assets                 6 files     25.5 KB gz
+css                    1 file       7.0 KB gz
+html                   1 file       0.7 KB gz
+TOTAL                 24 files    573.5 KB gz
+```
+
+Two readings, and the second is the one that matters. First: 46 files became 24
+and 470 KB became 573 KB — the font swap traded a long tail of subsets for
+fewer, larger files. Second: **the JS the budget gate watches is 198.6 KB of
+573.5 KB, about a third.** The gate has always measured the third that grows by
+accident and never the two thirds that grow by decision, which is why the
+ceiling raise for the backup block (200 000 → 210 000 bytes gz) says out loud
+that it is provisional: the final base has to be measured once, WITH PR-3a's D9
+verification in it (D18), and a number for JS alone is not the number a user on
+a phone experiences.
+
+`backup-viewer.html` is in NEITHER figure, by construction: it is excluded from
+the precache manifest (`globIgnores`) precisely so that an offline-first PWA
+does not silently carry a second copy of its own crypto. Its own ceiling is
+enforced separately at build time — `VIEWER_MAX_BYTES = 300 KB`, currently 62 KB.
+
+### Near-cap export and import — desktop measurement (step 13)
+
+`node scripts/measure-backup-near-cap.mjs` (the suite is skipped inside
+`npm test`; running it costs seconds and about a gigabyte of peak heap).
+Measured 2026-08-29, Node 24.19.0, desktop:
+
+```
+764 notes × 24 KB ciphertext  →  file 31.9 MB of the 32.0 MB cap
+export        5452 ms   (snapshot → canonical JSON → AES-GCM → SHA-256)
+verify        6607 ms   (size gate → parse → AES-GCM → per-record classify)
+memory        +148.9 MB heap used, +1009.1 MB RSS peak
+```
+
+Three things follow, and all three are already acted on in the code:
+
+1. **The cap arithmetic holds at the boundary.** A container built to the
+   plaintext budget lands at 31.9 MB — under the ceiling its own import
+   enforces, with ~100 KB to spare. `expectedContainerBytes` is therefore
+   neither optimistic (which would produce a file the app refuses) nor so
+   conservative that the near-cap warning is unreachable.
+2. **Near the cap the tab is frozen for five to seven seconds on a DESKTOP.**
+   The chain is synchronous crypto and JSON, so that time is unresponsiveness,
+   not background work. The settings block now says so in the warning rather
+   than letting the user discover it.
+3. **A gigabyte of peak RSS for a 32 MB file.** The container is held as a
+   string, parsed, decoded and classified, and the peaks overlap. A phone does
+   not have this to spare — which is why the warning advises making the copy on
+   a computer, and why «users above the cap are not supported until container
+   v2» is a statement about memory, not about disk.
+
+**Still owed by the operator:** the same measurement on a real phone, recorded
+here as a number (§13 — no device in this contour).
 
 ## Section density — `client-nav2` (client-only)
 
