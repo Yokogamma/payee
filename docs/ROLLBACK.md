@@ -962,12 +962,12 @@ the state at the archive redesign, not as the current download.
 
 ```
 fonts/literata         8 files    262.5 KB gz
-js                     4 files    198.6 KB gz
+js                     4 files    199.5 KB gz
 fonts/pt-mono          4 files     79.1 KB gz
 assets                 6 files     25.5 KB gz
-css                    1 file       7.0 KB gz
+css                    1 file       7.1 KB gz
 html                   1 file       0.7 KB gz
-TOTAL                 24 files    573.5 KB gz
+TOTAL                 24 files    574.4 KB gz
 ```
 
 Two readings, and the second is the one that matters. First: 46 files became 24
@@ -975,10 +975,15 @@ and 470 KB became 573 KB — the font swap traded a long tail of subsets for
 fewer, larger files. Second: **the JS the budget gate watches is 198.6 KB of
 573.5 KB, about a third.** The gate has always measured the third that grows by
 accident and never the two thirds that grow by decision, which is why the
-ceiling raise for the backup block (200 000 → 210 000 bytes gz) says out loud
-that it is provisional: the final base has to be measured once, WITH PR-3a's D9
-verification in it (D18), and a number for JS alone is not the number a user on
-a phone experiences.
+ceiling raise for the backup block (200 000 → 210 000 bytes gz) is marked
+provisional IN THE GATE rather than in a comment: `check-bundle-budget.mjs`
+carries `BUDGET_IS_PROVISIONAL = true` and **fails outright the moment
+`src/lib/gateways.ts` appears** — the artifact of PR-3a. D18 sets the ceiling
+once, on a base measured with the D9 verification in it, and a placeholder
+nobody is forced to revisit is a placeholder that ships. Clearing the flag and
+re-measuring is one commit, and the gate names it. (A number for JS alone is
+also not what a user on a phone experiences, which is the other half of why
+this ceiling is not the final word.)
 
 `backup-viewer.html` is in NEITHER figure, by construction: it is excluded from
 the precache manifest (`globIgnores`) precisely so that an offline-first PWA
@@ -992,28 +997,40 @@ enforced separately at build time — `VIEWER_MAX_BYTES = 300 KB`, currently 62 
 Measured 2026-08-29, Node 24.19.0, desktop:
 
 ```
-764 notes × 24 KB ciphertext  →  file 31.9 MB of the 32.0 MB cap
-export        5452 ms   (snapshot → canonical JSON → AES-GCM → SHA-256)
-verify        6607 ms   (size gate → parse → AES-GCM → per-record classify)
-memory        +148.9 MB heap used, +1009.1 MB RSS peak
+731 REAL encrypted notes × ~24 KB  →  file 30.8 MB of the 32.0 MB cap (96%)
+export           2907 ms   (snapshot → canonical JSON → AES-GCM → SHA-256)
+verify           3390 ms   (size gate → parse → AES-GCM → per-record DECRYPT)
+apply (stage B)     8 ms   (plan → per-record merge, in memory)
+peak memory     888.7 MB heap, 1199.4 MB RSS (+1057.9 MB over baseline)
+still held      124.7 MB heap
 ```
 
-Three things follow, and all three are already acted on in the code:
+The run is a real round trip, and the distinction matters: the records are
+encrypted with the real key, the verify comes back **green** (`ok`, every
+record readable), and stage B applies all 731. An earlier version of this
+measurement filled the container with `'A'` — base64 of the right length that
+nothing can decrypt — so every record was `damaged` by construction and the
+«passes its own import» claim was never actually tested. Memory is sampled for
+a PEAK; before/after deltas report what was still held at the end, which is not
+the number a device runs out of.
+
+Three things follow, and all three are acted on in the code:
 
 1. **The cap arithmetic holds at the boundary.** A container built to the
-   plaintext budget lands at 31.9 MB — under the ceiling its own import
-   enforces, with ~100 KB to spare. `expectedContainerBytes` is therefore
-   neither optimistic (which would produce a file the app refuses) nor so
-   conservative that the near-cap warning is unreachable.
-2. **Near the cap the tab is frozen for five to seven seconds on a DESKTOP.**
-   The chain is synchronous crypto and JSON, so that time is unresponsiveness,
-   not background work. The settings block now says so in the warning rather
-   than letting the user discover it.
-3. **A gigabyte of peak RSS for a 32 MB file.** The container is held as a
-   string, parsed, decoded and classified, and the peaks overlap. A phone does
-   not have this to spare — which is why the warning advises making the copy on
-   a computer, and why «users above the cap are not supported until container
-   v2» is a statement about memory, not about disk.
+   plaintext budget lands at 96% of the ceiling its own import enforces.
+   `expectedContainerBytes` is therefore neither optimistic (which would
+   produce a file the app refuses) nor so conservative that the near-cap
+   warning is unreachable.
+2. **Seconds, not milliseconds, near the cap.** ~3 s to export and ~3.4 s to
+   verify on a desktop. Note what is NOT claimed: this is Node, and the chain
+   mixes synchronous serialization with WebCrypto calls a browser may run
+   off-thread, so «the interface freezes for N seconds» is an inference nobody
+   has measured. The settings warning says the cost, not the mechanism.
+3. **1.2 GB of peak RSS for a 30.8 MB file.** The container is held as a
+   string, parsed, decoded and decrypted record by record, and the peaks
+   overlap. A phone does not have this to spare — which is why the warning
+   advises making the copy on a computer, and why «users above the cap are not
+   supported until container v2» is a statement about memory, not about disk.
 
 **Still owed by the operator:** the same measurement on a real phone, recorded
 here as a number (§13 — no device in this contour).

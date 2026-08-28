@@ -78,6 +78,34 @@ import { gzipSync } from 'node:zlib';
 
 const BUDGET_GZ_BYTES = 210_000;
 
+/**
+ * The raise above is PROVISIONAL, and this makes that enforceable rather than
+ * a promise in a comment.
+ *
+ * D18 reserves the remaining headroom for the D9 verification of PR-3a and
+ * says the ceiling is set ONCE, on a base measured with that code in the
+ * bundle. This raise was taken before PR-3a exists, so it is a placeholder
+ * that keeps a blocked stack's CI honest — and placeholders are exactly what
+ * nobody remembers to revisit.
+ *
+ * So the gate revisits it: the moment `src/lib/gateways.ts` appears — the
+ * artifact of PR-3a — this check fails until someone re-measures and clears
+ * the flag. It cannot be satisfied by waiting, and it names what to do.
+ */
+const BUDGET_IS_PROVISIONAL = true;
+const PR3A_MARKER = 'src/lib/gateways.ts';
+
+if (BUDGET_IS_PROVISIONAL && existsSync(join(process.cwd(), PR3A_MARKER))) {
+  console.error([
+    `check-bundle-budget: ${PR3A_MARKER} exists, so PR-3a has landed and the bundle base has`,
+    'changed. D18 sets the ceiling ONCE, on a base measured WITH the D9 verification in it —',
+    'the current value is the provisional one raised for the backup UI block.',
+    'Re-measure, set BUDGET_GZ_BYTES from that measurement, and set BUDGET_IS_PROVISIONAL=false',
+    'in the same commit, recording the numbers in docs/ROLLBACK.md.',
+  ].join('\n'));
+  process.exit(2);
+}
+
 const assetsDir = join(process.cwd(), 'dist', 'assets');
 if (!existsSync(assetsDir)) {
   console.error('check-bundle-budget: dist/assets not found — run `npm run build` first');
