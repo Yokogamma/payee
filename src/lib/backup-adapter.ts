@@ -90,6 +90,16 @@ export class BackupDisabledError extends Error {
   }
 }
 
+/** Every backup operation needs the mnemonic, and the mnemonic exists only
+ *  while the vault is open. Typed so the UI can say «unlock first» instead of
+ *  showing whatever a null dereference produces. */
+export class BackupVaultLockedError extends Error {
+  constructor() {
+    super('The vault is locked — backup operations need the seed phrase in memory');
+    this.name = 'BackupVaultLockedError';
+  }
+}
+
 /** No Web Locks: imports cannot be serialized across tabs, so none starts. */
 export class BackupLockUnavailableError extends Error {
   constructor() {

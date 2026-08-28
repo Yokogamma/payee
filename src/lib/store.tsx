@@ -58,6 +58,17 @@ import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } fr
 import { noteSearchText } from './note-search-text';
 import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED } from './flags';
 import {
+  applyPreparedImport,
+  prepareImport,
+  runExport,
+  runVerify,
+  BackupVaultLockedError,
+  type BackupVault,
+  type PreparedImport,
+} from './backup-adapter';
+import type { ExportedBackup, VerifyReport } from './backup-actions';
+import type { ImportReport } from './backup-import';
+import {
   detectQuickUnlockCapability,
   createPrfCredential,
   evalPrf,
@@ -575,6 +586,16 @@ interface NotesStore {
   copySafeboxPassword: (entryId: string) => Promise<boolean>;
   /** Decrypt one attachment and hand it to the browser as a download. */
   downloadSafeboxAttachment: (entryId: string, fid: string) => Promise<void>;
+  /** Backup (release-gated in the ACTIONS — a hidden button is not a gate).
+   *  All four need an unlocked vault: the container key comes from the seed. */
+  exportBackupFile: () => Promise<ExportedBackup>;
+  verifyBackupFile: (file: File) => Promise<VerifyReport>;
+  /** Stage A: decides nothing, applies nothing, and hands back what the
+   *  preview needs together with the plan built from THOSE bytes. */
+  prepareBackupImport: (file: File) => Promise<PreparedImport>;
+  /** Stage B: only ever called with what stage A returned and the user
+   *  confirmed. */
+  applyBackupImport: (prepared: PreparedImport) => Promise<ImportReport>;
   setSafeboxSearchQuery: (query: string) => void;
   goToRestore: () => void;
   goToOnboarding: () => void;
@@ -4463,6 +4484,111 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // L4: memoized — otherwise every provider render handed consumers a fresh
   // object and re-rendered the whole tree. All actions are useCallback'd, so
   // the deps below are the actual invalidation set.
+  // ─── Backup (steps 8/12) ────────────────────────────────────────────
+
+  /**
+   * The vault as the backup operations need it.
+   *
+   * ONE capture of the epoch and of the database generation, made here and
+   * carried through the whole operation: the writer is told which generation
+   * the caller believed in, and an import that outlived a reset is refused by
+   * the writer rather than by luck. Re-reading `getDbGeneration()` inside the
+   * loop would quietly re-authorize it.
+   *
+   * `assertAlive` THROWS. A guard that returns a boolean is a guard someone
+   * eventually forgets to read.
+   */
+  function backupVault(): BackupVault {
+    const mn = mnemonicRef.current;
+    if (!mn) throw new BackupVaultLockedError();
+    const myEpoch = vaultEpochRef.current;
+    const myDbGen = getDbGeneration();
+    return {
+      mnemonic: mn,
+      dbGeneration: myDbGen,
+      now: () => Date.now(),
+      assertAlive: () => {
+        if (vaultEpochRef.current !== myEpoch) {
+          throw new Error('Хранилище было заблокировано — операция прервана.');
+        }
+        if (getDbGeneration() !== myDbGen) {
+          throw new Error('Приложение было сброшено — операция прервана.');
+        }
+      },
+    };
+  }
+
+  async function exportBackupFile(): Promise<ExportedBackup> {
+    return runExport(backupVault());
+  }
+
+  async function verifyBackupFile(file: File): Promise<VerifyReport> {
+    return runVerify(backupVault(), file);
+  }
+
+  async function prepareBackupImport(file: File): Promise<PreparedImport> {
+    return prepareImport(backupVault(), file);
+  }
+
+  /**
+   * Stage B, plus everything the rest of the app has to be told afterwards
+   * (§4): the counts, the safebox presence flag, the note list, and the queue.
+   *
+   * The queue matters most and is the least obvious: the merge rules normalize
+   * a restored record's sync row to a retryable `error` WITHOUT a txId, which
+   * is precisely the state that gets it re-sent. Skipping the kick would leave
+   * the data restored and permanently unpublished until some later trigger.
+   */
+  async function applyBackupImport(prepared: PreparedImport): Promise<ImportReport> {
+    const vault = backupVault();
+    const myEpoch = vaultEpochRef.current;
+    const report = await applyPreparedImport(vault, prepared);
+
+    // Past this point the store has changed; refuse to paint a vault that is
+    // no longer the one that changed, but do NOT swallow the report — the
+    // caller still has to be told what happened to the user's file.
+    if (vaultEpochRef.current === myEpoch) {
+      await reloadNotesAfterImport(myEpoch);
+      await refreshSyncCounts(myEpoch);
+      await refreshSafeboxPresence(myEpoch);
+      if (arweaveRef.current.enabled) {
+        await syncPendingRecords();
+        kickQueue();
+      }
+    }
+    return report;
+  }
+
+  /**
+   * Re-read and re-decrypt the note list after an import.
+   *
+   * Deliberately NOT the vault-snapshot path: that one derives keys, checks
+   * vault identity and decides bindings — questions about OPENING a vault,
+   * none of which an import asks. What is needed here is only «the list on
+   * screen is stale, and the truth is in the database».
+   *
+   * Records this build cannot read are skipped exactly as everywhere else: an
+   * import may legitimately have left an opaque record untouched, and it must
+   * not become a hole in the list or an error on screen.
+   */
+  async function reloadNotesAfterImport(myEpoch: number): Promise<void> {
+    const key = cryptoKeyRef.current;
+    if (!key) return;
+    const encrypted = await getAllNotes();
+    const decrypted: NoteData[] = [];
+    for (const enc of encrypted) {
+      try {
+        const decoded = await decryptNote(key, enc);
+        decrypted.push({ id: enc.noteId, text: decoded.text, createdAt: decoded.createdAt, ...decoded.meta });
+      } catch {
+        // Unreadable here means unreadable everywhere; the sweep owns repairs.
+      }
+    }
+    if (vaultEpochRef.current !== myEpoch) return;
+    decrypted.sort((a, b) => b.createdAt - a.createdAt);
+    publishNotes(() => decrypted);
+  }
+
   const value: NotesStore = useMemo(() => ({
     screen,
     isReady,
@@ -4524,6 +4650,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     revealSafeboxSecret,
     copySafeboxPassword,
     downloadSafeboxAttachment,
+    exportBackupFile,
+    verifyBackupFile,
+    prepareBackupImport,
+    applyBackupImport,
     setSafeboxSearchQuery,
     goToRestore,
     goToOnboarding,
@@ -4571,6 +4701,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     changeSafeboxPin, deactivateSafebox, resetSafeboxPinWithSeed,
     getSafeboxPinLockState, addSafeboxEntry, editSafeboxEntry, restoreSafeboxVersion,
     revealSafeboxSecret, copySafeboxPassword, downloadSafeboxAttachment,
+    exportBackupFile, verifyBackupFile, prepareBackupImport, applyBackupImport,
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,
