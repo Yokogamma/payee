@@ -205,6 +205,32 @@ per-entry `t` stays inside the envelope. This is unavoidable in a
 single-wallet architecture; it is an accepted, user-disclosed risk (release
 notes + in-app text), not a bug to "fix" by moving metadata into tags.
 
+## Note id in the address fragment (disclosed risk) (`src/lib/route.ts`)
+
+Reading a note is a routed state — `#/notes/<chainRoot>` — because the Android
+system Back gesture, a reload and a PWA eviction all have to land where the
+user was. That puts a note's chain root in the address bar.
+
+The boundaries of the exposure, and why it is accepted rather than fixed:
+
+- The identifier is **opaque**: a `crypto.randomUUID()` chain root. It carries
+  no text, no title, no date and no count, and it cannot be correlated with
+  anything without the vault key.
+- A URL **fragment is never sent** — not in the HTTP request line, not in
+  `Referer`. The Worker proxy never sees it.
+- The link is **useless to anyone else**: the note it names is decryptable only
+  with the owner's seed, on a device that already holds the vault.
+- What DOES retain it: browser history, session restore, and profile sync
+  outside standalone/PWA mode. An attacker with the profile learns that *some*
+  note was opened, not which one or what it said.
+
+Do NOT "fix" this by moving the state out of the address: a fullscreen reading
+view that the Back gesture cannot close is a worse product, and hiding the id
+behind an index would leak ordering instead. If the exposure ever becomes
+unacceptable, the change is to stop restoring the note on a COLD start (strip
+the param on first render) — Back within a session would still work, and the
+three places that depend on cold-start restore are named in the plan.
+
 ## PIN unlock — typed errors gate the wipe (`src/lib/crypto.ts`)
 
 - Only `WrongPinError` (a GCM `OperationError` **after** the KDF ran) may count

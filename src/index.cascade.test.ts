@@ -218,6 +218,14 @@ describe('base layer, as the browser resolves it', () => {
     expect(declaresIn('.note-open-area', /--preview-ground:\s*var\(--bg\)/)).toBe(true);
   });
 
+  it('the feed reserves the scrollbar gutter — the measurement watches width', () => {
+    // Where the scrollbar takes width, its appearance narrows the line box,
+    // rewraps every preview and changes their heights — which can flip the
+    // scrollbar back off. `useTruncation` re-measures on WIDTH changes, so a
+    // width that moves by itself is the one input it cannot be robust against.
+    expect(declaresIn('.notes-feed', /scrollbar-gutter:\s*stable/)).toBe(true);
+  });
+
   it('the preview ceiling is four lines, and it cannot drift from the reading size', () => {
     // TWO ASSERTIONS THAT ARE ONE. The ceiling is expressed in `em` against
     // `.note-text`'s line-height, so pinning only the calc would let a change

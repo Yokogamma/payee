@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { useRef } from 'react';
-import { render, cleanup } from '@testing-library/react';
+import { render, cleanup, act } from '@testing-library/react';
 import { useTruncation } from './useTruncation';
 
 /**
@@ -74,6 +74,40 @@ describe('useTruncation', () => {
     } finally {
       globalThis.ResizeObserver = ro;
       Object.defineProperty(document, 'fonts', { configurable: true, value: fonts });
+    }
+  });
+
+  it('ignores a height-only ResizeObserver entry — that is the anti-oscillation guard', () => {
+    // Toggling the clamp changes the HEIGHT, which re-enters the observer. If
+    // the hook re-measured there, clamping would feed itself.
+    const observers: Array<(entries: unknown[]) => void> = [];
+    class FakeRO {
+      constructor(private cb: (entries: unknown[]) => void) { observers.push(cb); }
+      observe() {}
+      disconnect() {}
+    }
+    const real = globalThis.ResizeObserver;
+    // @ts-expect-error — replacing a global for the duration of the test
+    globalThis.ResizeObserver = FakeRO;
+    try {
+      stub({ scrollHeight: LINE * 2 });
+      const { container } = render(<Probe />);
+      expect(verdict(container)).toBe('no');
+
+      // Same width, taller content: must NOT be re-read.
+      stub({ scrollHeight: LINE * 9 });
+      act(() => { observers[0]([{ contentRect: { width: 333 } }]); });
+      expect(verdict(container)).toBe('yes'); // first entry establishes the width
+
+      stub({ scrollHeight: LINE * 2 });
+      act(() => { observers[0]([{ contentRect: { width: 333 } }]); });
+      expect(verdict(container), 'та же ширина — замер не повторяется').toBe('yes');
+
+      // A real width change does re-measure.
+      act(() => { observers[0]([{ contentRect: { width: 200 } }]); });
+      expect(verdict(container)).toBe('no');
+    } finally {
+      globalThis.ResizeObserver = real;
     }
   });
 

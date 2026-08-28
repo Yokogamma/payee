@@ -725,6 +725,18 @@ export function Main({ theme, onThemeChange }: MainProps) {
                     label: 'Копировать текст',
                     onSelect: () => handleCopyNote(readingNote.text),
                   },
+                  /* Editing is offered TWICE on purpose: the FAB is the
+                     thumb-reach route, this is the one a keyboard or
+                     screen-reader user finds where every other note action
+                     already lives. Same flag, same shape as the feed card. */
+                  ...(V3_WRITER_ENABLED
+                    ? [{
+                        key: 'edit',
+                        icon: <IconEdit />,
+                        label: 'Редактировать',
+                        onSelect: () => setEditChainRoot(readingChain.root),
+                      }]
+                    : []),
                   ...(V3_WRITER_ENABLED && readingChain.versions.length > 1
                     ? [{
                         key: 'history',

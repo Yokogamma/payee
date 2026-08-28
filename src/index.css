@@ -907,6 +907,12 @@ h1 {
   flex: 1;
   overflow-y: auto;
   padding: 6px var(--pad-screen);
+  /* RESERVED, NOT DISCOVERED. Where the scrollbar takes width (a desktop
+     browser without overlay scrollbars), its appearance narrows the line box —
+     which rewraps every preview, changes their heights, and can flip the
+     scrollbar back off. The truncation measurement watches width for exactly
+     this reason; holding the gutter means the width it watches never moves. */
+  scrollbar-gutter: stable;
 }
 
 .notes-feed::-webkit-scrollbar {

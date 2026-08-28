@@ -460,10 +460,20 @@ describe('Main — чтение заметки', () => {
     expect(document.querySelector('.main-screen')?.className).not.toContain('--composing');
   });
 
-  it('правка доступна из чтения при включённом писателе', () => {
+  it('правка доступна из чтения — и кнопкой, и пунктом меню', () => {
     window.history.replaceState(null, '', '#/notes/root1');
     render(<Main theme="system" onThemeChange={vi.fn()} />);
+
+    // Thumb-reach route.
     fireEvent.click(screen.getByRole('button', { name: 'Редактировать заметку' }));
+    expect(screen.getByRole('dialog', { name: 'Редактирование заметки' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
+
+    // Keyboard / screen-reader route: the menu where every other note action
+    // already lives. Its ABSENCE is what the writer-off matrix asserts, so
+    // this positive case is what keeps that assertion from passing vacuously.
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('Редактировать'));
     expect(screen.getByRole('dialog', { name: 'Редактирование заметки' })).toBeTruthy();
   });
 
