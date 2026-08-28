@@ -249,7 +249,16 @@ export async function inspectBackupFile(
   // detail of two loops.
   const classify = async (kind: 'note' | 'safebox', raw: unknown) => {
     const record = raw as EncryptedNote | EncryptedSafeboxEntry;
-    const verdict = await classifyBackupRecord(deps.keys, kind, record);
+    const verdict = await classifyBackupRecord(
+      deps.keys,
+      kind,
+      record,
+      // Between the two halves of a safebox entry as well as around the pair:
+      // the guard below runs once per RECORD, and a container can hold
+      // thousands, so «once per record» is not «promptly» for the half that
+      // decrypts passwords and attachment bytes (D15).
+      deps.assertAlive,
+    );
     if (verdict.state === 'readable') nodes.push({ kind, id: verdict.id, ...verdict.topology });
     else issues.push({ kind, id: verdict.id, problem: PROBLEM_OF[verdict.state] });
     records.push(

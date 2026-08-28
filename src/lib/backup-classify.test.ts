@@ -197,3 +197,41 @@ describe('classifying what is already on disk', () => {
     expect(await classifyLocalPayload(await vaultKeys(), 'note', undefined)).toBe('absent');
   });
 });
+
+describe('cancellation on the FILE path (D15)', () => {
+  const cancel = () => { const e = new Error('gone'); e.name = 'BackupCancelledError'; return e; };
+
+  it('is checked between the two halves of a safebox entry', async () => {
+    // The same contract as the local path above, on the other side of the
+    // pipeline. The guard the caller runs sits once per RECORD, and a
+    // container holds thousands — «once per record» is not promptly for the
+    // half that decrypts passwords and attachment bytes.
+    const entry = await makeEntry();
+    let calls = 0;
+    const boom = cancel();
+
+    await expect(classifyBackupRecord(await vaultKeys(), 'safebox', entry, () => {
+      calls += 1;
+      throw boom;
+    })).rejects.toBe(boom);
+
+    expect(calls).toBe(1);
+  });
+
+  it('re-throws cancellation instead of calling the record damaged', async () => {
+    const entry = await makeEntry();
+    for (const name of ['BackupCancelledError', 'AbortError']) {
+      const boom = new Error('cancelled');
+      boom.name = name;
+      await expect(classifyBackupRecord(await vaultKeys(), 'safebox', entry, () => { throw boom; }))
+        .rejects.toBe(boom);
+    }
+  });
+
+  it('a genuinely unreadable entry is still damaged — the escape is narrow', async () => {
+    const entry = await makeEntry();
+    const broken = { ...entry, secretCiphertext: `${entry.secretCiphertext.slice(0, -4)}AAAA` };
+
+    expect((await classifyBackupRecord(await vaultKeys(), 'safebox', broken)).state).toBe('damaged');
+  });
+});
