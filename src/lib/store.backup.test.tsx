@@ -261,6 +261,34 @@ describe('an operation belongs to the vault that started it (D15)', () => {
     });
   });
 
+  it('a second operation supersedes the first over the same database', async () => {
+    // The third number exists for this too, not only for the tab going away.
+    // Two backup operations in flight over one database is a race in which the
+    // EARLIER one can finish last — and stage B of the earlier one would then
+    // write over a store the later one has already judged. «Newest wins» is
+    // enforced by bumping the token on the way IN, so the first operation
+    // fails the moment it looks up again.
+    await openMain();
+    const json = await containerJson([
+      await encryptEnvelopeV3(await deriveKey(MN), 'FIRST-ATTEMPT', { fmt: 'plain', rev: 1 }),
+    ]);
+
+    const superseded = store.prepareBackupImport(new File([json], 'first.json'));
+    // The expectation is attached NOW, not after the second call: the first
+    // operation is refused during its own key derivation, and a rejection
+    // nobody is listening to yet is an unhandled rejection — a red run with a
+    // green test list.
+    const settled = expect(superseded).rejects.toBeInstanceOf(BackupCancelledError);
+
+    // The second call captures a NEW token. Nothing about the vault changed:
+    // it is not locked and the database was not reset, so only the third
+    // number can tell these two operations apart.
+    const winner = await act(async () => store.prepareBackupImport(new File([json], 'again.json')));
+
+    await act(async () => { await settled; });
+    expect(winner.report.ok).toBe(true);
+  });
+
   it('stops WAITING for another tab, not only working', async () => {
     // The wait can be long — another tab may be importing 30 MB — and a tab
     // that has gone away must stop queueing for a turn it no longer wants.
