@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   fetchBackupViewer,
+  MAX_VIEWER_RESPONSE_BYTES,
   ViewerDeliveryError,
   BACKUP_VIEWER_FILE_NAME,
   BACKUP_VIEWER_PATH,
@@ -89,6 +90,37 @@ describe('what comes back', () => {
   it('an offline failure is «unavailable» too', async () => {
     const d = deps({
       fetch: vi.fn(async () => { throw new TypeError('Failed to fetch'); }) as unknown as typeof globalThis.fetch,
+    });
+
+    await expect(fetchBackupViewer(d)).rejects.toMatchObject({ reason: 'unavailable' });
+  });
+});
+
+describe('a body too large to be a viewer is refused before it is trusted', () => {
+  it('refuses a declared length past the ceiling', async () => {
+    // The digest check is the wrong place to discover that the response is a
+    // gigabyte — by then it is a string in memory, and this guard exists for
+    // exactly the case where the origin is not to be trusted.
+    const d = deps({
+      fetch: vi.fn(async () => new Response(VIEWER, {
+        status: 200,
+        headers: { 'content-length': String(MAX_VIEWER_RESPONSE_BYTES + 1) },
+      })) as unknown as typeof globalThis.fetch,
+    });
+
+    await expect(fetchBackupViewer(d)).rejects.toMatchObject({ reason: 'unavailable' });
+  });
+
+  it('refuses actual bytes past the ceiling even when the header lied', async () => {
+    // A hostile server controls its own headers, so the declared size is a
+    // courtesy and the measured size is the rule.
+    const huge = 'x'.repeat(MAX_VIEWER_RESPONSE_BYTES + 1);
+    const d = deps({
+      fetch: vi.fn(async () => new Response(huge, {
+        status: 200,
+        headers: { 'content-length': '10' },
+      })) as unknown as typeof globalThis.fetch,
+      sha256Hex: async () => DIGEST,
     });
 
     await expect(fetchBackupViewer(d)).rejects.toMatchObject({ reason: 'unavailable' });

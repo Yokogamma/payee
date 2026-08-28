@@ -253,21 +253,46 @@ describe('the predecessor test does not depend on sort order', () => {
     expect(plan.notApplied).toEqual([{ kind: 'note', id: 'x1', counter: 'skipped' }]);
   });
 
-  it('a FORK is refused: two records cannot hold one position', () => {
-    // Both have a perfectly good predecessor, so the link check passes for
-    // each of them — and the store would end up with two records claiming to
-    // be revision 2, after which «which one is current» has no answer.
+  it('a FORK is planned in full — both branches, and everything behind them', () => {
+    // `rev` is assigned locally as `current.rev + 1`, so two devices editing
+    // the same note offline produce one position by construction; the app
+    // keeps both versions and picks the current one by `byCurrentness`
+    // (`chains.ts`). Refusing the second branch here dropped an ordinary
+    // two-device edit on the floor and reported it as unrestorable — data the
+    // app itself considers current history.
+    //
+    // «Which one is current» has an answer, and it is not the import's to
+    // give: the answer is the same rule the feed uses, applied after the bytes
+    // are back.
     const plan = planBackupImport([
       node('a1', 1, 'a1'),
       node('a2', 2, 'a1', 'a1'),
       node('a2b', 2, 'a1', 'a1'),
-      node('a3b', 3, 'a1', 'a2b'), // and everything behind the loser goes too
+      node('a3b', 3, 'a1', 'a2b'),
     ]);
 
-    expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'a2']);
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1', 'a2', 'a2b', 'a3b']);
+    expect(plan.notApplied).toEqual([]);
+    // Ordering still holds where it matters: every record comes after the
+    // predecessor it NAMES, which is what made the position rule unnecessary.
+    const at = (id: string) => plan.ordered.findIndex(r => r.id === id);
+    expect(at('a2b')).toBeLessThan(at('a3b'));
+    expect(at('a1')).toBeLessThan(at('a2b'));
+  });
+
+  it('but a child of a REFUSED record still cascades', () => {
+    // Accepting forks must not become accepting anything: the cascade exists
+    // for records whose predecessor never made it, and that is unchanged.
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      node('a3', 3, 'a1', 'zzz'), // names a predecessor nobody carries
+      node('a4', 4, 'a1', 'a3'),
+    ]);
+
+    expect(plan.ordered.map(r => r.id)).toEqual(['a1']);
     expect(plan.notApplied).toEqual([
-      { kind: 'note', id: 'a2b', counter: 'skipped' },
-      { kind: 'note', id: 'a3b', counter: 'skipped' },
+      { kind: 'note', id: 'a3', counter: 'skipped' },
+      { kind: 'note', id: 'a4', counter: 'skipped' },
     ]);
   });
 

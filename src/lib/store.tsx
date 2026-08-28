@@ -55,6 +55,7 @@ import {
   type SafeboxEntryInput,
   type SafeboxSecretData,
 } from './crypto';
+import { deriveBackupKey } from './backup';
 import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } from './chains';
 import { noteSearchText } from './note-search-text';
 import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED } from './flags';
@@ -1610,6 +1611,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   function invalidateVaultLifecycle(): void {
     vaultEpochRef.current++;
     queueGenerationRef.current++;
+    // A lock or a reset also RELEASES a backup operation that is waiting, not
+    // working: the epoch alone stops the next `assertAlive`, but a tab queued
+    // behind another tab's Web Lock has no next check to reach until its turn
+    // comes — which may be a 30 MB import away.
+    backupOpRef.current.generation++;
+    backupOpRef.current.abort?.abort();
+    backupOpRef.current.abort = null;
     // An app lock ALWAYS locks the safebox: the section epoch must move too, or
     // an in-flight reveal captured before the lock could still publish
     // plaintext behind the PIN screen.
@@ -4549,7 +4557,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     const abort = new AbortController();
     backupOpRef.current.abort = abort;
     return {
-      mnemonic: mn,
+      // The SEED STAYS HERE. What the operation gets is permission to derive,
+      // read from this ref at the moment it derives — so a prepared import
+      // waiting on a human decision holds no copy of the phrase, and the
+      // synchronous wipe in `clearVaultState` remains the whole truth about
+      // where the seed lives.
+      deriveKeys: async () => {
+        const live = mnemonicRef.current;
+        if (!live) throw new BackupVaultLockedError();
+        return {
+          note: await deriveKey(live),
+          safeboxMeta: await deriveSafeboxMetaKey(live),
+          safeboxSecret: await deriveSafeboxSecretKey(live),
+          container: await deriveBackupKey(live),
+        };
+      },
       dbGeneration: myDbGen,
       now: () => Date.now(),
       signal: abort.signal,
@@ -4656,9 +4678,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const reloadNotesAfterImport = useCallback(async (myEpoch: number): Promise<void> => {
     const key = cryptoKeyRef.current;
     if (!key) return;
+    const myOp = backupOpRef.current.generation;
+    // Checked INSIDE the loop, not only at the ends. This decrypts every note
+    // in the store one at a time, and the epoch does not move when the tab is
+    // merely hidden — so without the operation token a `pagehide` in the
+    // middle of a large store leaves the page decrypting for nobody.
+    const superseded = () => vaultEpochRef.current !== myEpoch
+      || backupOpRef.current.generation !== myOp;
     const encrypted = await getAllNotes();
     const decrypted: NoteData[] = [];
     for (const enc of encrypted) {
+      if (superseded()) return;
       try {
         const decoded = await decryptNote(key, enc);
         decrypted.push({ id: enc.noteId, text: decoded.text, createdAt: decoded.createdAt, ...decoded.meta });
@@ -4666,7 +4696,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Unreadable here means unreadable everywhere; the sweep owns repairs.
       }
     }
-    if (vaultEpochRef.current !== myEpoch) return;
+    if (superseded()) return;
     decrypted.sort((a, b) => b.createdAt - a.createdAt);
     publishNotes(() => decrypted);
   }, []);
