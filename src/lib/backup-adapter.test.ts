@@ -12,8 +12,10 @@ vi.mock('./flags', () => ({
 }));
 
 import {
+  estimateBackupSize,
   importSucceeded,
   prepareImport,
+  readBackupFreshness,
   runExport,
   runVerify,
   withImportLock,
@@ -24,7 +26,7 @@ import {
   type BackupStorage,
   type BackupVault,
 } from './backup-adapter';
-import { encodeBackup, deriveBackupKey } from './backup';
+import { encodeBackup, deriveBackupKey, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
 import {
   deriveKey,
   encryptEnvelopeV3,
@@ -373,5 +375,62 @@ describe('what counts as success', () => {
     expect(importSucceeded(report({}))).toBe(true);
     expect(importSucceeded(report({ allFileRecordsApplied: false }))).toBe(false);
     expect(importSucceeded(report({ incompleteRestore: true }))).toBe(false);
+  });
+});
+
+describe('what the block asks before offering anything', () => {
+  it('reads both D21 markers raw, and needs no vault to do it', async () => {
+    // Deliberately vault-free: the chip is two `meta` keys, and asking for the
+    // seed to render a date would tie a label to an unlock.
+    const { storage: store, meta } = storage();
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, { createdAt: 1, sha256: 'a', at: 2 });
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, { createdAt: 1, sha256: 'a', at: 3 });
+
+    expect(await readBackupFreshness(store)).toEqual({
+      lastExport: { createdAt: 1, sha256: 'a', at: 2 },
+      lastVerified: { createdAt: 1, sha256: 'a', at: 3 },
+    });
+  });
+
+  it('an empty store answers «nothing known», not an error', async () => {
+    expect(await readBackupFreshness(storage().storage)).toEqual({
+      lastExport: undefined,
+      lastVerified: undefined,
+    });
+  });
+
+  it('states the size in FILE bytes, not plaintext bytes (D17)', async () => {
+    // The cap is charged on the final file, so an estimate given in plaintext
+    // would understate it by a third — and a store that cannot be exported
+    // would look comfortable right up to the refusal.
+    const { storage: base } = storage();
+    const store = { ...base, estimateSize: async () => ({ plaintextBytes: 3_000, overCap: false }) };
+
+    const report = await estimateBackupSize(store);
+
+    expect(report.overCap).toBe(false);
+    expect(report.expectedFileBytes).toBeGreaterThan(4_000);
+  });
+
+  it('carries the over-cap verdict through, because the NUMBER cannot show it', async () => {
+    // The measurement stops at the budget, so its figure is small by
+    // construction once it stops. A caller reading the number alone would call
+    // an unexportable store fine.
+    const { storage: base } = storage();
+    const store = { ...base, estimateSize: async () => ({ plaintextBytes: 10, overCap: true }) };
+
+    expect(await estimateBackupSize(store)).toMatchObject({ overCap: true });
+  });
+
+  it('asks the measurer for the plaintext budget, not for the cap', async () => {
+    // Passing the cap would let the reader keep going a third longer than the
+    // container can hold — the early stop exists to bound memory, and the
+    // bound has to be the one the format actually allows.
+    const { storage: base } = storage();
+    const estimateSize = vi.fn(async () => ({ plaintextBytes: 1, overCap: false }));
+
+    await estimateBackupSize({ ...base, estimateSize });
+
+    expect(estimateSize).toHaveBeenCalledWith(BACKUP_PLAINTEXT_BUDGET_BYTES);
   });
 });

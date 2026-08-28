@@ -20,6 +20,7 @@ vi.mock('../lib/store', () => ({ useNotes: () => h.store }));
 
 import { BackupSettings } from './BackupSettings';
 import { saveText } from '../lib/download';
+import * as viewerHash from '../lib/backup-viewer-hash';
 import type { VerifyReport } from '../lib/backup-actions';
 import type { ImportCounters, ImportReport } from '../lib/backup-import';
 
@@ -91,7 +92,13 @@ async function choose(label: string) {
 }
 
 beforeEach(() => { fill(); vi.mocked(saveText).mockClear(); });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // `restoreAllMocks` undoes `spyOn`, and nothing else here needs it — but
+  // without it the checksum spy from one test decides the verdict of the next,
+  // which is exactly how the placeholder case would go green while broken.
+  vi.restoreAllMocks();
+});
 
 describe('what the block offers with both flags on', () => {
   it('shows all four actions and the permanent viewer instruction', async () => {
@@ -104,6 +111,33 @@ describe('what the block offers with both flags on', () => {
     // An instruction, not a readiness label: present before any export exists,
     // which is exactly when it is worth reading.
     expect(screen.getByText(/храните рядом с файлом копии/)).toBeTruthy();
+  });
+
+  it('says where the file goes and whose job the rest is (§7)', async () => {
+    // A backup feature silent about being device-local invites «my notes are
+    // backed up now» — the one belief this phase must not create.
+    await open();
+    expect(screen.getByText(/Хранить копию вне устройства/)).toBeTruthy();
+  });
+
+  it('shows the viewer checksum so it CAN be stored separately (D19)', async () => {
+    // The instruction asks the user to keep the checksum somewhere
+    // independent. That is not a request one can honour if the value is
+    // nowhere on screen.
+    vi.spyOn(viewerHash, 'BACKUP_VIEWER_HASH_IS_PLACEHOLDER', 'get').mockReturnValue(false);
+    vi.spyOn(viewerHash, 'BACKUP_VIEWER_SHA256', 'get').mockReturnValue('f'.repeat(64));
+
+    await open();
+
+    expect(screen.getByText('f'.repeat(64))).toBeTruthy();
+  });
+
+  it('shows NO checksum on a build that never produced a viewer', async () => {
+    // The committed constant is a placeholder, and presenting it as a checksum
+    // would be worse than silence: the user would store `not-built-yet` and
+    // believe they had an independent reference.
+    await open();
+    expect(screen.queryByText(/Контрольная сумма просмотрщика/)).toBeNull();
   });
 
   it('says the copy has never been made when no marker exists', async () => {
@@ -247,6 +281,35 @@ describe('import — two stages with a decision between them', () => {
     expect(screen.getByText('Не восстановлено: 3 — не удаляйте файл копии.')).toBeTruthy();
     expect(screen.getByText(/Требуется повторный импорт: 1/)).toBeTruthy();
     expect(screen.queryByText(/завершено полностью/)).toBeNull();
+  });
+
+  it('puts the REASONS behind a disclosure, with what to do about each', async () => {
+    // §7: one number is the headline, and the three reasons have three
+    // different answers. Collapsed, because most imports have none of them.
+    fill({
+      applyBackupImport: vi.fn(async () => ({
+        report: REPORT({ added: 1, quotaStopped: 4, unsupported: 2 }),
+        viewRefreshed: true,
+      })),
+    });
+    await open();
+    await choose('Файл резервной копии для импорта');
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Восстановить из файла' })); });
+
+    const disclosure = screen.getByText('Почему не восстановлено').closest('details');
+    expect(disclosure).toBeTruthy();
+    expect(disclosure?.open).toBe(false);
+    expect(disclosure?.textContent).toContain('Не хватило места в хранилище: 4');
+    expect(disclosure?.textContent).toContain('Освободите место');
+    expect(disclosure?.textContent).toContain('Обновите приложение');
+  });
+
+  it('offers no disclosure when everything was applied', async () => {
+    await open();
+    await choose('Файл резервной копии для импорта');
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Восстановить из файла' })); });
+
+    expect(screen.queryByText('Почему не восстановлено')).toBeNull();
   });
 
   it('a stale screen after a successful import is said out loud, not swallowed', async () => {

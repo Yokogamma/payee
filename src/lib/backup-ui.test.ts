@@ -21,6 +21,7 @@ import {
   sizeNotice,
   BACKUP_NEAR_CAP_FRACTION,
   INCOMPLETE_SOURCE_WARNING,
+  PHASE_ONE_SCOPE,
   VIEWER_INSTRUCTION,
 } from './backup-ui';
 import { BACKUP_CAP_BYTES, BackupError } from './backup';
@@ -189,11 +190,16 @@ describe('the report is three lines by what the user did (§7)', () => {
     expect(summary.notApplied).toBeUndefined();
   });
 
-  it.each(SKIP_COUNTERS)('a single %s is enough to withhold the success line', counter => {
-    // The invariant §7 states outright: no skip counter may be invisible. A
-    // counter added to the report and forgotten by this module would show
-    // «Восстановление завершено полностью» over unapplied data.
-    expect(importSummary(REPORT({ [counter]: 1 })).success).toBeUndefined();
+  it.each(SKIP_COUNTERS)('a single %s is withheld from success AND visible to the user', counter => {
+    // The invariant §7 states outright: no skip counter may be invisible, and
+    // it has TWO halves. Hiding the success line is the easy one. The other is
+    // that the number reaches one of the three lines — a counter added to the
+    // report and forgotten by both groups here would silently vanish, and the
+    // report would say «Не восстановлено: 0» over data still only in the file.
+    const summary = importSummary(REPORT({ [counter]: 7 }));
+
+    expect(summary.success).toBeUndefined();
+    expect([summary.restored, summary.notApplied, summary.retryable].join(' ')).toContain('7');
   });
 
   it('withholds it for a partial SOURCE too, at seven zeroes', () => {
@@ -204,10 +210,47 @@ describe('the report is three lines by what the user did (§7)', () => {
     expect(summary.blocking).toBe(INCOMPLETE_SOURCE_WARNING);
   });
 
+  it('splits «не восстановлено» by reason, because the reasons have different answers', () => {
+    // One number is the right headline and the wrong whole answer: «не хватило
+    // места» is fixed by freeing space, «не понимает эта версия» by updating,
+    // «конфликт публикации» by neither.
+    const summary = importSummary(REPORT({ conflicts: 1, unsupported: 2, quotaStopped: 4 }));
+
+    expect(summary.notApplied).toContain('7');
+    expect(summary.notAppliedReasons?.map(r => [r.label, r.count])).toEqual([
+      ['Конфликт публикации', 1],
+      ['Эта версия приложения не понимает запись из файла', 2],
+      ['Не хватило места в хранилище', 4],
+    ]);
+    // And each carries what to DO — the reason exists for the advice.
+    expect(summary.notAppliedReasons?.map(r => r.advice).join(' ')).toContain('Освободите место');
+  });
+
+  it('omits the reasons that did not happen', () => {
+    // A list padded with zeroes is a list nobody reads to the end.
+    const summary = importSummary(REPORT({ skipped: 1 }));
+    expect(summary.notAppliedReasons).toHaveLength(1);
+  });
+
+  it('has no breakdown when nothing went unapplied', () => {
+    expect(importSummary(REPORT({ deferred: 1 })).notAppliedReasons).toBeUndefined();
+  });
+
   it('shows it only at seven zeroes AND a complete source', () => {
     const summary = importSummary(REPORT({ added: 5 }));
     expect(summary.success).toBe('Восстановление завершено полностью.');
     expect(summary.blocking).toBeUndefined();
+  });
+});
+
+describe('the honest scope of phase 1', () => {
+  it('says where the file goes and whose job the rest is', () => {
+    // Not decoration: a backup feature that stays silent about being
+    // device-local invites the reading «my notes are backed up now», which is
+    // the one belief this phase must not create.
+    expect(PHASE_ONE_SCOPE).toContain('куда его кладёт браузер');
+    expect(PHASE_ONE_SCOPE).toContain('вне устройства');
+    expect(PHASE_ONE_SCOPE).toContain('никуда её не отправляет');
   });
 });
 

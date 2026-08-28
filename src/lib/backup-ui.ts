@@ -208,11 +208,32 @@ export function importPreview(
 
 // ─── The report: three lines by what the USER did ───────────────────
 
+/** One reason a record went unapplied, with the advice that follows from it. */
+export interface NotAppliedReason {
+  label: string;
+  count: number;
+  /** What the user can actually DO about this one. */
+  advice: string;
+}
+
 export interface ImportSummary {
   /** «Добавлено: N, восстановлено: M» — always shown. */
   restored: string;
   /** Everything unapplied, together. Blocking: the file must be kept. */
   notApplied?: string;
+  /**
+   * The same number, split by reason — shown behind a disclosure (§7).
+   *
+   * One number is the right headline and the wrong whole answer: «не хватило
+   * места» is fixed by freeing space and retrying, «не понимает эта версия» by
+   * updating the app, and «конфликт публикации» by neither. A user who cannot
+   * tell them apart cannot act on any of them, and the summary would be
+   * telling them to keep a file forever for reasons it declines to name.
+   *
+   * Only non-zero reasons appear: a list padded with zeroes is a list nobody
+   * reads to the end.
+   */
+  notAppliedReasons?: NotAppliedReason[];
   /** Outcomes that a second import can still fix. */
   retryable?: string;
   /** Shown ONLY at seven zeroes AND a source that was not itself partial. */
@@ -226,12 +247,50 @@ const RESTORED_KEYS = [
   'repaired', 'quarantinedRepaired', 'quarantinedDataRepaired', 'quarantineStale',
 ] as const;
 
-/** Everything unapplied, as ONE number: the eleven internal counters are a
- *  diagnostic, and a user reading eleven of them cannot tell which ones mean
- *  «your data is still only in the file». */
-const NOT_APPLIED_KEYS = [
-  'conflicts', 'unsupported', 'unsupportedLocal', 'skipped', 'quotaStopped',
-] as const;
+/**
+ * Everything unapplied — as ONE number in the headline, and as these five
+ * reasons behind the disclosure.
+ *
+ * The eleven internal counters are a diagnostic, and a user reading eleven of
+ * them cannot tell which ones mean «your data is still only in the file». But
+ * collapsing to one number and stopping there loses the only thing the user
+ * can act on, so the split is the same list, kept in one place: adding a
+ * counter to `NOT_APPLIED_KEYS` without a sentence here is impossible, because
+ * the keys ARE this list.
+ */
+const NOT_APPLIED_REASONS = [
+  {
+    key: 'conflicts',
+    label: 'Конфликт публикации',
+    advice: 'Локальная запись и запись из файла разошлись на цепочке. Автоматического '
+      + 'разрешения в этой версии нет — сохраните файл.',
+  },
+  {
+    key: 'unsupported',
+    label: 'Эта версия приложения не понимает запись из файла',
+    advice: 'Обновите приложение и повторите импорт того же файла — более новая версия '
+      + 'может её восстановить.',
+  },
+  {
+    key: 'unsupportedLocal',
+    label: 'Локальная запись новее, чем понимает это приложение',
+    advice: 'Она не заменяется намеренно, чтобы не затереть то, что записала более новая '
+      + 'версия. Обновите приложение.',
+  },
+  {
+    key: 'skipped',
+    label: 'Запись повреждена или неправильной формы',
+    advice: 'Восстановить её эта версия не может. Файл сохраните: более новая может.',
+  },
+  {
+    key: 'quotaStopped',
+    label: 'Не хватило места в хранилище',
+    advice: 'Освободите место на устройстве и повторите импорт того же файла — импорт '
+      + 'остановился, а не сломался.',
+  },
+] as const satisfies readonly { key: keyof ImportReport['counters']; label: string; advice: string }[];
+
+const NOT_APPLIED_KEYS = NOT_APPLIED_REASONS.map(r => r.key);
 
 /** Repeatable outcomes: a send was in flight, or another tab changed the data.
  *  Both are answered by importing the same file again. */
@@ -252,6 +311,11 @@ export function importSummary(report: ImportReport): ImportSummary {
     restored: `Добавлено: ${report.counters.added}, восстановлено: ${sum(RESTORED_KEYS)}.`,
     notApplied: notApplied > 0
       ? `Не восстановлено: ${notApplied} — не удаляйте файл копии.`
+      : undefined,
+    notAppliedReasons: notApplied > 0
+      ? NOT_APPLIED_REASONS
+        .map(r => ({ label: r.label, advice: r.advice, count: report.counters[r.key] }))
+        .filter(r => r.count > 0)
       : undefined,
     retryable: retryable > 0
       ? `Требуется повторный импорт: ${retryable}. Данные изменились или отправлялись во время `

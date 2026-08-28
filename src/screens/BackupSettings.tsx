@@ -299,6 +299,21 @@ function ImportResult({ summary }: { summary: ImportSummary }) {
       {summary.blocking && <div className="error-msg" role="alert">{summary.blocking}</div>}
       <div role="status">{summary.restored}</div>
       {summary.notApplied && <div className="error-msg" role="alert">{summary.notApplied}</div>}
+      {summary.notAppliedReasons && (
+        // Behind a disclosure, not in the alert: the headline is the number,
+        // and the reasons are what the user opens when they want to know what
+        // to DO — the three of them have three different answers.
+        <details className="backup-reasons">
+          <summary>Почему не восстановлено</summary>
+          <ul>
+            {summary.notAppliedReasons.map(reason => (
+              <li key={reason.label}>
+                <strong>{reason.label}: {reason.count}.</strong> {reason.advice}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
       {summary.retryable && <div>{summary.retryable}</div>}
       {summary.success && <div className="text-green">{summary.success}</div>}
     </div>
