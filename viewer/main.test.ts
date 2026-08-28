@@ -55,6 +55,10 @@ const BODY = TEMPLATE
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const status = () => $('status').textContent ?? '';
 const clicks: string[] = [];
+/** The files the page actually wrote — a name is not enough when the question
+ *  is what ended up INSIDE one. */
+const downloads: Array<{ name: string; blob: Blob }> = [];
+let lastBlob: Blob | null = null;
 
 async function makeNote(text = SECRETS.noteText): Promise<EncryptedNote> {
   return encryptEnvelopeV3(await deriveKey(MNEMONIC), text, { fmt: 'plain', rev: 1 });
@@ -132,6 +136,13 @@ async function clickOpen(seed = MNEMONIC): Promise<void> {
 beforeEach(async () => {
   document.body.innerHTML = BODY;
   clicks.length = 0;
+  downloads.length = 0;
+  lastBlob = null;
+  // Back to «yes» before every test. `vi.restoreAllMocks()` does not touch a
+  // plain `vi.fn`, so a `mockReturnValue(false)` set by one test would
+  // otherwise decide the outcome of the next one — and a test that fails
+  // because of its neighbour is worse than no test.
+  vi.mocked(globalThis.confirm).mockReset().mockReturnValue(true);
   vi.resetModules();
   await import('./main');
 });
@@ -143,10 +154,16 @@ afterEach(() => {
 // jsdom implements neither, and both are load-bearing here: the download path
 // and the two confirmations are exactly what these tests are about.
 vi.stubGlobal('confirm', vi.fn(() => true));
-Object.defineProperty(URL, 'createObjectURL', { value: vi.fn(() => 'blob:stub'), configurable: true });
+Object.defineProperty(URL, 'createObjectURL', {
+  value: vi.fn((blob: Blob) => { lastBlob = blob; return 'blob:stub'; }),
+  configurable: true,
+});
 Object.defineProperty(URL, 'revokeObjectURL', { value: vi.fn(), configurable: true });
 Object.defineProperty(HTMLAnchorElement.prototype, 'click', {
-  value: function (this: HTMLAnchorElement) { clicks.push(this.download); },
+  value: function (this: HTMLAnchorElement) {
+    clicks.push(this.download);
+    if (lastBlob) downloads.push({ name: this.download, blob: lastBlob });
+  },
   configurable: true,
 });
 
@@ -774,5 +791,206 @@ describe('two opens at once', () => {
 
     expect($('notes').textContent).toContain('SECOND-FILE-CONTENT');
     expect($('notes').textContent).not.toContain('FIRST-FILE-CONTENT');
+  });
+});
+
+describe('the doubt reaches the FILE, not only the dialog', () => {
+  async function chainWithOpaqueSuccessor(): Promise<EncryptedSafeboxEntry[]> {
+    const metaKey = await deriveSafeboxMetaKey(MNEMONIC);
+    const secretKey = await deriveSafeboxSecretKey(MNEMONIC);
+    const first = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '',
+      password: 'OLD-PASSWORD-THAT-NO-LONGER-WORKS', files: [], rev: 1,
+    });
+    const second = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '',
+      password: SECRETS.password, files: [], rev: 2, root: first.entryId, prev: first.entryId,
+    });
+    return [first, { ...second, v: 9 } as unknown as EncryptedSafeboxEntry];
+  }
+
+  const written = async (name: string): Promise<string> => {
+    const file = downloads.find(d => d.name === name);
+    expect(file, `nothing was written as ${name}`).toBeDefined();
+    return file!.blob.text();
+  };
+
+  it('the exported secrets TXT carries the caveat inside it', async () => {
+    // The dialog is gone the moment it is dismissed. In six months this text
+    // file is all there is, and an old password in it looks exactly as
+    // authoritative as a current one.
+    selectFile(await container({
+      safebox: await chainWithOpaqueSuccessor(), containsUnsupportedRecords: true,
+    }));
+    await clickOpen();
+
+    $('export-secrets').click();
+
+    const text = await written('eternal-notes-secrets.txt');
+    expect(text).toContain('ВНИМАНИЕ');
+    expect(text).toContain('НЕ самой новой версией');
+    expect(text).toContain('OLD-PASSWORD-THAT-NO-LONGER-WORKS'); // it is still exported
+  });
+
+  it('the exported notes TXT carries it too', async () => {
+    const opaqueNote = { ...(await makeNote()), v: 9 } as unknown as EncryptedNote;
+    selectFile(await container({
+      notes: [opaqueNote, await makeNote('a readable one')], containsUnsupportedRecords: true,
+    }));
+    await clickOpen();
+
+    $('export-notes').click();
+
+    expect(await written('eternal-notes.txt')).toContain('ВНИМАНИЕ');
+  });
+
+  it('a clean container writes no caveat at all', async () => {
+    selectFile(await container({ notes: [await makeNote()], safebox: [await makeEntry()] }));
+    await clickOpen();
+
+    $('export-notes').click();
+    $('export-secrets').click();
+
+    expect(await written('eternal-notes.txt')).not.toContain('ВНИМАНИЕ');
+    expect(await written('eternal-notes-secrets.txt')).not.toContain('ВНИМАНИЕ');
+  });
+
+  it('an attachment is written byte-for-byte — the caveat lives in its confirmation', async () => {
+    // The one export the caveat cannot travel inside: these are the user's own
+    // original bytes and this page does not alter them.
+    selectFile(await container({ safebox: [await makeEntry()] }));
+    await clickOpen();
+    const save = Array.from(document.querySelectorAll('#safebox button'))
+      .find(b => b.textContent === 'сохранить файл') as HTMLButtonElement;
+
+    save.click();
+
+    expect(await written('a.txt')).toBe(SECRETS.fileA);
+  });
+});
+
+describe('a doubt about one collection is not spoken about the other', () => {
+  it('an unreadable NOTE never puts the word «пароль» in the blocking warning', async () => {
+    // The list-level notices were already separate; the alert at the top was
+    // not, and it is the one the user reads first.
+    const opaqueNote = { ...(await makeNote()), v: 9 } as unknown as EncryptedNote;
+    selectFile(await container({
+      notes: [opaqueNote, await makeNote()],
+      safebox: [await makeEntry()],
+      containsUnsupportedRecords: true,
+    }));
+
+    await clickOpen();
+
+    const alert = $('view-warnings').textContent ?? '';
+    expect(alert).toContain('нельзя считать самой новой');
+    expect(alert).toContain('заметки');
+    expect(alert).not.toContain('пароль');
+  });
+
+  it('and an unreadable safebox entry does put it there', async () => {
+    const [first, opaqueSecond] = await (async () => {
+      const metaKey = await deriveSafeboxMetaKey(MNEMONIC);
+      const secretKey = await deriveSafeboxSecretKey(MNEMONIC);
+      const a = await encryptSafeboxEntry(metaKey, secretKey, {
+        title: SECRETS.title, login: '', url: '', note: '', password: 'old', files: [], rev: 1,
+      });
+      const b = await encryptSafeboxEntry(metaKey, secretKey, {
+        title: SECRETS.title, login: '', url: '', note: '', password: SECRETS.password,
+        files: [], rev: 2, root: a.entryId, prev: a.entryId,
+      });
+      return [a, { ...b, v: 9 } as unknown as EncryptedSafeboxEntry];
+    })();
+    selectFile(await container({
+      notes: [await makeNote()], safebox: [first, opaqueSecond], containsUnsupportedRecords: true,
+    }));
+
+    await clickOpen();
+
+    const alert = $('view-warnings').textContent ?? '';
+    expect(alert).toContain('пароль');
+    expect(alert).not.toContain('заметки');
+  });
+});
+
+describe('the reason given is the reason there is', () => {
+  it('a broken graph is not reported as «records were not read»', async () => {
+    // A newer viewer fixes an unreadable record. It does nothing whatsoever
+    // for links that do not line up, and saying otherwise sends the user
+    // looking for one.
+    const metaKey = await deriveSafeboxMetaKey(MNEMONIC);
+    const secretKey = await deriveSafeboxSecretKey(MNEMONIC);
+    const first = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '', password: 'old', files: [], rev: 1,
+    });
+    const third = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '', password: SECRETS.password,
+      files: [], rev: 3, root: first.entryId, prev: first.entryId, // rev 2 never existed
+    });
+    selectFile(await container({ safebox: [first, third] }));
+    await clickOpen();
+
+    expect($('view-warnings').textContent).toContain('связи между версиями');
+    expect($('view-warnings').textContent).not.toContain('не прочитал');
+
+    const ask = vi.mocked(globalThis.confirm);
+    ask.mockClear();
+    ask.mockReturnValue(true);
+    $('export-secrets').click();
+
+    const dialog = String(ask.mock.calls[0][0]);
+    expect(dialog).toContain('связи между версиями');
+    expect(dialog).not.toContain('не прочитал');
+  });
+});
+
+describe('a request that FAILS after losing the page keeps quiet', () => {
+  /** A file whose read never resolves on its own. `onRead` fires when the page
+   *  actually starts reading — the only moment at which a request can be
+   *  interrupted mid-flight rather than before it began. */
+  function fileThatFails(onRead: () => void = () => {}): (error: Error) => void {
+    let fail!: (error: Error) => void;
+    const read = new Promise<string>((_, reject) => { fail = reject; });
+    Object.defineProperty($('file'), 'files', {
+      value: [{ size: 100, text: () => { onRead(); return read; } }],
+      configurable: true,
+    });
+    return fail;
+  }
+
+  it('a read that rejects after `pagehide` writes nothing to the closed page', async () => {
+    // The success path was guarded; the failure path was not. A rejection
+    // arriving after the teardown would put «не удалось открыть» back onto a
+    // page that had been cleared — text on a page the user believes is closed.
+    const fail = fileThatFails(() => window.dispatchEvent(new Event('pagehide')));
+    $<HTMLTextAreaElement>('seed').value = MNEMONIC;
+    $<HTMLButtonElement>('open').click();
+    await settle();
+
+    fail(new Error('the file went away'));
+    await settle();
+
+    expect(status()).toBe('');
+    expect($('view').hidden).toBe(true);
+  });
+
+  it('an older request that rejects does not disturb the newer one', async () => {
+    let reading = false;
+    const fail = fileThatFails(() => { reading = true; });
+    $<HTMLTextAreaElement>('seed').value = MNEMONIC;
+    $<HTMLButtonElement>('open').click();          // A starts...
+    await vi.waitFor(() => { expect(reading).toBe(true); }); // ...and parks on the read
+
+    selectFile(await container({ notes: [await makeNote('SECOND-FILE-CONTENT')] }));
+    $<HTMLButtonElement>('open').click();          // B supersedes it
+    await settle();
+    expect($('notes').textContent).toContain('SECOND-FILE-CONTENT');
+
+    fail(new Error('the first file went away'));
+    await settle();
+
+    // B's result stands, and A's failure is not announced over it.
+    expect(status()).toBe('');
+    expect($('notes').textContent).toContain('SECOND-FILE-CONTENT');
   });
 });
