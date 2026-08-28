@@ -994,3 +994,164 @@ describe('a request that FAILS after losing the page keeps quiet', () => {
     expect($('notes').textContent).toContain('SECOND-FILE-CONTENT');
   });
 });
+
+describe('a file that declares itself incomplete cannot prove anything current', () => {
+  /** The written-down file for these: the marker is one authenticated boolean
+   *  about the whole container. It names no collection and no count, so the
+   *  doubt it raises cannot be narrowed to one list. */
+  const readWritten = async (name: string): Promise<string> => {
+    const file = downloads.find(d => d.name === name);
+    expect(file, `nothing was written as ${name}`).toBeDefined();
+    return file!.blob.text();
+  };
+
+  async function incompleteContainer(): Promise<string> {
+    const metaKey = await deriveSafeboxMetaKey(MNEMONIC);
+    const secretKey = await deriveSafeboxSecretKey(MNEMONIC);
+    const entry = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '',
+      password: 'OLD-PASSWORD-THAT-NO-LONGER-WORKS', files: [], rev: 1,
+    });
+    // Everything present is readable and internally consistent — the ONLY
+    // thing wrong with this container is that it knows it is short.
+    return container({ notes: [await makeNote()], safebox: [entry], incompleteRestore: true });
+  }
+
+  it('takes currentness off BOTH collections, readable or not', async () => {
+    // The missing rev 2 is not opaque — it is not in the file at all, which is
+    // less determinable, not more: there is not even a count of what is gone.
+    selectFile(await incompleteContainer());
+
+    await clickOpen();
+
+    const alert = $('view-warnings').textContent ?? '';
+    expect(alert).toContain('нельзя считать самой новой');
+    expect(alert).toContain('файл заведомо неполон');
+    expect($('notes').textContent).toContain('не обязательно самая новая');
+    expect($('safebox').textContent).toContain('мог быть уже заменён');
+  });
+
+  it('says so inside both exported files', async () => {
+    selectFile(await incompleteContainer());
+    await clickOpen();
+
+    $('export-notes').click();
+    $('export-secrets').click();
+
+    for (const name of ['eternal-notes.txt', 'eternal-notes-secrets.txt']) {
+      const text = await readWritten(name);
+      expect(text, name).toContain('ВНИМАНИЕ');
+      expect(text, name).toContain('исходный файл, из которого восстанавливались');
+    }
+  });
+
+  it('and in the confirmation the secrets export asks for', async () => {
+    selectFile(await incompleteContainer());
+    await clickOpen();
+    const ask = vi.mocked(globalThis.confirm);
+    ask.mockClear();
+
+    $('export-secrets').click();
+
+    expect(String(ask.mock.calls[0][0])).toContain('файл заведомо неполон');
+  });
+
+  it('the advice is not «find a newer viewer» — no viewer brings back what is absent', async () => {
+    selectFile(await incompleteContainer());
+    await clickOpen();
+
+    expect($('view-warnings').textContent).not.toContain('более новый просмотрщик');
+  });
+});
+
+describe('every reason there actually is, and no other', () => {
+  const readWritten = async (name: string): Promise<string> => {
+    const file = downloads.find(d => d.name === name);
+    expect(file, `nothing was written as ${name}`).toBeDefined();
+    return file!.blob.text();
+  };
+
+  it('an OPAQUE record and a DAMAGED one give different portable reasons', async () => {
+    // The distinction is kept in the counters for a reason — one is «a newer
+    // viewer opens this», the other is «these versions are gone» — and it used
+    // to be flattened away exactly where it matters most: in the file the user
+    // reads six months later, with nothing else to consult.
+    const opaque = { ...(await makeNote()), v: 9 } as unknown as EncryptedNote;
+    selectFile(await container({
+      notes: [opaque, await makeNote()], containsUnsupportedRecords: true,
+    }));
+    await clickOpen();
+    $('export-notes').click();
+    const withOpaque = await readWritten('eternal-notes.txt');
+
+    document.body.innerHTML = BODY;
+    downloads.length = 0;
+    vi.resetModules();
+    await import('./main');
+    vi.mocked(globalThis.confirm).mockReset().mockReturnValue(true);
+
+    const broken = await makeNote('gone');
+    selectFile(await container({
+      notes: [{ ...broken, ciphertext: `${broken.ciphertext.slice(0, -4)}AAAA` }, await makeNote()],
+    }));
+    await clickOpen();
+    $('export-notes').click();
+    const withDamaged = await readWritten('eternal-notes.txt');
+
+    expect(withOpaque).toContain('более новый просмотрщик');
+    expect(withDamaged).not.toContain('более новый просмотрщик');
+    expect(withDamaged).toContain('не расшифровывается');
+  });
+
+  it('both at once are both named', async () => {
+    const opaque = { ...(await makeNote()), v: 9 } as unknown as EncryptedNote;
+    const broken = await makeNote('gone');
+    selectFile(await container({
+      notes: [opaque, { ...broken, ciphertext: `${broken.ciphertext.slice(0, -4)}AAAA` }],
+      containsUnsupportedRecords: true,
+    }));
+
+    await clickOpen();
+
+    const alert = $('view-warnings').textContent ?? '';
+    expect(alert).toContain('более новый просмотрщик');
+    expect(alert).toContain('не расшифровывается');
+  });
+});
+
+describe('an attachment saved from a container whose currentness is in doubt', () => {
+  it('is written byte-for-byte, and its confirmation carries the caveat', async () => {
+    // The bytes are the user's own file and this page does not touch them, so
+    // the dialog is the only place the doubt can be said at all — which makes
+    // it the one place it must not be missing.
+    const metaKey = await deriveSafeboxMetaKey(MNEMONIC);
+    const secretKey = await deriveSafeboxSecretKey(MNEMONIC);
+    const first = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '', password: 'old',
+      files: [{
+        fid: FID_A, name: 'a.txt', mime: 'text/plain',
+        size: SECRETS.fileA.length, data: btoa(SECRETS.fileA),
+      }],
+      rev: 1,
+    });
+    const successor = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '', password: SECRETS.password,
+      files: [], rev: 2, root: first.entryId, prev: first.entryId,
+    });
+    selectFile(await container({
+      safebox: [first, { ...successor, v: 9 } as unknown as EncryptedSafeboxEntry],
+      containsUnsupportedRecords: true,
+    }));
+    await clickOpen();
+
+    const ask = vi.mocked(globalThis.confirm);
+    ask.mockClear();
+    const save = Array.from(document.querySelectorAll('#safebox button'))
+      .find(b => b.textContent === 'сохранить файл') as HTMLButtonElement;
+    save.click();
+
+    expect(String(ask.mock.calls[0][0])).toContain('НЕ самой новой версией');
+    const written = downloads.find(d => d.name === 'a.txt');
+    expect(await written!.blob.text()).toBe(SECRETS.fileA);
+  });
+});
