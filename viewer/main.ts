@@ -22,10 +22,13 @@
  *    bytes» means each individual save, not only the bulk export;
  *  - leaving the page tears the vault down SYNCHRONOUSLY, DOM included, and
  *    an open that was still running does not get to undo that;
- *  - what is shown is the CURRENT version of each note and entry, decided by
- *    the app's own rule — not every stored version side by side. In the
+ *  - one card per chain, never every stored version side by side: in the
  *    quadrant this page exists for there is nothing to cross-check against, so
- *    a superseded password shown as a peer of the current one is a trap.
+ *    a superseded password shown as a peer of the current one is a trap. That
+ *    card is the CURRENT version only when the collection was read in full and
+ *    its links hold up; otherwise it is the latest READABLE version, and the
+ *    page says so — on screen, in the confirmations, and inside the files it
+ *    writes.
  */
 
 import {
@@ -91,10 +94,11 @@ interface Opened {
   notes: NoteData[];
   entries: OpenedEntry[];
   incomplete: boolean;
-  /** Per collection: may what is shown be called the current version at all?
-   *  Carried on the state because the export paths have to say it too — a
-   *  warning on screen does not travel into a file being written to disk. */
-  provenCurrent: { notes: boolean; safebox: boolean };
+  /** Per collection: may what is shown be called the current version at all,
+   *  and if not, why. Carried on the state because the export paths have to
+   *  say it too — a warning on screen does not travel into a file being
+   *  written to disk. */
+  currentness: { notes: Currentness; safebox: Currentness };
 }
 
 let opened: Opened | null = null;
@@ -160,29 +164,33 @@ const emptyCollection = (): CollectionTally =>
 const unreadable = (c: CollectionTally): number => c.unsupported + c.damaged;
 
 /**
- * Can «this is the current version» still be said about what is shown?
+ * Can «this is the current version» still be said about what is shown — and if
+ * not, WHY not?
  *
- * No, once anything is missing from the collection — and this is the one
- * conclusion in the page that cannot be improved by better code. A record this
- * build cannot read carries its topology INSIDE the ciphertext, so there is no
- * way to learn which chain it belonged to or which position it held. A safebox
- * entry whose rev 2 is opaque leaves rev 1 as the only version there is, and
- * grouping will call it current: a password that was replaced, presented as
- * the live one, with nothing on the page to suggest otherwise.
+ * A reason rather than a boolean, because the two reasons send the user to
+ * different places. `unreadable`: a record this build cannot read carries its
+ * topology INSIDE the ciphertext, so there is no way to learn which chain it
+ * belonged to or which position it held — a safebox entry whose rev 2 is
+ * opaque leaves rev 1 as the only version there is, and grouping will call it
+ * current. That one a NEWER VIEWER fixes. `broken_graph`: every record was
+ * read, but the links between versions do not hold up, and `chains.ts` picks
+ * the newest by timestamp and revision — an answer only as trustworthy as
+ * those links. A newer viewer will not help with that at all, and saying it
+ * would send the user looking for one.
  *
- * A broken graph among fully readable records says the same thing for a
- * different reason: `chains.ts` picks the newest by timestamp and revision, and
- * that answer is only as trustworthy as the links behind it.
+ * The two are mutually exclusive by construction: a graph verdict is only
+ * recorded for a collection that was read in full.
  */
-const currentnessProven = (c: CollectionTally): boolean =>
-  unreadable(c) === 0 && !c.brokenGraph;
+type Currentness = 'proven' | 'unreadable' | 'broken_graph';
+
+const currentnessOf = (c: CollectionTally): Currentness => {
+  if (unreadable(c) > 0) return 'unreadable';
+  return c.brokenGraph ? 'broken_graph' : 'proven';
+};
 
 // ─── Opening ─────────────────────────────────────────────────────────
 
-async function open(file: File, mnemonic: string): Promise<void> {
-  // Claim the page: any open still running is now superseded, and will find
-  // that out at its next checkpoint rather than by overwriting this one.
-  const myEpoch = ++epoch;
+async function open(file: File, mnemonic: string, myEpoch: number): Promise<void> {
   /** Throws if the page was torn down under us. Checked after every await
    *  that can span a navigation, and — the load-bearing one — immediately
    *  before anything is published to the page. */
@@ -306,9 +314,9 @@ async function open(file: File, mnemonic: string): Promise<void> {
     notes,
     entries,
     incomplete: body.incompleteRestore,
-    provenCurrent: {
-      notes: currentnessProven(tally.notes),
-      safebox: currentnessProven(tally.safebox),
+    currentness: {
+      notes: currentnessOf(tally.notes),
+      safebox: currentnessOf(tally.safebox),
     },
   };
   render(tally);
@@ -401,18 +409,20 @@ function render(tally: OpenTally): void {
   // leave unsaid: a missing record may have been the NEWER version of
   // something shown below. Blocking, because the alternative is the user
   // acting on a password that was replaced.
-  if (!opened.provenCurrent.notes || !opened.provenCurrent.safebox) {
-    const caveat = el('p', 'warn warn-block', currentnessCaveat(tally));
-    caveat.setAttribute('role', 'alert');
-    warnings.appendChild(caveat);
+  const caveat = currentnessCaveat(opened.currentness);
+  if (caveat !== '') {
+    const node = el('p', 'warn warn-block', caveat);
+    node.setAttribute('role', 'alert');
+    warnings.appendChild(node);
   }
 
   const notes = byId('notes');
   clear(notes);
   // Repeated at the list itself: the warnings block is above the fold on the
   // way in, and a user who scrolled to a card is no longer looking at it.
-  if (!opened.provenCurrent.notes) {
-    notes.appendChild(el('p', 'warn', 'Показана последняя ЧИТАЕМАЯ версия каждой заметки — не обязательно самая новая.'));
+  if (opened.currentness.notes !== 'proven') {
+    notes.appendChild(el('p', 'warn',
+      'Показана последняя ЧИТАЕМАЯ версия каждой заметки — не обязательно самая новая.'));
   }
   for (const note of opened.notes) {
     const card = el('article', 'card');
@@ -425,7 +435,7 @@ function render(tally: OpenTally): void {
 
   const safebox = byId('safebox');
   clear(safebox);
-  if (!opened.provenCurrent.safebox) {
+  if (opened.currentness.safebox !== 'proven') {
     safebox.appendChild(el('p', 'warn',
       'Показана последняя ЧИТАЕМАЯ версия каждой записи — пароль ниже мог быть уже заменён.'));
   }
@@ -437,21 +447,46 @@ function render(tally: OpenTally): void {
   if (typeof top.scrollIntoView === 'function') top.scrollIntoView({ block: 'start' });
 }
 
+/** Why «current» cannot be claimed for one collection. */
+const REASON: Record<Exclude<Currentness, 'proven'>, string> = {
+  unreadable: 'какие-то записи этот просмотрщик не прочитал, а то, какой версией они были, '
+    + 'лежит внутри шифротекста',
+  broken_graph: 'связи между версиями в файле не сходятся',
+};
+
+/** What each collection loses by it — the safebox sentence is the sharp one
+ *  and must not be said about a safebox that was read in full. */
+const STAKE = {
+  notes: 'показана последняя ЧИТАЕМАЯ версия каждой заметки',
+  safebox: 'показана последняя ЧИТАЕМАЯ версия каждой записи, и пароль среди них мог быть уже заменён',
+} as const;
+
 /**
- * Why «current» cannot be claimed — stated by reason, because the two reasons
- * suggest different next steps: one asks for a newer viewer, the other says
- * the file's own links are inconsistent.
+ * The blocking caveat, built PER COLLECTION.
+ *
+ * An unreadable note proves nothing about the safebox — they are disjoint id
+ * spaces — so a doubt raised by one must not be spoken about the other. Saying
+ * «your password may have been replaced» over a safebox this viewer read in
+ * full is a false alarm in the one place where the user has no way to check.
+ *
+ * Empty string when there is nothing to say.
  */
-function currentnessCaveat(tally: OpenTally): string {
-  const missing = unreadable(tally.notes) + unreadable(tally.safebox) > 0;
-  const broken = tally.notes.brokenGraph || tally.safebox.brokenGraph;
-  const reason = missing
-    ? 'какие-то записи этот просмотрщик не прочитал, а их содержимое — включая то, какой версией они были — лежит внутри шифротекста'
-    : 'связи между версиями в файле не сходятся';
-  const alsoBroken = missing && broken ? ' Кроме того, связи между версиями не сходятся.' : '';
-  return 'Показанное нельзя считать самой новой версией: ' + reason + '. '
-    + 'Ниже — последняя версия каждой записи ИЗ ЧИТАЕМЫХ, и пароль среди них может быть уже заменён.'
-    + alsoBroken;
+function currentnessCaveat(currentness: Opened['currentness']): string {
+  const parts: string[] = [];
+  for (const collection of ['notes', 'safebox'] as const) {
+    const verdict = currentness[collection];
+    if (verdict === 'proven') continue;
+    parts.push(`${STAKE[collection]} — ${REASON[verdict]}`);
+  }
+  if (parts.length === 0) return '';
+  return `Показанное нельзя считать самой новой версией: ${parts.join('; ')}.`;
+}
+
+/** The same doubt, compressed for a file that will be read somewhere else
+ *  entirely, with none of the page around it. */
+function currentnessNote(verdict: Currentness): string {
+  if (verdict === 'proven') return '';
+  return `ВНИМАНИЕ: ${REASON[verdict]}, поэтому сохраняемое может быть НЕ самой новой версией.`;
 }
 
 function renderEntry(entry: OpenedEntry): HTMLElement {
@@ -489,7 +524,11 @@ function renderEntry(entry: OpenedEntry): HTMLElement {
     // bytes are secrets: saving one puts an unencrypted copy on disk, and a
     // single click is not a decision the user can be assumed to have made.
     save.addEventListener('click', () => {
-      if (!confirmPlaintextExport(`вложение «${file.name}»`, opened?.provenCurrent.safebox === false)) return;
+      // The one export the caveat cannot travel INSIDE: these are the original
+      // bytes of the user's own file, and this page does not alter them. The
+      // confirmation is where it is said, and that is stated as the exception
+      // it is (D22).
+      if (!confirmPlaintextExport(`вложение «${file.name}»`, opened?.currentness.safebox ?? 'proven')) return;
       download(file.name, file.mime, file.bytes);
     });
     row.appendChild(save);
@@ -503,13 +542,12 @@ function renderEntry(entry: OpenedEntry): HTMLElement {
 /** The warning says what actually happens rather than «are you sure», and it
  *  is confirmed twice. One helper for every path that puts a secret on disk —
  *  a second wording would eventually become a weaker one. */
-function confirmPlaintextExport(what: string, currentnessUnproven = false): boolean {
+function confirmPlaintextExport(what: string, verdict: Currentness = 'proven'): boolean {
   // The caveat travels INTO the confirmation, not only onto the page: a file
   // written to disk carries no warnings with it, and the user reads it later,
   // elsewhere, with none of this on screen.
-  const caveat = currentnessUnproven
-    ? '\n\nВНИМАНИЕ: часть записей не прочитана, поэтому сохраняемое может быть НЕ самой новой версией.'
-    : '';
+  const note = currentnessNote(verdict);
+  const caveat = note === '' ? '' : `\n\n${note}`;
   const first = confirm(
     `Файл будет НЕЗАШИФРОВАН: ${what} сохранится на диск в открытом виде.${caveat}\n\n`
     + 'Продолжить?');
@@ -534,10 +572,8 @@ function exportNotesText(): void {
   // A header line rather than a dialog: this file carries no secrets, so it
   // needs no confirmation — but it does need to be honest about what it is
   // once it is somewhere else entirely.
-  const header = opened.provenCurrent.notes
-    ? ''
-    : 'ВНИМАНИЕ: часть записей копии не прочитана этим просмотрщиком. '
-      + 'Ниже — последняя ЧИТАЕМАЯ версия каждой заметки, не обязательно самая новая.\n\n====\n\n';
+  const note = currentnessNote(opened.currentness.notes);
+  const header = note === '' ? '' : `${note}\n\n====\n\n`;
   const text = header + opened.notes
     .map(note => `${new Date(note.createdAt).toLocaleString()}\n${note.text}`)
     .join('\n\n----\n\n');
@@ -546,9 +582,14 @@ function exportNotesText(): void {
 
 function exportSecrets(): void {
   if (!opened) return;
-  if (!confirmPlaintextExport('пароли и содержимое вложений', !opened.provenCurrent.safebox)) return;
+  if (!confirmPlaintextExport('пароли и содержимое вложений', opened.currentness.safebox)) return;
 
-  const text = opened.entries
+  // ...and into the file, not only into the dialog nobody keeps. In six months
+  // this text file is all there is, and an old password in it looks exactly as
+  // authoritative as a current one.
+  const note = currentnessNote(opened.currentness.safebox);
+  const header = note === '' ? '' : `${note}\n\n====\n\n`;
+  const text = header + opened.entries
     .map(entry => [
       entry.title,
       entry.login && `логин: ${entry.login}`,
@@ -665,16 +706,24 @@ export function start(): void {
       // cards spell it derives a different key in silence, and a phrase
       // wrapped over two lines does not derive one at all.
       const phrase = normalizeMnemonic(seed.value);
+      // The generation belongs to the REQUEST, and the request is this click.
+      // Held here rather than inside `open` because the FAILURE paths need it
+      // too: a read that rejects after the page was closed, or after another
+      // click superseded this one, would otherwise write its verdict onto a
+      // page it no longer owns — a message on a torn-down page, or one file's
+      // error over another file's result.
+      const myEpoch = ++epoch;
       status.textContent = 'Открываем…';
       try {
-        await open(file, phrase);
-        status.textContent = '';
+        await open(file, phrase, myEpoch);
       } catch (error) {
-        // The page was closed under us: there is nobody to tell, and writing
-        // to a torn-down page would put text back on it.
+        if (epoch !== myEpoch) return; // superseded or closed: nobody to tell
         if (error instanceof PageClosed) return;
         status.textContent = openFailure(error, phrase);
+        return;
       }
+      if (epoch !== myEpoch) return;
+      status.textContent = '';
     })();
   });
 
