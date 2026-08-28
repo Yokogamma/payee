@@ -19,6 +19,7 @@ import {
   withImportLock,
   BackupCancelledError,
   BackupLockUnavailableError,
+  BackupVaultLockedError,
   LAST_EXPORT_ARTIFACT_KEY,
   LAST_VERIFIED_ARTIFACT_KEY,
   type BackupStorage,
@@ -27,6 +28,8 @@ import {
 import { encodeBackup, deriveBackupKey } from './backup';
 import {
   deriveKey,
+  deriveSafeboxMetaKey,
+  deriveSafeboxSecretKey,
   encryptEnvelopeV3,
   type EncryptedNote,
   type EncryptedSafeboxEntry,
@@ -49,8 +52,15 @@ const MNEMONIC =
 const NOW = 1_756_000_000_000;
 const DB_GENERATION = 7;
 
+const vaultKeys = async () => ({
+  note: await deriveKey(MNEMONIC),
+  safeboxMeta: await deriveSafeboxMetaKey(MNEMONIC),
+  safeboxSecret: await deriveSafeboxSecretKey(MNEMONIC),
+  container: await deriveBackupKey(MNEMONIC),
+});
+
 const vault = (over: Partial<BackupVault> = {}): BackupVault => ({
-  mnemonic: MNEMONIC,
+  deriveKeys: vaultKeys,
   dbGeneration: DB_GENERATION,
   assertAlive: () => {},
   now: () => NOW,
@@ -372,5 +382,62 @@ describe('what counts as success', () => {
     expect(importSucceeded(report({}))).toBe(true);
     expect(importSucceeded(report({ allFileRecordsApplied: false }))).toBe(false);
     expect(importSucceeded(report({ incompleteRestore: true }))).toBe(false);
+  });
+});
+
+describe('the session carries permission to derive, never the seed itself', () => {
+  it('holds no string that could be a seed phrase', async () => {
+    // Stage A and stage B are separated by a human decision, so the session
+    // sits in React state for as long as the preview is on screen — through a
+    // lock, through `pagehide`, past the store's synchronous wipe of every
+    // vault reference. That wipe is the app's actual guarantee about the seed;
+    // a copy living outside it would quietly make the guarantee false.
+    const { file } = countedFile(await container([await makeNote()]));
+    const prepared = await prepareImport(from(vault()), file, storage().storage);
+
+    const reachable = JSON.stringify(prepared, (_k, v) => (typeof v === 'function' ? undefined : v));
+    expect(reachable).not.toContain('abandon');
+    expect(reachable).not.toContain(MNEMONIC);
+  });
+
+  it('derives at APPLY time, so a vault that has since been locked cannot produce keys', async () => {
+    // The strongest form of the same property: the session cannot reconstruct
+    // the keys on its own, because the derivation reads the store's live
+    // reference and that reference is gone.
+    const { file } = countedFile(await container([await makeNote()]));
+    const { storage: store, merges } = storage();
+    let open = true;
+    const prepared = await prepareImport(
+      from(vault({
+        deriveKeys: async () => {
+          if (!open) throw new BackupVaultLockedError();
+          return vaultKeys();
+        },
+      })),
+      file,
+      store,
+    );
+
+    open = false;
+    await expect(prepared.apply()).rejects.toBeInstanceOf(BackupVaultLockedError);
+    expect(merges).toEqual([]);
+  });
+
+  it('checks the lifecycle AFTER derivation, which is the slowest step there is', async () => {
+    // Four key derivations are the first thing every backup operation does and
+    // are not instant on a phone. Without a guard behind them, a lock during
+    // derivation is noticed only once the work is already spent.
+    const { file } = countedFile(await container([await makeNote()]));
+    let derived = false;
+    const boom = new BackupCancelledError('locked mid-derivation');
+
+    await expect(prepareImport(
+      from(vault({
+        deriveKeys: async () => { derived = true; return vaultKeys(); },
+        assertAlive: () => { if (derived) throw boom; },
+      })),
+      file,
+      storage().storage,
+    )).rejects.toBe(boom);
   });
 });

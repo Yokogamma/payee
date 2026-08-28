@@ -24,7 +24,7 @@ import type { VerifyReport } from './backup-actions';
  */
 
 const vault: BackupVault = {
-  mnemonic: 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+  deriveKeys: () => { throw new Error('keys must not be derived while the release is off'); },
   dbGeneration: 1,
   assertAlive: () => {},
   now: () => 0,
