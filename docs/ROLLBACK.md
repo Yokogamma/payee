@@ -330,9 +330,16 @@ worker deploy and refuses a candidate that is not a descendant of the floor.
 - the checker and the floor therefore both come from outside the candidate: the
   script from the default branch, the value from the protected Environment
   variable `WORKER_FLOOR_SHA`;
-- the candidate is fetched as an **object**, checked, and only then checked out
-  — into `candidate/`, never over the trusted tree. Nothing of it executes
-  before the gate has answered;
+- **the candidate must be reachable from the commit the run itself is on** —
+  i.e. it must be something `main` actually contains. Without that the branch
+  policy is satisfied by the DISPATCH ref while the deployed code comes from
+  anywhere: this job installs and tests the candidate in a runner that holds
+  the Cloudflare token, so «deploy an arbitrary SHA» means «run arbitrary code
+  with the deploy credentials in scope». Ancestry, not equality, so every
+  commit `main` ever contained stays deployable and rollbacks keep working;
+- the candidate is therefore materialized with `git worktree` out of the
+  history already fetched — no second checkout, no network, no credential left
+  behind for it to find — and only AFTER the gate has answered;
 - the checkout uses `fetch-depth: 0`, because ancestry cannot be computed from
   a shallow clone.
 
@@ -341,31 +348,66 @@ Tags move. A moved tag would silently lower the floor, so the checker refuses a
 tag name outright rather than resolving it — the variable holds the full
 40-character SHA or nothing.
 
-**Empty is a legitimate state, and it is the current one.** The floor is raised
-immediately before the import flip (D2a), not earlier: the client-floor release
-ships with both backup flags off and does not yet depend on the contract, so
-taking its rollback window away early would cure nothing. With the variable
-unset the gate PASSES and prints `NO FLOOR` — loudly, because a silent no-op
-gate looks like protection in the log.
+**An unset variable is a REFUSAL, not «no floor yet».** It is tempting to read
+it the other way, because the SEMANTIC floor (D2a) is raised only just before
+the import flip. But a floor already exists and is recorded above: `worker-r3`
+is ABSOLUTE — every build below it answers 400 to App-Version=4 uploads and
+safebox data exists. A gate that passed with no configured floor would be a
+no-op standing in front of a constraint that already binds.
+
+So the variable is **initialized now**, with the data floor, and the future
+flip is a **raise** rather than a first filling:
+
+| When | `WORKER_FLOOR_SHA` | Why |
+|---|---|---|
+| now, before this workflow is used again | `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`) | the v4-acceptor; below it safebox uploads 400 |
+| before the import flip (D2a) | the semantic-idempotency worker's SHA | the client stops accepting a `txId` without the capability marker |
 
 **What only the operator can do** (no PR can, and none should pretend to):
 
-1. set `WORKER_FLOOR_SHA` in the `dev` Environment to the floor's full SHA —
-   today that is `9319491`'s full form, i.e. the `worker-r3` commit;
-2. restrict the Environment's **deployment branches** to the default branch:
-   that policy, not the guard step inside the workflow, is the real boundary —
+1. **set `WORKER_FLOOR_SHA`** in the `dev` Environment to
+   `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`). Until this is
+   done the worker deploy refuses to run at all — deliberately: the floor
+   exists whether or not the variable does;
+2. ~~restrict the Environment's **deployment branches** to the default
+   branch~~ — **done** (verified 2026-08-28: policy is branch-only, `main`).
+   That policy, not the guard step inside the workflow, is the real boundary:
    a branch that wanted to remove the guard would simply remove it;
-3. **forbid administrative bypass** on the Environment. By default admins may
-   bypass protection rules, and a «hard floor» that an admin can wave through
-   is a soft one;
+3. **forbid administrative bypass** on the Environment — **still open**
+   (verified 2026-08-28: `can_admins_bypass = true`). By default admins may
+   bypass protection rules, and a «hard floor» an admin can wave through is a
+   soft one;
 4. keep to the operational ban above: no dashboard rollback, no bare
-   `wrangler rollback`.
+   `wrangler rollback`;
+5. **do not dispatch the next worker deploy until the previous run has
+   finished.** `concurrency` in the workflow prevents overlap and protects a
+   running deploy from being cancelled, but GitHub keeps only one pending run
+   per group and promises nothing about the order queued runs start in. The
+   ordering rule is yours, not the workflow's.
 
-**Rehearsal before the floor goes up** (the plan asks for this on the real
-workflow, not as a unit test): with `WORKER_FLOOR_SHA` still empty, dispatch the
-deploy for a permitted older worker SHA and watch it go through as usual. Then
-set the variable and dispatch the same SHA again: the run must now stop at the
-gate, before the candidate is checked out. Record both run ids here.
+**Rehearsal — on the real workflow, not as a unit test.** The obvious version
+of it («deploy something with no floor, then set the floor and watch the same
+deploy be refused») cannot be run: with the variable unset nothing deploys at
+all, and there is no SHA that both passes without a floor and is blocked by
+`worker-r3` — anything below `worker-r3` is already forbidden. So the rehearsal
+is done in the direction that deploys nothing dangerous:
+
+1. set `WORKER_FLOOR_SHA` to the `worker-r3` SHA above;
+2. dispatch the deploy for the CURRENT head of `main` — it must pass the gate
+   and deploy normally (this is a redeploy of what is already live);
+3. dispatch it again for `cd7524e`'s full SHA (`worker-r2`, below the floor) —
+   the run must stop at the gate, **before** the candidate is materialized, and
+   nothing may reach Cloudflare;
+4. dispatch it once for a commit that exists only on an unmerged branch — the
+   run must stop at the same gate, with the «not reachable from the trusted
+   head» message;
+5. record all four run ids here.
+
+**When the floor is later raised** (before the import flip), the order matters:
+deploy the semantic worker first and verify `/health` reports
+`semanticIdempotency: 1`, and only then raise the variable to that SHA. Raising
+it first would leave nothing deployable — the live worker would already be
+below the new floor.
 
 **Two floors, and they are enforced by different things.** The worker floor is
 this gate. The CLIENT floor is `DB_VERSION`: today `client-r4` (IndexedDB v2);

@@ -1,8 +1,22 @@
 // NO SHEBANG here: this module is imported by its test, and a `#!` first line
 // breaks the vite-node build silently (see no-shebang-in-imported-mjs.test.mjs).
 /**
- * The worker floor gate (D2a): refuse to deploy a candidate that is not a
- * descendant of the last worker version the client depends on.
+ * The worker deploy gate: two questions about one candidate SHA.
+ *
+ *   1. TRUST — is the candidate reachable from the trusted head (the default
+ *      branch this workflow was dispatched from)? Code that never went through
+ *      branch protection must not be deployed, and must not even be RUN: the
+ *      deploy job installs and tests the candidate in a runner that holds the
+ *      Cloudflare token, so «deploy an arbitrary SHA» is «execute arbitrary
+ *      code with the deploy credentials in scope».
+ *   2. FLOOR (D2a) — is the candidate a descendant of the floor, i.e. not a
+ *      rollback below the version released clients depend on?
+ *
+ * The first check is what makes the second one worth having. Without it the
+ * Environment's branch policy is satisfied by the dispatch ref while the code
+ * actually deployed comes from anywhere — which is how this gate was written
+ * the first time, and it made the deploy strictly less safe than the «deploy
+ * whatever ref you dispatched» arrangement it replaced.
  *
  * ── Why a gate at all ────────────────────────────────────────────────
  *
@@ -22,6 +36,16 @@
  * else, is accepted as the floor. A tag name is refused rather than resolved,
  * because resolving it would reintroduce exactly the movability being avoided.
  *
+ * ── Why «reachable from main» rather than «is main» ──────────────────
+ *
+ * A rollback has to remain possible, and a rollback deploys an OLD commit —
+ * one that is in main's history but is not its head. So the boundary is
+ * ancestry again, in the other direction: `candidate` must be an ancestor of
+ * the trusted head. That admits every commit main ever contained and nothing
+ * else. An unmerged branch, a fork, a commit pushed and then force-removed:
+ * all refused, because none of them is reachable from the branch the
+ * protection rules actually guard.
+ *
  * ── Why this file cannot be the whole answer ─────────────────────────
  *
  * A script that lives in the repository can only gate a workflow that chooses
@@ -33,17 +57,22 @@
  * on administrative bypass, and the operational ban on dashboard rollbacks and
  * bare `wrangler rollback`, which no repository script can intercept.
  *
- * ── The empty floor is a PASS, loudly ────────────────────────────────
+ * ── An unset floor is a REFUSAL ──────────────────────────────────────
  *
- * The floor is raised only just before the import flip (D2a: the client-floor
- * release with both flags off does not yet depend on the contract, and taking
- * away its rollback window early would cure nothing and cost a forward-fix).
- * So an unset variable is the normal state for now — and it prints a line
- * saying the gate is not in effect, because a silent no-op gate is worse than
- * none: it looks like protection in the log.
+ * It would be tempting to treat «no variable» as «no floor yet», since the
+ * SEMANTIC floor is only raised just before the import flip (D2a). That
+ * reasoning is wrong here for a plain reason: a floor already exists. The
+ * runbook records `worker-r3` as ABSOLUTE — every build below it answers 400
+ * to App-Version=4 uploads, and safebox data exists — so a gate that passes
+ * with no configured floor would be a no-op sitting in front of a constraint
+ * that is already binding.
  *
- * Usage:  WORKER_FLOOR_SHA=<40-hex|empty> WORKER_CANDIDATE_SHA=<40-hex> \
- *           node scripts/check-worker-floor.mjs
+ * So: unset is fail-closed, and the message names the fix. The future flip is
+ * not the first filling of this variable but a RAISE of it, from the data
+ * floor to the semantic one.
+ *
+ * Usage:  WORKER_FLOOR_SHA=<40-hex> WORKER_CANDIDATE_SHA=<40-hex> \
+ *         WORKER_TRUSTED_HEAD=<40-hex> node scripts/check-worker-floor.mjs
  * Values are SHAs, not secrets, and are printed on purpose: a refusal a person
  * cannot diagnose gets bypassed rather than fixed.
  */
@@ -76,12 +105,12 @@ export function checkFloorInputs({ floor, candidate }) {
 
   if (trimmedFloor === '') {
     return {
-      ok: true,
-      floorInEffect: false,
-      candidate: trimmedCandidate,
-      reason: 'WORKER_FLOOR_SHA is not set — the worker floor is NOT in effect. '
-        + 'This is the expected state until the floor is raised (D2a: immediately before '
-        + 'the import flip, never earlier).',
+      ok: false,
+      reason: 'WORKER_FLOOR_SHA is not set. A floor already exists — the runbook records '
+        + '`worker-r3` as absolute, because every build below it rejects App-Version=4 '
+        + 'uploads and safebox data exists — so an unset variable is a missing '
+        + 'configuration, not an absent constraint. Set it in the `dev` Environment to the '
+        + "floor's full 40-character SHA (docs/ROLLBACK.md).",
     };
   }
 
@@ -95,7 +124,7 @@ export function checkFloorInputs({ floor, candidate }) {
     };
   }
 
-  return { ok: true, floorInEffect: true, floor: trimmedFloor, candidate: trimmedCandidate };
+  return { ok: true, floor: trimmedFloor, candidate: trimmedCandidate };
 }
 
 /**
@@ -104,10 +133,55 @@ export function checkFloorInputs({ floor, candidate }) {
  *   - `hasCommit(sha)` → boolean
  *   - `isAncestor(a, b)` → boolean, and THROWS on anything that is neither a
  *     yes nor a no. A git that cannot answer must never read as «yes».
+ *
+ * `trustedHead` is the commit the workflow itself is running from. It is
+ * required: a caller that has no trusted head has no trust boundary either,
+ * and defaulting it to «anything» is exactly the mistake this parameter
+ * exists to prevent.
  */
-export function checkWorkerFloor({ floor, candidate, git }) {
+export function checkWorkerFloor({ floor, candidate, trustedHead, git }) {
   const inputs = checkFloorInputs({ floor, candidate });
-  if (!inputs.ok || inputs.floorInEffect !== true) return inputs;
+  if (!inputs.ok) return inputs;
+
+  const head = String(trustedHead ?? '').trim().toLowerCase();
+  if (!SHA_RE.test(head)) {
+    return {
+      ok: false,
+      reason: `trusted head "${head}" is not a full 40-character commit SHA. The gate needs to `
+        + 'know what it is trusting; without it the candidate could be any commit in the world.',
+    };
+  }
+  if (!git.hasCommit(head)) {
+    return { ok: false, reason: `the trusted head ${head} is not in this clone.` };
+  }
+  if (!git.hasCommit(inputs.candidate)) {
+    return {
+      ok: false,
+      reason: `the candidate commit ${inputs.candidate} is not in this clone. With a full-history `
+        + 'checkout every commit reachable from the default branch is present, so a missing one '
+        + 'is a commit that was never on it.',
+    };
+  }
+
+  let onTrustedBranch;
+  try {
+    onTrustedBranch = git.isAncestor(inputs.candidate, head);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `git could not decide whether the candidate is on the trusted branch `
+        + `(${error instanceof Error ? error.message : String(error)}). Refusing.`,
+    };
+  }
+  if (!onTrustedBranch) {
+    return {
+      ok: false,
+      reason: `candidate ${inputs.candidate} is not reachable from the trusted head ${head}. `
+        + 'Only commits the default branch actually contains may be deployed: anything else '
+        + 'has not passed branch protection, and this job installs and runs what it deploys '
+        + 'in a runner that holds the deploy token.',
+    };
+  }
 
   if (!git.hasCommit(inputs.floor)) {
     return {
@@ -116,15 +190,6 @@ export function checkWorkerFloor({ floor, candidate, git }) {
         + '`fetch-depth: 0` — ancestry cannot be computed from a shallow history.',
     };
   }
-  if (!git.hasCommit(inputs.candidate)) {
-    return {
-      ok: false,
-      reason: `the candidate commit ${inputs.candidate} is not in this clone. Fetch it first `
-        + '(`git fetch --no-tags origin <sha>`); a SHA that cannot be found is refused rather '
-        + 'than assumed to be fine.',
-    };
-  }
-
   let descendant;
   try {
     descendant = git.isAncestor(inputs.floor, inputs.candidate);
@@ -148,38 +213,49 @@ export function checkWorkerFloor({ floor, candidate, git }) {
 
   return {
     ok: true,
-    floorInEffect: true,
     floor: inputs.floor,
     candidate: inputs.candidate,
-    reason: `candidate ${inputs.candidate} is a descendant of the floor ${inputs.floor}`,
+    reason: `candidate ${inputs.candidate} is reachable from the trusted head and is a `
+      + `descendant of the floor ${inputs.floor}`,
   };
 }
 
-/** The real git, in the two questions this gate asks it. */
-export const gitAdapter = {
-  hasCommit(sha) {
-    const { status, error } = git(['cat-file', '-e', `${sha}^{commit}`]);
-    return !error && status === 0;
-  },
-  isAncestor(ancestor, descendant) {
-    // `--is-ancestor` answers with the exit code: 0 yes, 1 no. ANYTHING else
-    // is «git could not tell», and the caller turns that into a refusal — an
-    // undecided gate must never read as a yes.
-    const { status, error } = git(['merge-base', '--is-ancestor', ancestor, descendant]);
-    if (error) throw error;
-    if (status === 0) return true;
-    if (status === 1) return false;
-    throw new Error(`git merge-base --is-ancestor exited with ${String(status)}`);
-  },
-};
+/**
+ * The real git, in the two questions this gate asks it, bound to a directory.
+ *
+ * The directory is a parameter so the tests can build a repository of their
+ * own with a known shape instead of asserting against whatever history the
+ * checkout happens to have — a test that needs `HEAD~3` fails on a shallow CI
+ * clone, which is exactly how the first version of this file shipped red.
+ */
+export function gitIn(cwd) {
+  const git = args => spawnSync('git', args, { cwd, stdio: 'ignore' });
+  return {
+    hasCommit(sha) {
+      const { status, error } = git(['cat-file', '-e', `${sha}^{commit}`]);
+      return !error && status === 0;
+    },
+    isAncestor(ancestor, descendant) {
+      // `--is-ancestor` answers with the exit code: 0 yes, 1 no. ANYTHING else
+      // is «git could not tell», and the caller turns that into a refusal — an
+      // undecided gate must never read as a yes.
+      const { status, error } = git(['merge-base', '--is-ancestor', ancestor, descendant]);
+      if (error) throw error;
+      if (status === 0) return true;
+      if (status === 1) return false;
+      throw new Error(`git merge-base --is-ancestor exited with ${String(status)}`);
+    },
+  };
+}
 
-const git = args => spawnSync('git', args, { stdio: 'ignore' });
+export const gitAdapter = gitIn(process.cwd());
 
 // CLI
 if (process.argv[1] && process.argv[1].endsWith('check-worker-floor.mjs')) {
   const verdict = checkWorkerFloor({
     floor: process.env.WORKER_FLOOR_SHA,
     candidate: process.env.WORKER_CANDIDATE_SHA ?? process.argv[2],
+    trustedHead: process.env.WORKER_TRUSTED_HEAD ?? process.argv[3],
     git: gitAdapter,
   });
 
@@ -187,9 +263,5 @@ if (process.argv[1] && process.argv[1].endsWith('check-worker-floor.mjs')) {
     console.error(`check-worker-floor: REFUSED — ${verdict.reason}`);
     process.exit(1);
   }
-  console.log(
-    verdict.floorInEffect
-      ? `check-worker-floor: OK — ${verdict.reason}`
-      : `check-worker-floor: NO FLOOR — ${verdict.reason}`,
-  );
+  console.log(`check-worker-floor: OK — ${verdict.reason}`);
 }

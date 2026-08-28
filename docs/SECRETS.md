@@ -42,7 +42,7 @@ Names and pointers only — no values.
 | Durable Objects | `RateLimiter`, `InviteManager`, `IpRateLimiter` | same classes, fresh instances |
 | Pages project | `eternal-notes` | not provisioned (separate project) |
 | Client domain | `notes.matamata.dev` | `.app` domain, name TBD at launch |
-| GitHub Environment | `dev` (branch policy: `main`; 4 variables + token secret) | `production` (required reviewers + branch policy — §2.1) |
+| GitHub Environment | `dev` (branch policy: `main`; 5 variables + token secret) | `production` (required reviewers + branch policy — §2.1) |
 | Cloudflare token scope | `Workers Scripts: Edit`, `Cloudflare Pages: Edit` (account-level — no per-resource granularity exists) | separate token; **separate account is the provisioning gate** (§2.1) |
 | Staging worker | `eternal-notes-proxy-staging` — **not deployed** (KV placeholder in wrangler.toml) | n/a |
 
