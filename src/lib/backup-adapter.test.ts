@@ -269,6 +269,34 @@ describe('the artifact markers (D21)', () => {
     });
   });
 
+  it('a verify writes ONE key and touches nothing else', async () => {
+    // The dry-run's whole promise is «I will tell you about this file and
+    // change nothing». Naming the boundary exactly — notes, safebox and sync
+    // never move; the single permitted write is one `meta` key — is what makes
+    // it checkable: «the marker is there» would stay green for an
+    // implementation that also repaired a record on the way past.
+    const { file } = countedFile(await container([await makeNote()]));
+    const store = storage();
+    const readSnapshot = vi.fn(store.storage.readSnapshot);
+
+    await runVerify(from(vault()), file, { ...store.storage, readSnapshot });
+
+    expect(store.merges).toEqual([]);
+    expect([...store.meta.keys()]).toEqual([LAST_VERIFIED_ARTIFACT_KEY]);
+    // And it never even looks at the local store: a verify is about the FILE.
+    expect(readSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('a verify that fails writes no key at all', async () => {
+    const { file } = countedFile('not a container');
+    const store = storage();
+
+    await expect(runVerify(from(vault()), file, store.storage)).rejects.toThrow();
+
+    expect(store.merges).toEqual([]);
+    expect(store.meta.size).toBe(0);
+  });
+
   it('a marker that cannot be written does NOT take the file away', async () => {
     // The one moment this feature exists for is also the moment storage is
     // most likely to be full. Losing the emergency copy because a note-to-self
