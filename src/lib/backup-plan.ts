@@ -141,17 +141,24 @@ export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
   // and nothing else:
   //
   //  1. a rev-1 record names ITSELF as its chain and claims no predecessor;
-  //  2. at most one record per position `(kind, root, rev)`;
-  //  3. `prev` is accepted, in the SAME chain, exactly one revision back.
+  //  2. `prev` is accepted, in the SAME chain, exactly one revision back.
   //
   // The rest of the graph verdict is stage A's and stays there, because these
-  // three already imply it for ordering purposes: a link into another
-  // collection cannot even be looked up (the key carries the kind); a chain
-  // whose root record is absent has no rev-1 to stand on, so (1) and (3) refuse
-  // it; and a non-integer or descending `rev` can never bottom out at a rev-1
-  // record, so the whole run of them is refused. What (3) alone could NOT
-  // catch is a fork — two records claiming one position, each with a perfectly
-  // good predecessor — which is why (2) is here rather than assumed.
+  // two already imply it for ordering purposes: a link into another collection
+  // cannot even be looked up (the key carries the kind); a chain whose root
+  // record is absent has no rev-1 to stand on, so (1) and (2) refuse it; and a
+  // non-integer or descending `rev` can never bottom out at a rev-1 record, so
+  // the whole run of them is refused.
+  //
+  // A FORK IS NOT REFUSED, and an earlier version of this list said it was.
+  // Two records may share `(kind, root, rev)`: `rev` is assigned locally as
+  // `current.rev + 1`, so two devices editing offline produce one position by
+  // construction, and the app keeps both versions on purpose (`chains.ts`).
+  // Refusing the second one dropped an ordinary two-device edit on the floor
+  // and counted it as `skipped` — the import reporting data as unrestorable
+  // that the app itself considers current history. Ordering never needed the
+  // rule: every record names its predecessor BY ID, so a child sorts after its
+  // own parent whichever branch it is on.
   //
   // Checked here rather than trusted from the caller for the same reason the
   // merge writer re-applies the upload barrier: the guarantee is this module's
@@ -159,22 +166,19 @@ export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
   // validate first is not an invariant.
   const accepted = new Map<string, PlannedRecord>();
   const refused = new Map<string, NotAppliedCounter>();
-  const taken = new Set<string>();
   for (const record of notApplied) refused.set(key(record.kind, record.id), record.counter);
 
   const ordered: PlannedRecord[] = [];
   for (const record of readable) {
     const prevKey = record.prev === undefined ? undefined : key(record.kind, record.prev);
     const prev = prevKey === undefined ? undefined : accepted.get(prevKey);
-    const position = `${record.kind}:${record.root}:${record.rev}`;
     const linked = record.rev === 1
       // A chain's first version names itself: a rev-1 record pointing at
       // someone else's chain would be a SECOND first version there.
       ? record.root === record.id && record.prev === undefined
       : prev !== undefined && prev.root === record.root && prev.rev === record.rev - 1;
-    const stands = linked && !taken.has(position);
 
-    if (!stands) {
+    if (!linked) {
       // A descendant is missing for its ANCESTOR's reason (D12a). A link stage
       // A would have rejected outright has no ancestor to inherit from, and
       // «left unapplied» is all that can honestly be said about it.
@@ -184,7 +188,6 @@ export function planBackupImport(inputs: readonly PlanInput[]): ImportPlan {
       continue;
     }
     accepted.set(key(record.kind, record.id), record);
-    taken.add(position);
     ordered.push(record);
   }
 
