@@ -21,7 +21,9 @@ import {
 
 const clean = [
   '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'">',
-  '<textarea data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"></textarea>',
+  '<textarea data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"'
+  + ' spellcheck="false" autocapitalize="none" autocorrect="off"></textarea>',
+  '<p>Сверьте хеш с независимой копией, прежде чем вводить seed-фразу.</p>',
 ].join('\n');
 
 describe('what the build refuses to emit', () => {
@@ -48,6 +50,30 @@ describe('what the build refuses to emit', () => {
     // entire vault to a third party.
     const without = clean.replace('data-lpignore="true" ', '');
     expect(checkViewerArtifact(without)).toContainEqual(expect.stringContaining('data-lpignore'));
+  });
+
+  it.each(['spellcheck', 'autocapitalize', 'autocorrect'])(
+    'refuses a seed field without %s (D20)',
+    attribute => {
+      // The half of D20 this check used to skip, and the likelier of the two
+      // leaks on a phone: the keyboard does it by default. A seed phrase that
+      // lands in an autocorrect dictionary or a cloud spellchecker has left the
+      // device with no manager involved, no prompt shown and nothing to decline.
+      const without = clean.replace(new RegExp(` ${attribute}="[^"]*"`), '');
+      expect(checkViewerArtifact(without)).toContainEqual(expect.stringContaining(attribute));
+    },
+  );
+
+  it('refuses an artifact that does not ask for an INDEPENDENT copy of the hash (D19)', () => {
+    // One paragraph of prose that nothing in the build depended on — so
+    // deleting it would break no test while removing the only sentence that
+    // stops a substituted viewer from being trusted. A checksum block sitting
+    // in the same folder confirms a forgery; the comparison has to be against
+    // something kept elsewhere, and the page must say so BEFORE a seed phrase
+    // is typed into it.
+    const without = clean.replace(/<p>Сверьте[^<]*<\/p>/, '');
+    expect(checkViewerArtifact(without))
+      .toContainEqual(expect.stringContaining('independent copy'));
   });
 
   it('refuses a missing or open Content-Security-Policy', () => {

@@ -10,6 +10,7 @@ import {
   getSyncRecord,
   getNoteById,
   getAllNotes,
+  getMeta,
   getSafeboxEntryById,
   readBackupSnapshot,
   estimateBackupPlaintextBytes,
@@ -68,6 +69,79 @@ describe('readBackupSnapshot', () => {
     expect(result.snapshot.notes).toHaveLength(1);
     expect(result.snapshot.safebox).toHaveLength(1);
     expect(result.snapshot.incompleteRestore).toBe(false);
+  });
+
+  it('a write racing the snapshot lands wholly outside it — the marker cannot disagree with the data', async () => {
+    /*
+     * The test above shows the three values arriving in ONE RESULT, which a
+     * reader opening one transaction per store would satisfy just as happily.
+     * What the single `transaction(['notes', 'safebox', 'meta'])` actually buys
+     * is a snapshot, and a snapshot is only observable against a concurrent
+     * write: an import running at the same time (export is deliberately left
+     * outside the import lock) must be either wholly inside the picture or
+     * wholly outside it — never half of each.
+     *
+     * The failure this catches is the torn read. Stage B of an import writes
+     * records AND raises `incompleteRestore`. A reader that takes the marker in
+     * one transaction and the records in another can catch the records WITHOUT
+     * the marker and export them under `incompleteRestore: false` — a file
+     * that declares itself complete while the import behind its contents never
+     * finished. The user is told the copy is good, deletes the source file, and
+     * the records stage B never reached are gone with it.
+     *
+     * Behavioural rather than a source-text guard, because the property is
+     * reachable: IndexedDB starts transactions in creation order and
+     * `readBackupSnapshot` creates its transaction synchronously on entry, so
+     * every write queued after the call is ordered behind it. Phase 2 replays
+     * the identical race against a two-transaction reader assembled from the
+     * same public API — without that control this test could go green for
+     * the boring reason that nothing interleaved at all.
+     */
+    const SECOND_ID = '22222222-2222-4333-8444-555555555555';
+    await saveNote(note());
+
+    // Deliberately not awaited: the snapshot's transaction is already open, and
+    // these are the two writes stage B makes to the stores it is reading.
+    const snapshot = readBackupSnapshot(BIG_BUDGET);
+    const racingWrites = Promise.all([
+      saveNote(note({ noteId: SECOND_ID })),
+      setMeta(INCOMPLETE_RESTORE_META_KEY, true),
+    ]);
+    const result = await snapshot;
+    await racingWrites;
+
+    expect(result.ok && result.snapshot.notes.map((n) => n.noteId)).toEqual([ID]);
+    expect(result.ok && result.snapshot.incompleteRestore).toBe(false);
+
+    // The writes did land — the race was live, merely invisible to a
+    // transaction that had already started.
+    const after = await readBackupSnapshot(BIG_BUDGET);
+    expect(after.ok && after.snapshot.notes).toHaveLength(2);
+    expect(after.ok && after.snapshot.incompleteRestore).toBe(true);
+
+    // Phase 2 — the control: the same race and the same writes, with the
+    // marker and the records read in two transactions instead of one.
+    await resetAll();
+    await saveNote(note());
+    const twoTransactionRead = (async () => {
+      const rawMarker = await getMeta(INCOMPLETE_RESTORE_META_KEY);
+      return {
+        notes: (await getAllNotes()).length,
+        incompleteRestore: rawMarker !== undefined && rawMarker !== false,
+      };
+    })();
+    const sameWrites = Promise.all([
+      saveNote(note({ noteId: SECOND_ID })),
+      setMeta(INCOMPLETE_RESTORE_META_KEY, true),
+    ]);
+    const torn = await twoTransactionRead;
+    await sameWrites;
+
+    // Should this ever equal the snapshot above, the race stopped interleaving
+    // and the assertions before it prove nothing: repair the race, never relax
+    // them.
+    expect(torn, 'two transactions must NOT survive the race a single one does')
+      .not.toEqual({ notes: 1, incompleteRestore: false });
   });
 
   it('an absent marker means complete', async () => {

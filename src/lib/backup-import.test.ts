@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { applyBackupImport, SKIP_COUNTERS, type ImportDeps } from './backup-import';
+import { applyBackupImport, SKIP_COUNTERS, type ImportCounters, type ImportDeps } from './backup-import';
 import { planBackupImport, type PlanInput } from './backup-plan';
 import type { BackupMergeResult } from './storage';
 import type { EncryptedNote } from './crypto';
@@ -31,6 +31,20 @@ const refused = (id: string, state: 'unsupported' | 'malformed' | 'damaged' = 'u
 const chain = (prefix: string, length: number): PlanInput[] =>
   Array.from({ length }, (_, i) =>
     node(`${prefix}${i + 1}`, i + 1, `${prefix}1`, i === 0 ? undefined : `${prefix}${i}`));
+
+/**
+ * The full counter map with only the named fields set.
+ *
+ * Asserting against ALL twelve at once is what makes «counted at most once»
+ * checkable: a record that landed in two buckets shows up as a non-zero counter
+ * nobody named, which a per-field expectation would happily ignore.
+ */
+const counted = (set: Partial<ImportCounters>): ImportCounters => ({
+  added: 0, repaired: 0, quarantinedRepaired: 0, quarantinedDataRepaired: 0,
+  quarantineStale: 0, unsupportedLocal: 0, conflicts: 0, deferred: 0,
+  skipped: 0, unsupported: 0, concurrentChange: 0, quotaStopped: 0,
+  ...set,
+});
 
 interface Harness {
   deps: ImportDeps;
@@ -123,6 +137,27 @@ describe('counting', () => {
   });
 });
 
+describe('a file that is already here in full', () => {
+  it('applies nothing at all and still takes the mark off', async () => {
+    // Every record present locally and publication-equivalent, so rule 2
+    // answers all of them with a no-op: not one counter moves, and not one
+    // payload is written. The mark must come off anyway. Tying its removal to
+    // «did we write anything» would leave a device that is ALREADY complete
+    // flagged as incompletely restored forever — and every export it makes
+    // from then on would carry that lie forward to the next machine.
+    const h = harness({ outcomes: { a1: 'noop', a2: 'noop', b1: 'noop' } });
+    const plan = planBackupImport([...chain('a', 2), ...chain('b', 1)]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(report.counters).toEqual(counted({})); // all twelve, `added` included
+    expect(report.allFileRecordsApplied).toBe(true);
+    expect(report.incompleteRestore).toBe(false);
+    expect(h.markerWrites).toEqual([true, false]); // the run's only writes
+    expect(h.merged).toEqual(['a1', 'a2', 'b1']);  // each one was considered
+  });
+});
+
 describe('a chain that cannot be applied is not half-written', () => {
   it('a conflict on the first version stops the rest of its chain', async () => {
     const h = harness({ outcomes: { a1: 'conflicts' } });
@@ -182,6 +217,41 @@ describe('running out of space', () => {
 
     expect(report.counters.added).toBe(2);        // chain a landed
     expect(report.counters.quotaStopped).toBe(5); // b1,b2 and all of c
+    expect(report.allFileRecordsApplied).toBe(false);
+  });
+
+  it('counts the tail and NOTHING that had already been decided', async () => {
+    // Mixed outcomes before the stop are where double counting hides. A record
+    // already refused for its own reason must not also be swept into the tail,
+    // and a record stranded behind one must be counted for the reason that
+    // stopped its chain — once. Get it wrong and the report blames a full disk
+    // for records that a conflict held back: the user goes off deleting photos
+    // to make room instead of looking at the record that needs a decision.
+    const quota = Object.assign(new Error('full'), { name: 'QuotaExceededError' });
+    const h = harness({
+      outcomes: { a1: 'conflicts', b1: 'skipped', c1: 'noop' },
+      throwOnMerge: id => (id === 'd1' ? quota : undefined),
+    });
+    const plan = planBackupImport([
+      ...chain('a', 2), // a1 conflicts, a2 stranded behind it
+      ...chain('b', 2), // b1 skipped, b2 stranded behind it
+      ...chain('c', 2), // c1 already equivalent, c2 written
+      ...chain('d', 3), // d1 runs into the quota, d2/d3 go with it
+      ...chain('e', 2), // never reached at all
+    ]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(report.counters).toEqual(counted({
+      conflicts: 2,    // a1, a2
+      skipped: 2,      // b1, b2
+      added: 1,        // c2 — c1 was a no-op and belongs in no counter at all
+      quotaStopped: 5, // d1, d2, d3, e1, e2
+    }));
+    // Eleven records in the file, ten in the counters. The sum is deliberately
+    // NOT the assertion (§8): only the per-counter values are, because a
+    // successful no-op is honoured without being counted.
+    expect(h.merged).toEqual(['a1', 'b1', 'c1', 'c2']); // the tail was never tried
     expect(report.allFileRecordsApplied).toBe(false);
   });
 

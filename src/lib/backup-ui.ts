@@ -159,8 +159,15 @@ export function sizeNotice(expectedFileBytes: number, overCap: boolean): SizeNot
     return {
       text,
       overCap: false,
+      // The second sentence is a measurement, not a guess: at the ceiling a
+      // desktop spends ~5.5 s exporting and ~6.6 s importing with the tab
+      // frozen and about a gigabyte of peak memory (step 13). A phone has
+      // neither the seconds nor the memory, and finding that out by watching
+      // the tab die is the wrong way to learn it.
       warning: `Копия приближается к пределу в ${formatBytes(BACKUP_CAP_BYTES)}. `
-        + 'Записи не удаляются, поэтому объём только растёт — учитывайте это заранее.',
+        + 'Записи не удаляются, поэтому объём только растёт. Рядом с пределом создание и '
+        + 'проверка копии занимают несколько секунд с замершим интерфейсом и требуют около '
+        + 'гигабайта памяти — на телефоне вкладка может не справиться, делайте копию на компьютере.',
     };
   }
   return { text, overCap: false };

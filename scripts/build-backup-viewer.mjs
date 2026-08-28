@@ -59,10 +59,27 @@ export function checkViewerArtifact(html) {
   if (bytes > VIEWER_MAX_BYTES) {
     problems.push(`artifact is ${bytes} bytes, over the ${VIEWER_MAX_BYTES} ceiling`);
   }
-  for (const attribute of ['data-1p-ignore', 'data-lpignore', 'data-bwignore', 'data-form-type']) {
+  // D20 names TWO groups of attributes on the seed field, and the check used to
+  // know only the first. A password manager that saves a seed phrase exports
+  // the whole vault; a spellchecker or an autocorrect dictionary that swallows
+  // one leaks it to a cloud service the user never chose — and on mobile the
+  // second path is the likelier one, because the keyboard is doing it by
+  // default. Both groups are required, so both are checked.
+  for (const attribute of [
+    'data-1p-ignore', 'data-lpignore', 'data-bwignore', 'data-form-type',
+    'spellcheck', 'autocapitalize', 'autocorrect',
+  ]) {
     if (!html.includes(attribute)) {
-      problems.push(`seed field is missing ${attribute} — a manager that saves a seed phrase exports the vault`);
+      problems.push(`seed field is missing ${attribute} — a seed phrase must not reach a manager, `
+        + 'a dictionary or a cloud spellchecker');
     }
+  }
+  // D19(в): the page must ask for an INDEPENDENT copy of the checksum before a
+  // seed phrase is typed into it. It is one paragraph of prose and nothing in
+  // the build depended on it, so deleting it broke no test — while removing
+  // precisely the sentence that stops a substituted viewer from being trusted.
+  if (!/Сверьте хеш с независимой копией/.test(html)) {
+    problems.push('artifact does not ask the user to check the hash against an independent copy (D19)');
   }
   if (!/Content-Security-Policy/.test(html) || !/default-src 'none'/.test(html)) {
     problems.push('artifact has no fail-closed Content-Security-Policy');

@@ -129,6 +129,11 @@ describe('size is stated in the units the cap is charged in (D17)', () => {
     const notice = sizeNotice(Math.ceil(BACKUP_CAP_BYTES * BACKUP_NEAR_CAP_FRACTION), false);
     expect(notice.warning).toContain('приближается к пределу');
     expect(notice.overCap).toBe(false);
+    // And it says what «near the ceiling» actually costs — measured, not
+    // guessed (step 13): seconds of frozen interface and about a gigabyte of
+    // peak memory. Learning that by watching a phone kill the tab is the
+    // wrong way to learn it, and the warning exists to prevent exactly that.
+    expect(notice.warning).toContain('на телефоне');
   });
 
   it('an over-cap measurement is over cap even if the NUMBER looks fine', () => {
