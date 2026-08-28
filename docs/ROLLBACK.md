@@ -3,6 +3,15 @@
 Both deploys are **manual** (`workflow_dispatch`) so nothing auto-publishes on
 merge. Reader-before-writer ordering is operator-driven.
 
+> **The worker deploy's interface changed (control plane, D2a).** It is no
+> longer «pick a branch and run it». Dispatch **Deploy Worker (proxy) — dev**
+> **from the default branch** and paste the full 40-character **commit SHA** of
+> the build you want into the `candidate` input. The workflow checks that SHA
+> against the floor before it checks out a single file of it, then deploys it
+> from `candidate/`. See «The floor as a gate» below — including what only the
+> operator can do, and why `wrangler rollback` and the dashboard's Rollback
+> button are out of bounds.
+
 > **Contour reclassified 2026-08-20 (operator decision).**
 > `notes.matamata.dev` is the **working (dev) contour**, not production. The
 > real production will be provisioned **from scratch** on a `.app` domain when
@@ -306,6 +315,118 @@ Every staging command (`deploy:staging`, `deploy:staging:check`) is gated by
 `npm run check:staging-config`, which fails with the checklist above while the
 KV placeholder is still in `wrangler.toml`.
 
+### The floor as a gate, not a discipline (D2a)
+
+Everything above was a rule people had to remember. Since the control-plane PR
+it is checked on the way out: `scripts/check-worker-floor.mjs` runs inside the
+worker deploy and refuses a candidate that is not a descendant of the floor.
+
+**How it is wired, and why exactly this way:**
+
+- the deploy takes the commit as an **input SHA**, not as the ref it runs from,
+  and is dispatched **from the default branch**. A `workflow_dispatch` takes
+  its workflow from the ref it is dispatched with, so a gate living in the
+  deployed code could be edited by the very commit it is meant to judge;
+- the checker and the floor therefore both come from outside the candidate: the
+  script from the default branch, the value from the protected Environment
+  variable `WORKER_FLOOR_SHA`;
+- **the candidate must be reachable from the commit the run itself is on** —
+  i.e. it must be something `main` actually contains. Without that the branch
+  policy is satisfied by the DISPATCH ref while the deployed code comes from
+  anywhere: this job installs and tests the candidate in a runner that holds
+  the Cloudflare token, so «deploy an arbitrary SHA» means «run arbitrary code
+  with the deploy credentials in scope». Ancestry, not equality, so every
+  commit `main` ever contained stays deployable and rollbacks keep working;
+- the candidate is therefore materialized with `git worktree` out of the
+  history already fetched — no second checkout, no network, no credential left
+  behind for it to find — and only AFTER the gate has answered;
+- the checkout uses `fetch-depth: 0`, because ancestry cannot be computed from
+  a shallow clone.
+
+**`WORKER_FLOOR_SHA` is the source of truth; the tag is a label for humans.**
+Tags move. A moved tag would silently lower the floor, so the checker refuses a
+tag name outright rather than resolving it — the variable holds the full
+40-character SHA or nothing.
+
+**An unset variable is a REFUSAL, not «no floor yet».** It is tempting to read
+it the other way, because the SEMANTIC floor (D2a) is raised only just before
+the import flip. But a floor already exists and is recorded above: `worker-r3`
+is ABSOLUTE — every build below it answers 400 to App-Version=4 uploads and
+safebox data exists. A gate that passed with no configured floor would be a
+no-op standing in front of a constraint that already binds.
+
+So the variable is **initialized now**, with the data floor, and the future
+flip is a **raise** rather than a first filling:
+
+| When | `WORKER_FLOOR_SHA` | Why |
+|---|---|---|
+| now, before this workflow is used again | `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`) | the v4-acceptor; below it safebox uploads 400 |
+| before the import flip (D2a) | the semantic-idempotency worker's SHA | the client stops accepting a `txId` without the capability marker |
+
+**What only the operator can do** (no PR can, and none should pretend to):
+
+1. **set `WORKER_FLOOR_SHA`** in the `dev` Environment to
+   `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`). Until this is
+   done the worker deploy refuses to run at all — deliberately: the floor
+   exists whether or not the variable does;
+2. ~~restrict the Environment's **deployment branches** to the default
+   branch~~ — **done** (verified 2026-08-28: policy is branch-only, `main`).
+   That policy, not the guard step inside the workflow, is the real boundary:
+   a branch that wanted to remove the guard would simply remove it;
+3. **forbid administrative bypass** on the Environment — **still open**
+   (verified 2026-08-28: `can_admins_bypass = true`). By default admins may
+   bypass protection rules, and a «hard floor» an admin can wave through is a
+   soft one;
+4. keep to the operational ban above: no dashboard rollback, no bare
+   `wrangler rollback`;
+5. **do not dispatch the next worker deploy until the previous run has
+   finished.** `concurrency` in the workflow prevents overlap and protects a
+   running deploy from being cancelled, but GitHub keeps only one pending run
+   per group and promises nothing about the order queued runs start in. The
+   ordering rule is yours, not the workflow's.
+
+**Rehearsal — on the real workflow, not as a unit test.** The obvious version
+of it («deploy something with no floor, then set the floor and watch the same
+deploy be refused») cannot be run: with the variable unset nothing deploys at
+all, and there is no SHA that both passes without a floor and is blocked by
+`worker-r3` — anything below `worker-r3` is already forbidden. So the rehearsal
+is done in the direction that deploys nothing dangerous:
+
+1. set `WORKER_FLOOR_SHA` to the `worker-r3` SHA above;
+2. dispatch the deploy for **`931949150f6145b6c79d36dbadc66b482c1cb6d1`
+   (`worker-r3`) itself** — it passes the gate (a commit is its own descendant)
+   and genuinely redeploys what is already live.
+   **NOT the head of `main`.** `main` carries 17 worker commits that have never
+   been deployed — the `@noble/ed25519` 2.x→3.1 migration on the upload
+   signature path, PR-2's metrics transport, the global `UPLOADS_ENABLED`
+   switch — so dispatching the head is a RELEASE, with the acceptance checklist
+   below and a release-tag entry, not a rehearsal step;
+3. dispatch it for `cd7524e`'s full SHA (`worker-r2`, below the floor) — the
+   run must stop at the gate, **before** the candidate is materialized, and
+   nothing may reach Cloudflare;
+4. dispatch it for a commit that exists only on an unmerged branch — the run
+   must stop at the same gate, with the «not reachable from the trusted head»
+   message;
+5. dispatch it for an untagged intermediate commit of a merged PR — refused
+   too: only the head of `main` and tagged commits are deployable, because every
+   mid-review state is also an ancestor of `main` and none of them was ever
+   judged as deployable;
+6. record all five run ids here.
+
+**When the floor is later raised** (before the import flip), the order matters:
+deploy the semantic worker first and verify `/health` reports
+`semanticIdempotency: 1`, and only then raise the variable to that SHA. Raising
+it first would leave nothing deployable — the live worker would already be
+below the new floor.
+
+**Two floors, and they are enforced by different things.** The worker floor is
+this gate. The CLIENT floor is `DB_VERSION`: today `client-r4` (IndexedDB v2);
+when the backup track's first release ships as `client-b1` it raises
+`DB_VERSION` to 3, and rolling the client below that tag stops being possible
+rather than merely forbidden — an older build meets a newer database and shows
+the non-destructive «update the app» screen. Until `client-b1` exists, the
+client floor in force is still `client-r4`.
+
 ## Rollback rules
 
 - **Never roll back below the reader release R** once v2 writes are enabled: an
@@ -341,9 +462,15 @@ KV placeholder is still in `wrangler.toml`.
     floor. **The floor is now absolute:** `worker-r2` and below 400 every
     App-Version=4 upload and would silently stop safebox sync.
   - **Allowed rollback targets = tags in this list that are descendants of
-    `WORKER_FLOOR_TAG`** (verify with `git merge-base --is-ancestor`). Never
-    deploy anything else once the floor Worker has run even once.
-  - Use `wrangler rollback` / redeploy of an allowed tag only.
+    the floor** (`git merge-base --is-ancestor`). Never deploy anything else
+    once the floor Worker has run even once.
+  - **The deploy workflow now checks this itself — see «The floor as a gate»
+    below.** Two consequences, and both are operational rather than technical:
+    a rollback goes through that workflow with the target's SHA, and
+    `wrangler rollback` / the Cloudflare dashboard's «Rollback» button are
+    **not to be used**. No repository script can intercept those two paths;
+    they bypass the gate entirely, and they are exactly what a person reaches
+    for at 2 a.m.
   - Allowed release tags (append on each deploy):
     - worker-r1 — 15b87d4cacbc19a3371a19b9141f1562b63781d8 (2026-07-23, first
       production worker deploy; recovery-protocol writer)

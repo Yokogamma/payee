@@ -21,6 +21,7 @@ provisioned» until then.
 | `CF_ANALYTICS_TOKEN` | secret | worker: `/admin/metrics` upstream (Analytics Engine SQL API) | **honestly wider than one dataset:** the `Account → Account Analytics → Read` scope cannot be narrowed — the token reads analytics of the WHOLE account. Still read-only |
 | `CLOUDFLARE_API_TOKEN` | secret, **top category (transitively)** | GitHub Actions (Environment `dev`) | **equals the radius of `ARWEAVE_JWK`.** Deploy rights = the right to read every worker secret: an attacker deploys code that returns `env.ARWEAVE_JWK`, `env.RECOVERY_HMAC_SECRET`, `env.ADMIN_SECRET` — and, after PR-2, `env.METRICS_ADMIN_SECRET` and `env.CF_ANALYTICS_TOKEN` — on the first request. Money + forged recovery tokens + invite issuance + admin metrics + account-wide Analytics Read; with a shared Cloudflare account — in BOTH contours |
 | `CLOUDFLARE_ACCOUNT_ID` | identifier → Environment variable | GitHub Actions | harmless |
+| `WORKER_FLOOR_SHA` | **non-secret config** → Environment variable in `dev`, protected | GitHub Actions: `scripts/check-worker-floor.mjs` in the worker deploy | not a secret at all — it is a public commit SHA. What matters is its INTEGRITY and who may change it: clearing or lowering it re-opens a worker rollback below the version released clients depend on, and that rollback is silent (a historical `txId` handed out for bytes that have since changed). Empty is a legitimate state — see docs/ROLLBACK.md — and the gate says so out loud rather than passing quietly |
 | `CF_PAGES_PROJECT` | config → Environment variable | GitHub Actions | deploy to the wrong project |
 | `VITE_PROXY_URL` | config → Environment variable | client build | pinned in CSP; also repo-pinned (scripts/check-deploy-config.mjs) |
 | `VITE_TRUSTED_OWNERS` | config, **integrity-critical** → Environment variable | client build | trusting a stranger's transactions; repo-pinned inclusion check |
@@ -41,7 +42,7 @@ Names and pointers only — no values.
 | Durable Objects | `RateLimiter`, `InviteManager`, `IpRateLimiter` | same classes, fresh instances |
 | Pages project | `eternal-notes` | not provisioned (separate project) |
 | Client domain | `notes.matamata.dev` | `.app` domain, name TBD at launch |
-| GitHub Environment | `dev` (branch policy: `main`; 4 variables + token secret) | `production` (required reviewers + branch policy — §2.1) |
+| GitHub Environment | `dev` (branch policy: `main`; 5 variables + token secret) | `production` (required reviewers + branch policy — §2.1) |
 | Cloudflare token scope | `Workers Scripts: Edit`, `Cloudflare Pages: Edit` (account-level — no per-resource granularity exists) | separate token; **separate account is the provisioning gate** (§2.1) |
 | Staging worker | `eternal-notes-proxy-staging` — **not deployed** (KV placeholder in wrangler.toml) | n/a |
 
