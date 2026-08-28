@@ -225,6 +225,11 @@ export async function verifyBackupFile(
       deps.keys,
       kind,
       record as EncryptedNote | EncryptedSafeboxEntry,
+      // Between the two halves of a safebox entry as well as around the pair:
+      // the guard below runs once per RECORD, and a container can hold
+      // thousands, so «once per record» is not «promptly» for the half that
+      // decrypts passwords and attachment bytes (D15).
+      deps.assertAlive,
     );
     if (verdict.state === 'readable') nodes.push({ kind, id: verdict.id, ...verdict.topology });
     else issues.push({ kind, id: verdict.id, problem: PROBLEM_OF[verdict.state] });

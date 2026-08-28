@@ -140,3 +140,43 @@ describe('there is ONE definition of a well-formed record', () => {
     expect(code).not.toMatch(/\.length\s*[<>=]|byteLength/);
   });
 });
+
+describe('cancellation on the FILE path (D15)', () => {
+  const cancel = () => { const e = new Error('gone'); e.name = 'BackupCancelledError'; return e; };
+
+  it('is checked between the two halves of a safebox entry', async () => {
+    // The secret half is the password and the attachment bytes. An operation
+    // the user has already abandoned has no reason to materialize them, and
+    // «once per record» is not promptly when a container holds thousands.
+    const entry = await makeEntry();
+    let calls = 0;
+    const boom = cancel();
+
+    await expect(classifyBackupRecord(await vaultKeys(), 'safebox', entry, () => {
+      calls += 1;
+      throw boom;
+    })).rejects.toBe(boom);
+
+    expect(calls).toBe(1);
+  });
+
+  it('re-throws cancellation instead of calling the record damaged', async () => {
+    // Swallowed by the per-record catch, «you left the page» would come back
+    // out as a verdict about the user's data — and the merge rules would act
+    // on it.
+    const entry = await makeEntry();
+    for (const name of ['BackupCancelledError', 'AbortError']) {
+      const boom = new Error('cancelled');
+      boom.name = name;
+      await expect(classifyBackupRecord(await vaultKeys(), 'safebox', entry, () => { throw boom; }))
+        .rejects.toBe(boom);
+    }
+  });
+
+  it('a genuinely unreadable entry is still damaged — the escape is narrow', async () => {
+    const entry = await makeEntry();
+    const broken = { ...entry, secretCiphertext: `${entry.secretCiphertext.slice(0, -4)}AAAA` };
+
+    expect((await classifyBackupRecord(await vaultKeys(), 'safebox', broken)).state).toBe('damaged');
+  });
+});
