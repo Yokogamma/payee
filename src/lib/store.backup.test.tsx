@@ -316,6 +316,34 @@ describe('an operation belongs to the vault that started it (D15)', () => {
     expect(winner.report.ok).toBe(true);
   });
 
+  it('a lock releases an operation that is WAITING, not only one that is working', async () => {
+    // The epoch stops the next `assertAlive` — but a tab queued behind another
+    // tab's Web Lock has no next check to reach until its turn comes, and that
+    // turn may be a 30 MB import away. Locking the app has to release the
+    // queue slot too, and say so by name rather than as a bare platform
+    // AbortError the UI would render as «не удалось выполнить действие».
+    await openMain();
+    const { file, note } = await containerWith('WAITING-WHEN-LOCKED');
+    const prepared = await act(async () => store.prepareBackupImport(file));
+
+    let release!: () => void;
+    let requested!: () => void;
+    const waiting = new Promise<void>(r => { requested = r; });
+    const seen = installLocks(new Promise<void>(r => { release = r; }), () => requested());
+
+    const pending = prepared.apply();
+    const settled = expect(pending).rejects.toBeInstanceOf(BackupCancelledError);
+    await act(async () => {
+      await waiting;
+      store.lockApp();
+      release();
+      await settled;
+    });
+
+    expect(seen[0].signal?.aborted).toBe(true);
+    expect(await getNoteById(note.noteId)).toBeUndefined();
+  });
+
   it('stops WAITING for another tab, not only working', async () => {
     // The wait can be long — another tab may be importing 30 MB — and a tab
     // that has gone away must stop queueing for a turn it no longer wants.

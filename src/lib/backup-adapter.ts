@@ -59,6 +59,7 @@ import {
   inspectBackupFile,
   type BackupActionDeps,
   type BackupArtifactRef,
+  type BackupVaultKeys,
   type BackupFileLike,
   type ExportedBackup,
   type InspectedRecord,
@@ -67,15 +68,8 @@ import {
 import { classifyLocalPayload } from './backup-classify';
 import { planBackupImport, type ImportPlan, type PlanInput } from './backup-plan';
 import { applyBackupImport as runStageB, type ImportReport } from './backup-import';
-import { deriveBackupKey, expectedContainerBytes, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
-import {
-  deriveKey,
-  deriveSafeboxMetaKey,
-  deriveSafeboxSecretKey,
-  sha256Hex,
-  type EncryptedNote,
-  type EncryptedSafeboxEntry,
-} from './crypto';
+import { expectedContainerBytes, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
+import { sha256Hex, type EncryptedNote, type EncryptedSafeboxEntry } from './crypto';
 import {
   estimateBackupPlaintextBytes,
   getMeta,
@@ -148,7 +142,23 @@ export class BackupLockUnavailableError extends Error {
  * database generation and the operation token together.
  */
 export interface BackupVault {
-  mnemonic: string;
+  /**
+   * Derive the four container keys — a CALLBACK, not the seed phrase.
+   *
+   * The difference matters because a prepared import outlives the moment it
+   * was created: stage A and stage B are separated by a human decision, and a
+   * session holding `mnemonic: string` would keep the seed reachable from
+   * React state for as long as the preview is on screen — through a lock,
+   * through `pagehide`, past the store's own synchronous wipe of every vault
+   * ref. That wipe is the app's actual guarantee about the seed, and one copy
+   * outside it is one too many.
+   *
+   * The store reads its own ref at call time and refuses when it is gone, so
+   * the seed lives in exactly one place. What travels instead is
+   * `CryptoKey`s, imported non-extractable (`crypto.ts`) — opaque handles the
+   * page cannot read back out.
+   */
+  deriveKeys(): Promise<BackupVaultKeys>;
   dbGeneration: number;
   /** Epoch, database generation and the operation token — and it THROWS. */
   assertAlive(): void;
@@ -212,26 +222,42 @@ export interface VerifyOutcome {
 export async function withImportLock<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
   if (!locks) throw new BackupLockUnavailableError();
-  return locks.request(
-    'eternal-notes-backup-import',
-    signal ? { mode: 'exclusive', signal } : { mode: 'exclusive' },
-    run,
-  ) as Promise<T>;
+  try {
+    return await locks.request(
+      'eternal-notes-backup-import',
+      signal ? { mode: 'exclusive', signal } : { mode: 'exclusive' },
+      run,
+    ) as T;
+  } catch (error) {
+    // An aborted WAIT comes back as a bare `AbortError` from the platform,
+    // which carries no hint that this app cancelled it on purpose — the UI
+    // would show «не удалось выполнить действие» for an ordinary page hide.
+    // Renamed here, at the only place that knows the abort was ours.
+    if (error instanceof Error && error.name === 'AbortError' && signal?.aborted) {
+      throw new BackupCancelledError('Ожидание другой вкладки прервано — операция отменена.');
+    }
+    throw error;
+  }
 }
 
-async function vaultKeys(mnemonic: string): Promise<BackupActionDeps['keys']> {
-  return {
-    note: await deriveKey(mnemonic),
-    safeboxMeta: await deriveSafeboxMetaKey(mnemonic),
-    safeboxSecret: await deriveSafeboxSecretKey(mnemonic),
-    container: await deriveBackupKey(mnemonic),
-  };
+/**
+ * Four derivations, four `await`s — and a guard after each (D15).
+ *
+ * Argon2-grade work, four times over, is not instant on a phone, and it is
+ * the FIRST thing every backup operation does. Without the guards a lock or a
+ * page hide during derivation is noticed only afterwards, by which time the
+ * operation has already spent the time and holds the keys.
+ */
+async function vaultKeys(vault: BackupVault): Promise<BackupVaultKeys> {
+  const keys = await vault.deriveKeys();
+  vault.assertAlive();
+  return keys;
 }
 
 async function actionDeps(vault: BackupVault, storage: BackupStorage): Promise<BackupActionDeps> {
   return {
     now: vault.now,
-    keys: await vaultKeys(vault.mnemonic),
+    keys: await vaultKeys(vault),
     readSnapshot: storage.readSnapshot,
     sha256Hex,
     assertAlive: vault.assertAlive,
@@ -309,11 +335,44 @@ export async function readBackupFreshness(
   storage: BackupStorage = liveStorage,
 ): Promise<BackupFreshness> {
   const [lastExport, lastVerified] = await Promise.all([
-    storage.readMeta<BackupArtifactMarker>(LAST_EXPORT_ARTIFACT_KEY),
-    storage.readMeta<BackupArtifactMarker>(LAST_VERIFIED_ARTIFACT_KEY),
+    storage.readMeta<unknown>(LAST_EXPORT_ARTIFACT_KEY),
+    storage.readMeta<unknown>(LAST_VERIFIED_ARTIFACT_KEY),
   ]);
-  return { lastExport, lastVerified };
+  const clean = { lastExport: sanitizeMarker(lastExport), lastVerified: sanitizeMarker(lastVerified) };
+  // Something was there and did not survive inspection. Reporting that as
+  // «nothing was ever exported» would answer a question this read cannot
+  // answer, so the UI is told it does not know.
+  const unreadable = (lastExport !== undefined && clean.lastExport === undefined)
+    || (lastVerified !== undefined && clean.lastVerified === undefined);
+  return unreadable ? { ...clean, unreadable } : clean;
 }
+
+/**
+ * A stored marker, believed only if it still looks like one.
+ *
+ * `getMeta<T>` is an ASSERTION, not a check — it casts whatever IndexedDB
+ * hands back. Trusting it here was fail-OPEN in the one place that must not
+ * be: two half-written records, or two `{}`, give `undefined === undefined`
+ * when the chip compares digests, and the block then says «этот экспорт
+ * проверен» about a file nobody ever checked. That sentence is the one a user
+ * relies on before deleting an original, so it has to be earned by data that
+ * survives inspection.
+ *
+ * Hence: a plain object, a digest of exactly 64 hex characters, and finite
+ * non-negative timestamps. Anything else is not a weaker marker, it is not a
+ * marker — and `undefined` reads as «nothing is known», which is the only safe
+ * reading of a value we cannot vouch for.
+ */
+function sanitizeMarker(raw: unknown): BackupArtifactMarker | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const { createdAt, sha256, at } = raw as Record<string, unknown>;
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) return undefined;
+  if (!isTimestamp(createdAt) || !isTimestamp(at)) return undefined;
+  return { createdAt, sha256, at };
+}
+
+const isTimestamp = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
 
 export interface BackupSizeReport {
   /** In the units the cap is charged in: the FINAL file size (D17). */
@@ -363,6 +422,18 @@ export class PreparedImport {
   readonly #vault: BackupVault;
   readonly #plan: ImportPlan;
   readonly #storage: BackupStorage;
+  /**
+   * «Was the FILE itself made by a partial restore» — read once, at
+   * construction, and frozen.
+   *
+   * `report` is public because the preview needs it, and public means
+   * mutable: a caller that edited `report.incompleteRestore` between the two
+   * stages would change what stage B writes to the completeness marker. The
+   * marker is the reason a user keeps or deletes the original file, so the
+   * answer is taken from the report the verdict was formed from and never
+   * read again.
+   */
+  readonly #fileIsComplete: boolean;
 
   constructor(init: {
     report: VerifyReport;
@@ -371,6 +442,7 @@ export class PreparedImport {
     storage: BackupStorage;
   }) {
     this.report = init.report;
+    this.#fileIsComplete = !init.report.incompleteRestore;
     this.#vault = init.vault;
     this.#plan = init.plan;
     this.#storage = init.storage;
@@ -395,8 +467,10 @@ export class PreparedImport {
     // one in front of us. A lock, a reset or a page hide moved one of the
     // three numbers, and none of them is recoverable by trying harder.
     vault.assertAlive();
-    const keys = await vaultKeys(vault.mnemonic);
-    vault.assertAlive();
+    // Derived HERE, at apply time, from the store's own live reference — the
+    // session never carried the seed, so a vault that has since been locked
+    // cannot produce keys at all.
+    const keys = await vaultKeys(vault);
 
     return runStageB(
       {
@@ -440,7 +514,7 @@ export class PreparedImport {
         withExclusiveLock: run => withImportLock(run, vault.signal),
       },
       this.#plan,
-      !this.report.incompleteRestore,
+      this.#fileIsComplete,
     );
   }
 }

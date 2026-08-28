@@ -163,6 +163,18 @@ describe('export', () => {
     );
   });
 
+  it('says the file was HANDED OVER, not that it was saved', async () => {
+    // `<a download>.click()` starts a download and reports nothing about how
+    // it ended. «Файл сохранён» is the app asserting something only the
+    // browser knows — and it is simply false for a download the user
+    // cancelled or a disk that filled up during it.
+    await open();
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Скачать резервную копию' })); });
+
+    expect(screen.getByText(/передан браузеру/)).toBeTruthy();
+    expect(screen.queryByText(/Файл сохранён/)).toBeNull();
+  });
+
   it('a marker that could not be written does NOT read as a failed export', async () => {
     // The moment this feature exists for is also the moment storage is most
     // likely to be full. The file is the result; the note about it is not.
@@ -176,7 +188,7 @@ describe('export', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Скачать резервную копию' })); });
 
     expect(saveText).toHaveBeenCalledWith('C', 'f.json', 'application/json');
-    expect(screen.getByText(/Файл сохранён, но отметку о нём записать не удалось/)).toBeTruthy();
+    expect(screen.getByText(/отметку о нём записать не удалось/)).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
   });
 

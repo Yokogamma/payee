@@ -24,6 +24,18 @@ export const BACKUP_VIEWER_PATH = 'backup-viewer';
 
 export const BACKUP_VIEWER_FILE_NAME = 'eternal-notes-backup-viewer.html';
 
+/**
+ * Refuse a body larger than the viewer could possibly be, BEFORE reading it.
+ *
+ * The digest check is the wrong place to discover that the response is a
+ * gigabyte: by then it is a string in memory. The build enforces a 300 KB
+ * ceiling on the artifact (`VIEWER_MAX_BYTES`), so anything past a generous
+ * multiple of that is not a viewer whatever its hash would have been — and
+ * the case this guards is precisely the one where the origin is not to be
+ * trusted.
+ */
+export const MAX_VIEWER_RESPONSE_BYTES = 1024 * 1024;
+
 export type ViewerDeliveryFailure =
   /** The constant is still the clean-checkout placeholder. */
   | 'not_built'
@@ -70,7 +82,17 @@ export async function fetchBackupViewer(deps: ViewerDeliveryDeps): Promise<Deliv
   try {
     const response = await deps.fetch(`${deps.baseUrl}${BACKUP_VIEWER_PATH}`, { cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    // Cheap and advisory — a hostile server can lie or omit it — so the real
+    // bound is applied to the bytes themselves below. This only avoids
+    // downloading what we already know we will refuse.
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > MAX_VIEWER_RESPONSE_BYTES) {
+      throw new Error(`declared ${declared} bytes`);
+    }
     text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_VIEWER_RESPONSE_BYTES) {
+      throw new Error('response is larger than any viewer this build could have produced');
+    }
   } catch (error) {
     throw new ViewerDeliveryError(
       'unavailable',

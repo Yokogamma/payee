@@ -132,7 +132,22 @@ const QUARANTINE_TXID_NOOP = new RegExp(
  * documented way through: state the rule as a denial, or do not state it.
  */
 const NEGATED = /(?<!\p{L})(?:не|нет|not|never|no longer|вместо|rather than)(?!\p{L})/iu;
-const isDenial = (match: string) => NEGATED.test(match);
+
+/**
+ * A denial has a negator OUTSIDE the verdict it denies — and the first version
+ * of this predicate did not check that.
+ *
+ * The banned phrasings contain their own «не»: «карантин с txId ничего не
+ * меняет» is the formula itself, positively asserted, and a bare search for a
+ * negator anywhere in the span forgave it. That is a false NEGATIVE in a guard
+ * whose entire job is to fire — the worst kind, because it is invisible until
+ * the day the formula comes back.
+ *
+ * So the verdict is removed from the span first. What is left is the subject
+ * («карантин с txId …»), and a negator surviving there is a real denial:
+ * «карантин с txId — это НЕ no-op».
+ */
+const isDenial = (match: string) => NEGATED.test(match.replace(new RegExp(DOES_NOTHING, 'giu'), ' '));
 
 /**
  * …and the second escape, which the first version of this guard lacked and
@@ -225,16 +240,35 @@ describe('the retired «quarantined + txId» formula stays out of the tree', () 
     expect(scanText('x.ts', bannedFormulas[1], QUARANTINE_TXID_NOOP, allowedFormula)).toHaveLength(1);
   });
 
+  it('a positive statement is NOT excused by the «не» inside its own verdict', () => {
+    // The false negative this closes. Every Russian «does nothing» phrasing
+    // carries a «не» — «ничего не меняет», «ничего не пишет» — so a negator
+    // search over the whole span forgave the formula in its most natural
+    // wording, and the guard was quietly asleep.
+    // Assembled, never written out: spelled contiguously these would sit in
+    // this file forever and the tree scan would report them — the same trap
+    // the banned formulas above are built from fragments to avoid.
+    const subject = `${POISON_RU[1]}txId `;
+    const positives = ['ничего не меняет', 'ничего не пишет', 'ничего не происходит']
+      .map(verdict => `${subject}${verdict}`);
+    for (const line of positives) {
+      expect(scanText('x.ts', line, QUARANTINE_TXID_NOOP, allowedFormula), line).toHaveLength(1);
+    }
+  });
+
   it('the correct rule may still be stated as a denial', () => {
     // Named explicitly so the escape hatch is a decision, not an accident: the
     // reason the formula is banned has to be sayable in the file that bans it.
     const denials = [
       'карантин с txId — это НЕ no-op: решение принимает таблица D5a',
+      'карантин с txId — не тот случай, когда ничего не меняется',
       'a quarantined row that carries a txId is not a no-op',
     ];
     for (const line of denials) expect(scanText('x.ts', line, QUARANTINE_TXID_NOOP, allowedFormula)).toEqual([]);
     // But only because of the denial — strip it and the same sentence is a hit.
-    expect(scanText('x.ts', denials[1].replace(' not', ''), QUARANTINE_TXID_NOOP, allowedFormula)).toHaveLength(1);
+    const english = denials.find(d => d.includes(' not '))!;
+    expect(scanText('x.ts', english.replace(' not', ''), QUARANTINE_TXID_NOOP, allowedFormula))
+      .toHaveLength(1);
   });
 
   it('the merge rules cannot consult a txId: outside their comments they never name one', () => {
