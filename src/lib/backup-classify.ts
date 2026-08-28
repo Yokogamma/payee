@@ -96,10 +96,15 @@ export async function classifyBackupRecord(
   keys: BackupRecordKeys,
   kind: BackupRecordKind,
   record: EncryptedNote | EncryptedSafeboxEntry,
+  /** Checked BETWEEN the two halves of a safebox entry — the same contract
+   *  `classifyLocalPayload` has, and for the same reason: the secret half is
+   *  the password and the attachment bytes, and a cancelled operation has no
+   *  business materializing them. Throws (D15). */
+  assertAlive: () => void = () => {},
 ): Promise<ClassifiedBackupRecord> {
   return kind === 'note'
     ? classifyNote(keys, record as EncryptedNote)
-    : classifyEntry(keys, record as EncryptedSafeboxEntry);
+    : classifyEntry(keys, record as EncryptedSafeboxEntry, assertAlive);
 }
 
 async function classifyNote(
@@ -128,12 +133,14 @@ async function classifyNote(
 async function classifyEntry(
   keys: BackupRecordKeys,
   entry: EncryptedSafeboxEntry,
+  assertAlive: () => void,
 ): Promise<ClassifiedBackupRecord> {
   const id = String(entry.entryId);
   if (!passesUploadShape('safebox', entry)) return { kind: 'safebox', id, state: 'malformed' };
   if (isOpaqueEntry(entry)) return { kind: 'safebox', id, state: 'unsupported' };
   try {
     const meta = await decryptSafeboxMeta(keys.safeboxMeta, entry);
+    assertAlive();
     // BOTH halves, always. A container whose meta opens and whose secret does
     // not restores an entry with no password in it — and the user would find
     // that out at the worst possible time.
@@ -144,9 +151,24 @@ async function classifyEntry(
       state: 'readable',
       topology: { root: meta.root, rev: meta.rev, prev: meta.prev },
     };
-  } catch {
+  } catch (error) {
+    // A cancelled operation is not a damaged record: swallowed here, «you left
+    // the page» would come back out as a verdict about the user's data, and
+    // the merge rules would act on it.
+    if (isCancellation(error)) throw error;
     return { kind: 'safebox', id, state: 'damaged' };
   }
+}
+
+/**
+ * Is this the operation being cancelled rather than a record being broken?
+ *
+ * Matched by NAME rather than by class: this module stays free of store
+ * imports, and that is what keeps it testable without an app around it.
+ */
+function isCancellation(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === 'AbortError' || error.name === 'BackupCancelledError';
 }
 
 /** The upload path's own barrier, asked as a question. Total by construction:
