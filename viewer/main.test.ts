@@ -572,3 +572,207 @@ describe('the blocking warning is actually delivered', () => {
     expect($('view-warnings').childElementCount).toBe(0);
   });
 });
+
+describe('«current» is a claim, and it is not always available', () => {
+  async function entryVersions(): Promise<[EncryptedSafeboxEntry, EncryptedSafeboxEntry]> {
+    const metaKey = await deriveSafeboxMetaKey(MNEMONIC);
+    const secretKey = await deriveSafeboxSecretKey(MNEMONIC);
+    const first = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '',
+      password: 'OLD-PASSWORD-THAT-NO-LONGER-WORKS', files: [], rev: 1,
+    });
+    const second = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: SECRETS.title, login: '', url: '', note: '',
+      password: SECRETS.password, files: [], rev: 2, root: first.entryId, prev: first.entryId,
+    });
+    return [first, second];
+  }
+
+  it('an UNREADABLE successor makes the readable predecessor «last readable», not «current»', async () => {
+    // The sharp case: rev 1 holds a password that was replaced, rev 2 holds the
+    // live one and was written by a build this viewer does not understand. Its
+    // topology is inside the ciphertext, so nothing can attribute it to this
+    // chain — and grouping over what is left will call the old password
+    // current, with no second card to hint otherwise.
+    const [first, second] = await entryVersions();
+    const opaqueSuccessor = { ...second, v: 9 } as unknown as EncryptedSafeboxEntry;
+    selectFile(await container({
+      safebox: [first, opaqueSuccessor],
+      containsUnsupportedRecords: true,
+    }));
+
+    await clickOpen();
+
+    expect($('view-warnings').textContent).toContain('нельзя считать самой новой');
+    expect($('safebox').textContent).toContain('мог быть уже заменён');
+  });
+
+  it('a DAMAGED successor says the same thing — the reason differs, the doubt does not', async () => {
+    const [first, second] = await entryVersions();
+    const damagedSuccessor = {
+      ...second, secretCiphertext: `${second.secretCiphertext.slice(0, -4)}AAAA`,
+    };
+    selectFile(await container({ safebox: [first, damagedSuccessor] }));
+
+    await clickOpen();
+
+    expect($('view-warnings').textContent).toContain('нельзя считать самой новой');
+  });
+
+  it('the doubt travels into the file the user saves', async () => {
+    // A warning on screen does not follow the file to wherever it is read.
+    const [first, second] = await entryVersions();
+    selectFile(await container({
+      safebox: [first, { ...second, v: 9 } as unknown as EncryptedSafeboxEntry],
+      containsUnsupportedRecords: true,
+    }));
+    await clickOpen();
+
+    const ask = vi.mocked(globalThis.confirm);
+    ask.mockClear();
+    ask.mockReturnValue(false);
+    $('export-secrets').click();
+
+    expect(String(ask.mock.calls[0][0])).toContain('НЕ самой новой версией');
+  });
+
+  it('an unreadable NOTE does not cast doubt on the safebox', async () => {
+    // The two collections are judged apart: an id space this record cannot
+    // belong to is not a reason to distrust the password.
+    // A whole, self-contained safebox entry — `entryVersions()[1]` would not do:
+    // its predecessor is absent from this container, and the graph check would
+    // (correctly) doubt it for that reason instead of the one under test.
+    const opaqueNote = { ...(await makeNote()), v: 9 } as unknown as EncryptedNote;
+    selectFile(await container({
+      notes: [opaqueNote], safebox: [await makeEntry()], containsUnsupportedRecords: true,
+    }));
+
+    await clickOpen();
+
+    expect($('notes').textContent).toContain('не обязательно самая новая');
+    expect($('safebox').textContent).not.toContain('мог быть уже заменён');
+  });
+
+  it('a fully readable but BROKEN chain graph is not silently resolved', async () => {
+    // Grouping ignores `prev` by design, so it will pick a «newest» out of a
+    // chain whose links do not hold up. The dry-run refuses to call such a
+    // container healthy; the viewer must not quietly out-rank it.
+    const key = await deriveKey(MNEMONIC);
+    const first = await encryptEnvelopeV3(key, 'the ORIGINAL text', { fmt: 'plain', rev: 1 });
+    const third = await encryptEnvelopeV3(key, SECRETS.noteText, {
+      fmt: 'plain', rev: 3, root: first.noteId, prev: first.noteId, // rev 2 never existed
+    });
+    selectFile(await container({ notes: [first, third] }));
+
+    await clickOpen();
+
+    expect($('view-warnings').textContent).toContain('связи между версиями');
+    expect($('notes').textContent).toContain('не обязательно самая новая');
+  });
+
+  it('an ordinary container claims currentness without a caveat', async () => {
+    selectFile(await container({ notes: [await makeNote()], safebox: [await makeEntry()] }));
+    await clickOpen();
+
+    expect($('view-warnings').textContent ?? '').not.toContain('нельзя считать');
+    expect($('notes').textContent).not.toContain('не обязательно самая новая');
+    expect($('safebox').textContent).not.toContain('мог быть уже заменён');
+  });
+});
+
+describe('the page stops working the moment it is closed, not at the next checkpoint', () => {
+  /** Fire `pagehide` when the Nth decryption is REQUESTED, which is the only
+   *  way to land a teardown between two specific awaits. */
+  function closeOnDecrypt(nth: number): { calls: () => number } {
+    const real = crypto.subtle.decrypt.bind(crypto.subtle);
+    let calls = 0;
+    vi.spyOn(crypto.subtle, 'decrypt').mockImplementation(((...args: unknown[]) => {
+      calls++;
+      if (calls === nth) window.dispatchEvent(new Event('pagehide'));
+      return (real as (...a: unknown[]) => Promise<ArrayBuffer>)(...args);
+    }) as typeof crypto.subtle.decrypt);
+    return { calls: () => calls };
+  }
+
+  it('a teardown while the file is being read stops it before the first decryption', async () => {
+    const text = await container({ notes: [await makeNote()] });
+    const decrypt = vi.spyOn(crypto.subtle, 'decrypt');
+    Object.defineProperty($('file'), 'files', {
+      value: [{
+        size: 100,
+        text: async () => { window.dispatchEvent(new Event('pagehide')); return text; },
+      }],
+      configurable: true,
+    });
+
+    $<HTMLTextAreaElement>('seed').value = MNEMONIC;
+    $<HTMLButtonElement>('open').click();
+    await settle();
+
+    // Not one byte of the container was authenticated, let alone decrypted.
+    expect(decrypt).not.toHaveBeenCalled();
+    expect($('view').hidden).toBe(true);
+  });
+
+  it('a teardown between the two halves of a safebox entry stops before the SECRET half', async () => {
+    // The secret half is the password and the attachment bytes. There is no
+    // reason to materialize them for a page nobody is looking at.
+    selectFile(await container({ safebox: [await makeEntry()] }));
+    const spy = closeOnDecrypt(2); // 1 = the container, 2 = the meta half
+
+    $<HTMLTextAreaElement>('seed').value = MNEMONIC;
+    $<HTMLButtonElement>('open').click();
+    await settle();
+
+    expect(spy.calls()).toBe(2);
+    expect($('view').hidden).toBe(true);
+  });
+
+  it('a closed page is never reported as a damaged record', async () => {
+    // The checkpoint sits inside the per-record try/catch. Swallowed there, it
+    // would keep the loop running AND turn «you left» into «your backup is
+    // damaged» — a verdict about the file, from an event that had nothing to
+    // do with it.
+    selectFile(await container({ safebox: [await makeEntry()] }));
+    closeOnDecrypt(2);
+
+    $<HTMLTextAreaElement>('seed').value = MNEMONIC;
+    $<HTMLButtonElement>('open').click();
+    await settle();
+
+    expect(status()).toBe('');
+    expect(document.body.textContent).not.toContain('Повреждённых записей');
+  });
+});
+
+describe('two opens at once', () => {
+  it('the newer one wins, even when the older finishes last', async () => {
+    // Two clicks — a corrected phrase, a different file — and key derivation
+    // does not run at a fixed speed. Without a generation the first result
+    // lands on top of the second, showing one file under the impression of
+    // having opened the other.
+    const textA = await container({ notes: [await makeNote('FIRST-FILE-CONTENT')] });
+    const textB = await container({ notes: [await makeNote('SECOND-FILE-CONTENT')] });
+
+    let releaseA!: () => void;
+    const slowRead = new Promise<string>(resolve => { releaseA = () => { resolve(textA); }; });
+    Object.defineProperty($('file'), 'files', {
+      value: [{ size: 100, text: () => slowRead }],
+      configurable: true,
+    });
+
+    $<HTMLTextAreaElement>('seed').value = MNEMONIC;
+    $<HTMLButtonElement>('open').click();   // A starts, and blocks on the read
+
+    selectFile(textB);
+    $<HTMLButtonElement>('open').click();   // B starts and runs to completion
+    await settle();
+    expect($('notes').textContent).toContain('SECOND-FILE-CONTENT');
+
+    releaseA();                             // ...and only now does A come back
+    await settle();
+
+    expect($('notes').textContent).toContain('SECOND-FILE-CONTENT');
+    expect($('notes').textContent).not.toContain('FIRST-FILE-CONTENT');
+  });
+});
