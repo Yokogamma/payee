@@ -89,9 +89,6 @@ jobs:
           # out of the history fetched here, via `git worktree`. A credential
           # left in the config would only be there for candidate code to find.
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: .nvmrc
       # A guard rail, not a boundary — see the header. It catches the honest
       # mistake (dispatching from a feature branch out of habit); the real
       # restriction is the Environment's deployment branch policy.
@@ -135,6 +132,16 @@ jobs:
         run: git worktree add --detach candidate "$CANDIDATE"
         env:
           CANDIDATE: ${{ inputs.candidate }}
+      # The CANDIDATE's Node, not this branch's. `npm ci` runs inside
+      # `candidate/` and enforces the candidate's `engines` under
+      # `engine-strict`, so a rollback to a commit that predates a Node bump
+      # would fail at install time with a message about versions — in exactly
+      # the situation where a rollback is what is needed, and where both other
+      # ways out are now banned. `.nvmrc` is data, and the gate has already
+      # proved this commit is one the default branch contains.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: candidate/.nvmrc
       # ROOT deps are needed by the worker TEST suite since #104:
       # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
       # which resolves @scure/bip39 from the root node_modules (in ci.yml the

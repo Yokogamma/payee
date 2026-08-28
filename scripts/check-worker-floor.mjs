@@ -41,10 +41,27 @@
  * A rollback has to remain possible, and a rollback deploys an OLD commit —
  * one that is in main's history but is not its head. So the boundary is
  * ancestry again, in the other direction: `candidate` must be an ancestor of
- * the trusted head. That admits every commit main ever contained and nothing
- * else. An unmerged branch, a fork, a commit pushed and then force-removed:
- * all refused, because none of them is reachable from the branch the
- * protection rules actually guard.
+ * the trusted head. An unmerged branch, a fork, a commit pushed and then
+ * force-removed: all refused, because none of them is reachable from the
+ * branch the protection rules actually guard.
+ *
+ * Ancestry alone is still wider than it looks. This repository merges pull
+ * requests with merge commits, so EVERY intermediate commit of every merged
+ * branch is an ancestor of main — including states that existed only mid-review
+ * and were never a state of main. Those were never judged as deployable.
+ *
+ * The obvious narrowing — «must be on main's first-parent chain» — is wrong
+ * HERE, and checking beats assuming: `worker-r3`, the floor and the currently
+ * live worker, is a PR-branch tip and is NOT on that chain. A gate that refuses
+ * its own floor is broken.
+ *
+ * So the rule follows the practice the runbook already prescribes («allowed
+ * rollback targets = tags in this list»; «append the release tag on each
+ * deploy»): the candidate must be reachable from the trusted head AND be
+ * either that head itself or a TAGGED commit. Deploying the newest thing and
+ * rolling back to a release both keep working; a mid-review state does not.
+ * The escape hatch, if some untagged commit really must ship, is to tag it —
+ * which the runbook demanded anyway.
  *
  * ── Why this file cannot be the whole answer ─────────────────────────
  *
@@ -80,6 +97,25 @@
 import { spawnSync } from 'node:child_process';
 
 export const SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * The floor below which the configured floor may not be set.
+ *
+ * The header explains at length why a TAG cannot be the source of truth: it
+ * moves, and a moved tag would silently lower the floor. An Environment
+ * variable moves just as freely, and leaves even less of a trace — no git
+ * history, no diff, no review. Nothing in the mechanism so far prevents
+ * someone from editing `WORKER_FLOOR_SHA` down to `worker-r2` and deploying a
+ * build that answers 400 to every App-Version=4 upload.
+ *
+ * So the floor has a floor, and it is pinned HERE, in a file on the protected
+ * default branch where lowering it is a reviewed change. `worker-r3` — the
+ * v4-acceptor — is absolute for a reason that has nothing to do with the
+ * backup track: safebox data exists on chain, and every build below it rejects
+ * those uploads (docs/ROLLBACK.md). The same repo-pinned monotonicity D2a
+ * requires of the trusted-owner registry, applied to the thing it guards.
+ */
+export const MINIMUM_FLOOR = '931949150f6145b6c79d36dbadc66b482c1cb6d1';
 
 /**
  * Everything decidable without touching git.
@@ -139,7 +175,7 @@ export function checkFloorInputs({ floor, candidate }) {
  * and defaulting it to «anything» is exactly the mistake this parameter
  * exists to prevent.
  */
-export function checkWorkerFloor({ floor, candidate, trustedHead, git }) {
+export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFloor = MINIMUM_FLOOR }) {
   const inputs = checkFloorInputs({ floor, candidate });
   if (!inputs.ok) return inputs;
 
@@ -183,12 +219,57 @@ export function checkWorkerFloor({ floor, candidate, trustedHead, git }) {
     };
   }
 
+  if (inputs.candidate !== head && !git.isTagged(inputs.candidate)) {
+    return {
+      ok: false,
+      reason: `candidate ${inputs.candidate} is neither the trusted head nor a tagged commit. `
+        + 'Every intermediate commit of every merged pull request is an ancestor of the default '
+        + 'branch, and those states were never judged as deployable. Deploy the head, or a '
+        + 'release tag — and if this commit really must ship, tag it first, which the runbook '
+        + 'requires of every deploy anyway.',
+    };
+  }
+
   if (!git.hasCommit(inputs.floor)) {
     return {
       ok: false,
-      reason: `the floor commit ${inputs.floor} is not in this clone. The checkout needs `
-        + '`fetch-depth: 0` — ancestry cannot be computed from a shallow history.',
+      reason: `the floor commit ${inputs.floor} is not in this repository. The value in `
+        + 'WORKER_FLOOR_SHA names a commit that does not exist here — check it against '
+        + 'docs/ROLLBACK.md. (If the clone were shallow the trusted head would have failed '
+        + 'this test first, so this is about the value, not the checkout.)',
     };
+  }
+
+  // The floor may be RAISED and never lowered past the pinned minimum. See
+  // MINIMUM_FLOOR: an Environment variable is as movable as the tag this gate
+  // refuses to resolve, and moving it leaves no trace at all.
+  if (inputs.floor !== minimumFloor) {
+    if (!git.hasCommit(minimumFloor)) {
+      return {
+        ok: false,
+        reason: `the pinned minimum floor ${minimumFloor} is not in this repository. `
+          + 'Refusing rather than guessing.',
+      };
+    }
+    let aboveMinimum;
+    try {
+      aboveMinimum = git.isAncestor(minimumFloor, inputs.floor);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `git could not compare the configured floor with the pinned minimum `
+          + `(${error instanceof Error ? error.message : String(error)}). Refusing.`,
+      };
+    }
+    if (!aboveMinimum) {
+      return {
+        ok: false,
+        reason: `WORKER_FLOOR_SHA ${inputs.floor} is BELOW the minimum pinned in this file `
+          + `(${minimumFloor}). Lowering the floor is a reviewed change to the repository, not `
+          + 'an edit to a variable: below that commit the worker rejects every App-Version=4 '
+          + 'upload, and safebox data exists.',
+      };
+    }
   }
   let descendant;
   try {
@@ -245,6 +326,13 @@ export function gitIn(cwd) {
       if (status === 1) return false;
       throw new Error(`git merge-base --is-ancestor exited with ${String(status)}`);
     },
+    isTagged(sha) {
+      // Output, not exit code: `tag --points-at` succeeds with nothing to say
+      // when the commit carries no tag.
+      const { status, error, stdout } = spawnSync('git', ['tag', '--points-at', sha], { cwd, encoding: 'utf8' });
+      if (error || status !== 0) return false;
+      return String(stdout).trim() !== '';
+    },
   };
 }
 
@@ -256,6 +344,11 @@ if (process.argv[1] && process.argv[1].endsWith('check-worker-floor.mjs')) {
     floor: process.env.WORKER_FLOOR_SHA,
     candidate: process.env.WORKER_CANDIDATE_SHA ?? process.argv[2],
     trustedHead: process.env.WORKER_TRUSTED_HEAD ?? process.argv[3],
+    // Overridable ONLY for the test that builds its own repository: the
+    // pinned value is a SHA of this one, and a hermetic clone cannot contain
+    // it. The workflow never sets this, so the pin is what applies in the
+    // place that matters.
+    ...(process.env.WORKER_MINIMUM_FLOOR ? { minimumFloor: process.env.WORKER_MINIMUM_FLOOR } : {}),
     git: gitAdapter,
   });
 

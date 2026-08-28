@@ -393,15 +393,25 @@ all, and there is no SHA that both passes without a floor and is blocked by
 is done in the direction that deploys nothing dangerous:
 
 1. set `WORKER_FLOOR_SHA` to the `worker-r3` SHA above;
-2. dispatch the deploy for the CURRENT head of `main` — it must pass the gate
-   and deploy normally (this is a redeploy of what is already live);
-3. dispatch it again for `cd7524e`'s full SHA (`worker-r2`, below the floor) —
-   the run must stop at the gate, **before** the candidate is materialized, and
+2. dispatch the deploy for **`931949150f6145b6c79d36dbadc66b482c1cb6d1`
+   (`worker-r3`) itself** — it passes the gate (a commit is its own descendant)
+   and genuinely redeploys what is already live.
+   **NOT the head of `main`.** `main` carries 17 worker commits that have never
+   been deployed — the `@noble/ed25519` 2.x→3.1 migration on the upload
+   signature path, PR-2's metrics transport, the global `UPLOADS_ENABLED`
+   switch — so dispatching the head is a RELEASE, with the acceptance checklist
+   below and a release-tag entry, not a rehearsal step;
+3. dispatch it for `cd7524e`'s full SHA (`worker-r2`, below the floor) — the
+   run must stop at the gate, **before** the candidate is materialized, and
    nothing may reach Cloudflare;
-4. dispatch it once for a commit that exists only on an unmerged branch — the
-   run must stop at the same gate, with the «not reachable from the trusted
-   head» message;
-5. record all four run ids here.
+4. dispatch it for a commit that exists only on an unmerged branch — the run
+   must stop at the same gate, with the «not reachable from the trusted head»
+   message;
+5. dispatch it for an untagged intermediate commit of a merged PR — refused
+   too: only the head of `main` and tagged commits are deployable, because every
+   mid-review state is also an ancestor of `main` and none of them was ever
+   judged as deployable;
+6. record all five run ids here.
 
 **When the floor is later raised** (before the import flip), the order matters:
 deploy the semantic worker first and verify `/health` reports

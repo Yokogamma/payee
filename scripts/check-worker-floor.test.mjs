@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import {
   checkFloorInputs,
   checkWorkerFloor,
   gitIn,
+  MINIMUM_FLOOR,
   SHA_RE,
 } from './check-worker-floor.mjs';
 
@@ -31,14 +32,20 @@ const C = 'c'.repeat(40);
 
 const HEAD = 'd'.repeat(40);
 
-/** A git that answers from a fixed ancestry map. By default everything named
- *  is present and everything is reachable from HEAD, so a test that is about
- *  the FLOOR does not have to restate the trust boundary. */
-const fakeGit = ({ present = [A, B, C, HEAD], ancestors = {} } = {}) => ({
+/** A git that answers from a fixed ancestry map.
+ *
+ *  Defaults satisfy everything a test is NOT about: every named commit exists,
+ *  everything is reachable from HEAD, everything carries a tag, and the pinned
+ *  minimum is below the configured floor. A test that wants one of those to
+ *  fail says so. */
+const fakeGit = ({ present = [A, B, C, HEAD, MINIMUM_FLOOR], ancestors = {}, tagged = true } = {}) => ({
   hasCommit: sha => present.includes(sha),
-  isAncestor: (ancestor, descendant) => (
-    descendant === HEAD ? present.includes(ancestor) : (ancestors[ancestor] ?? []).includes(descendant)
-  ),
+  isTagged: () => tagged,
+  isAncestor: (ancestor, descendant) => {
+    if (ancestor === MINIMUM_FLOOR) return true;
+    if (descendant === HEAD) return present.includes(ancestor);
+    return (ancestors[ancestor] ?? []).includes(descendant);
+  },
 });
 
 /** The floor decision, with the trust boundary satisfied unless stated. */
@@ -114,10 +121,17 @@ describe('the ancestry decision', () => {
     expect(decide({ floor: A, candidate: C }).ok).toBe(false);
   });
 
-  it('a floor missing from the clone is refused, and blames the shallow checkout', () => {
-    const verdict = decide({ floor: A, candidate: B, git: fakeGit({ present: [B, HEAD] }) });
+  it('a floor naming a commit this repository does not have is refused', () => {
+    // And the message blames the VALUE, not the checkout: with `fetch-depth: 0`
+    // a shallow clone is not the explanation, and a message that sends the
+    // operator to audit a correct workflow setting leaves them with no
+    // sanctioned way forward.
+    const verdict = decide({
+      floor: A, candidate: B, git: fakeGit({ present: [B, HEAD, MINIMUM_FLOOR] }),
+    });
     expect(verdict.ok).toBe(false);
-    expect(verdict.reason).toMatch(/fetch-depth: 0/);
+    expect(verdict.reason).toMatch(/is not in this repository/);
+    expect(verdict.reason).toMatch(/docs\/ROLLBACK\.md/);
   });
 
   it('«git could not tell» is a REFUSAL — an undecided gate is an open gate', () => {
@@ -167,6 +181,70 @@ describe('the trust boundary', () => {
   });
 });
 
+describe('which commits are deployable at all', () => {
+  it('an untagged commit that is not the head is refused', () => {
+    // Every intermediate commit of every merged pull request is an ancestor of
+    // the default branch. Those states were never judged as deployable, and
+    // «reachable from main» alone cannot tell them from a release.
+    const verdict = decide({
+      floor: A, candidate: B, git: fakeGit({ ancestors: { [A]: [B] }, tagged: false }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toMatch(/neither the trusted head nor a tagged commit/);
+  });
+
+  it('the head itself needs no tag', () => {
+    const verdict = decide({
+      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] }, tagged: false }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('a tagged commit below the head passes — that is what a rollback is', () => {
+    const verdict = decide({
+      floor: A, candidate: B, git: fakeGit({ ancestors: { [A]: [B] }, tagged: true }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+});
+
+describe('the floor has a floor', () => {
+  it('a configured floor BELOW the pinned minimum is refused', () => {
+    // An Environment variable moves as freely as the tag this gate refuses to
+    // resolve, and leaves less of a trace: no history, no diff, no review.
+    const verdict = decide({
+      floor: A,
+      candidate: B,
+      git: {
+        hasCommit: () => true,
+        isTagged: () => true,
+        isAncestor: (ancestor, descendant) => (
+          ancestor === MINIMUM_FLOOR ? false : (ancestor === A && descendant === B) || descendant === HEAD
+        ),
+      },
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toMatch(/BELOW the minimum pinned in this file/);
+  });
+
+  it('the minimum itself is a legal floor', () => {
+    const verdict = decide({
+      floor: MINIMUM_FLOOR,
+      candidate: B,
+      git: fakeGit({ ancestors: { [MINIMUM_FLOOR]: [B] } }),
+    });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('a minimum missing from the repository is a refusal, not a shrug', () => {
+    const verdict = decide({
+      floor: A, candidate: B, git: fakeGit({ present: [A, B, HEAD], ancestors: { [A]: [B] } }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toMatch(/pinned minimum floor/);
+  });
+});
+
 describe('against a real repository, built for the purpose', () => {
   // The fake above proves the wiring; this proves the two git invocations the
   // whole gate rests on. Built here rather than asserted against THIS
@@ -197,6 +275,10 @@ describe('against a real repository, built for the purpose', () => {
     first = commit('first');
     second = commit('second');
     third = commit('third');
+    // `second` is a release; `first` is only the minimum. `third` is the head
+    // and needs no tag of its own.
+    run('tag', 'release-2', second);
+    run('tag', 'release-1', first);
     // A branch that was never merged — the shape the trust boundary exists for.
     run('checkout', '-q', '-b', 'unmerged', first);
     offBranch = commit('off the default branch');
@@ -207,7 +289,10 @@ describe('against a real repository, built for the purpose', () => {
     if (repo) rmSync(repo, { recursive: true, force: true });
   });
 
-  const real = over => checkWorkerFloor({ trustedHead: third, git: gitIn(repo), ...over });
+  // The pinned minimum belongs to THIS repository, so the hermetic one supplies
+  // its own — the rule under test is «not below the minimum», not the value.
+  const real = over =>
+    checkWorkerFloor({ trustedHead: third, git: gitIn(repo), minimumFloor: first, ...over });
 
   it('the fixture is what the tests think it is', () => {
     for (const sha of [first, second, third, offBranch]) expect(SHA_RE.test(sha)).toBe(true);
@@ -236,6 +321,58 @@ describe('against a real repository, built for the purpose', () => {
 
   it('a well-formed SHA that is in no repository is refused', () => {
     expect(real({ floor: first, candidate: 'f'.repeat(40) }).ok).toBe(false);
+  });
+
+  it('an untagged commit in the history is refused, a tagged one is not', () => {
+    // On real git, with real `git tag --points-at`.
+    const run = (...args) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
+    run('tag', '-d', 'release-2');
+    expect(real({ floor: first, candidate: second }).ok, 'untagged').toBe(false);
+    run('tag', 'release-2', second);
+    expect(real({ floor: first, candidate: second }).ok, 'tagged again').toBe(true);
+  });
+
+  it('a floor below the pinned minimum is refused on real git too', () => {
+    // `first` is the minimum here, so a floor at… there is nothing below it.
+    // Instead: raise the minimum to `second` and offer `first` as the floor.
+    const verdict = checkWorkerFloor({
+      floor: first, candidate: third, trustedHead: third, git: gitIn(repo), minimumFloor: second,
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toMatch(/BELOW the minimum/);
+  });
+
+  it('the CLI reads the environment the workflow passes, and exits non-zero on a refusal', () => {
+    // The seam nothing else covers: every other test calls the functions
+    // directly, so a renamed env var would leave them all green while the gate
+    // in the workflow decided on `undefined`.
+    const script = fileURLToPath(new URL('./check-worker-floor.mjs', import.meta.url));
+    const run = env => spawnSync(process.execPath, [script], {
+      cwd: repo,
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+    });
+
+    const ok = run({
+      WORKER_FLOOR_SHA: first, WORKER_CANDIDATE_SHA: third, WORKER_TRUSTED_HEAD: third,
+      WORKER_MINIMUM_FLOOR: first,
+    });
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(ok.stdout).toMatch(/check-worker-floor: OK/);
+
+    const belowFloor = run({
+      WORKER_FLOOR_SHA: second, WORKER_CANDIDATE_SHA: first, WORKER_TRUSTED_HEAD: third,
+      WORKER_MINIMUM_FLOOR: first,
+    });
+    expect(belowFloor.status).toBe(1);
+    expect(belowFloor.stderr).toMatch(/REFUSED/);
+
+    const noFloor = run({
+      WORKER_FLOOR_SHA: '', WORKER_CANDIDATE_SHA: third, WORKER_TRUSTED_HEAD: third,
+      WORKER_MINIMUM_FLOOR: first,
+    });
+    expect(noFloor.status).toBe(1);
+    expect(noFloor.stderr).toMatch(/already exists/);
   });
 });
 
