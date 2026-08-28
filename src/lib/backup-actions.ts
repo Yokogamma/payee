@@ -184,14 +184,43 @@ export interface BackupFileLike {
   text(): Promise<string>;
 }
 
+/** One record of the container, as stage A judged it, WITH the encrypted
+ *  record it judged. The pairing is the point: whatever is written later must
+ *  be the very bytes this verdict was formed from, never a second read of the
+ *  file (§4, acceptance criterion 3). */
+export interface InspectedRecord {
+  kind: 'note' | 'safebox';
+  id: string;
+  state: BackupRecordState;
+  topology?: { root: string; rev: number; prev?: string };
+  record: EncryptedNote | EncryptedSafeboxEntry;
+}
+
+export interface InspectedContainer {
+  report: VerifyReport;
+  /** Every record of the file, classified once. */
+  records: InspectedRecord[];
+  /** The container's own marker, needed by stage B and not derivable from the
+   *  report (which is about the file, not about what an import would leave). */
+  incompleteRestore: boolean;
+}
+
 /**
- * The full dry-run. Reads a file, decrypts everything in it, and reports —
- * without changing a single stored record.
+ * The full dry-run, and the single pass both consumers share.
+ *
+ * «Verify this file» wants the report. Stage A of the import wants the report
+ * AND the classified records, so that the plan it builds and the bytes it
+ * later writes come from the SAME reading of the SAME file. Two passes would
+ * be two chances to disagree — and the disagreement would surface as «we
+ * checked one thing and wrote another», which is the defect D14 exists to
+ * prevent at the other end of the same pipeline.
+ *
+ * Nothing here changes a stored record, under any outcome.
  */
-export async function verifyBackupFile(
+export async function inspectBackupFile(
   deps: BackupActionDeps,
   file: BackupFileLike,
-): Promise<VerifyReport> {
+): Promise<InspectedContainer> {
   // Size FIRST, before the contents are ever pulled into memory. A file past
   // the cap is refused as a fact about the file, not discovered halfway
   // through parsing it.
@@ -212,19 +241,22 @@ export async function verifyBackupFile(
 
   const issues: VerifyIssue[] = [];
   const nodes: ChainNode[] = [];
+  const records: InspectedRecord[] = [];
 
   // ONE classifier for both collections, and the same one stage A of the
   // import uses (`backup-classify.ts`): a verdict that differs between «this
   // file is fine» and «this record may be restored» is the defect, not a
   // detail of two loops.
-  const classify = async (kind: 'note' | 'safebox', record: unknown) => {
-    const verdict = await classifyBackupRecord(
-      deps.keys,
-      kind,
-      record as EncryptedNote | EncryptedSafeboxEntry,
-    );
+  const classify = async (kind: 'note' | 'safebox', raw: unknown) => {
+    const record = raw as EncryptedNote | EncryptedSafeboxEntry;
+    const verdict = await classifyBackupRecord(deps.keys, kind, record);
     if (verdict.state === 'readable') nodes.push({ kind, id: verdict.id, ...verdict.topology });
     else issues.push({ kind, id: verdict.id, problem: PROBLEM_OF[verdict.state] });
+    records.push(
+      verdict.state === 'readable'
+        ? { kind, id: verdict.id, state: verdict.state, topology: verdict.topology, record }
+        : { kind, id: verdict.id, state: verdict.state, record },
+    );
     deps.assertAlive();
   };
 
@@ -238,7 +270,7 @@ export async function verifyBackupFile(
   const sawUnsupported = issues.some(i => i.problem === 'unsupported_version');
   assertHeaderHonest(header, sawUnsupported);
 
-  return {
+  const report: VerifyReport = {
     // Green requires all three: nothing unreadable, no broken chain, and a
     // container that claims to be complete. «Intact» and «complete» are
     // different questions (D11a) and only their conjunction is a backup the
@@ -251,6 +283,17 @@ export async function verifyBackupFile(
     containsUnsupportedRecords: sawUnsupported,
     issues,
   };
+
+  return { report, records, incompleteRestore: body.incompleteRestore };
+}
+
+/** “Проверить файл копии” — the dry-run's public face. The records stay
+ *  inside: a caller that only verifies has no business holding them. */
+export async function verifyBackupFile(
+  deps: BackupActionDeps,
+  file: BackupFileLike,
+): Promise<VerifyReport> {
+  return (await inspectBackupFile(deps, file)).report;
 }
 
 /**

@@ -141,6 +141,50 @@ async function classifyEntry(
   }
 }
 
+/**
+ * What this build makes of a record that is ALREADY IN THE STORE.
+ *
+ * A different question from the one above, and the difference is worth the
+ * second function rather than a flag on the first. For a record FROM A FILE
+ * the question is «may this be restored?», and a broken shape answers it
+ * (`malformed`) before anything is decrypted. For a record ON DISK the
+ * question is the one D5a's table asks — «can these bytes still be read?» —
+ * and a broken shape does not answer it at all: a record can violate the
+ * upload barrier and still decrypt perfectly, in which case the merge rules
+ * have things to say about it that depend on it being READABLE.
+ *
+ * So: version first (an opaque record is never replaced, whatever else is
+ * true of it), then the decryption itself.
+ */
+export async function classifyLocalPayload(
+  keys: BackupRecordKeys,
+  kind: BackupRecordKind,
+  record: EncryptedNote | EncryptedSafeboxEntry | undefined,
+): Promise<'absent' | 'readable' | 'corrupt' | 'opaque'> {
+  if (record === undefined) return 'absent';
+  if (kind === 'note') {
+    if (isOpaqueNote(record as EncryptedNote)) return 'opaque';
+    try {
+      await decryptNote(keys.note, record as EncryptedNote);
+      return 'readable';
+    } catch {
+      return 'corrupt';
+    }
+  }
+  const entry = record as EncryptedSafeboxEntry;
+  if (isOpaqueEntry(entry)) return 'opaque';
+  try {
+    const meta = await decryptSafeboxMeta(keys.safeboxMeta, entry);
+    // BOTH halves: an entry whose secret half is unreadable is not «readable»
+    // in any sense the merge rules could act on — restoring its meta alone
+    // would leave a password-shaped hole.
+    await decryptSafeboxSecret(keys.safeboxSecret, entry, meta.files);
+    return 'readable';
+  } catch {
+    return 'corrupt';
+  }
+}
+
 /** The upload path's own barrier, asked as a question. Total by construction:
  *  any refusal reads as «no». It carries D14b's ordering inside it — stable
  *  fields unconditionally, version-dependent ones only for a version it knows —
