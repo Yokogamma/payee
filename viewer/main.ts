@@ -25,10 +25,12 @@
  *  - one card per chain, never every stored version side by side: in the
  *    quadrant this page exists for there is nothing to cross-check against, so
  *    a superseded password shown as a peer of the current one is a trap. That
- *    card is the CURRENT version only when the collection was read in full and
- *    its links hold up; otherwise it is the latest READABLE version, and the
- *    page says so — on screen, in the confirmations, and inside the files it
- *    writes.
+ *    card is the CURRENT version only when the collection was read in full,
+ *    its links hold up and the file does not declare itself incomplete;
+ *    otherwise it is the latest READABLE version, and the page says so — on
+ *    screen, in the confirmations, and inside the text files it writes. An
+ *    attachment is the one exception: those bytes are the user's own file and
+ *    are written unchanged, so its caveat lives in the confirmation alone.
  */
 
 import {
@@ -94,11 +96,10 @@ interface Opened {
   notes: NoteData[];
   entries: OpenedEntry[];
   incomplete: boolean;
-  /** Per collection: may what is shown be called the current version at all,
-   *  and if not, why. Carried on the state because the export paths have to
-   *  say it too — a warning on screen does not travel into a file being
-   *  written to disk. */
-  currentness: { notes: Currentness; safebox: Currentness };
+  /** Per collection: every reason «current» cannot be claimed, empty when it
+   *  can. Carried on the state because the export paths have to say it too —
+   *  a warning on screen does not travel into a file being written to disk. */
+  currentness: { notes: CurrentnessDoubt[]; safebox: CurrentnessDoubt[] };
 }
 
 let opened: Opened | null = null;
@@ -164,28 +165,49 @@ const emptyCollection = (): CollectionTally =>
 const unreadable = (c: CollectionTally): number => c.unsupported + c.damaged;
 
 /**
- * Can «this is the current version» still be said about what is shown — and if
- * not, WHY not?
+ * Every reason the page may have to refuse the word «current».
  *
- * A reason rather than a boolean, because the two reasons send the user to
- * different places. `unreadable`: a record this build cannot read carries its
- * topology INSIDE the ciphertext, so there is no way to learn which chain it
- * belonged to or which position it held — a safebox entry whose rev 2 is
- * opaque leaves rev 1 as the only version there is, and grouping will call it
- * current. That one a NEWER VIEWER fixes. `broken_graph`: every record was
- * read, but the links between versions do not hold up, and `chains.ts` picks
- * the newest by timestamp and revision — an answer only as trustworthy as
- * those links. A newer viewer will not help with that at all, and saying it
- * would send the user looking for one.
+ * A SET rather than a choice, because they co-occur and they send the user to
+ * DIFFERENT places — and the difference is the whole value of saying it:
  *
- * The two are mutually exclusive by construction: a graph verdict is only
- * recorded for a collection that was read in full.
+ *  - `unsupported`: a record written by a newer build. Its topology is inside
+ *    the ciphertext, so nothing can say which chain it belonged to; a safebox
+ *    entry whose rev 2 is opaque leaves rev 1 as the only version there is,
+ *    and grouping will call it current. A NEWER VIEWER opens it.
+ *  - `damaged`: bytes that no longer authenticate. Same blindness, but no
+ *    viewer will ever help — those versions are gone.
+ *  - `broken_graph`: everything was read and the links still do not line up,
+ *    so `chains.ts` picking «newest by timestamp and revision» is only as
+ *    trustworthy as the links behind it.
+ *  - `source_incomplete`: the container itself says it was made from an
+ *    incomplete restore (D11a). The missing record is not merely unreadable —
+ *    it is not in the file at all, which is LESS determinable, not more: there
+ *    is not even a count. Only the original file that device restored from can
+ *    settle it.
+ *
+ * An empty list is the only state in which «current» may be said.
  */
-type Currentness = 'proven' | 'unreadable' | 'broken_graph';
+type CurrentnessDoubt = 'source_incomplete' | 'unsupported' | 'damaged' | 'broken_graph';
 
-const currentnessOf = (c: CollectionTally): Currentness => {
-  if (unreadable(c) > 0) return 'unreadable';
-  return c.brokenGraph ? 'broken_graph' : 'proven';
+/**
+ * `sourceIncomplete` applies to BOTH collections and cannot be narrowed: the
+ * marker is one authenticated boolean about the whole container and names
+ * neither a collection nor a count. Guessing otherwise would be the same
+ * over-reach the per-collection split exists to prevent, only in the
+ * direction that costs the user something.
+ */
+const doubtsOf = (c: CollectionTally, sourceIncomplete: boolean): CurrentnessDoubt[] => {
+  const doubts: CurrentnessDoubt[] = [];
+  if (sourceIncomplete) doubts.push('source_incomplete');
+  if (c.unsupported > 0) doubts.push('unsupported');
+  if (c.damaged > 0) doubts.push('damaged');
+  // NOT suppressed when the source is incomplete, unlike the unreadable case:
+  // there the gap in the node list is our own doing (the record IS in the file,
+  // we just could not read it), while here the version is genuinely absent from
+  // the container — a fact about the file, and the most concrete evidence of
+  // what is missing that the page can offer.
+  if (c.brokenGraph) doubts.push('broken_graph');
+  return doubts;
 };
 
 // ─── Opening ─────────────────────────────────────────────────────────
@@ -315,8 +337,8 @@ async function open(file: File, mnemonic: string, myEpoch: number): Promise<void
     entries,
     incomplete: body.incompleteRestore,
     currentness: {
-      notes: currentnessOf(tally.notes),
-      safebox: currentnessOf(tally.safebox),
+      notes: doubtsOf(tally.notes, body.incompleteRestore),
+      safebox: doubtsOf(tally.safebox, body.incompleteRestore),
     },
   };
   render(tally);
@@ -409,7 +431,7 @@ function render(tally: OpenTally): void {
   // leave unsaid: a missing record may have been the NEWER version of
   // something shown below. Blocking, because the alternative is the user
   // acting on a password that was replaced.
-  const caveat = currentnessCaveat(opened.currentness);
+  const caveat = currentnessCaveat(opened.currentness);  // '' when nothing is in doubt
   if (caveat !== '') {
     const node = el('p', 'warn warn-block', caveat);
     node.setAttribute('role', 'alert');
@@ -420,7 +442,7 @@ function render(tally: OpenTally): void {
   clear(notes);
   // Repeated at the list itself: the warnings block is above the fold on the
   // way in, and a user who scrolled to a card is no longer looking at it.
-  if (opened.currentness.notes !== 'proven') {
+  if (opened.currentness.notes.length > 0) {
     notes.appendChild(el('p', 'warn',
       'Показана последняя ЧИТАЕМАЯ версия каждой заметки — не обязательно самая новая.'));
   }
@@ -435,7 +457,7 @@ function render(tally: OpenTally): void {
 
   const safebox = byId('safebox');
   clear(safebox);
-  if (opened.currentness.safebox !== 'proven') {
+  if (opened.currentness.safebox.length > 0) {
     safebox.appendChild(el('p', 'warn',
       'Показана последняя ЧИТАЕМАЯ версия каждой записи — пароль ниже мог быть уже заменён.'));
   }
@@ -447,10 +469,14 @@ function render(tally: OpenTally): void {
   if (typeof top.scrollIntoView === 'function') top.scrollIntoView({ block: 'start' });
 }
 
-/** Why «current» cannot be claimed for one collection. */
-const REASON: Record<Exclude<Currentness, 'proven'>, string> = {
-  unreadable: 'какие-то записи этот просмотрщик не прочитал, а то, какой версией они были, '
-    + 'лежит внутри шифротекста',
+/** Why «current» cannot be claimed — one sentence per reason, and each says
+ *  what would actually help. */
+const REASON: Record<CurrentnessDoubt, string> = {
+  source_incomplete: 'сам файл заведомо неполон — записи, которой в нём нет, могла быть более '
+    + 'новая версия, и вернуть её может только исходный файл, из которого восстанавливались',
+  unsupported: 'часть записей создана более новой версией приложения и не прочитана — их покажет '
+    + 'более новый просмотрщик',
+  damaged: 'часть записей не расшифровывается — этих версий уже не вернуть',
   broken_graph: 'связи между версиями в файле не сходятся',
 };
 
@@ -474,19 +500,25 @@ const STAKE = {
 function currentnessCaveat(currentness: Opened['currentness']): string {
   const parts: string[] = [];
   for (const collection of ['notes', 'safebox'] as const) {
-    const verdict = currentness[collection];
-    if (verdict === 'proven') continue;
-    parts.push(`${STAKE[collection]} — ${REASON[verdict]}`);
+    const doubts = currentness[collection];
+    if (doubts.length === 0) continue;
+    parts.push(`${STAKE[collection]} — ${reasons(doubts)}`);
   }
   if (parts.length === 0) return '';
   return `Показанное нельзя считать самой новой версией: ${parts.join('; ')}.`;
 }
 
+/** Every reason there actually is, not the first one found: an opaque record
+ *  and a damaged one in the same collection are two different pieces of advice,
+ *  and dropping either leaves the user acting on half the picture. */
+const reasons = (doubts: readonly CurrentnessDoubt[]): string =>
+  doubts.map(doubt => REASON[doubt]).join('; ');
+
 /** The same doubt, compressed for a file that will be read somewhere else
  *  entirely, with none of the page around it. */
-function currentnessNote(verdict: Currentness): string {
-  if (verdict === 'proven') return '';
-  return `ВНИМАНИЕ: ${REASON[verdict]}, поэтому сохраняемое может быть НЕ самой новой версией.`;
+function currentnessNote(doubts: readonly CurrentnessDoubt[]): string {
+  if (doubts.length === 0) return '';
+  return `ВНИМАНИЕ: ${reasons(doubts)}. Поэтому сохранённое ниже может быть НЕ самой новой версией.`;
 }
 
 function renderEntry(entry: OpenedEntry): HTMLElement {
@@ -528,7 +560,7 @@ function renderEntry(entry: OpenedEntry): HTMLElement {
       // bytes of the user's own file, and this page does not alter them. The
       // confirmation is where it is said, and that is stated as the exception
       // it is (D22).
-      if (!confirmPlaintextExport(`вложение «${file.name}»`, opened?.currentness.safebox ?? 'proven')) return;
+      if (!confirmPlaintextExport(`вложение «${file.name}»`, opened?.currentness.safebox ?? [])) return;
       download(file.name, file.mime, file.bytes);
     });
     row.appendChild(save);
@@ -542,11 +574,12 @@ function renderEntry(entry: OpenedEntry): HTMLElement {
 /** The warning says what actually happens rather than «are you sure», and it
  *  is confirmed twice. One helper for every path that puts a secret on disk —
  *  a second wording would eventually become a weaker one. */
-function confirmPlaintextExport(what: string, verdict: Currentness = 'proven'): boolean {
-  // The caveat travels INTO the confirmation, not only onto the page: a file
-  // written to disk carries no warnings with it, and the user reads it later,
-  // elsewhere, with none of this on screen.
-  const note = currentnessNote(verdict);
+function confirmPlaintextExport(what: string, doubts: readonly CurrentnessDoubt[] = []): boolean {
+  // The caveat travels INTO the confirmation as well as into the text files
+  // themselves: the dialog is gone the moment it is dismissed, and for an
+  // attachment — bytes this page writes unchanged — the dialog is the only
+  // place it can be said at all.
+  const note = currentnessNote(doubts);
   const caveat = note === '' ? '' : `\n\n${note}`;
   const first = confirm(
     `Файл будет НЕЗАШИФРОВАН: ${what} сохранится на диск в открытом виде.${caveat}\n\n`
