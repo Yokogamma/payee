@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { buildSignedTx, gatewayFetchMock, notesTags, testWallet } from '../test-stubs/signed-tx';
 
 // §4 (B3) + §8: the v4 half of restore and the v4 wire contract.
 // config.ts reads VITE_TRUSTED_OWNERS at module load, so each test stubs the
@@ -23,24 +24,42 @@ async function safeboxKeyring() {
 }
 
 /** GraphQL page + /raw payloads keyed by txId. */
-function stubGateway(
+async function stubGateway(
   edges: Array<{ txId: string; version: string; noteId: string }>,
   payloads: Record<string, unknown>,
 ) {
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-    if (url.includes('/graphql')) {
-      return new Response(JSON.stringify({ data: { transactions: {
-        edges: edges.map(e => ({ cursor: e.txId, node: { id: e.txId, tags: [
-          { name: 'App-Name', value: 'EternalNotes' },
-          { name: 'App-Version', value: e.version },
-          { name: 'Note-Id', value: e.noteId },
-        ] } })),
-        pageInfo: { hasNextPage: false },
-      } } }), { status: 200 });
-    }
-    const txId = url.split('/raw/')[1];
-    return new Response(JSON.stringify(payloads[txId]), { status: 200 });
-  }));
+  // Под D9 txId вычисляется из подписи, выдумать его нельзя. Хелпер подписывает
+  // транзакции настоящим ключом и согласует с ним доверенный набор; тесты
+  // продолжают говорить своими метками, маппинг живёт здесь.
+  const wallet = await testWallet();
+  vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+
+  const realById = new Map<string, string>();
+  const txs = [];
+  for (const e of edges) {
+    const tx = await buildSignedTx(
+      JSON.stringify(payloads[e.txId] ?? {}),
+      notesTags({ version: e.version, ownerHash: 'oh', noteId: e.noteId }),
+      wallet,
+    );
+    realById.set(e.txId, tx.txId);
+    txs.push(tx);
+  }
+
+  vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({
+    txs,
+    pages: [edges.map((e, i) => ({
+      txId: txs[i].txId,
+      cursor: txs[i].txId,
+      tags: [
+        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Version', value: e.version },
+        { name: 'Note-Id', value: e.noteId },
+      ],
+    }))],
+  })));
+
+  return { id: (label: string) => realById.get(label)! };
 }
 
 interface WireEntry {
@@ -62,7 +81,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const { encryptSafeboxEntry } = await import('./crypto');
     const entry = await encryptSafeboxEntry(keys.safeboxMeta, keys.safeboxSecret, ENTRY_INPUT);
 
-    stubGateway([{ txId: 'TXV4', version: '4', noteId: entry.entryId }], { TXV4: wire(entry) });
+    const gw = await stubGateway([{ txId: 'TXV4', version: '4', noteId: entry.entryId }], { TXV4: wire(entry) });
     const { fetchAllNotes } = await import('./arweave');
     const { notes, safeboxEntries, incomplete } = await fetchAllNotes('oh', keys);
 
@@ -73,7 +92,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     expect(safeboxEntries[0].encrypted.v).toBe(4);
     // createdAt comes from the AUTHENTICATED envelope `t`, not from any tag.
     expect(safeboxEntries[0].encrypted.createdAt).toBe(entry.createdAt);
-    expect(safeboxEntries[0].txId).toBe('TXV4');
+    expect(safeboxEntries[0].txId).toBe(gw.id('TXV4'));
   });
 
   it('the decrypted SECRET never leaves the sweep (only ciphertext is carried out)', async () => {
@@ -83,7 +102,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const entry = await encryptSafeboxEntry(keys.safeboxMeta, keys.safeboxSecret, {
       ...ENTRY_INPUT, password: 'SUPER-SECRET-42',
     });
-    stubGateway([{ txId: 'TX1', version: '4', noteId: entry.entryId }], { TX1: wire(entry) });
+    await stubGateway([{ txId: 'TX1', version: '4', noteId: entry.entryId }], { TX1: wire(entry) });
 
     const { fetchAllNotes } = await import('./arweave');
     const { safeboxEntries } = await fetchAllNotes('oh', keys);
@@ -98,7 +117,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const rotten = base64ToBuffer(entry.secretCiphertext);
     rotten[0] ^= 0xff;
 
-    stubGateway([{ txId: 'TXBAD', version: '4', noteId: entry.entryId }], {
+    await stubGateway([{ txId: 'TXBAD', version: '4', noteId: entry.entryId }], {
       TXBAD: { ...wire(entry), sc: bufferToBase64(rotten) },
     });
     const { fetchAllNotes } = await import('./arweave');
@@ -120,7 +139,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     rotten[0] ^= 0xff;
 
     // HEIGHT_DESC order: the corrupted replay comes FIRST.
-    stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXNEW', version: '4', noteId: entry.entryId },
         { txId: 'TXOLD', version: '4', noteId: entry.entryId },
@@ -133,7 +152,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const { fetchAllNotes } = await import('./arweave');
     const { safeboxEntries } = await fetchAllNotes('oh', keys);
     expect(safeboxEntries).toHaveLength(1);
-    expect(safeboxEntries[0].txId).toBe('TXOLD');          // claim-after-decrypt
+    expect(safeboxEntries[0].txId).toBe(gw.id('TXOLD'));    // claim-after-decrypt
     expect(safeboxEntries[0].meta.title).toBe('ИСПРАВНАЯ');
   });
 
@@ -143,7 +162,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const { encryptSafeboxEntry, randomUuidV8 } = await import('./crypto');
     const entry = await encryptSafeboxEntry(keys.safeboxMeta, keys.safeboxSecret, ENTRY_INPUT);
     const foreignId = randomUuidV8();
-    stubGateway([{ txId: 'TX1', version: '4', noteId: foreignId }], {
+    await stubGateway([{ txId: 'TX1', version: '4', noteId: foreignId }], {
       TX1: { ...wire(entry), id: foreignId },
     });
     const { fetchAllNotes } = await import('./arweave');
@@ -155,7 +174,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const keys = await safeboxKeyring();
     const { randomUuidV8 } = await import('./crypto');
     const id = randomUuidV8();
-    stubGateway([{ txId: 'TX1', version: '4', noteId: id }], {
+    await stubGateway([{ txId: 'TX1', version: '4', noteId: id }], {
       TX1: { id, mc: 'AAAA', miv: 'AAAAAAAAAAAAAAAA' }, // no sc/siv
     });
     const { fetchAllNotes } = await import('./arweave');
@@ -173,7 +192,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
       ...ENTRY_INPUT, title: 'секрет',
     });
 
-    stubGateway(
+    await stubGateway(
       [
         { txId: 'TXN', version: '3', noteId: note.noteId },
         { txId: 'TXS', version: '4', noteId: entry.entryId },
@@ -195,7 +214,7 @@ describe('fetchAllNotes v4 (safebox split envelope through restore)', () => {
     const theirs = await safeboxKeyring();
     const { encryptSafeboxEntry } = await import('./crypto');
     const entry = await encryptSafeboxEntry(mine.safeboxMeta, mine.safeboxSecret, ENTRY_INPUT);
-    stubGateway([{ txId: 'TX1', version: '4', noteId: entry.entryId }], { TX1: wire(entry) });
+    await stubGateway([{ txId: 'TX1', version: '4', noteId: entry.entryId }], { TX1: wire(entry) });
     const { fetchAllNotes } = await import('./arweave');
     expect((await fetchAllNotes('oh', theirs)).safeboxEntries).toHaveLength(0);
   });

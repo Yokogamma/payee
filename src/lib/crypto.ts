@@ -340,8 +340,38 @@ export async function encryptEnvelopeV3(
   };
 }
 
+/**
+ * Thrown when a lock/reset lands mid-decryption. Distinct from a crypto failure:
+ * nothing is wrong with the data, we simply stopped being allowed to look at it.
+ */
+export class DecryptAbortedError extends Error {
+  constructor() {
+    super('decryption aborted');
+    this.name = 'DecryptAbortedError';
+  }
+}
+
+/**
+ * The checkpoint that matters, placed where it matters.
+ *
+ * Checking the signal BEFORE `subtle.decrypt` does nothing for a lock that
+ * arrives while the call is already in flight — and that is precisely the
+ * window D9 widened, by adding several awaits between the fetch and the
+ * decryption. So the check goes immediately AFTER the WebCrypto call returns
+ * and BEFORE the plaintext is decoded or parsed: the bytes exist for an instant
+ * either way (JavaScript cannot promise otherwise, and pretending it can would
+ * be worse than saying so), but nothing downstream ever sees them.
+ */
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new DecryptAbortedError();
+}
+
 /** Low-level AES-256-GCM decrypt → UTF-8 string. Throws on wrong key/tamper. */
-async function aesDecrypt(key: CryptoKey, encrypted: EncryptedNote): Promise<string> {
+async function aesDecrypt(
+  key: CryptoKey,
+  encrypted: EncryptedNote,
+  signal?: AbortSignal,
+): Promise<string> {
   const ciphertext = base64ToBuffer(encrypted.ciphertext);
   const iv = base64ToBuffer(encrypted.iv);
   const decrypted = await crypto.subtle.decrypt(
@@ -349,6 +379,7 @@ async function aesDecrypt(key: CryptoKey, encrypted: EncryptedNote): Promise<str
     key,
     ciphertext as BufferSource
   );
+  assertNotAborted(signal);
   return new TextDecoder().decode(decrypted);
 }
 
@@ -419,14 +450,15 @@ function parseEnvelopeV3(raw: string, noteId: string): { text: string; createdAt
  */
 export async function decryptNote(
   key: CryptoKey,
-  encrypted: EncryptedNote
+  encrypted: EncryptedNote,
+  signal?: AbortSignal,
 ): Promise<{ text: string; createdAt: number; meta: NoteVersionMeta }> {
   const v = encrypted.v;
   if (v !== undefined && v !== 1 && v !== 2 && v !== 3) {
     throw new UnsupportedNoteVersionError(v);
   }
 
-  const raw = await aesDecrypt(key, encrypted);
+  const raw = await aesDecrypt(key, encrypted, signal);
 
   if (v === 3) {
     return parseEnvelopeV3(raw, encrypted.noteId);
@@ -651,7 +683,12 @@ function assertContents(raw: unknown): SafeboxAttachmentContent[] {
 }
 
 /** AES-GCM decrypt of one safebox half → UTF-8 string. */
-async function aesDecryptRaw(key: CryptoKey, ciphertextB64: string, ivB64: string): Promise<string> {
+async function aesDecryptRaw(
+  key: CryptoKey,
+  ciphertextB64: string,
+  ivB64: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const ciphertext = base64ToBuffer(ciphertextB64);
   const iv = base64ToBuffer(ivB64);
   const decrypted = await crypto.subtle.decrypt(
@@ -659,6 +696,7 @@ async function aesDecryptRaw(key: CryptoKey, ciphertextB64: string, ivB64: strin
     key,
     ciphertext as BufferSource,
   );
+  assertNotAborted(signal);
   return new TextDecoder().decode(decrypted);
 }
 
@@ -747,9 +785,10 @@ export async function encryptSafeboxEntry(
 export async function decryptSafeboxMeta(
   key: CryptoKey,
   entry: EncryptedSafeboxEntry,
+  signal?: AbortSignal,
 ): Promise<SafeboxEntryData> {
   if (entry.v !== 4) throw new SafeboxEnvelopeError(`unsupported version: ${String(entry.v)}`);
-  const raw = await aesDecryptRaw(key, entry.metaCiphertext, entry.metaIv);
+  const raw = await aesDecryptRaw(key, entry.metaCiphertext, entry.metaIv, signal);
 
   let env: unknown;
   try {
@@ -831,9 +870,10 @@ export async function decryptSafeboxSecret(
   key: CryptoKey,
   entry: EncryptedSafeboxEntry,
   descriptors: SafeboxAttachmentDescriptor[],
+  signal?: AbortSignal,
 ): Promise<SafeboxSecretData> {
   if (entry.v !== 4) throw new SafeboxEnvelopeError(`unsupported version: ${String(entry.v)}`);
-  const raw = await aesDecryptRaw(key, entry.secretCiphertext, entry.secretIv);
+  const raw = await aesDecryptRaw(key, entry.secretCiphertext, entry.secretIv, signal);
 
   let env: unknown;
   try {

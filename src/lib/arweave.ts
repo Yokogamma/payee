@@ -20,6 +20,19 @@ import {
   UnsupportedNoteVersionError,
 } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
+import { INDEX_QUERY_URL, PAYLOAD_GATEWAYS, STATUS_GATEWAYS } from './gateways';
+import { statusVerdict, toTxStatusKind, type StatusVote } from './status-quorum';
+import {
+  HEADER_CAP_BYTES,
+  TXID_RE,
+  isRejection,
+  parseTxHeader,
+  readVerifiedTags,
+  verifyBytes,
+  verifyHeader,
+  type Rejection,
+  type TxHeader,
+} from './tx-verify';
 
 // ─── Config ──────────────────────────────────────────────────────────
 
@@ -208,16 +221,28 @@ export interface RegistrationCheck {
 
 // ─── Network Status ──────────────────────────────────────────────────
 
-/** Check if Arweave gateway is reachable */
+/**
+ * Online iff AT LEAST ONE status gateway answers — `Promise.any` over the pool.
+ *
+ * Each probe THROWS on a non-ok response, which is load-bearing: `fetch` does
+ * not reject on HTTP 500, so a naive `Promise.any` would settle on the first
+ * fast 500 and report "offline" while a healthy gateway was still answering.
+ */
 export async function isArweaveOnline(): Promise<boolean> {
   try {
-    const response = await fetch('https://arweave.net/info', {
-      method: 'GET',
-      signal: AbortSignal.timeout(5000),
-    });
-    return response.ok;
+    await Promise.any(
+      STATUS_GATEWAYS.map(async (origin) => {
+        const response = await fetch(`${origin}/info`, {
+          method: 'GET',
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!response.ok) throw new Error(`gateway ${origin} answered ${response.status}`);
+        return true;
+      }),
+    );
+    return true;
   } catch {
-    return false;
+    return false; // AggregateError: every gateway failed
   }
 }
 
@@ -235,30 +260,92 @@ export type TxStatusResult =
   | { kind: 'invalid' }     // malformed tx id
   | { kind: 'unavailable' };// gateway degraded — status unknown
 
-/**
- * Check finalization status of an Arweave transaction, per the gateway's HTTP
- * contract:
- *   200 + confirmations → confirmed
- *   202 "Pending"       → pending (NOT 404)
- *   404                 → dropped (unknown tx / evicted from mempool)
- *   400                 → invalid tx id
- *   other / network     → unavailable (do not act on it)
- */
-export async function getTxStatus(txId: string): Promise<TxStatusResult> {
+/** Best-effort read of a capped response body. `null` = over the cap. */
+async function readCapped(response: Response, cap: number): Promise<Uint8Array | null> {
+  if (!response.body) return null;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
   try {
-    const response = await fetch(`https://arweave.net/tx/${txId}/status`, {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) { await reader.cancel(); return null; }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+  return out;
+}
+
+/** A status body is at most a couple of hundred bytes; anything larger is a
+ *  gateway defect, not a status. */
+const STATUS_BODY_CAP_BYTES = 1024;
+
+/** One origin's answer, mapped onto the shared vote vocabulary.
+ *  NOTHING here decides the verdict — that is `statusVerdict`'s job alone. */
+async function probeStatus(origin: string, txId: string): Promise<StatusVote> {
+  try {
+    const response = await fetch(`${origin}/tx/${txId}/status`, {
       method: 'GET',
       signal: AbortSignal.timeout(10000),
     });
-    if (response.status === 202) return { kind: 'pending' };
-    if (response.status === 404) return { kind: 'dropped' };
-    if (response.status === 400) return { kind: 'invalid' };
-    if (!response.ok) return { kind: 'unavailable' };
-    const data: TxStatusResponse = await response.json();
-    return { kind: 'confirmed', confirmations: data.number_of_confirmations, blockHeight: data.block_height };
+    if (response.status === 202) return { origin, kind: 'pending' };
+    if (response.status === 404) return { origin, kind: 'dead404' };
+    // 400/429/5xx all land here: `other` is never alive, and it makes `dead`
+    // unreachable this round — which is the entire point (a 400 must never
+    // authorize a paid re-post).
+    if (!response.ok) return { origin, kind: 'other' };
+    const body = await readCapped(response, STATUS_BODY_CAP_BYTES);
+    if (body === null) return { origin, kind: 'other' };
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
+    if (typeof parsed !== 'object' || parsed === null) return { origin, kind: 'other' };
+    const data = parsed as Partial<TxStatusResponse>;
+    // A 200 whose body fails the schema is a PROTOCOL defect: not alive, and a
+    // non-404 outcome for the quorum.
+    if (!isSafeCount(data.number_of_confirmations) || !isSafeCount(data.block_height)) {
+      return { origin, kind: 'other' };
+    }
+    return {
+      origin,
+      kind: 'confirmed',
+      confirmations: data.number_of_confirmations,
+      blockHeight: data.block_height,
+    };
   } catch {
-    return { kind: 'unavailable' };
+    return { origin, kind: 'other' }; // timeout / network / malformed JSON
   }
+}
+
+function isSafeCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Finalization status by QUORUM over every configured status gateway.
+ *
+ * `invalid` is now a purely LOCAL verdict — a txId that is not 43 base64url
+ * characters, decided without touching the network. A gateway's 400 is
+ * `unavailable`, never `invalid`: under the old single-gateway contract a 400
+ * fed `needsRecheck`, i.e. the paid re-post path, on nothing more than one
+ * host's opinion.
+ *
+ * The verdict itself comes from the shared table (status-quorum.ts), the same
+ * code the Worker runs, with one vote per configured origin.
+ */
+export async function getTxStatus(txId: string): Promise<TxStatusResult> {
+  if (!TXID_RE.test(txId)) return { kind: 'invalid' };
+  const votes = await Promise.all(STATUS_GATEWAYS.map(origin => probeStatus(origin, txId)));
+  const verdict = statusVerdict(STATUS_GATEWAYS, votes);
+  if (verdict.kind === 'confirmed') {
+    return { kind: 'confirmed', confirmations: verdict.confirmations, blockHeight: verdict.blockHeight };
+  }
+  return { kind: toTxStatusKind(verdict.kind) } as TxStatusResult;
 }
 
 // ─── Registration ────────────────────────────────────────────────────
@@ -499,9 +586,17 @@ async function fetchPage(
   after: string | null,
   signal?: AbortSignal
 ): Promise<{ edges: ArweaveEdge[]; hasNextPage: boolean }> {
-  // `owners` restricts results to TX signed by the trusted proxy wallet(s) (C2):
-  // an attacker cannot post under these addresses, so squatted/replayed Note-Ids
-  // never appear. `Owner-Hash` tag still scopes to this user's notes.
+  // `owners` and the tag filters are a WORK REDUCTION, not a trust boundary.
+  //
+  // This comment used to claim the filter is what stops squatted/replayed
+  // Note-Ids — which was misleading (F1): nothing forces a gateway to honour
+  // `owners:`, and an index that ignores it would hand us a stranger's edge
+  // with no way to tell. Trust now comes from D9 instead: every candidate's
+  // header is verified against the requested txId and its wallet address is
+  // checked against TRUSTED_OWNERS before a single byte is decrypted, and
+  // attribution is read from the SIGNED tags rather than from this edge.
+  // Getting the filter wrong can therefore only cost extra work, never
+  // acceptance.
   const query = `query($ownerHash: [String!]!, $appName: [String!]!, $owners: [String!]!, $after: String) {
     transactions(
       owners: $owners,
@@ -528,7 +623,11 @@ async function fetchPage(
     after: after,
   };
 
-  const response = await fetch('https://arweave.net/graphql', {
+  // The index endpoint is configuration now (INDEX_SOURCES, D8). PR-3a still
+  // queries ONE index — the union across logical sources is PR-4 — so this is
+  // the first URL of the first source, which defaults to arweave.net/graphql
+  // and keeps the single-index edge order byte-identical.
+  const response = await fetch(INDEX_QUERY_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
@@ -595,6 +694,14 @@ export interface FetchAllNotesResult {
   notes: RestoredNote[];
   safeboxEntries: RestoredSafeboxEntry[];
   incomplete: boolean;
+  /** Per-gateway count of D9 verification failures during THIS sweep.
+   *
+   *  LOCAL DIAGNOSTIC ONLY — nothing is transmitted. D5 keeps telemetry
+   *  server-side, and this verification runs in the client, so the fleet-wide
+   *  `payload_hash_mismatch` KPI of the plan is knowingly NOT obtainable here;
+   *  the gap is recorded rather than papered over with a client beacon. Absent
+   *  when nothing failed. */
+  gatewayMismatches?: Readonly<Record<string, number>>;
 }
 
 /** How many note payloads are fetched+decrypted concurrently during restore.
@@ -625,6 +732,118 @@ interface RestoreCandidate {
 export interface KnownTxRecord {
   noteId: string;
   kind: 'note' | 'safebox';
+}
+
+
+/** Hard ceiling on a `/raw` body. The writer cannot publish more than
+ *  MAX_BODY_BYTES (51200), so 64 KiB is generous — and without a cap D9 would
+ *  have to hold whatever a hostile gateway decided to send. */
+const RAW_CAP_BYTES = 65536;
+
+/** Whole-candidate budget across BOTH pool passes (header + raw).
+ *  Per-request timeouts alone would allow 4 gateways x 20 s x 2 phases on a
+ *  single candidate; the observed worst cold path is 12–16 s for one gateway,
+ *  so this leaves room for two and then gives up. */
+const PAYLOAD_DEADLINE_MS = 45_000;
+
+type PayloadOutcome =
+  | { kind: 'verified'; header: TxHeader; bytes: Uint8Array }
+  /** Authenticated, but not ours (untrusted wallet / foreign tags). Every honest
+   *  gateway returns the same thing, so the pool stops — and the sweep is NOT
+   *  incomplete, because nothing was lost. */
+  | { kind: 'skip' }
+  /** Every gateway failed or lied. A real note may be unreachable → incomplete. */
+  | { kind: 'unavailable' };
+
+/**
+ * The payload pool for ONE sweep: gateway iteration, D9, and an in-flight cache.
+ *
+ * The cache holds PROMISES, not results, so five restore workers meeting the
+ * same repeated txId run one pipeline rather than five. Terminal outcomes
+ * (verified / skip) stay cached; a transient `unavailable` is EVICTED so a
+ * later duplicate may try again instead of inheriting a network blip.
+ *
+ * Scope is one `fetchAllNotes` call by construction — it is created there and
+ * dies with it, so it can never span a vault change or outlive a reset.
+ */
+function createPayloadPool(ownerAddresses: readonly string[]) {
+  const inFlight = new Map<string, Promise<PayloadOutcome>>();
+  const mismatches = new Map<string, number>();
+
+  const countMismatch = (origin: string) =>
+    mismatches.set(origin, (mismatches.get(origin) ?? 0) + 1);
+
+  async function fetchBody(
+    origin: string,
+    path: string,
+    cap: number,
+    signal: AbortSignal | undefined,
+    deadline: AbortSignal,
+  ): Promise<Uint8Array | null> {
+    try {
+      const composed = signal
+        ? AbortSignal.any([signal, deadline, AbortSignal.timeout(PAYLOAD_TIMEOUT_MS)])
+        : AbortSignal.any([deadline, AbortSignal.timeout(PAYLOAD_TIMEOUT_MS)]);
+      const response = await fetch(`${origin}${path}`, { signal: composed });
+      if (!response.ok) return null;
+      return await readCapped(response, cap);
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolve(txId: string, signal: AbortSignal | undefined): Promise<PayloadOutcome> {
+    const deadline = AbortSignal.timeout(PAYLOAD_DEADLINE_MS);
+
+    // Pass 1 — a header that survives every body-independent step of D9.
+    // A gateway answering with a self-consistent header for a DIFFERENT txId
+    // must not end the search: the loop continues to the next gateway.
+    let header: TxHeader | null = null;
+    for (const origin of PAYLOAD_GATEWAYS) {
+      if (signal?.aborted || deadline.aborted) break;
+      const body = await fetchBody(origin, `/tx/${txId}`, HEADER_CAP_BYTES, signal, deadline);
+      if (body === null) continue;
+      const parsed = parseTxHeader(new TextDecoder().decode(body));
+      if (parsed === null) { countMismatch(origin); continue; }
+      const rejection: Rejection | null = await verifyHeader(txId, parsed, ownerAddresses);
+      if (rejection === null) { header = parsed; break; }
+      if (rejection.kind === 'skip') return { kind: 'skip' };
+      countMismatch(origin);
+    }
+    if (header === null) return { kind: 'unavailable' };
+
+    // Pass 2 — bytes that hash to this header. The two may come from DIFFERENT
+    // gateways: the protocol binds them cryptographically, so mixing sources is
+    // safe by construction.
+    for (const origin of PAYLOAD_GATEWAYS) {
+      if (signal?.aborted || deadline.aborted) break;
+      const bytes = await fetchBody(origin, `/raw/${txId}`, RAW_CAP_BYTES, signal, deadline);
+      if (bytes === null) continue;
+      if ((await verifyBytes(header, bytes)) === null) return { kind: 'verified', header, bytes };
+      // A 200 with a corrupted, truncated or foreign body does NOT stop the
+      // search — a later gateway's valid answer neutralizes this one.
+      countMismatch(origin);
+    }
+    return { kind: 'unavailable' };
+  }
+
+  return {
+    fetchVerified(txId: string, signal: AbortSignal | undefined): Promise<PayloadOutcome> {
+      const cached = inFlight.get(txId);
+      if (cached) return cached;
+      const pending = resolve(txId, signal).then((outcome) => {
+        // Transient failures must not poison a later retry of the same txId.
+        if (outcome.kind === 'unavailable') inFlight.delete(txId);
+        return outcome;
+      });
+      inFlight.set(txId, pending);
+      return pending;
+    },
+    /** Host → count, empty when nothing failed. Local diagnostic only (D5). */
+    snapshot(): Record<string, number> | undefined {
+      return mismatches.size > 0 ? Object.fromEntries(mismatches) : undefined;
+    },
+  };
 }
 
 /**
@@ -710,6 +929,8 @@ export async function fetchAllNotes(
     cursor = edges[edges.length - 1].cursor;
   }
 
+  const pool = createPayloadPool(TRUSTED_OWNERS);
+
   // Phase 2: bounded-parallel payload fetch + decrypt. Results keep the
   // original slot so claiming stays deterministic (HEIGHT_DESC order).
   // Sentinels are not fetched; the progress denominator counts only the
@@ -731,28 +952,42 @@ export async function fetchAllNotes(
       const cand = candidates[i];
       if (cand.known) continue; // sentinel: no fetch, no decrypt, no progress event
 
-      let dataResponse: Response | null = null;
-      try {
-        dataResponse = await fetch(`https://arweave.net/raw/${cand.txId}`, {
-          signal: requestSignal(PAYLOAD_TIMEOUT_MS, signal),
+      const fetched = await pool.fetchVerified(cand.txId, signal);
+
+      if (fetched.kind === 'unavailable') {
+        // Every gateway refused or lied: a legitimate note may be unreachable
+        // right now. This is the ONLY payload outcome that means «partial».
+        incomplete = true;
+      } else if (fetched.kind === 'verified') {
+        // Attribution comes from the VERIFIED tags, never from the GraphQL
+        // edge: the signature covers the tags and nothing covers the edge.
+        const tags = readVerifiedTags(fetched.header, {
+          appName: APP_NAME,
+          supportedVersions: SUPPORTED_VERSIONS,
+          ownerHash,
         });
-      } catch {
-        incomplete = true; // network — a legit note may be unreachable right now
-      }
-      if (dataResponse) {
-        if (!dataResponse.ok) {
-          incomplete = true;
-        } else {
+        if (!isRejection(tags) && !signal?.aborted) {
           try {
-            const raw = await dataResponse.json();
-            results[i] = cand.version === '4'
-              ? await buildRestoredSafeboxEntry(keys, cand.noteId, raw, cand.txId)
-              : await buildRestoredNote(keys.note, cand.version, cand.noteId, raw, cand.txId);
+            const raw: unknown = JSON.parse(new TextDecoder().decode(fetched.bytes));
+            // For v1 the writer emits Timestamp; now that it is SIGNED, it must
+            // agree with the envelope's own `t` — a header and a body that
+            // disagree about the creation time are not one record.
+            const timestampAgrees = tags.version !== '1'
+              || (typeof raw === 'object' && raw !== null
+                && String((raw as { t?: unknown }).t) === tags.timestamp);
+            if (timestampAgrees) {
+              results[i] = tags.version === '4'
+                ? await buildRestoredSafeboxEntry(keys, tags.noteId, raw as never, cand.txId, signal)
+                : await buildRestoredNote(keys.note, tags.version, tags.noteId, raw as never, cand.txId, signal);
+            }
           } catch {
             // malformed entry — intentional skip, not a partial restore
           }
         }
       }
+      // 'skip' (authenticated but not ours) falls through deliberately: it is an
+      // intentional skip, exactly like a candidate that fails to decrypt, and it
+      // must NOT mark the sweep incomplete.
       done++;
       onProgress?.(done, fetchTotal);
     }
@@ -794,7 +1029,15 @@ export async function fetchAllNotes(
 
   restored.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);
   restoredSafebox.sort((a, b) => b.encrypted.createdAt - a.encrypted.createdAt);
-  return { notes: restored, safeboxEntries: restoredSafebox, incomplete };
+
+  // ONE aggregated line, hosts and counts only — never a txId or an Owner-Hash.
+  // Nothing leaves the device (D5): this is the honest local substitute for the
+  // fleet-wide payload_hash_mismatch metric the plan cannot have client-side.
+  const gatewayMismatches = pool.snapshot();
+  if (gatewayMismatches) {
+    console.warn('arweave: payload verification failures by gateway', gatewayMismatches);
+  }
+  return { notes: restored, safeboxEntries: restoredSafebox, incomplete, gatewayMismatches };
 }
 
 function isSafeboxResult(r: RestoredNote | RestoredSafeboxEntry): r is RestoredSafeboxEntry {
@@ -816,6 +1059,7 @@ async function buildRestoredSafeboxEntry(
   entryIdTag: string,
   raw: { id?: unknown; mc?: unknown; miv?: unknown; sc?: unknown; siv?: unknown },
   txId: string,
+  signal?: AbortSignal,
 ): Promise<RestoredSafeboxEntry | null> {
   if (typeof raw.id !== 'string' || raw.id !== entryIdTag) return null; // outer id must match the tag
   if (typeof raw.mc !== 'string' || typeof raw.miv !== 'string') return null;
@@ -833,11 +1077,13 @@ async function buildRestoredSafeboxEntry(
 
   let meta: SafeboxEntryData;
   try {
-    meta = await decryptSafeboxMeta(keys.safeboxMeta, encrypted);
+    // The signal is threaded through BOTH halves: a lock landing between them
+    // must not let the secret plaintext materialize either.
+    meta = await decryptSafeboxMeta(keys.safeboxMeta, encrypted, signal);
     // Validate the secret half too, then drop the plaintext immediately.
-    await decryptSafeboxSecret(keys.safeboxSecret, encrypted, meta.files);
+    await decryptSafeboxSecret(keys.safeboxSecret, encrypted, meta.files, signal);
   } catch {
-    return null; // not ours / replay / tampered / malformed envelope
+    return null; // not ours / replay / tampered / malformed envelope / aborted
   }
 
   encrypted.createdAt = meta.createdAt; // authoritative, from the envelope
@@ -856,6 +1102,7 @@ async function buildRestoredNote(
   noteIdTag: string,
   raw: { id?: unknown; c?: unknown; iv?: unknown; t?: unknown },
   txId: string,
+  signal?: AbortSignal,
 ): Promise<RestoredNote | null> {
   let encrypted: EncryptedNote;
 
@@ -874,9 +1121,9 @@ async function buildRestoredNote(
 
   let decoded: { text: string; createdAt: number; meta: NoteVersionMeta };
   try {
-    decoded = await decryptNote(key, encrypted);
+    decoded = await decryptNote(key, encrypted, signal);
   } catch {
-    return null; // not ours / replay / tampered / malformed envelope
+    return null; // not ours / replay / tampered / malformed envelope / aborted
   }
 
   encrypted.createdAt = decoded.createdAt; // v2/v3: authoritative from envelope

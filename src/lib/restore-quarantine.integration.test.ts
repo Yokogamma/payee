@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { buildSignedTx, gatewayFetchMock, notesTags, testWallet } from '../test-stubs/signed-tx';
 
 // §1.9, интеграция: снятие карантина recovery_invalidated — привилегия
 // ДОКАЗАТЕЛЬНОГО пути, то есть кандидата, которого restore-конвейер
@@ -43,24 +44,42 @@ function quarantinedRow(storage: Storage, noteId: string, kind: 'note' | 'safebo
 }
 
 /** GraphQL page + /raw payloads keyed by txId (as in arweave-v4.test.ts). */
-function stubGateway(
+async function stubGateway(
   edges: Array<{ txId: string; version: string; noteId: string }>,
   payloads: Record<string, unknown>,
 ) {
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-    if (url.includes('/graphql')) {
-      return new Response(JSON.stringify({ data: { transactions: {
-        edges: edges.map(e => ({ cursor: e.txId, node: { id: e.txId, tags: [
-          { name: 'App-Name', value: 'EternalNotes' },
-          { name: 'App-Version', value: e.version },
-          { name: 'Note-Id', value: e.noteId },
-        ] } })),
-        pageInfo: { hasNextPage: false },
-      } } }), { status: 200 });
-    }
-    const txId = url.split('/raw/')[1];
-    return new Response(JSON.stringify(payloads[txId]), { status: 200 });
-  }));
+  // Под D9 txId вычисляется из подписи, выдумать его нельзя. Хелпер подписывает
+  // транзакции настоящим ключом и согласует с ним доверенный набор; тесты
+  // продолжают говорить своими метками, маппинг живёт здесь.
+  const wallet = await testWallet();
+  vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+
+  const realById = new Map<string, string>();
+  const txs = [];
+  for (const e of edges) {
+    const tx = await buildSignedTx(
+      JSON.stringify(payloads[e.txId] ?? {}),
+      notesTags({ version: e.version, ownerHash: 'oh', noteId: e.noteId }),
+      wallet,
+    );
+    realById.set(e.txId, tx.txId);
+    txs.push(tx);
+  }
+
+  vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({
+    txs,
+    pages: [edges.map((e, i) => ({
+      txId: txs[i].txId,
+      cursor: txs[i].txId,
+      tags: [
+        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Version', value: e.version },
+        { name: 'Note-Id', value: e.noteId },
+      ],
+    }))],
+  })));
+
+  return { id: (label: string) => realById.get(label)! };
 }
 
 /** Зеркало restore-цикла store.tsx: мержится ТОЛЬКО то, что конвейер вернул. */
@@ -91,7 +110,7 @@ describe('restore-конвейер × карантин recovery_invalidated (з�
     const foreign = await encryptEnvelope(otherKey, 'not yours');
     await quarantinedRow(storage, foreign.noteId, 'note');
 
-    stubGateway([{ txId: 'TX-F', version: '2', noteId: foreign.noteId }],
+    await stubGateway([{ txId: 'TX-F', version: '2', noteId: foreign.noteId }],
       { 'TX-F': { id: foreign.noteId, c: foreign.ciphertext, iv: foreign.iv } });
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', { note: key, safeboxMeta: key, safeboxSecret: key });
@@ -113,7 +132,7 @@ describe('restore-конвейер × карантин recovery_invalidated (з�
     const key = await deriveKey(generateMnemonic());
     await quarantinedRow(storage, '11111111-2222-8333-8444-555555555555', 'note');
 
-    stubGateway([], {});
+    await stubGateway([], {});
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', { note: key, safeboxMeta: key, safeboxSecret: key });
     await runMergeLoop(storage, fetched);
@@ -130,7 +149,7 @@ describe('restore-конвейер × карантин recovery_invalidated (з�
     const good = await encryptEnvelope(key, 'моя заметка');
     await quarantinedRow(storage, good.noteId, 'note');
 
-    stubGateway([{ txId: 'TX-G', version: '2', noteId: good.noteId }],
+    const gw = await stubGateway([{ txId: 'TX-G', version: '2', noteId: good.noteId }],
       { 'TX-G': { id: good.noteId, c: good.ciphertext, iv: good.iv } });
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', { note: key, safeboxMeta: key, safeboxSecret: key });
@@ -140,7 +159,7 @@ describe('restore-конвейер × карантин recovery_invalidated (з�
     const row = (await storage.getSyncRecord(good.noteId))!;
     expect(row.terminalError).toBeUndefined(); // доказательный путь снял карантин
     expect(row.status).toBe('confirmed');
-    expect(row.txId).toBe('TX-G');
+    expect(row.txId).toBe(gw.id('TX-G'));
     expect(await storage.getNoteById(good.noteId)).toBeTruthy(); // payload дошёл
   });
 });
@@ -168,7 +187,7 @@ describe('restore-конвейер × карантин recovery_invalidated (с�
     const foreign = await encryptSafeboxEntry(foreignKeys.safeboxMeta, foreignKeys.safeboxSecret, ENTRY_INPUT);
     await quarantinedRow(storage, foreign.entryId, 'safebox');
 
-    stubGateway([{ txId: 'TX-SF', version: '4', noteId: foreign.entryId }], { 'TX-SF': wire(foreign) });
+    await stubGateway([{ txId: 'TX-SF', version: '4', noteId: foreign.entryId }], { 'TX-SF': wire(foreign) });
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', keys);
     expect(fetched.safeboxEntries).toHaveLength(0);
@@ -187,7 +206,7 @@ describe('restore-конвейер × карантин recovery_invalidated (с�
     const good = await encryptSafeboxEntry(keys.safeboxMeta, keys.safeboxSecret, ENTRY_INPUT);
     await quarantinedRow(storage, good.entryId, 'safebox');
 
-    stubGateway([{ txId: 'TX-SG', version: '4', noteId: good.entryId }], { 'TX-SG': wire(good) });
+    await stubGateway([{ txId: 'TX-SG', version: '4', noteId: good.entryId }], { 'TX-SG': wire(good) });
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', keys);
     expect(fetched.safeboxEntries).toHaveLength(1);

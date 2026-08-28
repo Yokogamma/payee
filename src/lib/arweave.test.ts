@@ -1,4 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  buildSignedTx,
+  edgeFor,
+  gatewayFetchMock,
+  newWallet,
+  notesTags,
+  testWallet,
+} from '../test-stubs/signed-tx';
 
 // C2: restore must filter by trusted wallet owners, fail closed without them,
 // and (v2) take truth from the decrypted envelope.
@@ -96,36 +104,157 @@ describe('uploadViaProxy committed flag', () => {
   });
 });
 
-describe('getTxStatus semantics (L1)', () => {
-  const cases: Array<[number, string]> = [
-    [202, 'pending'],
-    [404, 'dropped'],
-    [400, 'invalid'],
-    [500, 'unavailable'],
-    [503, 'unavailable'],
-  ];
-  for (const [httpStatus, kind] of cases) {
-    it(`maps HTTP ${httpStatus} → ${kind}`, async () => {
-      vi.stubGlobal('fetch', vi.fn(async () => new Response('x', { status: httpStatus })));
-      const { getTxStatus } = await import('./arweave');
-      expect((await getTxStatus('tx')).kind).toBe(kind);
-    });
-  }
+describe('getTxStatus semantics — QUORUM (L1, PR-3a)', () => {
+  const TX = 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs'; // canonical 43 chars
+  const G1 = 'https://g1.example';
+  const G2 = 'https://g2.example';
 
-  it('maps HTTP 200 + confirmations → confirmed', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ block_height: 5, number_of_confirmations: 42 }), { status: 200 }),
-    ));
+  /** Two configured origins — the minimum at which `dead` is reachable at all. */
+  function stubTwoGateways() {
+    vi.stubEnv('VITE_STATUS_GATEWAYS', G1 + ',' + G2);
+  }
+  const respond = (per: Record<string, () => Response>) =>
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      for (const [origin, make] of Object.entries(per)) {
+        if (url.startsWith(origin)) return make();
+      }
+      throw new Error('unexpected ' + url);
+    });
+
+  it('a malformed txId is INVALID without touching the network', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
     const { getTxStatus } = await import('./arweave');
-    const r = await getTxStatus('tx');
+    expect((await getTxStatus('tx')).kind).toBe('invalid');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('202 from either gateway → pending', async () => {
+    stubTwoGateways();
+    vi.stubGlobal('fetch', respond({
+      [G1]: () => new Response('', { status: 404 }),
+      [G2]: () => new Response('Pending', { status: 202 }),
+    }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('pending');
+  });
+
+  it('404 from EVERY configured gateway → dropped', async () => {
+    stubTwoGateways();
+    vi.stubGlobal('fetch', respond({
+      [G1]: () => new Response('', { status: 404 }),
+      [G2]: () => new Response('', { status: 404 }),
+    }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('dropped');
+  });
+
+  // The normative example: agreeing 404s are not a quorum while anyone is silent.
+  it('404 + timeout → unavailable, NOT dropped', async () => {
+    stubTwoGateways();
+    vi.stubGlobal('fetch', respond({
+      [G1]: () => new Response('', { status: 404 }),
+      [G2]: () => { throw new Error('timeout'); },
+    }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('unavailable');
+  });
+
+  // CHANGED BEHAVIOR, deliberately: a 400 used to be `invalid`, which fed
+  // needsRecheck — the paid re-post path — on one host's opinion alone.
+  it('400 is unavailable, never invalid and never dropped', async () => {
+    stubTwoGateways();
+    vi.stubGlobal('fetch', respond({
+      [G1]: () => new Response('', { status: 400 }),
+      [G2]: () => new Response('', { status: 400 }),
+    }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('unavailable');
+  });
+
+  it('5xx and network errors → unavailable', async () => {
+    stubTwoGateways();
+    const makers: Array<() => Response> = [
+      () => new Response('', { status: 500 }),
+      () => new Response('', { status: 503 }),
+      () => { throw new Error('network'); },
+    ];
+    for (const make of makers) {
+      vi.stubGlobal('fetch', respond({ [G1]: make, [G2]: make }));
+      const { getTxStatus } = await import('./arweave');
+      expect((await getTxStatus(TX)).kind).toBe('unavailable');
+    }
+  });
+
+  it('200 with a valid body → confirmed', async () => {
+    stubTwoGateways();
+    const body = () => new Response(
+      JSON.stringify({ block_height: 5, number_of_confirmations: 42 }), { status: 200 });
+    vi.stubGlobal('fetch', respond({ [G1]: body, [G2]: body }));
+    const { getTxStatus } = await import('./arweave');
+    const r = await getTxStatus(TX);
     expect(r.kind).toBe('confirmed');
     if (r.kind === 'confirmed') expect(r.confirmations).toBe(42);
   });
 
-  it('maps a network error → unavailable', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network'); }));
+  it('disagreeing 200s aggregate to the LOWEST confirmation count', async () => {
+    stubTwoGateways();
+    vi.stubGlobal('fetch', respond({
+      [G1]: () => new Response(JSON.stringify({ block_height: 9, number_of_confirmations: 40 }), { status: 200 }),
+      [G2]: () => new Response(JSON.stringify({ block_height: 7, number_of_confirmations: 3 }), { status: 200 }),
+    }));
     const { getTxStatus } = await import('./arweave');
-    expect((await getTxStatus('tx')).kind).toBe('unavailable');
+    expect(await getTxStatus(TX)).toEqual({ kind: 'confirmed', confirmations: 3, blockHeight: 7 });
+  });
+
+  it('a 200 with a malformed body is not alive AND blocks dead', async () => {
+    stubTwoGateways();
+    vi.stubGlobal('fetch', respond({
+      [G1]: () => new Response('not json', { status: 200 }),
+      [G2]: () => new Response('', { status: 404 }),
+    }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('unavailable');
+  });
+
+  it('a duplicated origin in the CSV cannot manufacture a quorum', async () => {
+    // Both entries collapse to ONE configured origin, so `dead` would need a
+    // second one that does not exist — the verdict can only be unavailable.
+    vi.stubEnv('VITE_STATUS_GATEWAYS', G1 + ',' + G1 + '/');
+    vi.stubGlobal('fetch', respond({ [G1]: () => new Response('', { status: 404 }) }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('unavailable');
+  });
+
+  // The empty env is NOT the old behavior: one configured origin makes `dead`
+  // unreachable, so a lone 404 no longer authorizes anything.
+  it('with the default single gateway a 404 is unavailable, not dropped', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 404 })));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('unavailable');
+  });
+});
+
+describe('isArweaveOnline — any live gateway', () => {
+  it('a fast non-ok answer does not mask a slower 200', async () => {
+    vi.stubEnv('VITE_STATUS_GATEWAYS', 'https://fast.example,https://slow.example');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      // fetch does NOT reject on 500; without an explicit throw per probe,
+      // Promise.any would settle on this one and report the pool offline.
+      if (String(input).startsWith('https://fast.example')) return new Response('', { status: 500 });
+      await new Promise(r => setTimeout(r, 5));
+      return new Response('{}', { status: 200 });
+    }));
+    const { isArweaveOnline } = await import('./arweave');
+    expect(await isArweaveOnline()).toBe(true);
+  });
+
+  it('every gateway failing → offline', async () => {
+    vi.stubEnv('VITE_STATUS_GATEWAYS', 'https://a.example,https://b.example');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 500 })));
+    const { isArweaveOnline } = await import('./arweave');
+    expect(await isArweaveOnline()).toBe(false);
   });
 });
 
@@ -155,30 +284,22 @@ describe('buildUploadPayload version-aware serialization', () => {
 
 describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
   it('decrypts a v2 note and takes id/date from the authenticated envelope', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
     vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const note = await encryptEnvelope(key, 'секрет v2');
 
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '2' },
-            { name: 'Note-Id', value: note.noteId },
-          ] } }],
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
-      // v2 outer JSON: {id, c, iv} — no `t`
-      return new Response(
-        JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
-        { status: 200 },
-      );
-    });
+    // Under D9 the payload must arrive with a header that actually verifies —
+    // a bare JSON blob is no longer a restorable candidate.
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+    const fetchMock = vi.fn(gatewayFetchMock({ txs: [tx] }));
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
@@ -189,18 +310,19 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     expect(res[0].text).toBe('секрет v2');
     expect(res[0].encrypted.v).toBe(2);
     expect(res[0].encrypted.createdAt).toBe(note.createdAt);
-    expect(res[0].txId).toBe('TX1');
+    expect(res[0].txId).toBe(tx.txId);
 
     // Regression guard (restore CORS bug): the note payload MUST be fetched from
     // the /raw/<txId> endpoint. The bare gateway URL arweave.net/<txId> 302-
     // redirects to a sandbox subdomain that sends no CORS headers, so a browser
     // fetch is blocked — this silently broke restore for every user until pinned.
-    const dataCall = fetchMock.mock.calls.find(c => !String(c[0]).includes('/graphql'));
-    expect(String(dataCall?.[0])).toContain('/raw/TX1');
+    const rawCall = fetchMock.mock.calls.find(c => String(c[0]).includes('/raw/'));
+    expect(String(rawCall?.[0])).toContain('/raw/' + tx.txId);
   });
 
   it('skips a candidate that fails to decrypt (replay/garbage)', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
@@ -208,23 +330,12 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     // Ciphertext encrypted under a DIFFERENT key → won't decrypt with `key`.
     const foreign = await encryptEnvelope(otherKey, 'not yours');
 
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '2' },
-            { name: 'Note-Id', value: foreign.noteId },
-          ] } }],
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
-      return new Response(
-        JSON.stringify({ id: foreign.noteId, c: foreign.ciphertext, iv: foreign.iv }),
-        { status: 200 },
-      );
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: foreign.noteId, c: foreign.ciphertext, iv: foreign.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: foreign.noteId }),
+      wallet,
+    );
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({ txs: [tx] })));
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
@@ -235,32 +346,28 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
 
   it('restores notes posted under BOTH owners after a wallet rotation', async () => {
     // Rotation runbook: the old owner stays in TRUSTED_OWNERS, so notes signed
-    // by either wallet must come back in one sweep.
-    vi.stubEnv('VITE_TRUSTED_OWNERS', `${OWNER_A},${OWNER_B}`);
+    // by either wallet must come back in one sweep — and now that D9 checks the
+    // SIGNING wallet, this is a real two-key test rather than two labels.
+    const oldWallet = await testWallet();
+    const newWallet_ = await newWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', oldWallet.address + ',' + newWallet_.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const oldNote = await encryptEnvelope(key, 'под старым кошельком');
     const newNote = await encryptEnvelope(key, 'под новым кошельком');
 
-    const byId: Record<string, { id: string; c: string; iv: string }> = {
-      TXOLD: { id: oldNote.noteId, c: oldNote.ciphertext, iv: oldNote.iv },
-      TXNEW: { id: newNote.noteId, c: newNote.ciphertext, iv: newNote.iv },
-    };
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: ['TXOLD', 'TXNEW'].map(txId => ({ cursor: txId, node: { id: txId, tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '2' },
-            { name: 'Note-Id', value: byId[txId].id },
-          ] } })),
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
-      const txId = url.split('/').pop()!;
-      return new Response(JSON.stringify(byId[txId]), { status: 200 });
-    });
+    const oldTx = await buildSignedTx(
+      JSON.stringify({ id: oldNote.noteId, c: oldNote.ciphertext, iv: oldNote.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: oldNote.noteId }),
+      oldWallet,
+    );
+    const newTx = await buildSignedTx(
+      JSON.stringify({ id: newNote.noteId, c: newNote.ciphertext, iv: newNote.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: newNote.noteId }),
+      newWallet_,
+    );
+    const fetchMock = vi.fn(gatewayFetchMock({ txs: [oldTx, newTx] }));
     vi.stubGlobal('fetch', fetchMock);
 
     const { fetchAllNotes } = await import('./arweave');
@@ -270,7 +377,64 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     expect(res.map(r => r.text).sort()).toEqual(['под новым кошельком', 'под старым кошельком']);
     // The GraphQL query itself must have asked for both owners.
     const gqlBody = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
-    expect(gqlBody.variables.owners).toEqual([OWNER_A, OWNER_B]);
+    expect(gqlBody.variables.owners).toEqual([oldWallet.address, newWallet_.address]);
+  });
+
+  // D9 attribution: the edge is DISCOVERY only. When it disagrees with the
+  // signed header, the header wins — nothing covers the edge.
+  it('takes Note-Id from the SIGNED header, not from the GraphQL edge', async () => {
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'подписанные теги решают');
+
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+    // The index announces a DIFFERENT Note-Id for the same txId.
+    const lying = edgeFor(tx, {
+      tags: [
+        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Version', value: '2' },
+        { name: 'Note-Id', value: 'ffffffff-ffff-4fff-8fff-ffffffffffff' },
+      ],
+    });
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({ txs: [tx], pages: [[lying]] })));
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res } = await fetchAllNotes('oh', ring(key));
+    expect(res).toHaveLength(1);
+    expect(res[0].encrypted.noteId).toBe(note.noteId);
+  });
+
+  // F1 regression: an index that ignores the `owners:` filter hands us a
+  // stranger's edge. D9 rejects it on the trusted-owner step — before any
+  // decryption, and without claiming the Note-Id.
+  it('a foreign-owner candidate is skipped and does not mark the sweep incomplete', async () => {
+    const trusted = await testWallet();
+    const attacker = await newWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', trusted.address);
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'чужая транзакция');
+
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      attacker,
+    );
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({ txs: [tx] })));
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
+    expect(res).toHaveLength(0);
+    // NOT incomplete: this candidate was never ours, nothing was lost.
+    expect(incomplete).toBe(false);
   });
 });
 
@@ -310,30 +474,20 @@ describe('checkRegistration structured result (RegistrationCheck)', () => {
 
 describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => {
   it('reports progress per settled payload and restores everything', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const notes = await Promise.all(
       Array.from({ length: 7 }, (_, i) => encryptEnvelope(key, `заметка ${i}`)),
     );
-    const byTx = new Map(notes.map((n, i) => [`TX${i}`, n]));
-
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [...byTx.entries()].map(([txId, n]) => ({ cursor: txId, node: { id: txId, tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '2' },
-            { name: 'Note-Id', value: n.noteId },
-          ] } })),
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
-      const n = byTx.get(url.split('/').pop()!)!;
-      return new Response(JSON.stringify({ id: n.noteId, c: n.ciphertext, iv: n.iv }), { status: 200 });
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    const txs = await Promise.all(notes.map(n => buildSignedTx(
+      JSON.stringify({ id: n.noteId, c: n.ciphertext, iv: n.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: n.noteId }),
+      wallet,
+    )));
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({ txs })));
 
     const progress: Array<[number, number]> = [];
     const { fetchAllNotes } = await import('./arweave');
@@ -348,35 +502,31 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
   });
 
   it('never runs more than 5 payload fetches in flight (bounded pool)', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const notes = await Promise.all(
       Array.from({ length: 12 }, (_, i) => encryptEnvelope(key, `n${i}`)),
     );
-    const byTx = new Map(notes.map((n, i) => [`TX${i}`, n]));
+    const txs = await Promise.all(notes.map(n => buildSignedTx(
+      JSON.stringify({ id: n.noteId, c: n.ciphertext, iv: n.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: n.noteId }),
+      wallet,
+    )));
 
     let inFlight = 0;
     let maxInFlight = 0;
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [...byTx.entries()].map(([txId, n]) => ({ cursor: txId, node: { id: txId, tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '2' },
-            { name: 'Note-Id', value: n.noteId },
-          ] } })),
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
+    const serve = gatewayFetchMock({ txs });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/graphql')) return serve(input, init);
       inFlight++;
       maxInFlight = Math.max(maxInFlight, inFlight);
       // Yield so the pool actually overlaps requests before any completes.
       await new Promise(r => setTimeout(r, 5));
       inFlight--;
-      const n = byTx.get(url.split('/').pop()!)!;
-      return new Response(JSON.stringify({ id: n.noteId, c: n.ciphertext, iv: n.iv }), { status: 200 });
+      return serve(input, init);
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -385,35 +535,33 @@ describe('fetchAllNotes parallel pool + progress (Phase 6 perf-restore)', () => 
 
     expect(res).toHaveLength(12);
     expect(maxInFlight).toBeGreaterThan(1); // the pool really parallelizes...
-    expect(maxInFlight).toBeLessThanOrEqual(5); // ...but never beyond the cap
+    // ...but never beyond the cap. Each worker issues ONE request at a time
+    // (header, then raw), so the bound is unchanged by D9's extra round trip.
+    expect(maxInFlight).toBeLessThanOrEqual(5);
   });
 });
 
 describe('fetchAllNotes partial-restore flag (M1)', () => {
   it('flags incomplete when a later page fails, keeping page-1 notes', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const note = await encryptEnvelope(key, 'страница 1');
 
-    let gqlCalls = 0;
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        gqlCalls++;
-        if (gqlCalls > 1) return new Response('gateway down', { status: 502 });
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '2' },
-            { name: 'Note-Id', value: note.noteId },
-          ] } }],
-          pageInfo: { hasNextPage: true }, // → second page will be requested
-        } } }), { status: 200 });
-      }
-      return new Response(JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }), { status: 200 });
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({
+      txs: [tx],
+      // Page 1 carries the note and announces a second page; that second call
+      // fails, so the sweep keeps what it has and reports partial.
+      pages: [[edgeFor(tx)], []],
+      onGraphql: (call) => (call > 0 ? new Response('gateway down', { status: 502 }) : undefined),
+    })));
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
@@ -605,30 +753,20 @@ describe('getWorkerCapabilities (strict /health validation, per version)', () =>
 
 describe('fetchAllNotes v3 (chain meta through restore)', () => {
   it('restores a v3 note with its meta and authenticated createdAt', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelopeV3, randomUuidV8 } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const root = randomUuidV8();
     const note = await encryptEnvelopeV3(key, '# v3 markdown', { fmt: 'md', rev: 2, root, prev: root });
 
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [{ cursor: 'c1', node: { id: 'TXV3', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '3' },
-            { name: 'Note-Id', value: note.noteId },
-          ] } }],
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
-      return new Response(
-        JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
-        { status: 200 },
-      );
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '3', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({ txs: [tx] })));
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
@@ -642,7 +780,8 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
   });
 
   it('skips a v3 candidate whose envelope meta is malformed (intentional skip)', async () => {
-    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
 
     const { deriveKey, generateMnemonic, randomUuidV8, bufferToBase64 } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
@@ -653,23 +792,14 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
     const ct = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(envelope)));
 
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.includes('/graphql')) {
-        return new Response(JSON.stringify({ data: { transactions: {
-          edges: [{ cursor: 'c1', node: { id: 'TXBAD', tags: [
-            { name: 'App-Name', value: 'EternalNotes' },
-            { name: 'App-Version', value: '3' },
-            { name: 'Note-Id', value: id },
-          ] } }],
-          pageInfo: { hasNextPage: false },
-        } } }), { status: 200 });
-      }
-      return new Response(
-        JSON.stringify({ id, c: bufferToBase64(ct), iv: bufferToBase64(iv) }),
-        { status: 200 },
-      );
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    // The TRANSACTION is perfectly valid — only the envelope inside is not, so
+    // this stays an intentional skip rather than a gateway failure.
+    const tx = await buildSignedTx(
+      JSON.stringify({ id, c: bufferToBase64(ct), iv: bufferToBase64(iv) }),
+      notesTags({ version: '3', ownerHash: 'oh', noteId: id }),
+      wallet,
+    );
+    vi.stubGlobal('fetch', vi.fn(gatewayFetchMock({ txs: [tx] })));
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
