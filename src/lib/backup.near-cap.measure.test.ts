@@ -4,6 +4,8 @@ import {
   inspectBackupFile,
   type BackupActionDeps,
 } from './backup-actions';
+import { planBackupImport, type PlanInput } from './backup-plan';
+import { applyBackupImport } from './backup-import';
 import {
   BACKUP_CAP_BYTES,
   BACKUP_PLAINTEXT_BUDGET_BYTES,
@@ -13,6 +15,7 @@ import {
   deriveKey,
   deriveSafeboxMetaKey,
   deriveSafeboxSecretKey,
+  encryptEnvelopeV3,
   sha256Hex,
   type EncryptedNote,
 } from './crypto';
@@ -26,24 +29,32 @@ import {
  * to buy a number nobody reads on every commit. It runs from
  * `scripts/measure-backup-near-cap.mjs`, which sets `MEASURE_NEAR_CAP=1`.
  *
- * Two different things happen here and both are deliberate:
+ * ── What it PROVES, and what it merely reports ───────────────────────
  *
- *  - an ASSERTION the plan requires and no other test makes at this size —
- *    «a near-cap export produces a file that passes its own import» (D17). The
- *    cap arithmetic is proven in `backup.test.ts` on constants, and the
- *    round-trip on ~2 MB; neither would notice a per-record overhead that only
- *    matters when there are tens of thousands of records. Getting this wrong
- *    means an export that hands the user a file its own import refuses — at
- *    the one moment the file is all they have;
- *  - a MEASUREMENT, printed rather than thresholded. A threshold on wall-clock
- *    would be a flaky test on a shared runner, and the number's real consumer
- *    is `docs/ROLLBACK.md`, where a human compares it against a device.
+ * The assertion the plan asks for is «a near-cap export produces a file that
+ * passes its own import» (D17), and it only means something if the round trip
+ * could have failed. The first version of this file could not: it filled the
+ * container with `'A'` — base64 of the right length, decryptable by nobody —
+ * so every record came back `damaged`, `report.ok` was never consulted, and
+ * stage B never ran. It measured the pipeline and proved nothing.
  *
- * What it does NOT measure is the browser's main thread. This is Node: the
- * chain under test is synchronous crypto, canonical serialization and JSON, so
- * the time here IS the time the tab would be unresponsive for — but scheduling,
- * GC pauses and the actual heap ceiling on a phone are a different question,
- * and the plan leaves the mobile number to the operator for that reason.
+ * Now: real records under the real key, a GREEN verify (`ok === true`, every
+ * record `readable`), and stage B applied in full against an in-memory writer.
+ * A database is deliberately not involved — what is under test is the
+ * container path at this size, not IndexedDB.
+ *
+ * The TIMINGS are reported, never thresholded: a wall-clock threshold on a
+ * shared runner is a flaky test, and the consumer of these numbers is a human
+ * in `docs/ROLLBACK.md` comparing them against a device.
+ *
+ * ── What it does NOT measure ─────────────────────────────────────────
+ *
+ * A browser main thread. This is Node, and the chain mixes synchronous work
+ * (canonical serialization, `JSON.parse`, base64) with WebCrypto calls that a
+ * browser may run off-thread. So these seconds are the COST of the operation,
+ * not a proven duration of a frozen interface — and the mobile figure, which
+ * is the one that decides whether a phone can do this at all, is the
+ * operator's to take on a real device (§13).
  */
 
 const RUN = process.env.MEASURE_NEAR_CAP === '1';
@@ -54,17 +65,15 @@ const MNEMONIC =
 /** Fill the budget to within a hair of it, in realistically-shaped records. */
 const RECORD_PAYLOAD_BYTES = 24 * 1024;
 
-function fakeNote(index: number, bytes: number): EncryptedNote {
-  // Base64 of the right LENGTH — this measures the format and the pipeline, not
-  // AES. Real ciphertext would cost minutes of key derivation for records the
-  // reader never decrypts on the export path anyway.
-  const ciphertext = 'A'.repeat(Math.ceil(bytes / 3) * 4);
-  return {
-    noteId: `11111111-2222-4333-8444-${String(index).padStart(12, '0')}`,
-    ciphertext,
-    iv: 'AAAAAAAAAAAAAAAA',
-    createdAt: 1_756_000_000_000 + index,
-  } as EncryptedNote;
+/** The file has to be genuinely near the ceiling for the run to mean anything:
+ *  a «near-cap» measurement at half the cap measures something else. */
+const MIN_CAP_FRACTION = 0.9;
+
+/** A distinct body per record: identical plaintext would compress in ways a
+ *  real store does not, and the cap is charged on the serialized bytes. */
+async function realNote(index: number, key: CryptoKey): Promise<EncryptedNote> {
+  const text = `${index}:${'note '.repeat(Math.floor(RECORD_PAYLOAD_BYTES / 5))}`;
+  return encryptEnvelopeV3(key, text, { fmt: 'plain', rev: 1 });
 }
 
 async function deps(notes: EncryptedNote[]): Promise<BackupActionDeps> {
@@ -88,47 +97,99 @@ async function deps(notes: EncryptedNote[]): Promise<BackupActionDeps> {
 const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
 describe.skipIf(!RUN)('near-cap export and import (step 13)', () => {
-  it('produces a file that passes its own import, and reports what it cost', async () => {
-    const count = Math.floor(BACKUP_PLAINTEXT_BUDGET_BYTES / (RECORD_PAYLOAD_BYTES * 1.34));
-    const notes = Array.from({ length: count }, (_, i) => fakeNote(i, RECORD_PAYLOAD_BYTES));
+  it('produces a file that passes its own import IN FULL, and reports what it cost', async () => {
+    const key = await deriveKey(MNEMONIC);
+    const count = Math.floor(BACKUP_PLAINTEXT_BUDGET_BYTES / (RECORD_PAYLOAD_BYTES * 1.4));
+    const notes: EncryptedNote[] = [];
+    for (let i = 0; i < count; i += 1) notes.push(await realNote(i, key));
 
-    const before = process.memoryUsage();
-    const startExport = performance.now();
-    const exported = await exportBackup(await deps(notes));
-    const exportMs = performance.now() - startExport;
+    // PEAK, not delta. `memoryUsage()` before and after reports what was still
+    // held at the end, which for a pipeline that builds and drops several
+    // large intermediates is the least interesting number available — and not
+    // the one a phone runs out of.
+    const baseRss = process.memoryUsage().rss;
+    let peakRss = baseRss;
+    let peakHeap = process.memoryUsage().heapUsed;
+    const sampler = setInterval(() => {
+      const now = process.memoryUsage();
+      peakRss = Math.max(peakRss, now.rss);
+      peakHeap = Math.max(peakHeap, now.heapUsed);
+    }, 25);
 
-    const fileBytes = new TextEncoder().encode(exported.text).byteLength;
+    try {
+      const startExport = performance.now();
+      const exported = await exportBackup(await deps(notes));
+      const exportMs = performance.now() - startExport;
 
-    // The assertion the plan asks for, at a size where it can actually fail:
-    // the cap is charged on the FINAL file on both sides, so a near-cap export
-    // must not produce something its own import refuses.
-    expect(fileBytes).toBeLessThanOrEqual(BACKUP_CAP_BYTES);
+      const fileBytes = new TextEncoder().encode(exported.text).byteLength;
 
-    const startImport = performance.now();
-    const inspected = await inspectBackupFile(
-      await deps([]),
-      { size: fileBytes, text: async () => exported.text },
-    );
-    const importMs = performance.now() - startImport;
-    const after = process.memoryUsage();
+      // The assertion the plan asks for, at a size where it can actually fail:
+      // the cap is charged on the FINAL file on both sides, so a near-cap
+      // export must not produce something its own import refuses.
+      expect(fileBytes).toBeLessThanOrEqual(BACKUP_CAP_BYTES);
+      // …and genuinely near it, or this is a measurement of something else.
+      expect(fileBytes).toBeGreaterThan(BACKUP_CAP_BYTES * MIN_CAP_FRACTION);
 
-    // Every record came back, and the reader agrees the file is intact. The
-    // records are not decryptable (synthetic ciphertext), so the verdict is
-    // «damaged» per record — what is being measured is the pipeline, and what
-    // is being asserted is that nothing was LOST or refused wholesale.
-    expect(inspected.report.counts.notes).toBe(count);
-    expect(inspected.records).toHaveLength(count);
+      const startVerify = performance.now();
+      const inspected = await inspectBackupFile(
+        await deps([]),
+        { size: fileBytes, text: async () => exported.text },
+      );
+      const verifyMs = performance.now() - startVerify;
 
-    console.log([
-      '',
-      '  near-cap measurement (desktop, Node — not a browser main thread)',
-      `    records:        ${count} notes × ${(RECORD_PAYLOAD_BYTES / 1024).toFixed(0)} KB ciphertext`,
-      `    plaintext:      ${mb(BACKUP_PLAINTEXT_BUDGET_BYTES)} budget`,
-      `    file produced:  ${mb(fileBytes)} of ${mb(BACKUP_CAP_BYTES)} cap`,
-      `    export:         ${exportMs.toFixed(0)} ms  (snapshot → canonical → GCM → SHA-256)`,
-      `    verify/import:  ${importMs.toFixed(0)} ms  (size gate → parse → GCM → per-record classify)`,
-      `    heap delta:     ${mb(after.heapUsed - before.heapUsed)} used, ${mb(after.rss - before.rss)} RSS`,
-      '',
-    ].join('\n'));
-  }, 300_000);
+      // GREEN, not merely parseable: every record decrypted, the chain graph
+      // agrees and the header is honest.
+      expect(inspected.report.ok).toBe(true);
+      expect(inspected.report.counts.notes).toBe(count);
+      expect(inspected.records.every(r => r.state === 'readable')).toBe(true);
+
+      // Stage B for real, against an in-memory writer.
+      const merged: string[] = [];
+      const startApply = performance.now();
+      const report = await applyBackupImport(
+        {
+          now: () => 1_756_000_000_000,
+          assertAlive: () => {},
+          classifyLocal: async () => ({ state: 'absent' }),
+          mergeRecord: async (_kind, incoming) => {
+            merged.push((incoming as EncryptedNote).noteId);
+            return 'added';
+          },
+          readIncompleteMarker: async () => false,
+          writeIncompleteMarker: async () => {},
+          withExclusiveLock: run => run(),
+        },
+        planBackupImport(inspected.records.map(r => ({
+          kind: r.kind,
+          id: r.id,
+          state: 'readable',
+          topology: r.topology,
+          record: r.record,
+        }) as PlanInput)),
+        true,
+      );
+      const applyMs = performance.now() - startApply;
+      const stillHeld = process.memoryUsage().heapUsed;
+
+      expect(report.counters.added).toBe(count);
+      expect(report.allFileRecordsApplied).toBe(true);
+      expect(report.incompleteRestore).toBe(false);
+      expect(merged).toHaveLength(count);
+
+      console.log([
+        '',
+        '  near-cap measurement (desktop, Node — NOT a browser main thread)',
+        `    records:         ${count} real encrypted notes × ~${(RECORD_PAYLOAD_BYTES / 1024).toFixed(0)} KB`,
+        `    file produced:   ${mb(fileBytes)} of ${mb(BACKUP_CAP_BYTES)} cap`,
+        `    export:          ${exportMs.toFixed(0)} ms  (snapshot → canonical → GCM → SHA-256)`,
+        `    verify:          ${verifyMs.toFixed(0)} ms  (size gate → parse → GCM → per-record decrypt)`,
+        `    apply (stage B): ${applyMs.toFixed(0)} ms  (plan → per-record merge, in memory)`,
+        `    peak memory:     ${mb(peakHeap)} heap, ${mb(peakRss)} RSS (+${mb(peakRss - baseRss)} over baseline)`,
+        `    still held:      ${mb(stillHeld)} heap`,
+        '',
+      ].join('\n'));
+    } finally {
+      clearInterval(sampler);
+    }
+  }, 600_000);
 });

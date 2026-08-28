@@ -181,15 +181,16 @@ export function sizeNotice(expectedFileBytes: number, overCap: boolean): SizeNot
     return {
       text,
       overCap: false,
-      // The second sentence is a measurement, not a guess: at the ceiling a
-      // desktop spends ~5.5 s exporting and ~6.6 s importing with the tab
-      // frozen and about a gigabyte of peak memory (step 13). A phone has
-      // neither the seconds nor the memory, and finding that out by watching
-      // the tab die is the wrong way to learn it.
+      // The second sentence is measured, and says only what was measured
+      // (step 13): near the ceiling a desktop spends ~3 s exporting and ~3.4 s
+      // verifying, with a peak of ~1.2 GB RSS. The memory is the part that
+      // decides a phone's fate, so it is named; «the interface freezes» is NOT
+      // claimed, because the chain mixes synchronous serialization with
+      // WebCrypto calls a browser may run off-thread and nobody measured that.
       warning: `Копия приближается к пределу в ${formatBytes(BACKUP_CAP_BYTES)}. `
         + 'Записи не удаляются, поэтому объём только растёт. Рядом с пределом создание и '
-        + 'проверка копии занимают несколько секунд с замершим интерфейсом и требуют около '
-        + 'гигабайта памяти — на телефоне вкладка может не справиться, делайте копию на компьютере.',
+        + 'проверка копии занимают несколько секунд и требуют больше гигабайта памяти — '
+        + 'на телефоне вкладка может не справиться, делайте копию на компьютере.',
     };
   }
   return { text, overCap: false };
