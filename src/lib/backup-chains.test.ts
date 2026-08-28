@@ -82,12 +82,41 @@ describe('revisions', () => {
     expect(problems(nodes)).toEqual(['broken_link']);
   });
 
-  it('two records claiming the same position', () => {
+  it('a FORK is not a problem — two records may share a position', () => {
+    // The app assigns `rev` locally as `current.rev + 1`, so two devices
+    // editing the same note offline produce the same revision number by
+    // construction, and `chains.ts` keeps both versions on purpose. A
+    // validator that called this damaged would have the app accuse its own
+    // export — and a user told their emergency copy is corrupt does the wrong
+    // thing with it.
     const nodes = [
       ...chain('a', 2),
       node({ id: 'a-2b', rev: 2, root: 'a-1', prev: 'a-1' }),
     ];
-    expect(problems(nodes)).toContain('conflicting_rev');
+    expect(problems(nodes)).toEqual([]);
+  });
+
+  it('…and both branches of a fork may grow, each linked to its own parent', () => {
+    // The reason position-uniqueness was never needed for ordering: the link
+    // is checked per record, against the predecessor it NAMES. Sorting by
+    // `rev` still puts every child after its own parent.
+    const nodes = [
+      ...chain('a', 2),
+      node({ id: 'a-2b', rev: 2, root: 'a-1', prev: 'a-1' }),
+      node({ id: 'a-3a', rev: 3, root: 'a-1', prev: 'a-2' }),
+      node({ id: 'a-3b', rev: 3, root: 'a-1', prev: 'a-2b' }),
+    ];
+    expect(problems(nodes)).toEqual([]);
+  });
+
+  it('but a link to a record that is NOT the previous revision is still broken', () => {
+    // Accepting forks must not become accepting anything: the direct-link rule
+    // is what makes the graph a graph.
+    const nodes = [
+      ...chain('a', 2),
+      node({ id: 'a-2b', rev: 2, root: 'a-1', prev: 'a-2' }),
+    ];
+    expect(problems(nodes)).toEqual(['broken_link']);
   });
 
   it('a revision that is not a positive integer', () => {
