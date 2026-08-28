@@ -1,0 +1,254 @@
+import { describe, it, expect, vi } from 'vitest';
+
+// The «on» build: the flag matrix is the point of half this file, and the
+// shipped pair is both-off. What must hold while they ARE off gets its own
+// file, against the real flags.
+vi.mock('./flags', () => ({
+  V3_WRITER_ENABLED: true,
+  SAFEBOX_WRITER_ENABLED: true,
+  QUICK_UNLOCK_ENABLED: false,
+  BACKUP_EXPORT_ENABLED: true,
+  BACKUP_IMPORT_ENABLED: true,
+}));
+
+import {
+  backupActions,
+  backupErrorMessage,
+  formatBytes,
+  freshnessSummary,
+  importPreview,
+  importSummary,
+  sizeNotice,
+  BACKUP_NEAR_CAP_FRACTION,
+  INCOMPLETE_SOURCE_WARNING,
+  VIEWER_INSTRUCTION,
+} from './backup-ui';
+import { BACKUP_CAP_BYTES, BackupError } from './backup';
+import { SKIP_COUNTERS, type ImportCounters, type ImportReport } from './backup-import';
+import type { VerifyReport } from './backup-actions';
+
+/**
+ * The sentences, one rule at a time.
+ *
+ * Every case below is a place where the honest sentence and the comfortable
+ * sentence differ, and where the comfortable one would be acted on: a user
+ * deletes an original because the app said the copy was checked, or keeps a
+ * file because it said something was not restored.
+ */
+
+const at = (ts: number) => `T${ts}`; // a deterministic clock, not a timezone
+
+const REPORT = (over: Partial<ImportCounters> = {}, incompleteRestore = false): ImportReport => {
+  const counters: ImportCounters = {
+    added: 0, repaired: 0, quarantinedRepaired: 0, quarantinedDataRepaired: 0,
+    quarantineStale: 0, unsupportedLocal: 0, conflicts: 0, deferred: 0,
+    skipped: 0, unsupported: 0, concurrentChange: 0, quotaStopped: 0,
+    ...over,
+  };
+  return {
+    counters,
+    allFileRecordsApplied: SKIP_COUNTERS.every(k => counters[k] === 0),
+    incompleteRestore,
+  };
+};
+
+const VERIFY = (over: Partial<VerifyReport> = {}): VerifyReport => ({
+  ok: true,
+  sha256: 'a'.repeat(64),
+  createdAt: 1,
+  counts: { notes: 3, safebox: 2 },
+  incompleteRestore: false,
+  containsUnsupportedRecords: false,
+  issues: [],
+  ...over,
+});
+
+describe('the flag matrix decides what exists, not what is greyed out (D16)', () => {
+  it('with both flags on, everything is offered', () => {
+    expect(backupActions()).toEqual({ canImport: true, canExport: true, anyVisible: true });
+  });
+});
+
+describe('the freshness chip says only what is known (D21)', () => {
+  it('«не создавалась» when nothing was ever exported', () => {
+    expect(freshnessSummary({}, at)).toEqual({
+      chip: 'не создавалась',
+      lines: ['Резервная копия ещё не создавалась.'],
+    });
+  });
+
+  it('calls an export checked ONLY when the checked bytes were those bytes', () => {
+    // The dangerous sentence. «Checked» said about an export whose bytes were
+    // never the ones checked is what a user relies on before deleting an
+    // original — so it is gated on the digest, not on the fact that a check
+    // happened at some point.
+    const sha = 'deadbeef';
+    const summary = freshnessSummary({
+      lastExport: { createdAt: 10, sha256: sha, at: 11 },
+      lastVerified: { createdAt: 10, sha256: sha, at: 20 },
+    }, at);
+
+    expect(summary.chip).toBe('проверена');
+    expect(summary.lines).toEqual(['Последний экспорт подготовлен T11.', 'Этот экспорт проверен T20.']);
+  });
+
+  it('a DIFFERENT file checked gets its own line, and the export stays unchecked', () => {
+    const summary = freshnessSummary({
+      lastExport: { createdAt: 10, sha256: 'aaa', at: 11 },
+      lastVerified: { createdAt: 5, sha256: 'bbb', at: 20 },
+    }, at);
+
+    expect(summary.chip).toBe('не проверена');
+    expect(summary.lines).toEqual([
+      'Последний экспорт подготовлен T11.',
+      // Named by ITS OWN date — that is what lets the user tell the two apart.
+      'Файл от T5 проверен T20.',
+    ]);
+  });
+
+  it('a file checked with nothing ever exported here is still reported', () => {
+    // A copy from another device. «Не создавалась» alone would read as «nothing
+    // was ever checked», which is a different and false statement.
+    const summary = freshnessSummary({ lastVerified: { createdAt: 5, sha256: 'b', at: 20 } }, at);
+
+    expect(summary.chip).toBe('не создавалась');
+    expect(summary.lines[1]).toBe('Файл от T5 проверен T20.');
+  });
+});
+
+describe('size is stated in the units the cap is charged in (D17)', () => {
+  it('says nothing extra while the store is small', () => {
+    const notice = sizeNotice(1024 * 1024, false);
+    expect(notice.warning).toBeUndefined();
+    expect(notice.overCap).toBe(false);
+    expect(notice.text).toContain('1.0 МБ');
+  });
+
+  it('warns BEFORE the ceiling, because nothing in this app deletes records', () => {
+    const notice = sizeNotice(Math.ceil(BACKUP_CAP_BYTES * BACKUP_NEAR_CAP_FRACTION), false);
+    expect(notice.warning).toContain('приближается к пределу');
+    expect(notice.overCap).toBe(false);
+  });
+
+  it('an over-cap measurement is over cap even if the NUMBER looks fine', () => {
+    // The measurement stops at the budget, so the figure it returns is small
+    // by construction — trusting the number alone would report a store that
+    // cannot be exported as comfortable.
+    const notice = sizeNotice(1024, true);
+    expect(notice.overCap).toBe(true);
+    expect(notice.warning).toContain('экспорт откажет');
+  });
+
+  it('formats bytes without pretending to precision it does not have', () => {
+    expect(formatBytes(512)).toBe('512 Б');
+    expect(formatBytes(2048)).toBe('2.0 КБ');
+    expect(formatBytes(32 * 1024 * 1024)).toBe('32 МБ');
+  });
+});
+
+describe('the import preview (D11a)', () => {
+  it('leads with the blocking warning when the file admits it is partial', () => {
+    const preview = importPreview(VERIFY({ incompleteRestore: true }), at);
+    expect(preview.blocking).toBe(INCOMPLETE_SOURCE_WARNING);
+    expect(preview.blocking).toContain('Не удаляйте исходный файл');
+  });
+
+  it('has no blocking line for a complete file', () => {
+    expect(importPreview(VERIFY(), at).blocking).toBeUndefined();
+  });
+
+  it('counts the file, and says what the import will and will not do', () => {
+    const preview = importPreview(VERIFY({ createdAt: 7 }), at);
+    expect(preview.headline).toBe('Файл от T7: 3 заметки, 2 записи сейфа.');
+    expect(preview.body.join(' ')).toContain('Здоровые локальные записи не заменяются');
+    expect(preview.body.join(' ')).toContain('повторная отправка бесплатна');
+  });
+});
+
+describe('the report is three lines by what the user did (§7)', () => {
+  it('sums the four repair counters into one «восстановлено»', () => {
+    const summary = importSummary(REPORT({
+      added: 2, repaired: 1, quarantinedRepaired: 1, quarantinedDataRepaired: 1, quarantineStale: 1,
+    }));
+    expect(summary.restored).toBe('Добавлено: 2, восстановлено: 4.');
+  });
+
+  it('sums everything unapplied into ONE number with «не удаляйте файл»', () => {
+    const summary = importSummary(REPORT({
+      conflicts: 1, unsupported: 2, unsupportedLocal: 3, skipped: 4, quotaStopped: 5,
+    }));
+    expect(summary.notApplied).toBe('Не восстановлено: 15 — не удаляйте файл копии.');
+    expect(summary.success).toBeUndefined();
+  });
+
+  it('keeps the repeatable outcomes apart from the lost ones', () => {
+    // «Try again» is true for these two and false for the other five; merging
+    // them would send the user to retry something no retry can fix.
+    const summary = importSummary(REPORT({ deferred: 1, concurrentChange: 2 }));
+    expect(summary.retryable).toContain('Требуется повторный импорт: 3');
+    expect(summary.notApplied).toBeUndefined();
+  });
+
+  it.each(SKIP_COUNTERS)('a single %s is enough to withhold the success line', counter => {
+    // The invariant §7 states outright: no skip counter may be invisible. A
+    // counter added to the report and forgotten by this module would show
+    // «Восстановление завершено полностью» over unapplied data.
+    expect(importSummary(REPORT({ [counter]: 1 })).success).toBeUndefined();
+  });
+
+  it('withholds it for a partial SOURCE too, at seven zeroes', () => {
+    // Different question: everything in the file was applied, and the file was
+    // never a complete backup of the vault it descends from.
+    const summary = importSummary(REPORT({ added: 5 }, true));
+    expect(summary.success).toBeUndefined();
+    expect(summary.blocking).toBe(INCOMPLETE_SOURCE_WARNING);
+  });
+
+  it('shows it only at seven zeroes AND a complete source', () => {
+    const summary = importSummary(REPORT({ added: 5 }));
+    expect(summary.success).toBe('Восстановление завершено полностью.');
+    expect(summary.blocking).toBeUndefined();
+  });
+});
+
+describe('the viewer instruction separates the two threats (D19)', () => {
+  it('offers the neighbouring check for CORRUPTION and the separate copy for authenticity', () => {
+    const text = VIEWER_INSTRUCTION.join(' ');
+    expect(text).toContain('случайную порчу');
+    expect(text).toContain('отдельно от файла');
+    // Never the other claim: whoever can rewrite the HTML in that folder can
+    // rewrite a checksum stored beside it.
+    expect(text).not.toMatch(/блок.{0,40}подлинност/i);
+  });
+});
+
+describe('failures become sentences that claim nothing extra', () => {
+  it.each([
+    ['BackupVaultLockedError', 'разблокируйте'],
+    ['BackupDisabledError', 'выключена'],
+    ['BackupCancelledError', 'прервана'],
+    ['BackupLockUnavailableError', 'вкладками'],
+    ['BackupStoreTooLargeError', 'больше предела'],
+  ])('%s', (name, fragment) => {
+    const error = new Error('raw');
+    error.name = name;
+    expect(backupErrorMessage(error)).toContain(fragment);
+  });
+
+  it('does not guess between a wrong seed phrase and damaged bytes', () => {
+    // GCM cannot tell them apart, and naming one would send the user to fix
+    // the wrong thing — or to throw away a file that is fine.
+    const message = backupErrorMessage(new BackupError('undecryptable', 'auth failed'));
+    expect(message).toContain('другой seed-фразы');
+    expect(message).toContain('повреждён');
+    expect(message).toContain('не удаляйте файл');
+  });
+
+  it('an unknown failure says nothing about the file at all', () => {
+    // The default is the one that matters: «копия повреждена» said about a
+    // full disk would have the user throw away a working file.
+    const message = backupErrorMessage(new Error('QuotaExceededError'));
+    expect(message).toContain('Файл копии не изменялся');
+    expect(message).not.toMatch(/поврежд/i);
+  });
+});

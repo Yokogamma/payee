@@ -46,6 +46,7 @@ import {
   UnsupportedNoteVersionError,
   bufferToBase64,
   base64ToBuffer,
+  sha256Hex,
   type EncryptedSafeboxEntry,
   type NoteData,
   type NoteFormat,
@@ -57,17 +58,23 @@ import {
 import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } from './chains';
 import { noteSearchText } from './note-search-text';
 import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED } from './flags';
+import { saveBlob } from './download';
 import {
+  estimateBackupSize as runEstimate,
   prepareImport,
+  readBackupFreshness as runReadFreshness,
   runExport,
   runVerify,
   BackupCancelledError,
   BackupVaultLockedError,
+  type BackupSizeReport,
   type BackupVault,
   type ExportOutcome,
   type PreparedImport,
   type VerifyOutcome,
 } from './backup-adapter';
+import type { BackupFreshness } from './backup-ui';
+import { fetchBackupViewer, type DeliveredViewer } from './viewer-delivery';
 import type { ImportReport } from './backup-import';
 
 /** Stage B's result, plus whether the screen managed to catch up with it. The
@@ -610,6 +617,16 @@ interface NotesStore {
    *  confirmed, and applied to the vault stage A ran against — the session
    *  refuses if that vault is gone. */
   applyBackupImport: (prepared: PreparedImport) => Promise<ImportOutcome>;
+  /** The two D21 markers, read raw. What they MEAN together is a rule about
+   *  words and lives in `backup-ui`; no vault is needed for either. */
+  readBackupFreshness: () => Promise<BackupFreshness>;
+  /** What an export would weigh, without making one (D17). */
+  estimateBackupSize: () => Promise<BackupSizeReport>;
+  /** Fetch the standalone viewer and check it against the digest this build
+   *  was compiled with (D19). Throws `ViewerDeliveryError` on any doubt — a
+   *  download presented as verified when nothing was verified is worse than
+   *  no download. */
+  downloadBackupViewer: () => Promise<DeliveredViewer>;
   setSafeboxSearchQuery: (query: string) => void;
   goToRestore: () => void;
   goToOnboarding: () => void;
@@ -4437,21 +4454,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     armSafeboxIdleTimer();
 
     const bytes = base64ToBuffer(content.data);
-    const blob = new Blob([bytes as BlobPart], { type: descriptor.mime || 'application/octet-stream' });
-    const url = URL.createObjectURL(blob);
-    try {
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = descriptor.name;
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    } finally {
-      // Revoke on the NEXT task: a synchronous revoke aborts the download in
-      // several browsers.
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-    }
+    saveBlob(
+      new Blob([bytes as BlobPart], { type: descriptor.mime || 'application/octet-stream' }),
+      descriptor.name,
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -4595,6 +4601,19 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * the report away: the import has already happened, and an exception here
    * would leave the user to retry blind over data that is already in place.
    */
+  const readBackupFreshness = useCallback((): Promise<BackupFreshness> => runReadFreshness(), []);
+
+  const estimateBackupSize = useCallback((): Promise<BackupSizeReport> => runEstimate(), []);
+
+  // No vault: the viewer is a public artifact of this build, and the check is
+  // about DELIVERY, not about the user's data. `sha256Hex` comes from `crypto`
+  // so there is one definition of «the digest of this text» in the app.
+  const downloadBackupViewer = useCallback((): Promise<DeliveredViewer> => fetchBackupViewer({
+    fetch: (...args) => fetch(...args),
+    sha256Hex,
+    baseUrl: import.meta.env.BASE_URL,
+  }), []);
+
   const applyBackupImport = useCallback(async (prepared: PreparedImport): Promise<ImportOutcome> => {
     const myEpoch = vaultEpochRef.current;
     const report = await prepared.apply();
@@ -4717,6 +4736,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     verifyBackupFile,
     prepareBackupImport,
     applyBackupImport,
+    readBackupFreshness,
+    estimateBackupSize,
+    downloadBackupViewer,
     setSafeboxSearchQuery,
     goToRestore,
     goToOnboarding,
@@ -4765,6 +4787,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     getSafeboxPinLockState, addSafeboxEntry, editSafeboxEntry, restoreSafeboxVersion,
     revealSafeboxSecret, copySafeboxPassword, downloadSafeboxAttachment,
     exportBackupFile, verifyBackupFile, prepareBackupImport, applyBackupImport,
+    readBackupFreshness, estimateBackupSize, downloadBackupViewer,
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,
     setupPinAction, removePinAction, unlockWithPinAction, getPinLockState,

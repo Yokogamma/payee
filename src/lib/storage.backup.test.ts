@@ -12,6 +12,7 @@ import {
   getAllNotes,
   getSafeboxEntryById,
   readBackupSnapshot,
+  estimateBackupPlaintextBytes,
   mergeBackupRecord,
   mergeRestoredSafeboxEntry,
   getDbGeneration,
@@ -331,6 +332,52 @@ describe('readBackupSnapshot — the size measure is an upper bound in BYTES', (
     await saveNote({ ...note(), extra: new ArrayBuffer(8) } as unknown as EncryptedNote);
 
     await expect(readBackupSnapshot(BIG_BUDGET)).rejects.toMatchObject({ code: 'unsupported_value' });
+  });
+});
+
+describe('estimateBackupPlaintextBytes — the same measure, without the records', () => {
+  it('agrees with the reader byte for byte', async () => {
+    // Two measures that could disagree would mean the settings block promises
+    // a file the export then refuses to produce. They share one function, and
+    // this is the assertion that keeps it that way.
+    await saveNote(note());
+    await saveNote(other);
+
+    const estimate = await estimateBackupPlaintextBytes(BIG_BUDGET);
+    const snapshot = await readBackupSnapshot(estimate.plaintextBytes - 1);
+
+    expect(estimate.overCap).toBe(false);
+    // One byte under the measured total is not enough — which is only true if
+    // both sides counted the same bytes.
+    expect(snapshot.ok).toBe(false);
+    expect(await readBackupSnapshot(estimate.plaintextBytes)).toMatchObject({ ok: true });
+  });
+
+  it('counts safebox entries as well as notes', async () => {
+    await saveNote(note());
+    const notesOnly = await estimateBackupPlaintextBytes(BIG_BUDGET);
+
+    await mergeRestoredSafeboxEntry({
+      entryId: '88888888-9999-8aaa-baaa-cccccccccccc',
+      metaCiphertext: 'QUFBQUFBQUFBQUFBQUFBQQ==', metaIv: IV,
+      secretCiphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', secretIv: IV,
+      createdAt: NOW, v: 4,
+    }, 'tx-A', NOW, getDbGeneration());
+
+    expect((await estimateBackupPlaintextBytes(BIG_BUDGET)).plaintextBytes)
+      .toBeGreaterThan(notesOnly.plaintextBytes);
+  });
+
+  it('stops at the budget and SAYS it stopped', async () => {
+    // The figure it returns is small by construction once it stops, so a
+    // consumer reading the number alone would call an unexportable store
+    // comfortable. The flag is the answer, not the number.
+    await saveNote(note());
+
+    const estimate = await estimateBackupPlaintextBytes(4);
+
+    expect(estimate.overCap).toBe(true);
+    expect(estimate.plaintextBytes).toBeGreaterThan(4);
   });
 });
 

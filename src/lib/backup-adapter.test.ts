@@ -70,6 +70,7 @@ function storage(over: Partial<BackupStorage> = {}) {
       ok: true,
       snapshot: { notes: [], safebox: [], incompleteRestore: false },
     }),
+    estimateSize: async () => ({ plaintextBytes: 0, overCap: false }),
     getNote: async () => undefined,
     getEntry: async () => undefined,
     mergeRecord: async input => {

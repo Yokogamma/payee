@@ -7,7 +7,10 @@ import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-libra
 
 // Writer-OFF (R3) UI matrix — flag pinned explicitly; the ON surface lives in
 // Main.v3.test.tsx. Keeps the W3 flip a pure one-line change.
-vi.mock('../lib/flags', () => ({ V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
+vi.mock('../lib/flags', () => ({
+  V3_WRITER_ENABLED: false, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false,
+  BACKUP_EXPORT_ENABLED: false, BACKUP_IMPORT_ENABLED: false,
+}));
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({

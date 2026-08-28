@@ -1266,6 +1266,22 @@ h1 {
   gap: 8px;
 }
 
+/* Backup block (§7). Same stack as the PIN actions; its own class because the
+   two are unrelated and one of them will move first. */
+.backup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 64 hex characters have to WRAP: on a 360px phone an unbreakable digest
+   pushes the whole settings column sideways, and this one is meant to be read
+   and copied out by hand — which is also why it does not get a smaller size
+   than everything else. */
+.backup-digest {
+  word-break: break-all;
+}
+
 /* ─── Loader ────────────────────────────────────────────────── */
 
 .loader {

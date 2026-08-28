@@ -67,15 +67,17 @@ import {
 import { classifyLocalPayload } from './backup-classify';
 import { planBackupImport, type ImportPlan, type PlanInput } from './backup-plan';
 import { applyBackupImport as runStageB, type ImportReport } from './backup-import';
-import { deriveBackupKey } from './backup';
+import { deriveBackupKey, expectedContainerBytes, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
 import {
   deriveKey,
   deriveSafeboxMetaKey,
   deriveSafeboxSecretKey,
+  sha256Hex,
   type EncryptedNote,
   type EncryptedSafeboxEntry,
 } from './crypto';
 import {
+  estimateBackupPlaintextBytes,
   getMeta,
   getNoteById,
   getSafeboxEntryById,
@@ -84,9 +86,11 @@ import {
   setMeta,
   INCOMPLETE_RESTORE_META_KEY,
   type BackupMergeResult,
+  type BackupSizeEstimate,
   type LocalPayload,
   type MergeBackupRecordInput,
 } from './storage';
+import type { BackupArtifactMarker, BackupFreshness } from './backup-ui';
 
 /** D21: which file the freshness chip is about. */
 export const LAST_EXPORT_ARTIFACT_KEY = 'last-export-artifact';
@@ -158,6 +162,7 @@ export interface BackupVault {
  *  database, and bound to the real one by `liveStorage` below. */
 export interface BackupStorage {
   readSnapshot(maxPlaintextBytes: number): ReturnType<typeof readBackupSnapshot>;
+  estimateSize(maxPlaintextBytes: number): Promise<BackupSizeEstimate>;
   getNote(id: string): Promise<EncryptedNote | undefined>;
   getEntry(id: string): Promise<EncryptedSafeboxEntry | undefined>;
   mergeRecord(input: MergeBackupRecordInput): Promise<BackupMergeResult>;
@@ -167,6 +172,7 @@ export interface BackupStorage {
 
 export const liveStorage: BackupStorage = {
   readSnapshot: readBackupSnapshot,
+  estimateSize: estimateBackupPlaintextBytes,
   getNote: getNoteById,
   getEntry: getSafeboxEntryById,
   mergeRecord: mergeBackupRecord,
@@ -220,11 +226,6 @@ async function vaultKeys(mnemonic: string): Promise<BackupActionDeps['keys']> {
     safeboxSecret: await deriveSafeboxSecretKey(mnemonic),
     container: await deriveBackupKey(mnemonic),
   };
-}
-
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function actionDeps(vault: BackupVault, storage: BackupStorage): Promise<BackupActionDeps> {
@@ -294,6 +295,46 @@ export async function runVerify(
       at: vault.now(),
     }),
   };
+}
+
+/**
+ * What the freshness chip is allowed to say (D21).
+ *
+ * NOT gated by a flag and NOT needing a vault: it reads two `meta` keys and
+ * makes no claim of its own. The rule about what those keys MEAN together —
+ * «this export, checked» only on a SHA-256 match — lives in `backup-ui`, next
+ * to the sentence it authorizes.
+ */
+export async function readBackupFreshness(
+  storage: BackupStorage = liveStorage,
+): Promise<BackupFreshness> {
+  const [lastExport, lastVerified] = await Promise.all([
+    storage.readMeta<BackupArtifactMarker>(LAST_EXPORT_ARTIFACT_KEY),
+    storage.readMeta<BackupArtifactMarker>(LAST_VERIFIED_ARTIFACT_KEY),
+  ]);
+  return { lastExport, lastVerified };
+}
+
+export interface BackupSizeReport {
+  /** In the units the cap is charged in: the FINAL file size (D17). */
+  expectedFileBytes: number;
+  /** The measurement stopped at the budget — the real figure is larger. */
+  overCap: boolean;
+}
+
+/**
+ * How big an export would be, without making one.
+ *
+ * Gated with the export flag for the same reason the export itself is: it
+ * describes a file only that release can produce. No vault — the measurement
+ * reads ciphertext lengths and decrypts nothing.
+ */
+export async function estimateBackupSize(
+  storage: BackupStorage = liveStorage,
+): Promise<BackupSizeReport> {
+  if (!BACKUP_EXPORT_ENABLED) throw new BackupDisabledError('export');
+  const { plaintextBytes, overCap } = await storage.estimateSize(BACKUP_PLAINTEXT_BUDGET_BYTES);
+  return { expectedFileBytes: expectedContainerBytes(plaintextBytes), overCap };
 }
 
 /**

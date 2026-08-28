@@ -37,6 +37,7 @@ const makeVault = () => vi.fn((): BackupVault => vault);
 
 const refuseEverything = (): BackupStorage => ({
   readSnapshot: vi.fn(async () => { throw new Error('storage must not be touched'); }),
+  estimateSize: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   getNote: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   getEntry: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   mergeRecord: vi.fn(async () => { throw new Error('storage must not be touched'); }),
