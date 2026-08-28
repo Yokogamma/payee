@@ -265,11 +265,16 @@ describe('base layer, as the browser resolves it', () => {
   });
 
   it('the reader anchors its own card menu and keeps the reading measure', () => {
-    // In the feed `.note-card { position: relative }` is the menu's containing
-    // block. The reader has no such ancestor, and without one the menu would
-    // resolve `top: calc(100% - 4px)` against some other forebear.
-    expect(declaresIn('.note-reader-meta', /position:\s*relative/)).toBe(true);
-    expect(declaresIn('.note-reader-meta', /z-index/)).toBe(false);
+    // The reader carries no ⋯ menu any more — its actions are a labelled bar
+    // at the bottom, in the thumb's reach — so the meta row is facts only and
+    // needs no positioning of its own.
+    expect(declaresIn('.note-reader-meta', /position:/)).toBe(false);
+    // 13px, not the tab bar's 12.5px: that size is a named exception granted
+    // to `.app-nav-item` alone, and a third exception would end the floor.
+    expect(declaresIn('.note-action', /font-size:\s*13px/)).toBe(true);
+    expect(declaresIn('.note-action', /min-height:\s*56px/)).toBe(true);
+    // The date labels the screen at the same size as the control beside it.
+    expect(declaresIn('.note-reader-title', /font-size:\s*15px/)).toBe(true);
     // The body keeps `.note-text` as its wrapper — that is where the 18px and
     // the `pre-wrap` unformatted notes depend on live. `.note-reading` only
     // opens the rhythm and sets the measure.

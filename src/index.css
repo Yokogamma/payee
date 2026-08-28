@@ -2189,13 +2189,33 @@ mark {
 }
 
 /* ─── Reading a note ─────────────────────────────────────────
-   The meta row is the CardMenu's anchor. In the feed that job belongs to
-   `.note-card { position: relative }`; here there is no such ancestor, and
-   without one the menu would resolve `top: calc(100% - 4px)` against some
-   other positioned forebear and land at the bottom of the screen. No z-index —
-   same reason as everywhere else in this file. */
+   THE HEADER IS TWO POLES: return on the left, the note's own name on the
+   right. Returning to the list is NAVIGATION and belongs where every platform
+   puts it; the right side is where actions on the object live, and here it
+   carries the date instead — because the word «Заметка» named nothing, while
+   the date names this entry and nothing else does. */
+.notes-topbar--reading { gap: 6px; padding: 8px 12px 6px; }
+/* KEEPS `.btn-ghost`'s rule — the Ф1 contract is that a control declares a
+   fill or a line, never nothing, and a back control is not exempt just because
+   it carries an arrow. Only the INK is raised: the one way out of this screen
+   must not read quieter than the date label beside it. */
+.note-back { width: auto; padding: 10px 10px 10px 4px; color: var(--text); }
+.note-back svg { width: 22px; height: 22px; }
+/* Same 15px as the control it shares the line with — quiet in TONE, not in
+   size: it labels the screen, it does not lead it. */
+.note-reader-title {
+  flex: 0 0 auto;
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--text-dim);
+  padding-right: 6px;
+}
+
+/* Facts, and only facts. The date went to the header and the menu went to the
+   action bar; the transaction link stays because it answers «where does this
+   live», which is what the rest of this row answers too. */
 .note-reader-meta {
-  position: relative;
   display: flex;
   align-items: center;
   gap: 14px;
@@ -2203,10 +2223,57 @@ mark {
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
 }
-.note-reader-meta .note-date { margin-bottom: 0; }
+.note-reader-tx {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  text-decoration-color: var(--border-control);
+  white-space: nowrap;
+}
+.note-reader-tx svg { width: 15px; height: 15px; flex: none; }
 
-/* The FAB is `position: sticky`, so it has to live INSIDE the scroller — as a
-   sibling of it, it would simply never stick. */
+/* ACTIONS AT THE BOTTOM, IN THE THUMB'S REACH, and in the same place the tab
+   bar occupies in the feed — so the bottom of the screen means one thing in
+   both modes: this is where you tap. Labels are words, not a lone glyph: a nib
+   in a corner has to be guessed.
+   13px, NOT the tab bar's 12.5px — that size is a named exception granted to
+   `.app-nav-item` alone, and a third exception would mean the floor is not a
+   floor. */
+.note-reader-actions {
+  display: flex;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.note-action {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 56px;
+  padding: 10px 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 13px;
+  letter-spacing: 0.03em;
+  color: var(--text);
+  transition: background-color 0.15s;
+}
+.note-action svg { width: 22px; height: 22px; }
+.note-action:hover { background: var(--accent-glow); }
+/* Secondary actions recede in TONE — the row stays one row of equals in size,
+   which is what keeps it scannable. */
+.note-action--quiet { color: var(--text-dim); }
+.note-action--quiet:hover { color: var(--text); }
+
 /* FLEX, NOT `grid-area`. The reader's three parts are children of
    `.main-content`, which is a flex COLUMN — a `grid-area` there is inert, and
    the body fell back to `flex: 0 1 auto` and sized itself to its content. Both

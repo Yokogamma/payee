@@ -937,16 +937,12 @@ describe('Main — чтение при выключенном писателе',
     expect(document.querySelector('.notes-feed')).toBeNull();
   });
 
-  it('но правки нет — ни кнопкой, ни пунктом меню', () => {
+  it('но панель не предлагает ни правку, ни историю', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     openFirstNote();
-    expect(screen.queryByRole('button', { name: 'Редактировать заметку' })).toBeNull();
-    expect(document.querySelector('.note-reader-body .fab')).toBeNull();
-
-    fireEvent.click(screen.getByLabelText('Меню заметки'));
-    expect(screen.queryByText('Редактировать')).toBeNull();
-    expect(screen.queryByText(/История версий/)).toBeNull();
-    // Copying is writer-independent and stays.
-    expect(screen.getByText('Копировать текст')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Изменить' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'История' })).toBeNull();
+    // Copying is writer-independent and stays — the panel is not empty.
+    expect(screen.getByRole('button', { name: 'Копировать' })).toBeTruthy();
   });
 });

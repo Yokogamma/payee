@@ -14,7 +14,7 @@ import { SyncStateBadge } from '../components/SyncStateBadge';
 import { CardMenu } from '../components/CardMenu';
 import { formatNoteDate, formatNoteDateFull } from '../lib/format-date';
 import { noteSearchText } from '../lib/note-search-text';
-import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote } from '../components/icons';
+import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote, IconChevronLeft } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
 import { useRoute, navigate, canonicalHash, type RouteHistoryState } from '../lib/route';
 import { AppNav } from '../components/AppNav';
@@ -608,24 +608,36 @@ export function Main({ theme, onThemeChange }: MainProps) {
           `min-height` and 20px of side padding, sitting where the section name
           goes. The mockup puts creation on a round button at the bottom of the
           list, within thumb reach, and gives the header back to the title. */}
+      {/* READING HAS ITS OWN HEADER, and the difference is not cosmetic.
+          «Свернуть» sits on the RIGHT because it cancels what you are doing;
+          a return to the list is NAVIGATION and belongs on the left, where
+          every platform puts it. Reading also has no need for the word
+          «Заметка» — the date is what names this particular entry, so the date
+          IS the screen title: same 15px as the back control, quiet in tone
+          because it labels rather than leads. */}
+      {reading && readingNote ? (
+        <div className="notes-topbar notes-topbar--reading">
+          <button className="btn btn-ghost note-back" onClick={closeNote}>
+            <IconChevronLeft />
+            Заметки
+          </button>
+          <span className="note-meta-gap" />
+          <h2 className="section-title note-reader-title" tabIndex={-1}>
+            {formatNoteDate(readingNote.createdAt)}
+          </h2>
+        </div>
+      ) : (
       <div className="notes-topbar">
         <h2 className="section-title" tabIndex={-1}>
-          {composing ? 'Новая заметка' : reading ? 'Заметка' : 'Заметки'}
+          {composing ? 'Новая заметка' : 'Заметки'}
         </h2>
         {composing && (
           <button className="btn btn-ghost" onClick={collapseComposer}>
             Свернуть
           </button>
         )}
-        {/* Mirrors «Свернуть»: the same slot, the same shape, the in-app way
-            out of a fullscreen state. The system Back gesture is the other
-            one, and it is why this state lives in the address at all. */}
-        {reading && (
-          <button className="btn btn-ghost" onClick={closeNote}>
-            Назад
-          </button>
-        )}
       </div>
+      )}
 
       {composing && (
         // TWO SENTENCES, and only the first is unconditional.
@@ -695,8 +707,11 @@ export function Main({ theme, onThemeChange }: MainProps) {
           version count under the reader instead of going stale. */}
       {reading && readingChain && readingNote && readingInfo && (
           <>
+            {/* FACTS ONLY. The date left this row for the header, the ⋯ menu
+                left for the action bar; what remains states where the note
+                lives. The transaction link belongs here for the same reason —
+                it answers «where is it», not «what can I do». */}
             <div className="note-reader-meta">
-              <span className="note-date section-label">{formatNoteDate(readingNote.createdAt)}</span>
               <SyncStateBadge
                 badge={badgeFor(readingInfo, arweave.enabled && arweave.registered)}
                 onRetry={
@@ -711,61 +726,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
                 </span>
               )}
               <span className="note-meta-gap" />
-              <CardMenu
-                open={openMenuId === readingChain.root}
-                onOpenChange={next => setOpenMenuId(next ? readingChain.root : null)}
-                label="Меню заметки"
-                id={`note-menu-${readingChain.root}`}
-                /* The SAME ref map as the feed. A second one would leave
-                   `confirmRestore` focusing a button that is not on screen.
-                   The map is written during render here, as it is in the
-                   feed's map callback — it is a cache keyed by chain root,
-                   not React state. */
-                // eslint-disable-next-line react-hooks/refs -- lazily-created ref cache, not a read of rendered state
-                triggerRef={menuTriggerRef(readingChain.root)}
-                items={[
-                  {
-                    key: 'copy',
-                    icon: <IconCopy />,
-                    label: 'Копировать текст',
-                    onSelect: () => handleCopyNote(readingNote.text),
-                  },
-                  /* Editing is offered TWICE on purpose: the FAB is the
-                     thumb-reach route, this is the one a keyboard or
-                     screen-reader user finds where every other note action
-                     already lives. Same flag, same shape as the feed card. */
-                  ...(V3_WRITER_ENABLED
-                    ? [{
-                        key: 'edit',
-                        icon: <IconEdit />,
-                        label: 'Редактировать',
-                        onSelect: () => setEditChainRoot(readingChain.root),
-                      }]
-                    : []),
-                  ...(V3_WRITER_ENABLED && readingChain.versions.length > 1
-                    ? [{
-                        key: 'history',
-                        icon: <IconHistory />,
-                        label: `История версий (${readingChain.versions.length})`,
-                        onSelect: () => {
-                          setHistoryFocusVersionId(null);
-                          setHistoryChainRoot(readingChain.root);
-                        },
-                      }]
-                    : []),
-                  ...(readingInfo.status === 'confirmed' && readingInfo.txId
-                    ? [{
-                        key: 'tx',
-                        icon: <IconLink />,
-                        label: 'Транзакция в блокчейне',
-                        href: `https://viewblock.io/arweave/tx/${readingInfo.txId}`,
-                      }]
-                    : []),
-                ]}
-                hint={V3_WRITER_ENABLED
-                  ? 'Редактирование добавляет новую версию — старые остаются в истории. Версию, уже опубликованную в блокчейне, изменить или удалить невозможно.'
-                  : 'Опубликованная в блокчейне копия неизменяема: её нельзя отредактировать или удалить.'}
-              />
+              {readingInfo.status === 'confirmed' && readingInfo.txId && (
+                <a
+                  className="note-reader-tx"
+                  href={`https://viewblock.io/arweave/tx/${readingInfo.txId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <IconLink />
+                  Транзакция
+                </a>
+              )}
             </div>
             <div className="note-reader-body">
               {/* `.note-text` is the wrapper here too — it carries the 18px
@@ -777,16 +748,48 @@ export function Main({ theme, onThemeChange }: MainProps) {
                   ? <NoteMarkdown text={readingNote.text} />
                   : readingNote.text}
               </div>
-              {/* Editing sits where creation sits in the feed: same corner,
-                  same thumb. Gated on the writer flag — with it off `editNote`
-                  throws, and the rollback contract says the control is hidden,
-                  not merely inert. The reader itself is never gated. */}
+            </div>
+            {/*
+              ACTIONS AT THE BOTTOM, NAMED IN WORDS.
+              They used to sit in three different places along the right edge —
+              «Назад» at the top, ⋯ in the facts row, a nib in the corner — so
+              finding out what a note could do meant scanning that edge. Here
+              they are one row, in the thumb's reach, and the bottom of the
+              screen means the same thing in both modes: this is where you tap.
+              The corner the nib occupied goes back to «Новая заметка», which is
+              what it means in the feed.
+            */}
+            <div className="note-reader-actions">
               {V3_WRITER_ENABLED && (
-                <Fab
-                  label="Редактировать заметку"
-                  icon={<IconEdit />}
+                <button
+                  type="button"
+                  className="note-action"
                   onClick={() => setEditChainRoot(readingChain.root)}
-                />
+                >
+                  <IconEdit />
+                  <span>Изменить</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className="note-action note-action--quiet"
+                onClick={() => void handleCopyNote(readingNote.text)}
+              >
+                <IconCopy />
+                <span>{copyFeedback === 'ok' ? 'Скопировано' : copyFeedback === 'fail' ? 'Не вышло' : 'Копировать'}</span>
+              </button>
+              {V3_WRITER_ENABLED && readingChain.versions.length > 1 && (
+                <button
+                  type="button"
+                  className="note-action note-action--quiet"
+                  onClick={() => {
+                    setHistoryFocusVersionId(null);
+                    setHistoryChainRoot(readingChain.root);
+                  }}
+                >
+                  <IconHistory />
+                  <span>История</span>
+                </button>
               )}
             </div>
           </>

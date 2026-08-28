@@ -417,7 +417,7 @@ describe('Main — чтение заметки', () => {
       window.dispatchEvent(new PopStateEvent('popstate'));
     });
     const before = window.history.length;
-    fireEvent.click(screen.getByRole('button', { name: 'Назад' }));
+    fireEvent.click(screen.getByRole('button', { name: /Заметки/ }));
     expect(window.location.hash).toBe('#/notes');
     expect(window.history.length).toBe(before);
   });
@@ -460,21 +460,31 @@ describe('Main — чтение заметки', () => {
     expect(document.querySelector('.main-screen')?.className).not.toContain('--composing');
   });
 
-  it('правка доступна из чтения — и кнопкой, и пунктом меню', () => {
+  it('действия читалки — подписанная панель у нижнего края', () => {
     window.history.replaceState(null, '', '#/notes/root1');
     render(<Main theme="system" onThemeChange={vi.fn()} />);
 
-    // Thumb-reach route.
-    fireEvent.click(screen.getByRole('button', { name: 'Редактировать заметку' }));
-    expect(screen.getByRole('dialog', { name: 'Редактирование заметки' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
+    // Words, not a lone glyph — and no ⋯ in the reader at all: the actions
+    // that used to hide behind it are the panel now.
+    expect(screen.getByRole('button', { name: 'Изменить' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Копировать' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'История' })).toBeTruthy();
+    expect(screen.queryByLabelText('Меню заметки')).toBeNull();
+    // The corner the nib occupied belongs to «Новая заметка» in the feed.
+    expect(document.querySelector('.note-reader-body .fab')).toBeNull();
 
-    // Keyboard / screen-reader route: the menu where every other note action
-    // already lives. Its ABSENCE is what the writer-off matrix asserts, so
-    // this positive case is what keeps that assertion from passing vacuously.
-    fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText('Редактировать'));
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить' }));
     expect(screen.getByRole('dialog', { name: 'Редактирование заметки' })).toBeTruthy();
+  });
+
+  it('дата стоит в шапке как заголовок экрана, слова «Заметка» нет', () => {
+    window.history.replaceState(null, '', '#/notes/root1');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    const title = document.querySelector('.section-title');
+    expect(title?.className).toContain('note-reader-title');
+    expect(title?.textContent).not.toBe('Заметка');
+    // Focus contract intact: the effect finds the title by this class.
+    expect(title?.getAttribute('tabindex')).toBe('-1');
   });
 
   it('и правка из чтения действительно сохраняется', async () => {
@@ -482,7 +492,7 @@ describe('Main — чтение заметки', () => {
     window.history.replaceState(null, '', '#/notes/root1');
     render(<Main theme="system" onThemeChange={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Редактировать заметку' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить' }));
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'правка из читалки' } });
     fireEvent.click(screen.getByRole('button', { name: 'Сохранить новую версию' }));
@@ -498,15 +508,13 @@ describe('Main — чтение заметки', () => {
    */
   const openers: Array<[string, () => void]> = [
     ['EditNoteModal', () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Редактировать заметку' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Изменить' }));
     }],
     ['VersionHistoryModal', () => {
-      fireEvent.click(screen.getByLabelText('Меню заметки'));
-      fireEvent.click(screen.getByText(/История версий/));
+      fireEvent.click(screen.getByRole('button', { name: 'История' }));
     }],
     ['RestoreVersionDialog', () => {
-      fireEvent.click(screen.getByLabelText('Меню заметки'));
-      fireEvent.click(screen.getByText(/История версий/));
+      fireEvent.click(screen.getByRole('button', { name: 'История' }));
       fireEvent.click(screen.getByText(/Версия 1 из 2/));
       fireEvent.click(document.querySelector('.history-restore-btn') as HTMLButtonElement);
     }],
@@ -547,7 +555,7 @@ describe('Main — чтение заметки', () => {
 
     const back = vi.spyOn(window.history, 'back').mockImplementation(() => {});
     const lengthBefore = window.history.length;
-    fireEvent.click(screen.getByRole('button', { name: 'Назад' }));
+    fireEvent.click(screen.getByRole('button', { name: /Заметки/ }));
     expect(back).toHaveBeenCalledTimes(1);
     // Никакой замены адреса поверх нашей же записи.
     expect(window.history.length).toBe(lengthBefore);
@@ -579,8 +587,7 @@ describe('Main — поздний хвост восстановления вер
     render(<Main theme="system" onThemeChange={vi.fn()} />);
 
     // Open history from the reader, pick the older version, confirm.
-    fireEvent.click(screen.getByLabelText('Меню заметки'));
-    fireEvent.click(screen.getByText(/История версий/));
+    fireEvent.click(screen.getByRole('button', { name: 'История' }));
     // The restore control only exists inside an EXPANDED row.
     fireEvent.click(screen.getByText(/Версия 1 из 2/));
     // Its label is split across an icon and text, so query by class.
@@ -634,7 +641,6 @@ describe('Main — прокрутка ленты', () => {
   });
 
   it('но НЕ отбрасывает ленту после сохранения заметки', async () => {
-    const s = h.store as ReturnType<typeof makeStore>;
     render(<Main theme="system" onThemeChange={vi.fn()} />);
 
     // Один поход в заметку — именно он раньше «отравлял» все последующие
@@ -650,7 +656,9 @@ describe('Main — прокрутка ленты', () => {
     const input = document.querySelector('.note-input') as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: 'новая заметка' } });
     fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
-    await waitFor(() => expect(s.addNote).toHaveBeenCalled());
+    // Ждём именно ВОЗВРАТА ленты, а не только вызова addNote: композер
+    // закрывается после того, как промис сохранения разрешится.
+    await waitFor(() => expect(feed()).toBeTruthy());
 
     // Лента должна остаться там, где её оставил пользователь.
     expect(feed()?.scrollTop).toBe(0);
