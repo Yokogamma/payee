@@ -92,7 +92,7 @@ interface OpenedEntry extends SafeboxEntryData {
 interface Opened {
   createdAt: number;
   /** The newest READABLE version of each chain, feed-ordered. Whether
-   *  «newest readable» is also «current» is `provenCurrent`. */
+   *  «newest readable» is also «current» is `currentness` below. */
   notes: NoteData[];
   entries: OpenedEntry[];
   incomplete: boolean;
@@ -324,7 +324,7 @@ async function open(file: File, mnemonic: string, myEpoch: number): Promise<void
   // rule). Rendering versions flat would put a superseded password next to the
   // current one with nothing to tell them apart, in the one place where there
   // is nothing else to check against. What «current» is worth when something is
-  // missing is settled by `currentnessProven`, and said out loud in `render`.
+  // missing is settled by `doubtsOf`, and said out loud in `render`.
   const notes = groupChains(noteVersions).map(chain => chain.current);
   const entries = groupSafeboxChains(entryVersions)
     .map(chain => entryById.get(chain.current.id))
