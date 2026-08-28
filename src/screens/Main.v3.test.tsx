@@ -477,18 +477,81 @@ describe('Main — чтение заметки', () => {
     expect(screen.getByRole('dialog', { name: 'Редактирование заметки' })).toBeTruthy();
   });
 
-  it('переход маршрута закрывает модалку и не оставляет её над лентой', () => {
+  it('и правка из чтения действительно сохраняется', async () => {
+    const s = h.store as ReturnType<typeof makeStore>;
     window.history.replaceState(null, '', '#/notes/root1');
     render(<Main theme="system" onThemeChange={vi.fn()} />);
+
     fireEvent.click(screen.getByRole('button', { name: 'Редактировать заметку' }));
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'правка из читалки' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить новую версию' }));
+
+    await waitFor(() => expect(s.editNote).toHaveBeenCalledWith('root1', 'правка из читалки'));
+  });
+
+  /**
+   * ALL THREE dialogs, not just the edit one. They render as unconditional
+   * siblings outside the routed section and none of them listens to popstate,
+   * so each has to be shown to close on a route change — otherwise a forgotten
+   * one stands over the restored feed.
+   */
+  const openers: Array<[string, () => void]> = [
+    ['EditNoteModal', () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Редактировать заметку' }));
+    }],
+    ['VersionHistoryModal', () => {
+      fireEvent.click(screen.getByLabelText('Меню заметки'));
+      fireEvent.click(screen.getByText(/История версий/));
+    }],
+    ['RestoreVersionDialog', () => {
+      fireEvent.click(screen.getByLabelText('Меню заметки'));
+      fireEvent.click(screen.getByText(/История версий/));
+      fireEvent.click(screen.getByText(/Версия 1 из 2/));
+      fireEvent.click(document.querySelector('.history-restore-btn') as HTMLButtonElement);
+    }],
+  ];
+
+  for (const [name, open] of openers) {
+    it(`переход маршрута закрывает ${name} и не оставляет её над лентой`, () => {
+      window.history.replaceState(null, '', '#/notes/root1');
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      open();
+      expect(document.querySelector('[role="dialog"]')).toBeTruthy();
+
+      act(() => {
+        window.history.replaceState({ enSection: true }, '', '#/notes');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      });
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect(document.querySelector('.notes-feed')).toBeTruthy();
+    });
+  }
+
+  it('и смена СЕКЦИИ тоже: диалог не остаётся поверх сейфа', () => {
+    // Это уже существовавшая дыра — модалка рендерится вне секции и переживала
+    // переход. Тот же ключ маршрута закрывает и её.
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('Редактировать'));
     expect(document.querySelector('[role="dialog"]')).toBeTruthy();
 
-    act(() => {
-      window.history.replaceState({ enSection: true }, '', '#/notes');
-      window.dispatchEvent(new PopStateEvent('popstate'));
-    });
+    fireEvent.click(screen.getByRole('button', { name: /Сейф/ }));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(document.querySelector('.notes-feed')).toBeTruthy();
+  });
+
+  it('«Назад» над НАШЕЙ записью уходит назад по истории, а не заменяет адрес', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(window.history.state).toEqual({ enSection: true });
+
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => {});
+    const lengthBefore = window.history.length;
+    fireEvent.click(screen.getByRole('button', { name: 'Назад' }));
+    expect(back).toHaveBeenCalledTimes(1);
+    // Никакой замены адреса поверх нашей же записи.
+    expect(window.history.length).toBe(lengthBefore);
+    back.mockRestore();
   });
 
   it('#/settings/x канонизируется в #/settings', () => {

@@ -1,5 +1,4 @@
 import { useRef, type ReactNode, type RefObject } from 'react';
-import { NoteMarkdown } from './NoteMarkdown';
 import { useTruncation } from '../lib/useTruncation';
 
 /**
@@ -68,9 +67,4 @@ export function NotePreview({
       />
     </div>
   );
-}
-
-/** The preview's markdown surface — links and image chips are inert here. */
-export function NotePreviewMarkdown({ text }: { text: string }) {
-  return <NoteMarkdown text={text} preview />;
 }

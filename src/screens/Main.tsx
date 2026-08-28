@@ -508,6 +508,10 @@ export function Main({ theme, onThemeChange }: MainProps) {
 
   function requestRestore(version: NoteData) {
     if (!historyChainRoot) return;
+    // A NEW flow invalidates the previous one's tail — otherwise a restore the
+    // user backed out of could still steal focus from the one they started
+    // instead.
+    restoreOpRef.current++;
     // Modal-stack discipline: close history BEFORE the confirm opens.
     setRestoreTarget({ root: historyChainRoot, version });
     setHistoryChainRoot(null);
@@ -515,6 +519,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
 
   function cancelRestore() {
     if (!restoreTarget) return;
+    restoreOpRef.current++;
     // Reopen history with focus back on the version row the user came from.
     setHistoryFocusVersionId(restoreTarget.version.id);
     setHistoryChainRoot(restoreTarget.root);
