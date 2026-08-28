@@ -211,18 +211,38 @@ Reading a note is a routed state — `#/notes/<chainRoot>` — because the Andro
 system Back gesture, a reload and a PWA eviction all have to land where the
 user was. That puts a note's chain root in the address bar.
 
-The boundaries of the exposure, and why it is accepted rather than fixed:
+**The chain root is NOT an opaque local handle.** For a v3 chain's first
+version `root === noteId` (`crypto.ts`: «root: noteId of the chain's FIRST
+version; rev===1 ⇒ root===id»), and that same `noteId` is published to Arweave
+as a PUBLIC TAG next to `Owner-Hash` (`arweave.ts`, the `Note-Id` /
+`Owner-Hash` tag pair). So an identifier read out of browser history can be
+looked up on-chain.
 
-- The identifier is **opaque**: a `crypto.randomUUID()` chain root. It carries
-  no text, no title, no date and no count, and it cannot be correlated with
-  anything without the vault key.
+The boundaries of the exposure, stated honestly:
+
+- **What an attacker with the history CAN do**: find the transaction carrying
+  that `Note-Id`, and from it learn the `Owner-Hash` cohort the note belongs
+  to, its publication time and block height, and — by comparing repeated
+  entries — that this particular note was opened more than once. Given several
+  ids from the history, they can tie them to the same owner cohort.
+- **What stays sealed**: the note's TEXT and every later version's content, all
+  AES-256-GCM under the owner's key. The seed, the vault and the ability to
+  write anything under that owner are unaffected.
 - A URL **fragment is never sent** — not in the HTTP request line, not in
-  `Referer`. The Worker proxy never sees it.
-- The link is **useless to anyone else**: the note it names is decryptable only
-  with the owner's seed, on a device that already holds the vault.
-- What DOES retain it: browser history, session restore, and profile sync
-  outside standalone/PWA mode. An attacker with the profile learns that *some*
-  note was opened, not which one or what it said.
+  `Referer`. The Worker proxy never sees it. The exposure is entirely local:
+  browser history, session restore, and profile sync outside standalone/PWA.
+- The link is **useless as a link**: the note it names is decryptable only with
+  the owner's seed, on a device that already holds the vault.
+
+So the honest summary is not «an opaque id that means nothing off-device». It
+is: **the address fragment leaks a public on-chain identifier, and therefore a
+correlation handle to the owner cohort and to publication timing — but no
+content.** That is what is accepted here. Anyone re-approving this risk should
+weigh the correlation, not just the opacity.
+
+(For the record: v3 ids are `randomUuidV8()`, not `crypto.randomUUID()` — the
+UUIDv4 form is v1/v2 only. The distinction does not change the risk; the
+generator is not the reason the id is exposed, the on-chain tag is.)
 
 Do NOT "fix" this by moving the state out of the address: a fullscreen reading
 view that the Back gesture cannot close is a worse product, and hiding the id
