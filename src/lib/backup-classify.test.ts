@@ -1,7 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { classifyBackupRecord, type BackupRecordKeys } from './backup-classify';
+import {
+  classifyBackupRecord,
+  classifyLocalPayload,
+  type BackupRecordKeys,
+} from './backup-classify';
 import {
   deriveKey,
   deriveSafeboxMetaKey,
@@ -138,5 +142,58 @@ describe('there is ONE definition of a well-formed record', () => {
     // a shape check somebody would write here by hand.
     expect(code).not.toMatch(/RegExp|\/\^/);
     expect(code).not.toMatch(/\.length\s*[<>=]|byteLength/);
+  });
+});
+
+/**
+ * The local-side classifier, and the one thing it must not do to a cancelled
+ * operation (D15).
+ *
+ * The safebox path is the interesting one: its two halves are decrypted in
+ * sequence, the SECOND is the password and the attachment bytes, and the
+ * whole function body sits inside one `catch`. That `catch` is why cancellation
+ * needs a name — swallowed, «you left the page» would come back out as «this
+ * record is damaged» and the merge rules would act on the lie.
+ */
+describe('classifying what is already on disk', () => {
+  const cancel = () => { const e = new Error('gone'); e.name = 'BackupCancelledError'; return e; };
+
+  it('checks between the two halves of a safebox entry, not only around them', async () => {
+    const entry = await makeEntry();
+    let calls = 0;
+    const boom = cancel();
+
+    await expect(classifyLocalPayload(await vaultKeys(), 'safebox', entry, () => {
+      calls += 1;
+      throw boom;
+    })).rejects.toBe(boom);
+
+    // Once, and from between the halves: the secret half — the password and
+    // the attachment contents — is never materialized for an operation that
+    // has already been abandoned.
+    expect(calls).toBe(1);
+  });
+
+  it('re-throws cancellation instead of calling the record corrupt', async () => {
+    // Both names the app can produce: its own, and the one the platform uses
+    // when an AbortSignal fires mid-operation.
+    const entry = await makeEntry();
+    for (const name of ['BackupCancelledError', 'AbortError']) {
+      const boom = new Error('cancelled');
+      boom.name = name;
+      await expect(classifyLocalPayload(await vaultKeys(), 'safebox', entry, () => { throw boom; }))
+        .rejects.toBe(boom);
+    }
+  });
+
+  it('a genuinely unreadable record is still corrupt — the escape hatch is narrow', async () => {
+    const entry = await makeEntry();
+    const damaged = { ...entry, secretCiphertext: `${entry.secretCiphertext.slice(0, -4)}AAAA` };
+
+    expect(await classifyLocalPayload(await vaultKeys(), 'safebox', damaged)).toBe('corrupt');
+  });
+
+  it('an absent record needs no keys and no guard', async () => {
+    expect(await classifyLocalPayload(await vaultKeys(), 'note', undefined)).toBe('absent');
   });
 });

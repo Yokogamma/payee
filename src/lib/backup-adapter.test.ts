@@ -12,12 +12,12 @@ vi.mock('./flags', () => ({
 }));
 
 import {
-  applyPreparedImport,
   importSucceeded,
   prepareImport,
   runExport,
   runVerify,
   withImportLock,
+  BackupCancelledError,
   BackupLockUnavailableError,
   LAST_EXPORT_ARTIFACT_KEY,
   LAST_VERIFIED_ARTIFACT_KEY,
@@ -57,9 +57,14 @@ const vault = (over: Partial<BackupVault> = {}): BackupVault => ({
   ...over,
 });
 
+/** The operations take a FACTORY, not a vault: with a release flag off, «the
+ *  vault is locked» is a true statement and the wrong answer, so the flag is
+ *  checked before the vault is asked for. */
+const from = (v: BackupVault) => () => v;
+
 function storage(over: Partial<BackupStorage> = {}) {
   const meta = new Map<string, unknown>();
-  const merges: Array<{ id: string; generation: number }> = [];
+  const merges: Array<{ id: string; generation: number; record: unknown }> = [];
   const base: BackupStorage = {
     readSnapshot: async () => ({
       ok: true,
@@ -71,6 +76,7 @@ function storage(over: Partial<BackupStorage> = {}) {
       merges.push({
         id: input.kind === 'note' ? input.incoming.noteId : input.incoming.entryId,
         generation: input.expectedDbGeneration,
+        record: input.incoming,
       });
       return 'added';
     },
@@ -114,8 +120,8 @@ describe('the file is read ONCE, and stage B writes what stage A judged', () => 
     const { file, read } = countedFile(await container([note]));
     const { storage: store, merges } = storage();
 
-    const prepared = await prepareImport(vault(), file, store);
-    await applyPreparedImport(vault(), prepared, store);
+    const prepared = await prepareImport(from(vault()), file, store);
+    await prepared.apply();
 
     expect(read).toHaveBeenCalledTimes(1);
     expect(merges.map(m => m.id)).toEqual([note.noteId]);
@@ -125,10 +131,52 @@ describe('the file is read ONCE, and stage B writes what stage A judged', () => 
     const note = await makeNote('carried through');
     const { file } = countedFile(await container([note]));
 
-    const prepared = await prepareImport(vault(), file, storage().storage);
+    const { storage: store, merges } = storage();
+    const prepared = await prepareImport(from(vault()), file, store);
+    await prepared.apply();
 
-    expect(prepared.plan.ordered).toHaveLength(1);
-    expect(prepared.plan.ordered[0].record).toEqual(note);
+    // The BYTES, not the id: an adapter that carried the right identifier and
+    // the wrong ciphertext would pass an id-only assertion and write a record
+    // the vault cannot read.
+    expect(prepared.plannedCount).toBe(1);
+    expect(merges.map(m => m.record)).toEqual([note]);
+  });
+});
+
+describe('a prepared import belongs to the vault it was prepared against', () => {
+  it('refuses to apply after a lock or a reset — before the marker and before any merge', async () => {
+    // The gap this closes: stage A and stage B are separated by a human
+    // decision, which takes long enough to lock the app, reset it and open a
+    // DIFFERENT seed. A stage B that accepted a fresh vault would let the new
+    // generation authorize writing the FIRST seed's ciphertext into the second
+    // vault — permanently undecryptable there, and published under the new
+    // identity by the queue.
+    const { file } = countedFile(await container([await makeNote()]));
+    const { storage: store, merges, meta } = storage();
+    let alive = true;
+
+    const prepared = await prepareImport(
+      from(vault({ assertAlive: () => { if (!alive) throw new BackupCancelledError('reset'); } })),
+      file,
+      store,
+    );
+
+    alive = false; // lock / reset / a different seed opened
+    await expect(prepared.apply()).rejects.toBeInstanceOf(BackupCancelledError);
+
+    expect(merges).toEqual([]);
+    expect(meta.size).toBe(0); // not even the provisional incompleteRestore marker
+  });
+
+  it('takes no vault at all — there is no parameter to hand it a different one', async () => {
+    // Structural, and deliberately so: the guarantee is «cannot», not
+    // «does not». `apply` is a method on the session, the session's vault is
+    // private, and there is no argument through which a caller could offer a
+    // second one.
+    const { file } = countedFile(await container([await makeNote()]));
+    const prepared = await prepareImport(from(vault()), file, storage().storage);
+
+    expect(prepared.apply.length).toBe(0);
   });
 });
 
@@ -141,9 +189,11 @@ describe('one database generation for the whole import', () => {
     const { file } = countedFile(await container([first, second]));
     const { storage: store, merges } = storage();
 
-    const prepared = await prepareImport(vault(), file, store);
-    await applyPreparedImport(vault({ dbGeneration: 42 }), prepared, store);
+    const prepared = await prepareImport(from(vault({ dbGeneration: 42 })), file, store);
+    await prepared.apply();
 
+    // 42 is the generation STAGE A captured, and stage B uses that one — not a
+    // fresh reading taken between the two.
     expect(merges).toHaveLength(2);
     expect(merges.every(m => m.generation === 42)).toBe(true);
   });
@@ -161,7 +211,7 @@ describe('stage A validates the graph, not just the records', () => {
     });
     const { file } = countedFile(await container([first, third]));
 
-    const prepared = await prepareImport(vault(), file, storage().storage);
+    const prepared = await prepareImport(from(vault()), file, storage().storage);
 
     expect(prepared.report.ok).toBe(false);
     expect(prepared.report.issues.some(i => i.problem === 'chain')).toBe(true);
@@ -175,7 +225,7 @@ describe('the lifecycle guard is honoured, and it throws', () => {
     let checks = 0;
 
     await expect(prepareImport(
-      vault({ assertAlive: () => { if (++checks >= 2) throw boom; } }),
+      from(vault({ assertAlive: () => { if (++checks >= 2) throw boom; } })),
       file,
       storage().storage,
     )).rejects.toBe(boom);
@@ -186,8 +236,9 @@ describe('the artifact markers (D21)', () => {
   it('an export records the file it produced', async () => {
     const { storage: store, meta } = storage();
 
-    const exported = await runExport(vault(), store);
+    const { exported, markerRecorded } = await runExport(from(vault()), store);
 
+    expect(markerRecorded).toBe(true);
     expect(meta.get(LAST_EXPORT_ARTIFACT_KEY)).toEqual(exported.artifact);
     expect(exported.artifact.sha256).toMatch(/^[0-9a-f]{64}$/);
   });
@@ -198,9 +249,10 @@ describe('the artifact markers (D21)', () => {
     const { file } = countedFile(await container([damaged]));
     const { storage: store, meta } = storage();
 
-    const report = await runVerify(vault(), file, store);
+    const { report, markerRecorded } = await runVerify(from(vault()), file, store);
 
     expect(report.ok).toBe(false);
+    expect(markerRecorded).toBe(false);
     expect(meta.has(LAST_VERIFIED_ARTIFACT_KEY)).toBe(false);
   });
 
@@ -208,12 +260,40 @@ describe('the artifact markers (D21)', () => {
     const { file } = countedFile(await container([await makeNote()]));
     const { storage: store, meta } = storage();
 
-    const report = await runVerify(vault(), file, store);
+    const { report, markerRecorded } = await runVerify(from(vault()), file, store);
 
     expect(report.ok).toBe(true);
+    expect(markerRecorded).toBe(true);
     expect(meta.get(LAST_VERIFIED_ARTIFACT_KEY)).toEqual({
       createdAt: report.createdAt, sha256: report.sha256, at: NOW,
     });
+  });
+
+  it('a marker that cannot be written does NOT take the file away', async () => {
+    // The one moment this feature exists for is also the moment storage is
+    // most likely to be full. Losing the emergency copy because a note-to-self
+    // about it could not be stored would be the failure mode in person.
+    const { storage: store } = storage({
+      writeMeta: async () => { throw new Error('QuotaExceededError'); },
+    });
+
+    const { exported, markerRecorded } = await runExport(from(vault()), store);
+
+    expect(markerRecorded).toBe(false);
+    expect(exported.text.length).toBeGreaterThan(0);
+    expect(exported.fileName).toMatch(/^eternal-notes-backup-/);
+  });
+
+  it('...and the same for a verify report', async () => {
+    const { file } = countedFile(await container([await makeNote()]));
+    const { storage: store } = storage({
+      writeMeta: async () => { throw new Error('QuotaExceededError'); },
+    });
+
+    const { report, markerRecorded } = await runVerify(from(vault()), file, store);
+
+    expect(report.ok).toBe(true);
+    expect(markerRecorded).toBe(false);
   });
 });
 
@@ -230,6 +310,18 @@ describe('the cross-tab lock', () => {
     await expect(withImportLock(async () => 'ran')).resolves.toBe('ran');
     expect(request.mock.calls[0][0]).toBe('eternal-notes-backup-import');
     expect(request.mock.calls[0][1]).toEqual({ mode: 'exclusive' });
+  });
+
+  it('hands the abort signal to the WAIT, not only to the work', async () => {
+    // The wait can be long — another tab may be importing 30 MB — and a tab
+    // that has gone away must stop queueing for a turn it no longer wants.
+    const request = vi.fn(async (_name: string, _opts: unknown, run: () => Promise<unknown>) => run());
+    vi.stubGlobal('navigator', { locks: { request } });
+    const controller = new AbortController();
+
+    await withImportLock(async () => 'ran', controller.signal);
+
+    expect(request.mock.calls[0][1]).toEqual({ mode: 'exclusive', signal: controller.signal });
   });
 });
 

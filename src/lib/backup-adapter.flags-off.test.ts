@@ -1,15 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  applyPreparedImport,
   prepareImport,
   runExport,
   runVerify,
+  PreparedImport,
   BackupDisabledError,
   type BackupStorage,
   type BackupVault,
 } from './backup-adapter';
 import { BACKUP_EXPORT_ENABLED, BACKUP_IMPORT_ENABLED } from './flags';
-import type { PreparedImport } from './backup-adapter';
+import type { ImportPlan } from './backup-plan';
+import type { VerifyReport } from './backup-actions';
 
 /**
  * The build as it actually ships — real flags, not mocked ones.
@@ -28,6 +29,11 @@ const vault: BackupVault = {
   assertAlive: () => {},
   now: () => 0,
 };
+
+/** The factory is what the operations are handed, and with the flags off it
+ *  must never be CALLED: asking for the vault is how «disabled» turns into the
+ *  wrong error — «unlock first» — for a feature that does not exist yet. */
+const makeVault = () => vi.fn((): BackupVault => vault);
 
 const refuseEverything = (): BackupStorage => ({
   readSnapshot: vi.fn(async () => { throw new Error('storage must not be touched'); }),
@@ -52,29 +58,43 @@ describe('the shipped flag pair', () => {
 describe('with the flags off, the actions refuse — in the action, not the markup', () => {
   it('export', async () => {
     const storage = refuseEverything();
-    await expect(runExport(vault, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    const factory = makeVault();
+    await expect(runExport(factory, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    expect(factory).not.toHaveBeenCalled();
     expect(storage.readSnapshot).not.toHaveBeenCalled();
     expect(storage.writeMeta).not.toHaveBeenCalled();
   });
 
   it('verify', async () => {
     const storage = refuseEverything();
-    await expect(runVerify(vault, file, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    const factory = makeVault();
+    await expect(runVerify(factory, file, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    expect(factory).not.toHaveBeenCalled();
     expect(storage.writeMeta).not.toHaveBeenCalled();
   });
 
   it('prepare', async () => {
     const storage = refuseEverything();
-    await expect(prepareImport(vault, file, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    const factory = makeVault();
+    await expect(prepareImport(factory, file, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    expect(factory).not.toHaveBeenCalled();
   });
 
-  it('apply — checked again, because a prepared plan may outlive a rollback', async () => {
-    // The second check is not redundant: a plan prepared by an earlier build
-    // could in principle be handed to this one. Refusing on the way IN is
-    // cheap; discovering it halfway through stage B is not.
+  it('apply — checked again, because a prepared session may outlive a rollback', async () => {
+    // The second check is not redundant: a session prepared while the flag was
+    // on could still be in a variable when the flag goes off under it — a
+    // rollback is a new build, but a long-lived tab is not. Refusing on the
+    // way IN is cheap; discovering it halfway through stage B is not.
     const storage = refuseEverything();
-    const prepared = { plan: { ordered: [], notApplied: [] }, fileIsComplete: true } as unknown as PreparedImport;
-    await expect(applyPreparedImport(vault, prepared, storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    const prepared = new PreparedImport({
+      report: { ok: true, incompleteRestore: false } as unknown as VerifyReport,
+      vault,
+      plan: { ordered: [], notApplied: {} } as unknown as ImportPlan,
+      storage,
+    });
+
+    await expect(prepared.apply()).rejects.toBeInstanceOf(BackupDisabledError);
     expect(storage.mergeRecord).not.toHaveBeenCalled();
+    expect(storage.writeMeta).not.toHaveBeenCalled();
   });
 });

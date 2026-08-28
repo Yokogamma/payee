@@ -58,16 +58,25 @@ import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } fr
 import { noteSearchText } from './note-search-text';
 import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED } from './flags';
 import {
-  applyPreparedImport,
   prepareImport,
   runExport,
   runVerify,
+  BackupCancelledError,
   BackupVaultLockedError,
   type BackupVault,
+  type ExportOutcome,
   type PreparedImport,
+  type VerifyOutcome,
 } from './backup-adapter';
-import type { ExportedBackup, VerifyReport } from './backup-actions';
 import type { ImportReport } from './backup-import';
+
+/** Stage B's result, plus whether the screen managed to catch up with it. The
+ *  report is never lost: the import happened, and a failed refresh is a stale
+ *  view, not a failed import. */
+export interface ImportOutcome {
+  report: ImportReport;
+  viewRefreshed: boolean;
+}
 import {
   detectQuickUnlockCapability,
   createPrfCredential,
@@ -587,15 +596,20 @@ interface NotesStore {
   /** Decrypt one attachment and hand it to the browser as a download. */
   downloadSafeboxAttachment: (entryId: string, fid: string) => Promise<void>;
   /** Backup (release-gated in the ACTIONS — a hidden button is not a gate).
-   *  All four need an unlocked vault: the container key comes from the seed. */
-  exportBackupFile: () => Promise<ExportedBackup>;
-  verifyBackupFile: (file: File) => Promise<VerifyReport>;
+   *  All four need an unlocked vault: the container key comes from the seed.
+   *  Export and verify report separately whether their freshness marker got
+   *  stored: the file and the report are the results, and a `meta` key that
+   *  could not be written — which is what a full disk does first — must not
+   *  take them away. */
+  exportBackupFile: () => Promise<ExportOutcome>;
+  verifyBackupFile: (file: File) => Promise<VerifyOutcome>;
   /** Stage A: decides nothing, applies nothing, and hands back what the
-   *  preview needs together with the plan built from THOSE bytes. */
+   *  preview needs bound to the vault it was prepared against. */
   prepareBackupImport: (file: File) => Promise<PreparedImport>;
   /** Stage B: only ever called with what stage A returned and the user
-   *  confirmed. */
-  applyBackupImport: (prepared: PreparedImport) => Promise<ImportReport>;
+   *  confirmed, and applied to the vault stage A ran against — the session
+   *  refuses if that vault is gone. */
+  applyBackupImport: (prepared: PreparedImport) => Promise<ImportOutcome>;
   setSafeboxSearchQuery: (query: string) => void;
   goToRestore: () => void;
   goToOnboarding: () => void;
@@ -1037,6 +1051,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // every lock/reset, captured by every async flow, checked before every
   // publication of sensitive state.
   const vaultEpochRef = useRef(0);
+  /** D15's operation token for the backup actions, plus the abort signal the
+   *  Web Lock wait is given. Bumped on the hidden edge and on every new
+   *  operation: neither the epoch nor the database generation moves when the
+   *  TAB goes away, and a page that has gone away must stop decrypting and
+   *  stop mutating. */
+  const backupOpRef = useRef<{ generation: number; abort: AbortController | null }>(
+    { generation: 0, abort: null },
+  );
+
+  /** Invalidate every backup operation in flight. Synchronous by design: the
+   *  BFCache snapshot is taken when the handler returns. */
+  const cancelBackupOperations = useCallback(() => {
+    backupOpRef.current.generation++;
+    backupOpRef.current.abort?.abort();
+    backupOpRef.current.abort = null;
+  }, []);
   // Aborts the in-flight vault operation (prepare or restore sweep) on lock.
   const vaultOpAbortRef = useRef<AbortController | null>(null);
   // Ref mirrors for values the lifecycle handlers need SYNCHRONOUSLY (a React
@@ -1295,12 +1325,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       })();
     };
     const onVisibility = () => {
-      if (document.visibilityState === 'hidden') onHiddenEdge();
+      if (document.visibilityState === 'hidden') { cancelBackupOperations(); onHiddenEdge(); }
       else evaluateReturn();
     };
     // pagehide refines the marker (earliest wins) — it also fires on
     // navigation away, where visibilitychange:hidden may not.
-    const onPageHide = () => onHiddenEdge();
+    const onPageHide = () => { cancelBackupOperations(); onHiddenEdge(); };
     const onPageShow = (e: PageTransitionEvent) => {
       // BFCache restore resumes the app exactly where it was — same decision
       // as a visibility return. A non-persisted pageshow accompanies a normal
@@ -1313,7 +1343,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
     };
     // Chrome freezes background tabs without necessarily firing pagehide.
-    const onFreeze = () => onHiddenEdge();
+    const onFreeze = () => { cancelBackupOperations(); onHiddenEdge(); };
 
     document.addEventListener('visibilitychange', onVisibility);
     document.addEventListener('freeze', onFreeze);
@@ -4487,77 +4517,110 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // ─── Backup (steps 8/12) ────────────────────────────────────────────
 
   /**
-   * The vault as the backup operations need it.
+   * The vault as the backup operations need it — and the operation token D15
+   * asks for, which is the part the other two guards cannot supply.
    *
-   * ONE capture of the epoch and of the database generation, made here and
-   * carried through the whole operation: the writer is told which generation
-   * the caller believed in, and an import that outlived a reset is refused by
-   * the writer rather than by luck. Re-reading `getDbGeneration()` inside the
-   * loop would quietly re-authorize it.
+   * Epoch answers «was the vault locked», database generation answers «was the
+   * app reset». Neither moves when the TAB goes away: `pagehide` and `freeze`
+   * mark the hidden edge and may lock later, asynchronously, or not at all. So
+   * a third number is captured here and bumped by `cancelBackupOperations`,
+   * and every backup operation is judged against all three.
    *
-   * `assertAlive` THROWS. A guard that returns a boolean is a guard someone
-   * eventually forgets to read.
+   * Bumping on entry also makes the newest request the only live one: two
+   * operations in flight over the same database is a race nobody needs, and
+   * the lesson is fresh — the viewer had exactly this bug.
+   *
+   * `assertAlive` THROWS, and throws something NAMED: swallowed by a per-record
+   * `catch`, an anonymous error would become «this record is damaged».
    */
-  function backupVault(): BackupVault {
+  const backupVault = useCallback((): BackupVault => {
     const mn = mnemonicRef.current;
     if (!mn) throw new BackupVaultLockedError();
     const myEpoch = vaultEpochRef.current;
     const myDbGen = getDbGeneration();
+    const myOp = ++backupOpRef.current.generation;
+    backupOpRef.current.abort?.abort();
+    const abort = new AbortController();
+    backupOpRef.current.abort = abort;
     return {
       mnemonic: mn,
       dbGeneration: myDbGen,
       now: () => Date.now(),
+      signal: abort.signal,
       assertAlive: () => {
         if (vaultEpochRef.current !== myEpoch) {
-          throw new Error('Хранилище было заблокировано — операция прервана.');
+          throw new BackupCancelledError('Хранилище было заблокировано — операция прервана.');
         }
         if (getDbGeneration() !== myDbGen) {
-          throw new Error('Приложение было сброшено — операция прервана.');
+          throw new BackupCancelledError('Приложение было сброшено — операция прервана.');
+        }
+        if (backupOpRef.current.generation !== myOp) {
+          throw new BackupCancelledError('Операция резервного копирования отменена.');
         }
       },
     };
-  }
+  }, []);
 
-  async function exportBackupFile(): Promise<ExportedBackup> {
-    return runExport(backupVault());
-  }
+  // The factory is passed UNCALLED: with a release flag off, «the vault is
+  // locked» is a true statement and the wrong answer, so the flag has to be
+  // checked before the vault is even asked for.
+  const exportBackupFile = useCallback(async (): Promise<ExportOutcome> => (
+    runExport(backupVault)
+  ), [backupVault]);
 
-  async function verifyBackupFile(file: File): Promise<VerifyReport> {
-    return runVerify(backupVault(), file);
-  }
+  const verifyBackupFile = useCallback(async (file: File): Promise<VerifyOutcome> => (
+    runVerify(backupVault, file)
+  ), [backupVault]);
 
-  async function prepareBackupImport(file: File): Promise<PreparedImport> {
-    return prepareImport(backupVault(), file);
-  }
+  const prepareBackupImport = useCallback(async (file: File): Promise<PreparedImport> => (
+    prepareImport(backupVault, file)
+  ), [backupVault]);
 
   /**
    * Stage B, plus everything the rest of the app has to be told afterwards
    * (§4): the counts, the safebox presence flag, the note list, and the queue.
    *
-   * The queue matters most and is the least obvious: the merge rules normalize
-   * a restored record's sync row to a retryable `error` WITHOUT a txId, which
-   * is precisely the state that gets it re-sent. Skipping the kick would leave
-   * the data restored and permanently unpublished until some later trigger.
+   * NO second vault. The prepared session carries the one stage A ran against,
+   * and applying it to a freshly built vault is exactly the hole this used to
+   * have: lock, reset, open a different seed, and the new generation would
+   * authorize writing the FIRST seed's ciphertext into the second vault —
+   * where it is permanently undecryptable and would be published under the new
+   * identity by the queue.
+   *
+   * The queue matters most among the refreshers and is the least obvious: the
+   * merge rules normalize a restored record's sync row to a retryable `error`
+   * WITHOUT a txId, which is precisely the state that gets it re-sent.
+   *
+   * Everything after `apply` is the app CATCHING UP, and none of it may take
+   * the report away: the import has already happened, and an exception here
+   * would leave the user to retry blind over data that is already in place.
    */
-  async function applyBackupImport(prepared: PreparedImport): Promise<ImportReport> {
-    const vault = backupVault();
+  const applyBackupImport = useCallback(async (prepared: PreparedImport): Promise<ImportOutcome> => {
     const myEpoch = vaultEpochRef.current;
-    const report = await applyPreparedImport(vault, prepared);
+    const report = await prepared.apply();
 
-    // Past this point the store has changed; refuse to paint a vault that is
-    // no longer the one that changed, but do NOT swallow the report — the
-    // caller still has to be told what happened to the user's file.
-    if (vaultEpochRef.current === myEpoch) {
-      await reloadNotesAfterImport(myEpoch);
-      await refreshSyncCounts(myEpoch);
-      await refreshSafeboxPresence(myEpoch);
-      if (arweaveRef.current.enabled) {
-        await syncPendingRecords();
-        kickQueue();
+    let viewRefreshed = false;
+    try {
+      if (vaultEpochRef.current === myEpoch) {
+        await reloadNotesAfterImport(myEpoch);
+        await refreshSyncCounts(myEpoch);
+        await refreshSafeboxPresence(myEpoch);
+        if (arweaveRef.current.enabled) {
+          await syncPendingRecords();
+          kickQueue();
+        }
+        viewRefreshed = true;
       }
+    } catch {
+      // The screen is stale, the data is not. The caller is told which.
+      viewRefreshed = false;
     }
-    return report;
-  }
+    return { report, viewRefreshed };
+    // The refreshers are plain closures over refs and setters, stable in the
+    // way that matters and recreated on every render in the way that does not
+    // — the same reason every other action in this file carries an empty list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /**
    * Re-read and re-decrypt the note list after an import.
@@ -4571,7 +4634,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * import may legitimately have left an opaque record untouched, and it must
    * not become a hole in the list or an error on screen.
    */
-  async function reloadNotesAfterImport(myEpoch: number): Promise<void> {
+  const reloadNotesAfterImport = useCallback(async (myEpoch: number): Promise<void> => {
     const key = cryptoKeyRef.current;
     if (!key) return;
     const encrypted = await getAllNotes();
@@ -4587,7 +4650,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (vaultEpochRef.current !== myEpoch) return;
     decrypted.sort((a, b) => b.createdAt - a.createdAt);
     publishNotes(() => decrypted);
-  }
+  }, []);
 
   const value: NotesStore = useMemo(() => ({
     screen,

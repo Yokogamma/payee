@@ -160,6 +160,10 @@ export async function classifyLocalPayload(
   keys: BackupRecordKeys,
   kind: BackupRecordKind,
   record: EncryptedNote | EncryptedSafeboxEntry | undefined,
+  /** Checked BETWEEN the two halves of a safebox entry, not only around the
+   *  pair: the secret half is the password and the attachment bytes, and a
+   *  cancelled operation has no reason to materialize them. Throws (D15). */
+  assertAlive: () => void = () => {},
 ): Promise<'absent' | 'readable' | 'corrupt' | 'opaque'> {
   if (record === undefined) return 'absent';
   if (kind === 'note') {
@@ -167,7 +171,8 @@ export async function classifyLocalPayload(
     try {
       await decryptNote(keys.note, record as EncryptedNote);
       return 'readable';
-    } catch {
+    } catch (error) {
+      if (isCancellation(error)) throw error;
       return 'corrupt';
     }
   }
@@ -175,14 +180,32 @@ export async function classifyLocalPayload(
   if (isOpaqueEntry(entry)) return 'opaque';
   try {
     const meta = await decryptSafeboxMeta(keys.safeboxMeta, entry);
+    assertAlive();
     // BOTH halves: an entry whose secret half is unreadable is not «readable»
     // in any sense the merge rules could act on — restoring its meta alone
     // would leave a password-shaped hole.
     await decryptSafeboxSecret(keys.safeboxSecret, entry, meta.files);
     return 'readable';
-  } catch {
+  } catch (error) {
+    // A cancelled operation is not a damaged record. Swallowed here it would
+    // become a verdict about the user's data, from an event that had nothing
+    // to do with it — and the loop would carry on classifying for a page
+    // nobody is looking at.
+    if (isCancellation(error)) throw error;
     return 'corrupt';
   }
+}
+
+/**
+ * Is this the operation being cancelled rather than a record being broken?
+ *
+ * Matched by NAME rather than by class, exactly like the quota check in the
+ * import executor: this module stays free of store imports, and that is what
+ * keeps it testable without an app around it.
+ */
+function isCancellation(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === 'AbortError' || error.name === 'BackupCancelledError';
 }
 
 /** The upload path's own barrier, asked as a question. Total by construction:
