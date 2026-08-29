@@ -38,9 +38,11 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
-      # The typecheck half of `npm run build` (`tsc -b`, noEmit in both projects).
-      # The deploys get it for free inside the build; CI cannot run the build
-      # (see below), so the gate is invoked directly — it needs no secrets.
+      # The typecheck half of `npm run build` (`tsc -b`, noEmit in both
+      # projects), invoked directly and early: it needs no secrets and no
+      # placeholders, so a type error surfaces here rather than inside the
+      # asset-gate build further down (which runs with placeholder VITE_* —
+      # see the note there).
       - run: npm run typecheck
       # The one forbidden pair of backup flags (D16): export ON while import is
       # OFF would ship a release producing files the same build can neither
@@ -91,6 +93,10 @@ jobs:
           VITE_STATUS_GATEWAYS: https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io
           VITE_PAYLOAD_GATEWAYS: https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz
           VITE_INDEX_SOURCES: https://arweave.net/graphql|https://vilenarios.com/graphql,https://arweave-search.goldsky.com/graphql
+      # The dist-reading assertions skip without a build, which is right for
+      # `npm test` above and useless as proof. Same command as the deploy
+      # workflow runs on ITS build — see the script's header.
+      - run: node scripts/verify-viewer-dist.mjs
       - run: node scripts/check-bundle-budget.mjs
       - run: node scripts/check-no-inlined-fonts.mjs
       # Report only, no threshold — prints what users actually download so the

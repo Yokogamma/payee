@@ -75,6 +75,17 @@ export default defineConfig(({ command, mode }) => {
           globIgnores: ["**/icon-*.png", "backup-viewer.html"],
           // SPA offline navigation falls back to the precached shell.
           navigateFallback: `${base}index.html`,
+          // ...but never for the viewer. It is a separate document, not a
+          // route of this app, and answering its URL with the app shell would
+          // hand the user a page that cannot open a backup and does not say
+          // why. Belt to the `_redirects` rule's braces: that one governs the
+          // server, this one governs the service worker.
+          // Anchored at the start and open at the end for a query string:
+          // Workbox tests this against `pathname + search`, so a `$` here
+          // would let `/backup-viewer?anything` fall through to the SPA shell
+          // — the app answering, from precache, for the one URL that must not
+          // be the app.
+          navigateFallbackDenylist: [/^\/backup-viewer(?:\.html)?(?:$|\?)/],
           // No runtimeCaching entries: proxy/Arweave requests stay network-only.
         },
       }),

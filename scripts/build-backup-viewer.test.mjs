@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { requireDist } from './require-dist.mjs';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   buildBackupViewer,
@@ -116,12 +117,19 @@ describe('the committed hash module', () => {
     // local build — pressure to commit the built hash, which is the one thing
     // this arrangement exists to prevent.
     if (declared === PLACEHOLDER) {
+      // Post-build, the placeholder is itself the defect: the build rewrites
+      // this module as its first step, so still seeing it means the assertion
+      // below — the whole point of running here — was never reached.
+      if (process.env.REQUIRE_DIST === '1') {
+        expect(declared, 'REQUIRE_DIST=1 but the module still holds the placeholder — the build did not run')
+          .not.toBe(PLACEHOLDER);
+      }
       expect(source).toContain('BACKUP_VIEWER_HASH_IS_PLACEHOLDER = true;');
       return;
     }
     expect(declared).toMatch(/^[0-9a-f]{64}$/);
     expect(source).toContain('BACKUP_VIEWER_HASH_IS_PLACEHOLDER = false;');
-    if (!existsSync(distPath)) return;
+    if (!requireDist(distPath, expect)) return;
     expect(declared).toBe(createHash('sha256').update(readFileSync(distPath)).digest('hex'));
   });
 
@@ -132,8 +140,14 @@ describe('the committed hash module', () => {
     // then compare the app's own stale cache against its own constant —
     // passing while telling the user nothing.
     const swPath = fileURLToPath(new URL('../dist/sw.js', import.meta.url));
-    if (!existsSync(swPath)) return; // nothing built in this checkout
-    expect(readFileSync(swPath, 'utf8')).not.toContain('backup-viewer');
+    if (!requireDist(swPath, expect)) return;
+    const sw = readFileSync(swPath, 'utf8');
+    // The PRECACHE MANIFEST specifically, not any mention of the name: the
+    // navigation-fallback denylist legitimately carries the same string as a
+    // pattern, and a bare substring check would call that a precache entry.
+    const precached = [...sw.matchAll(/url:"([^"]+)"/g)].map(m => m[1]);
+    expect(precached.length).toBeGreaterThan(0); // the scan really found the manifest
+    expect(precached).not.toContain('backup-viewer.html');
   });
 
   it('the value in the COMMIT is the placeholder, whatever the working tree holds', () => {

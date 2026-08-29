@@ -124,6 +124,11 @@ jobs:
       # INCLUDED in VITE_TRUSTED_OWNERS (inclusion, not equality: rotation
       # keeps old+new). Build-time validation is format-only, so this is the
       # step that catches a wrong-but-well-formed owner list before deploy.
+      # Same command CI runs on its own build: the three viewer invariants that
+      # only exist after one. A deploy can be dispatched from an arbitrary ref,
+      # so CI having proved them for a DIFFERENT build proves nothing about the
+      # bytes this job is seconds away from publishing.
+      - run: node scripts/verify-viewer-dist.mjs
       - run: node scripts/check-owners-vs-worker.mjs
         env:
           VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}
