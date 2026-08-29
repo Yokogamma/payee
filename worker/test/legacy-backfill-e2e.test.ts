@@ -345,3 +345,44 @@ describe('recovery token — the token proves the id, never the bytes', () => {
     expect(await storedFp(noteId)).toBeUndefined();
   });
 });
+
+describe('a legacy record whose transaction is PROVEN gone', () => {
+  it('re-posts instead of answering 503 forever', async () => {
+    // The distinction that makes this necessary: from the payload pool, «the
+    // gateways are having a bad afternoon» and «this transaction is gone» look
+    // identical. Treating both as retryable is safe for the first and PERMANENT
+    // for the second — the redrop path is only reachable once a record is
+    // comparable, and a legacy record over a dropped transaction never becomes
+    // comparable on its own.
+    const noteId = '33333333-4444-4555-8666-77777777bbbb';
+    const deadTx = 'DEADDEADDEADDEADDEADDEADDEADDEADDEADDEADDEA'; // 43 base64url
+    await seedLegacyCommitted(noteId, deadTx); // committedAt is an hour ago
+
+    // Unreachable on the payload pool…
+    // …and unanimously 404 on the status pool, which is what `dead` requires.
+    for (const origin of ['https://arweave.net', 'https://g2.test']) {
+      mockRoute('GET', new RegExp(`^${origin}/tx/${deadTx}/status$`), 404, 'not found');
+    }
+    // The re-post legs.
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
+    const postTx = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
+
+    const signer = await newWallet();
+    const r = await worker.fetch(await uploadRequest(noteId, 'lb-dead'), {
+      ...(await envFor()),
+      // A real signable wallet, declared trusted, so the re-post can complete.
+      ARWEAVE_JWK: JSON.stringify(signer.jwk),
+      TRUSTED_OWNERS: signer.address,
+    } as never);
+
+    expect(r.status).toBe(200);
+    const body = await r.json() as { txId: string; deduped?: boolean };
+    expect(postTx.calls).toBe(1);       // exactly one paid POST
+    expect(body.txId).not.toBe(deadTx); // under a NEW transaction
+    expect(body.deduped).toBe(false);   // this one was paid for
+
+    // …and the record is no longer legacy: it carries this payload's fp.
+    expect(await storedFp(noteId)).toBe(await computePublicationFp(VERSION, dataFor(noteId)));
+  });
+});

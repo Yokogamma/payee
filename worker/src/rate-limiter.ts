@@ -139,6 +139,13 @@ export class RateLimiter implements DurableObject {
           snapshot: {
             status: record.status, txId: record.txId, token: record.token, gen: record.gen,
           } satisfies LegacySnapshot,
+          // Reported ALONGSIDE the snapshot, not inside it: the CAS compares
+          // record identity, and a timestamp is not part of that. The caller
+          // needs it for the age guard on the redrop path — a legacy record
+          // whose transaction is provably dead must still be re-postable, or it
+          // would answer 503 forever.
+          committedAt: record.committedAt ?? record.reservedAt ?? 0,
+          postedAt: record.postedAt ?? record.reservedAt ?? 0,
         });
       }
       if (requestedFp !== undefined && record.fp !== requestedFp) {

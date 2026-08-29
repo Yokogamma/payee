@@ -1037,7 +1037,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
    *
    * Returns a Response to send, or null meaning «resolved, ask the DO again».
    */
-  const resolveLegacy = async (snapshot: LegacySnapshot): Promise<Response | null> => {
+  const resolveLegacy = async (
+    snapshot: LegacySnapshot,
+    age: number,
+  ): Promise<{ kind: 'respond'; response: Response } | { kind: 'retry' } | { kind: 'dead' }> => {
     const auth = await authenticatePublication(snapshot.txId, {
       origins: payloadOrigins(env),
       trustedOwners,
@@ -1045,39 +1048,55 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     });
 
     if (auth.kind === 'unproven') {
-      // Absence of evidence from the pool is a TRANSPORT failure. Turning it
-      // into a verdict would let a bad afternoon on the gateway network
-      // permanently damage a healthy record. Nothing is written.
-      return error('Publication could not be authenticated', 503);
+      // Two very different reasons look identical from the payload pool: «the
+      // gateways are having a bad afternoon» and «this transaction is gone».
+      // Collapsing both into 503 would be safe for the first and PERMANENT for
+      // the second — a legacy record over a dropped transaction could never be
+      // re-posted again, because the redrop path is only reachable once the
+      // record is comparable. So the status quorum is asked, and only a
+      // unanimous `dead` past the age guard opens the re-post.
+      const live = await getTxStatusWorker(snapshot.txId, emit, env);
+      if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) return { kind: 'dead' };
+      // Alive-but-unfetchable, unavailable, or too recent: retryable, and
+      // nothing is written.
+      return { kind: 'respond', response: error('Publication could not be authenticated', 503) };
     }
     if (auth.kind === 'not-ours') {
       // PROVEN to be something else: another wallet, another vault, or a body
       // this canonicalization cannot read. Not transient, so a 503 would loop
       // forever — and the historical txId must never be returned as a success.
       // Nothing is written: no observedFp, no binding.
-      return idPayloadConflict(snapshot.txId);
+      return { kind: 'respond', response: idPayloadConflict(snapshot.txId) };
     }
 
     // Proven. The fingerprint is recorded WHATEVER the comparison then says —
     // the verification is expensive and its result is a fact about the
     // publication, not a verdict about this request.
     await doCall('/backfill-fp', { noteId, snapshot, observedFp: auth.observedFp });
-    return null;
+    return { kind: 'retry' };
   };
 
   let checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
   let checkResult: CheckResult = await checkResp.json();
 
+  let legacyRedrop: string | null = null;
   if (checkResult.status === 'legacy' && checkResult.snapshot) {
-    const resolved = await resolveLegacy(checkResult.snapshot);
-    if (resolved) return resolved;
-    // Exactly ONE retry. The record is no longer legacy (this backfill filled
-    // it, or a concurrent one did), so a second `legacy` would mean the record
-    // is being rewritten under us — and looping on that is how a retry storm
-    // starts. Whatever the DO says now is the answer.
-    checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
-    checkResult = await checkResp.json();
-    if (checkResult.status === 'legacy') return error('Record is being reconciled, retry', 503);
+    const age = checkResult.snapshot.status === 'committed'
+      ? (checkResult.committedAt ?? 0)
+      : (checkResult.postedAt ?? 0);
+    const outcome = await resolveLegacy(checkResult.snapshot, age);
+    if (outcome.kind === 'respond') return outcome.response;
+    if (outcome.kind === 'dead') {
+      legacyRedrop = checkResult.snapshot.txId;
+    } else {
+      // Exactly ONE retry. The record is no longer legacy (this backfill filled
+      // it, or a concurrent one did), so a second `legacy` would mean the record
+      // is being rewritten under us — and looping on that is how a retry storm
+      // starts. Whatever the DO says now is the answer.
+      checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
+      checkResult = await checkResp.json();
+      if (checkResult.status === 'legacy') return error('Record is being reconciled, retry', 503);
+    }
   }
 
   if (checkResult.status === 'id_payload_conflict') {
@@ -1093,7 +1112,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // additionally emits redrop_new_tx.
   let viaRedrop = false;
 
-  if (checkResult.status === 'exists') {
+  if (legacyRedrop !== null) {
+    // A legacy record over a PROVEN dead transaction, past the age guard. This
+    // is the ordinary redrop, reached the only way it can be for a record that
+    // is not comparable: quota and attempts apply exactly as elsewhere, and the
+    // new reservation carries THIS payload's fingerprint, so the record stops
+    // being legacy whatever happens next.
+    const rd = await doRedrop(legacyRedrop);
+    if (rd.kind === 'resolved') {
+      return json({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+    }
+    if (rd.kind === 'defer') return error('Recheck deferred', 503);
+    reserveToken = rd.token;
+    viaRedrop = true;
+  } else if (checkResult.status === 'exists') {
     // Already committed. Without recheck this is the idempotent happy path.
     if (!wantsRecheck) {
       // The idempotent happy path: an existing transaction, PROVEN to be this
