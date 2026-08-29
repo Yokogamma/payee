@@ -1571,3 +1571,105 @@ closed, blocking reconciliation until operator intervention).
 Since PR-2 additionally: `METRICS_ADMIN_SECRET` and `CF_ANALYTICS_TOKEN`
 (both OPTIONAL for uploads — only `/admin/metrics` 503s while they are
 missing; see the PR-2 section above and `docs/SECRETS.md`).
+
+## PR-3a «Read-path multi-gateway» — release runbook
+
+The read path stops being pinned to one host: status verdicts come from a
+quorum over every configured gateway, and note payloads are fetched from a pool
+and verified cryptographically against the txId that was asked for (D9).
+
+This release **creates no paid transactions**. Its risk is the opposite one: a
+verdict that is wrong in the other direction. So the runbook below is mostly
+about not letting the two halves disagree about what `dead` means.
+
+### What changed that an operator can observe
+
+- **A lone 404 is no longer `dropped`.** `dead` now requires EVERY configured
+  origin to answer 404, and at least two to be configured. One flapping gateway
+  defers `dead` — deliberately: `dead` is the only verdict that authorizes
+  spending money, while a stuck `unavailable` merely means «try later».
+- **A gateway `400` is `unavailable`, never `invalid`.** It used to feed
+  `needsRecheck`, i.e. the paid re-post path, on one host's opinion.
+- **`invalid` is now a LOCAL verdict only** — a txId that is not 43 base64url
+  characters, decided without a request.
+- **Restore rejects payloads that do not match the requested txId**, and reads
+  attribution from the SIGNED tags rather than from the GraphQL edge.
+- **`/health` gained an attestation**: `statusQuorumPolicy`, the gateway hash
+  and count, `releaseSha`, `workerVersionId`, and a `nonce` echo. It answers
+  `no-store`. A client that cannot verify all of it keeps its upload pause up.
+
+### Required configuration before the release
+
+| Where | Variable |
+|---|---|
+| GitHub Environment `dev` + Cloudflare Pages | `VITE_STATUS_GATEWAYS`, `VITE_PAYLOAD_GATEWAYS`, `VITE_INDEX_SOURCES` |
+| `worker/wrangler.toml` (repo, both blocks) | `STATUS_GATEWAYS` |
+
+All three client variables are pinned EXACTLY in `scripts/gateway-pins.mjs`;
+the deploy gate refuses anything else, and `check-gateways-vs-worker.mjs`
+refuses a worker list that differs from the client's.
+
+### Release order — and the two-stage floor raise
+
+The floor is raised in TWO steps, and skipping the second leaves it lowerable:
+
+1. Dispatch **Deploy Worker (proxy) — dev** with `candidate = <SHA>` and
+   `profile = normal`. The gate refuses a candidate that is not the trusted
+   head or an allowlisted release, and refuses anything below the floor.
+2. The post-deploy smoke checks the LIVE worker: policy id, gateway hash and
+   count, `releaseSha`, the activated `workerVersionId`, and the nonce echo.
+3. **Raise `WORKER_FLOOR_SHA` to that SHA** in the Environment. Nothing does
+   this automatically — the control plane keeps applying the OLD floor until
+   the variable changes.
+4. **Land a separate protected commit raising `MINIMUM_FLOOR`** in
+   `scripts/check-worker-floor.mjs` to the same SHA. Without it the Environment
+   value can be edited back down to the previous repo pin, and the «absolute»
+   floor is only as absolute as its lower bound.
+5. Dispatch **Deploy client to Cloudflare Pages — dev** with
+   `worker_candidate` and `worker_version_id` from step 2. It re-checks the
+   live `/health` immediately before publishing and refuses unless BOTH floors
+   already equal that release.
+
+Both workflows share the `release-dev` concurrency group, so a worker deploy
+cannot land between the client's live check and its publish. Serialization is
+not ordering: still do not dispatch the next deploy until the previous run has
+finished.
+
+### Local deploys
+
+`npm run deploy` in `worker/` **refuses**. A local wrangler deploy bypasses the
+floor gate, the Environment and the release lock — the three things that make
+the attestation worth anything. Staging keeps `npm run deploy:staging`.
+
+### Rollback
+
+- **Client**: rolls back freely and independently. A client below this release
+  loses D9 and the strict capability check, so the integrity position regresses
+  even though no duplicate payment becomes possible (recovery stays
+  server-authoritative). Treat this release as the client floor: below it, roll
+  back only with uploads disabled.
+- **Worker**: `worker-g1` — the SHA recorded in `WORKER_FLOOR_SHA` and
+  `MINIMUM_FLOOR` — is an **absolute floor**. `wrangler rollback` and a
+  redeploy of anything below it are forbidden unconditionally, not «while
+  uploads are on»: a Cloudflare version carries its own bindings and vars, so
+  rolling back restores the old `UPLOADS_ENABLED` along with the old code.
+- **The only break-glass path** is a commit that is already on `main`, is a
+  descendant of the floor, declares `statusQuorumPolicy = legacy-single-v0`,
+  and has ALL THREE upload switches `"false"` in its own `[vars]`. Deploy it
+  with `profile = emergency`; the preflight verifies those flags from the
+  candidate's own config BEFORE the Cloudflare action, and the emergency
+  profile never opens a client release. Such a SHA goes in the list below, not
+  in the normal allowlist.
+- **Preferred emergency path is roll-FORWARD**: turn uploads off and ship the
+  fix forward.
+
+### Emergency releases — uploads permanently off
+
+_(none yet)_
+
+### The post-deploy smoke is a DETECTOR
+
+Cloudflare activates a version before any smoke can answer. A red smoke
+therefore does not undo anything — recovery is roll-forward under the rules
+above. That is stated here rather than implied, because a check that cannot
+revert must not be mistaken for one that can.

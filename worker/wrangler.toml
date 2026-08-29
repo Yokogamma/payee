@@ -46,8 +46,11 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 # v3 upload kill switch. STRICTLY "true" enables; anything else fails CLOSED
 # (v3 uploads get 503 {code:'v3_uploads_disabled'}, v1/v2 unaffected).
-# SOURCE OF TRUTH is this file: toggling = edit here + `npm run deploy` from the
-# verified v3-acceptor tag. A Cloudflare-dashboard override is EMERGENCY-ONLY
+# SOURCE OF TRUTH is this file: toggling = edit here, land it on the default
+# branch, then dispatch the trusted workflow ("Deploy Worker (proxy) — dev")
+# with that commit as `candidate`. `npm run deploy` REFUSES on purpose (PR-3a):
+# a local wrangler deploy bypasses the floor gate, the Environment and the
+# release lock. A Cloudflare-dashboard override is EMERGENCY-ONLY
 # and must be synced back here immediately (the next deploy would silently
 # restore the repo value). Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v3Uploads" matches the intended state.
