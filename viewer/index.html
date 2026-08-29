@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="__CSP__">
+<title>Eternal Notes — просмотр резервной копии</title>
+<style>__CSS__</style>
+</head>
+<body>
+<main>
+  <h1>Eternal Notes — просмотр резервной копии</h1>
+
+  <section id="entry">
+    <p class="lead">Страница работает полностью офлайн. Нужны только файл копии и ваша seed-фраза.</p>
+
+    <p class="warn">
+      Подлинность этой страницы проверяется контрольной суммой, сохранённой <strong>отдельно</strong>
+      от неё — в менеджере паролей или на бумаге рядом с seed-фразой. Блок с суммой, лежащий
+      в той же папке, ловит только случайную порчу: тот, кто способен подменить эту страницу,
+      подменит и файл с суммой рядом. Сверьте хеш с независимой копией, прежде чем вводить seed-фразу.
+    </p>
+
+    <p class="warn">
+      Полнота копии будет проверена после расшифровки — пока не удаляйте исходные файлы.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <label for="file">Выберите файл копии</label>
+        <input type="file" id="file" accept="application/json,.json">
+      </li>
+      <li>
+        <label for="seed">Seed-фраза</label>
+        <textarea id="seed" rows="3" name="recovery-phrase-input"></textarea>
+      </li>
+    </ol>
+
+    <button type="button" id="open">Открыть копию</button>
+    <p id="status" class="status" role="status"></p>
+  </section>
+
+  <section id="view" hidden>
+    <p id="summary" class="summary"></p>
+    <div id="view-warnings"></div>
+
+    <button type="button" id="export-notes">Скачать заметки текстом</button>
+    <p class="hint">Текстовый файл заметок не содержит паролей и вложений.</p>
+
+    <h2>Заметки</h2>
+    <div id="notes"></div>
+
+    <h2>Сейф</h2>
+    <div id="safebox"></div>
+
+    <button type="button" id="export-secrets" class="danger">Экспортировать секреты</button>
+    <p class="hint">
+      Отдельное действие: файл будет <strong>незашифрован</strong> и потребует повторного подтверждения.
+    </p>
+  </section>
+</main>
+<script>__JS__</script>
+</body>
+</html>

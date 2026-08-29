@@ -1,0 +1,28 @@
+:root { color-scheme: light dark; --fg: #1a1a1a; --bg: #fdfdfc; --muted: #5a5a5a; --line: #d8d8d4; --warn: #8a5a00; --danger: #a02020; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e8e8e6; --bg: #17171a; --muted: #a0a0a0; --line: #33333a; --warn: #e0b060; --danger: #e07070; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+h1 { font-size: 1.35rem; margin: 0 0 1rem; }
+h2 { font-size: 1.1rem; margin: 2rem 0 .75rem; padding-top: .75rem; border-top: 1px solid var(--line); }
+.lead { color: var(--muted); }
+.warn { border-left: 3px solid var(--warn); padding: .5rem .75rem; margin: .75rem 0; color: var(--fg); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.warn-block { border-left-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); font-weight: 600; }
+.steps { padding-left: 1.25rem; }
+.steps li { margin: .75rem 0; }
+label { display: block; margin-bottom: .25rem; font-weight: 600; }
+input[type=file] { max-width: 100%; }
+textarea { width: 100%; font: inherit; padding: .5rem; border: 1px solid var(--line); border-radius: .375rem; background: var(--bg); color: var(--fg); }
+button { font: inherit; padding: .5rem .9rem; border: 1px solid var(--line); border-radius: .375rem; background: var(--bg); color: var(--fg); cursor: pointer; }
+button.danger { border-color: var(--danger); color: var(--danger); }
+button.link { border: 0; background: none; color: var(--muted); text-decoration: underline; padding: 0 .4rem; cursor: pointer; }
+.status { min-height: 1.5rem; color: var(--danger); }
+.summary { font-weight: 600; }
+.hint { color: var(--muted); font-size: .9rem; margin-top: .35rem; }
+.card { border: 1px solid var(--line); border-radius: .5rem; padding: .75rem; margin: .75rem 0; }
+.card-date { color: var(--muted); font-size: .85rem; margin-bottom: .35rem; }
+.card-title { margin: 0 0 .5rem; font-size: 1rem; }
+.card-text { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
+.row { display: flex; gap: .5rem; align-items: baseline; margin: .25rem 0; flex-wrap: wrap; }
+.label { color: var(--muted); min-width: 5rem; }
+.value { word-break: break-word; }
