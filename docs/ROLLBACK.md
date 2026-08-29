@@ -1759,8 +1759,11 @@ the attestation worth anything. Staging keeps `npm run deploy:staging`.
   even though no duplicate payment becomes possible (recovery stays
   server-authoritative). Treat this release as the client floor: below it, roll
   back only with uploads disabled.
-- **Worker**: `worker-g1` — the SHA recorded in `WORKER_FLOOR_SHA` and
-  `MINIMUM_FLOOR` — is an **absolute floor**. `wrangler rollback` and a
+- **Worker**: `ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` — the SHA recorded in
+  BOTH `WORKER_FLOOR_SHA` and `MINIMUM_FLOOR` — is an **absolute floor**. It is
+  named by SHA and not by a tag on purpose: since this release a tag no longer
+  makes a commit deployable, so naming a floor after one would point at the
+  wrong kind of thing. `wrangler rollback` and a
   redeploy of anything below it are forbidden unconditionally, not «while
   uploads are on»: a Cloudflare version carries its own bindings and vars, so
   rolling back restores the old `UPLOADS_ENABLED` along with the old code.
