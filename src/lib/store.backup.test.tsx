@@ -3,6 +3,8 @@ import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { render, act, cleanup, waitFor } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // The backup slice with both release flags mocked ON, against REAL storage
 // (fake-indexeddb) and REAL crypto. What is under test is the WIRING: that the
@@ -229,6 +231,36 @@ describe('an import puts the records where the app can see them', () => {
   });
 });
 
+describe('the seed is not copied out of its one reference', () => {
+  it('the vault factory creates no local binding for it', () => {
+    // Asserted on the SOURCE, because that is where the property lives. A
+    // runtime check cannot see a captured lexical binding, and the earlier
+    // attempt — serializing the prepared session and searching for the phrase
+    // — proved nothing at all: private `#fields` and closures are invisible to
+    // `JSON.stringify`, so the test was green by construction.
+    //
+    // What must not come back: `const mn = mnemonicRef.current` at the top of
+    // the factory. Every closure it returns shares that environment, so the
+    // phrase would stay reachable for as long as a prepared import sits on
+    // screen waiting for a human — through a lock, past the synchronous wipe
+    // that is the app's actual guarantee about the seed.
+    // `process.cwd()`, not `import.meta.url`: this suite runs in jsdom, where
+    // `import.meta.url` is not a `file:` URL.
+    const source = readFileSync(join(process.cwd(), 'src/lib/store.tsx'), 'utf8');
+    // Only the OUTER scope — from the factory head to the object it returns.
+    // That is the environment every closure on the vault shares, and therefore
+    // the only one whose bindings outlive the call. A binding inside
+    // `deriveKeys`'s own `live()` helper is fine and deliberate: it exists for
+    // the length of one derivation argument and dies with it.
+    const start = source.indexOf('const backupVault = useCallback');
+    const outer = source.slice(start, source.indexOf('return {', start));
+
+    expect(outer.length).toBeGreaterThan(200); // the slice found the factory
+    expect(outer).toMatch(/mnemonicRef\.current/);       // it does read the ref
+    expect(outer).not.toMatch(/(?:const|let|var)\s+\w+\s*=\s*mnemonicRef\.current/);
+  });
+});
+
 describe('an operation belongs to the vault that started it (D15)', () => {
   it('a prepared import is refused after a lock — with nothing written', async () => {
     // The gap: stage A and stage B are separated by a human decision, and a
@@ -343,6 +375,35 @@ describe('an operation belongs to the vault that started it (D15)', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0].signal?.aborted).toBe(true);
     expect(await getNoteById(note.noteId)).toBeUndefined();
+  });
+});
+
+describe('the freshest answer wins (D15)', () => {
+  it('a superseded export does not come back and overwrite the newer one', async () => {
+    // The adapter's last await is the artifact marker; after it the outcome
+    // goes straight to a download. Two exports in flight — an impatient second
+    // click — end with the SLOWER one arriving last, and without this the file
+    // saved is the older one.
+    await openMain();
+
+    const first = store.exportBackupFile();
+    const settled = expect(first).rejects.toBeInstanceOf(BackupCancelledError);
+    const second = await act(async () => store.exportBackupFile());
+
+    await act(async () => { await settled; });
+    expect(second.exported.text.length).toBeGreaterThan(0);
+  });
+
+  it('…and the same for a verify', async () => {
+    await openMain();
+    const { file } = await containerWith('SUPERSEDED');
+
+    const first = store.verifyBackupFile(file);
+    const settled = expect(first).rejects.toBeInstanceOf(BackupCancelledError);
+    const second = await act(async () => store.verifyBackupFile(file));
+
+    await act(async () => { await settled; });
+    expect(second.report.ok).toBe(true);
   });
 });
 
