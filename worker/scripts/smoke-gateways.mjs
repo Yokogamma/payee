@@ -33,11 +33,23 @@ const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 /** A health body is a few hundred bytes; anything larger is not one. */
 export const BODY_CAP_BYTES = 8192;
-export const DEADLINE_MS = 15_000;
+/**
+ * Total budget across all attempts.
+ *
+ * A POST-DEPLOY smoke races Cloudflare's propagation: for a few seconds after
+ * the upload some edges still answer from the previous version, which looks
+ * exactly like a failed release — wrong `releaseSha`, missing `no-store`,
+ * an older `workerVersionId`. That is a wait, not a verdict, so the caller
+ * raises this budget (SMOKE_DEADLINE_MS) for that use and the loop keeps
+ * asking until the deadline rather than judging the first answer.
+ */
+export const DEADLINE_MS = Number(process.env.SMOKE_DEADLINE_MS ?? 15_000);
 /** Bound on ONE attempt, inside the shared budget above. */
 export const ATTEMPT_TIMEOUT_MS = 7_000;
-/** Total attempts, not retries-after-the-first. */
-export const ATTEMPTS = 3;
+/** Upper bound on attempts; the DEADLINE is what actually stops the loop. */
+export const ATTEMPTS = Number(process.env.SMOKE_ATTEMPTS ?? 12);
+/** Pause between attempts, so a propagation wait is not a busy loop. */
+export const RETRY_PAUSE_MS = 2_000;
 
 export function randomNonce() {
   const bytes = new Uint8Array(8);
@@ -187,6 +199,52 @@ export async function readCapped(response, cap) {
   return out;
 }
 
+/**
+ * Ask until the answer matches or the budget runs out.
+ *
+ * Extracted from the CLI because this loop — not `checkHealth` — is where the
+ * post-deploy propagation race lives, and a loop that cannot be tested is how
+ * that race reached production: the first release failed its own smoke while
+ * the worker it deployed was correct.
+ *
+ * `probeOnce` takes the nonce for that attempt, so freshness is the loop's
+ * responsibility and every retry is provably a new question.
+ */
+export async function runAttempts({
+  probeOnce,
+  expected,
+  deadline,
+  attempts = ATTEMPTS,
+  pauseMs = RETRY_PAUSE_MS,
+  sleep = ms => new Promise(r => setTimeout(r, ms)),
+}) {
+  let last = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    // «deadline exhausted» is APPENDED, never substituted: on its own it hides
+    // what the worker actually answered, and now that every mismatch is
+    // retried, an exhausted budget is the ordinary way a real failure ends.
+    if (deadline.aborted) return { ok: false, problems: [...(last ?? []), 'deadline exhausted'] };
+    const nonce = randomNonce();
+    let result;
+    try {
+      result = await probeOnce(nonce);
+    } catch (e) {
+      result = { error: e instanceof Error ? e.message : String(e) };
+    }
+    if (result.error) {
+      last = [result.error];
+    } else {
+      const { ok, problems } = checkHealth(result.body, { ...expected, nonce });
+      if (ok) return { ok: true, problems: [], attempts: attempt };
+      last = problems;
+    }
+    if (attempt === attempts) break;
+    if (deadline.aborted) return { ok: false, problems: [...last, 'deadline exhausted'] };
+    await sleep(pauseMs);
+  }
+  return { ok: false, problems: last ?? ['no answer'] };
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────
 if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
   const args = process.argv.slice(2);
@@ -235,40 +293,25 @@ if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
       ? { workerVersionId: process.env.EXPECT_WORKER_VERSION_ID } : {}),
   };
 
-  // ONE budget for the whole smoke: three attempts with their own 15 s each
-  // would let a stalled worker hold the deploy for 45.
+  // ONE budget for the whole smoke: per-attempt timeouts of their own would
+  // let a stalled worker hold the deploy for the sum of them.
   const deadline = AbortSignal.timeout(DEADLINE_MS);
-  let last = null;
-  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-    if (deadline.aborted) { last = ['deadline exhausted']; break; }
-    // A NEW nonce every attempt: reusing one would let the retry reproduce the
-    // very cached answer the retry exists to get past.
-    const nonce = randomNonce();
-    let result;
-    try {
-      result = await probe(origin, nonce, deadline);
-    } catch (e) {
-      result = { error: e instanceof Error ? e.message : String(e) };
-    }
-    if (result.error) {
-      last = [result.error];
-      if (attempt < ATTEMPTS) continue;
-      break;
-    }
-    const { ok, problems } = checkHealth(result.body, { ...expected, nonce });
-    if (ok) {
-      console.log(`✓ smoke-gateways: ${origin} matches the "${profile}" profile`);
-      process.exit(0);
-    }
-    last = problems;
-    // A FRESHNESS failure is the one content verdict worth retrying — a new
-    // nonce is precisely the remedy for a stale answer. Every other verdict is
-    // about the release itself and will not change.
-    const stale = problems.some(p => p.includes('nonce'));
-    if (!stale || attempt === ATTEMPTS) break;
-  }
+  const { ok: passed, problems: last } = await runAttempts({
+    probeOnce: nonce => probe(origin, nonce, deadline),
+    expected,
+    deadline,
+  });
 
-  console.error(`✗ smoke-gateways FAILED for ${origin} (profile "${profile}"):`);
-  for (const p of last ?? ['no answer']) console.error(`  - ${p}`);
-  process.exit(1);
+  // SET the code, do not `process.exit`: a hard exit while the deadline timer
+  // is still live trips a libuv assertion on Windows, and the smoke then reports
+  // 127 — «command not found» — for a run that actually passed. Letting the
+  // process end on its own reports the verdict it reached.
+  if (passed) {
+    console.log(`✓ smoke-gateways: ${origin} matches the "${profile}" profile`);
+    process.exitCode = 0;
+  } else {
+    console.error(`✗ smoke-gateways FAILED for ${origin} (profile "${profile}"):`);
+    for (const p of last ?? ['no answer']) console.error(`  - ${p}`);
+    process.exitCode = 1;
+  }
 }
