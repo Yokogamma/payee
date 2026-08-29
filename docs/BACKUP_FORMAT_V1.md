@@ -12,7 +12,9 @@ yet shipped is absent from this document rather than sketched in it.
 
 Sections land with the code that implements them. Currently documented:
 
-- §1 — the canonical publication fingerprint (`fp`).
+- §1 — the canonical publication fingerprint (`fp`);
+- §2 — the backup container v1 (shape, canonical JSON, keys, nonce, cap, vector);
+- §3 — `publicationEquivalent`, the client-side counterpart of §1.
 
 ## 1. Publication fingerprint (`fp`)
 
@@ -133,7 +135,183 @@ suite additionally asserts that this document still contains them — a vector
 that drifts out of the documentation is the failure mode a frozen format cannot
 afford.
 
-## 2. `publicationEquivalent` (client)
+## 2. Container v1
+
+Implemented by `src/lib/backup.ts`. Read by the PWA and by the standalone
+`backup-viewer.html`, which may be years older or newer than the file it opens
+— everything below is therefore frozen.
+
+### 2.1 Shape
+
+```jsonc
+{
+  "format": "eternal-notes-backup",
+  "v": 1,                              // container version
+  "minReaderVersion": 1,               // lowest reader protocol that understands the body
+  "containsUnsupportedRecords": false, // required field
+  "createdAt": 1756000000000,
+  "body": { "iv": "<base64>", "ciphertext": "<base64>" }
+}
+```
+
+One AES-256-GCM blob, and the **canonical bytes of the five header fields are
+the AEAD additional data**. A separate manifest, body hash or per-record MAC
+would only add ways for two integrity claims to disagree; GCM already gives
+integrity and authentication for both halves at once. Editing any header field
+in a text editor therefore fails decryption rather than passing unnoticed.
+
+A top-level key outside these six is a **rejection**, not something ignored:
+anything else would sit outside the additional data, which is precisely where
+it would be useful to an attacker.
+
+### 2.2 The encrypted body
+
+```jsonc
+{
+  "counts":   { "notes": 1, "safebox": 1 },
+  "incompleteRestore": false,
+  "notes":    [ /* IndexedDB records, as they are */ ],
+  "safebox":  [ /* IndexedDB records, as they are */ ]
+}
+```
+
+**No sync section, in any form.** A file cannot prove «these bytes were
+published by that transaction», so publication state is never exported and
+never restored. Its absence is checked, not assumed: an unexpected body key is
+corruption.
+
+Records travel verbatim — no `{id, v, raw}` wrapper — and unknown fields are
+preserved. The guarantee is **semantic preservation plus equality of canonical
+JSON bytes**; byte equality of the original object is not promised, because
+canonization reorders keys and IndexedDB stores a structured clone anyway.
+
+Stable fields, by collection, with the real key names:
+
+| Field | Required | Note |
+|---|---|---|
+| `notes[*].noteId` | yes | |
+| `notes[*].v` | **no** | its absence legitimately means v1 (`crypto.ts`), so requiring it would either reject legacy backups or mutate records that must travel as they are. An OPAQUE note must therefore carry an explicit unsupported `v` — otherwise it is indistinguishable from a legacy v1 record. |
+| `safebox[*].entryId` | yes | |
+| `safebox[*].v` | yes | |
+
+`counts` must equal the collection lengths. It is a cheap end-to-end check: a
+truncated or half-written body fails here instead of restoring silently short.
+
+**Every invariant in this section is enforced identically in BOTH
+directions**, by one shared validator. A decoder stricter than its encoder
+would let an export write a file that its own import rejects — and the
+rejection would surface at restore time, on another device, possibly after
+the original data is gone.
+
+**Id uniqueness is fail-closed on all three counts** (D10): unique within
+`notes`, unique within `safebox`, and **disjoint between them**. Notes and
+safebox entries share one key space downstream — the sync store is keyed by a
+single id, and so is restore — so a cross-collection collision would make the
+result depend on processing order.
+
+`incompleteRestore` lives **inside the ciphertext**, never in the open header:
+it is one more metadata bit to leak and a second source of truth for something
+the body already states. It says the container is *narrower than the file it
+was restored from*, which is orthogonal to `containsUnsupportedRecords` (what
+the container *holds*). A reader never clears it on its own.
+
+`containsUnsupportedRecords` is checked **asymmetrically** after successful
+authentication: header `false` while the reader sees unreadable records → fail
+closed; header `true` while the reader sees none → normal, the reader is simply
+newer and the warning is dropped. Strict equality would reject a valid backup
+at exactly the build able to restore it.
+
+### 2.3 Canonical JSON
+
+Keys in **code-point** order (not the UTF-16 code-unit order `Array.prototype.sort`
+gives by default — they differ for astral characters), arrays in order, no
+whitespace, standard JSON string escaping.
+
+Serialization also **validates**, in the same pass, and fails closed. Values
+`JSON.stringify` would silently mangle are refused rather than written:
+`undefined`, functions, symbols (as values or keys), `BigInt`, `Date`, `Map`,
+`Set`, `ArrayBuffer`, typed arrays, any non-plain prototype, cycles, `NaN`,
+`±Infinity`, `-0` (it would return as `+0`), **sparse arrays** (a hole becomes
+`null`) and **non-index properties on an array** (they vanish). Each of those is
+silent data loss inside a file whose whole purpose is to still be readable when
+nothing else is left, so the record waits for a container v2 instead.
+
+### 2.4 Key derivation
+
+```
+IKM  = mnemonicToSeedSync(mnemonic).slice(0, 32)   // BIP-39, empty passphrase
+salt = "eternal-notes-v1"
+info = "backup-v1"
+key  = HKDF-SHA256(IKM, salt, info) -> AES-256-GCM
+```
+
+The mnemonic is normalized exactly as everywhere else in `crypto.ts`, the salt
+is the same fixed one, and only `info` separates the domains — so a backup key
+can never open a note envelope, or the reverse. Written out here in words, not
+only pinned by the vector, because a viewer saved today may have to be
+re-implemented from this document alone.
+
+### 2.5 Nonce and tag
+
+A **fresh** `crypto.getRandomValues(new Uint8Array(12))` per export, and no
+other source: the key is constant for a mnemonic while exports are many, so a
+repeated 96-bit nonce would destroy both confidentiality and authenticity. The
+IV is never derived from the date, the contents or the file name. `tagLength`
+is 128 bits. A reader requires **exactly** 12 IV bytes, a ciphertext of at
+least 16, and canonical base64 for both.
+
+There is no parameter to inject an IV — tests that need the vector stub the
+CSPRNG instead, which also makes the single 12-byte draw observable.
+
+### 2.6 Size cap
+
+**32 MiB (33 554 432 bytes), measured on both sides as the FINAL file size.**
+Measuring the cap on the plaintext would let an export produce a near-cap file
+roughly 1.33x larger — base64 plus the JSON wrapper — which its own import
+would then refuse. Readers check `File.size` before reading the text. Stores
+above the ceiling are not supported until a streaming container v2, and the UI
+says so plainly.
+
+### 2.7 File name
+
+`eternal-notes-backup-YYYY-MM-DD-HHmm.json`, in the user's **local** time —
+several exports on one day stay distinguishable, and the name matches the clock
+the user just looked at.
+
+### 2.8 Test vector
+
+Mnemonic (BIP-39, the standard all-`abandon` vector):
+
+```
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+```
+
+IV: bytes `01 02 03 04 05 06 07 08 09 0a 0b 0c` (base64 `AQIDBAUGBwgJCgsM`).
+`createdAt`: `1756000000000`.
+
+Canonical body, before encryption:
+
+```
+{"counts":{"notes":1,"safebox":1},"incompleteRestore":false,"notes":[{"ciphertext":"QUFBQQ==","createdAt":1756000000000,"iv":"AAAAAAAAAAAAAAAA","noteId":"11111111-2222-4333-8444-555555555555"}],"safebox":[{"createdAt":1756000000000,"entryId":"88888888-9999-8aaa-baaa-cccccccccccc","metaCiphertext":"QkJCQg==","metaIv":"AAAAAAAAAAAAAAAA","secretCiphertext":"Q0NDQw==","secretIv":"AAAAAAAAAAAAAAAA","v":4}]}
+```
+
+Additional data (the canonical header):
+
+```
+{"containsUnsupportedRecords":false,"createdAt":1756000000000,"format":"eternal-notes-backup","minReaderVersion":1,"v":1}
+```
+
+The complete file:
+
+```
+{"body":{"ciphertext":"JNsiCBJ4BSIexY24Y4b/iJ4yvPHrP5OAleKyB9Whav/jI8SzB9/2x90D50DyEekqxM3o5SUmoePUt7vR46k0JiU7HjKi2fIfyN+J7rCzPskPpDCrjOstJ/lnHmTGPiQmedRV4Ix/vUG28lHQQRNJv6LE5Dt7pQDtQHEEUbQVspOmXY6LfGkq8OS9gz3I0E4EynQXfWY5Jf6D2c12F5BYd0xff8ZpvSjHzK4jrsflb5dA2hX9zWIU6YvYApd1tzFkWD171pw9VpIU8kEa4fAUpb/Hwef6MHBCcM4UVk02aatA3NHW6rrsQzYmz6CraNKbmGJvtFKwiWIR6PG2IOtJJTuGZUGM5KjChHuRa9qNukazZPNI9QXcF6pGacAYzIl5HnOdv24mEZrx2fsUXpmJJXNjSugOylmbYQMq+pXbIrAspkIheW1gVn/vhbbvADksaswOB3aNULjB3MTH4c9eSq755V2TMYoBHEpKtC292bW6WpG2VZqa4GcT4SG21/RuCEvUgDggGI+y6e6q/V/4oWBnVEJa/KtB9Fr1ID4i5OrihZUq+A==","iv":"AQIDBAUGBwgJCgsM"},"containsUnsupportedRecords":false,"createdAt":1756000000000,"format":"eternal-notes-backup","minReaderVersion":1,"v":1}
+```
+
+Both halves of `src/lib/backup.test.ts` assert this artefact: that the encoder
+reproduces the file byte for byte, that the decoder reads it back, and that
+this document still carries the same strings.
+
+## 3. `publicationEquivalent` (client)
 
 Not a wire format, documented here because it is the client-side counterpart of
 §1 and the two are easy to confuse.
