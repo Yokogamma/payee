@@ -53,6 +53,18 @@ export const READER_VERSION = 1;
  */
 export const BACKUP_CAP_BYTES = 32 * 1024 * 1024;
 
+/**
+ * How much PLAINTEXT can still fit under the cap, once base64 and the JSON
+ * wrapper have taken their share. Deliberately conservative: base64 costs 4/3,
+ * and the header, the envelope keys and the GCM tag are charged a flat
+ * over-estimate on top. Better to refuse a store that would have just fitted
+ * than to hand the user a file its own import rejects.
+ *
+ * Exported so the snapshot reader can stop early without knowing anything else
+ * about the format — the arithmetic stays here, where the format lives.
+ */
+export const BACKUP_PLAINTEXT_BUDGET_BYTES = Math.floor((BACKUP_CAP_BYTES - 4096) * 3 / 4);
+
 /** GCM contract: a FRESH 96-bit nonce per export, 128-bit tag. The key is
  *  constant for a mnemonic and exports are many, so a repeated nonce would
  *  destroy both confidentiality and authenticity — the IV is never derived
