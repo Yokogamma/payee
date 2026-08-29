@@ -6,17 +6,17 @@ import { NoteComposer } from '../components/NoteComposer';
 import { Fab } from '../components/Fab';
 import { NoteMarkdown } from '../components/NoteMarkdown';
 import { NotePreview } from '../components/NotePreview';
-import { EditNoteModal } from '../components/EditNoteModal';
+import { EditNoteModal, type EditSeed } from '../components/EditNoteModal';
 import { VersionHistoryModal, RestoreVersionDialog } from '../components/VersionHistoryModal';
 import { SafeboxSection } from '../components/SafeboxSection';
 import { badgeFor } from '../components/syncBadge';
 import { SyncStateBadge } from '../components/SyncStateBadge';
 import { CardMenu } from '../components/CardMenu';
-import { formatNoteDate, formatNoteDateFull } from '../lib/format-date';
+import { formatNoteDate, formatNoteDateFull, formatVersionStamp } from '../lib/format-date';
 import { noteSearchText } from '../lib/note-search-text';
-import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote, IconChevronLeft } from '../components/icons';
+import { IconCopy, IconEdit, IconHistory, IconLink, IconClose, IconNote, IconChevronLeft, IconRestore } from '../components/icons';
 import { V3_WRITER_ENABLED } from '../lib/flags';
-import { useRoute, navigate, canonicalHash, type RouteHistoryState } from '../lib/route';
+import { useRoute, navigate, canonicalHash, parseHash, noteTarget, parseNoteTarget, type RouteHistoryState } from '../lib/route';
 import { AppNav } from '../components/AppNav';
 import { StatusLine } from '../components/StatusLine';
 import type { ThemePref } from '../lib/theme';
@@ -64,6 +64,8 @@ export function Main({ theme, onThemeChange }: MainProps) {
     v3Paused,
     safeboxLockGeneration,
     restoring,
+    updateCheck,
+    lastSweepOutcome,
   } = useNotes();
 
   // The section lives in the address, not in local state: the Android system
@@ -71,7 +73,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // kept alongside `view` because the canonicaliser below needs to see a
   // change that `view` alone would hide (`#/notes` → `#/garbage` parses to the
   // same section).
-  const { hash, section: view, param } = useRoute();
+  const { hash, section: view } = useRoute();
   // The safebox item is ALWAYS in the nav — the visibility formula is gone.
   // A section that appears and disappears makes the layout jump the moment a
   // user activates it, and it hid the only route to activation. It is dimmed
@@ -92,20 +94,108 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // phone has.
   const [composerOpen, setComposerOpen] = useState(false);
   /**
-   * The note being read, resolved from the ADDRESS.
+   * What the ADDRESS names, parsed — before asking whether the store has it.
    *
-   * Against `chains`, never `filteredChains`: an active search must not close
-   * a note that is already open. A param that resolves to nothing (a stale
-   * link, a chain quarantined while it was open) simply leaves `readingRoot`
-   * null, and the canonicaliser below strips it from the bar — no second
-   * redirect effect.
+   * `#/notes/<root>` or `#/notes/<root>/v/<n>`. Everything downstream keys off
+   * THIS and not off the chain we managed to find: during a sweep the chain may
+   * not have arrived yet, and a route identity that collapses whenever a lookup
+   * misses would let the held address and the lifecycle drift apart.
    */
-  const readingChain = param && view === 'notes' ? chains.find(c => c.root === param) ?? null : null;
+  const target = view === 'notes' ? parseNoteTarget(hash) : null;
+  const targetRoot = target?.root ?? null;
+  const targetOrdinal = target?.ordinal ?? null;
+
+  /** The chain, looked up against `chains` and never `filteredChains`: an
+   *  active search must not close a note that is already open. */
+  const readingChain = targetRoot ? chains.find(c => c.root === targetRoot) ?? null : null;
   const readingRoot = readingChain?.root ?? null;
-  const reading = readingChain !== null;
+
+  /**
+   * IS A SWEEP RUNNING — the only honest form of «the snapshot is still moving».
+   *
+   * `restoring` alone is not it. `checkForUpdates` shares `restoringRef` with
+   * restore but deliberately never calls `setRestoring` (see its comment in
+   * store.tsx), while publishing versions as it merges them. A partial restore,
+   * meanwhile, ends with `setRestoring(false)` like any other. So both flags
+   * are needed — and NEITHER means «the snapshot is complete». That question is
+   * answered by `lastSweepOutcome`, and answering it is all it does: it gates
+   * nothing.
+   */
+  const sweepInFlight = restoring || updateCheck.status === 'checking';
+
   /* Derived at the top level, not inside the JSX: reading `chain.current`
      inside a callback is what react-hooks/refs flags by property name. */
-  const readingNote = readingChain?.current ?? null;
+  const readingCurrent = readingChain?.current ?? null;
+
+  const versionTotal = readingChain?.versions.length ?? 0;
+  /* The ordinal counts from the OLDEST (1) while `versions` runs current-first,
+     which is why this is a subtraction and not an index. */
+  const versionByOrdinal = readingChain && targetOrdinal !== null && targetOrdinal <= versionTotal
+    ? readingChain.versions[versionTotal - targetOrdinal] ?? null
+    : null;
+
+  /**
+   * THE PIN: the version this page resolved to, held by ID for as long as the
+   * page stays open.
+   *
+   * The address carries a POSITION, and a position is only as stable as the
+   * snapshot it was read from — a version arriving out of order (a second
+   * device with a lagging clock) shifts the ordinals of everything newer than
+   * itself. Without the pin the text would change under the reader. With it,
+   * only the caption moves: it is recomputed from where the pinned version
+   * sits NOW, so it never lies either.
+   *
+   * Keyed by the full route target and cleared on every route change (see the
+   * reset block below), so leaving and re-entering the same address resolves it
+   * afresh instead of resurrecting whatever was shown last time.
+   */
+  const [versionPin, setVersionPin] = useState<{ key: string; versionId: string } | null>(null);
+  const routeKey = `${view}|${target ? noteTarget(target.root, target.ordinal) : ''}`;
+  const pinnedVersion = versionPin && versionPin.key === routeKey && readingChain
+    ? readingChain.versions.find(v => v.id === versionPin.versionId) ?? null
+    : null;
+  const shownVersion = pinnedVersion ?? versionByOrdinal;
+  const shownIsCurrent = shownVersion !== null && shownVersion.id === readingCurrent?.id;
+
+  /**
+   * WHICH SCREEN — and it follows the ADDRESS, not the lookup.
+   *
+   *   feed     — the address names no note
+   *   holding  — it names one that cannot be shown yet (or any more): the
+   *              reader is HELD until the canonicaliser rewrites the hash
+   *   note     — the ordinary reader (#121)
+   *   version  — one older version, on its own page
+   *
+   * `holding` exists because the alternative is a frame of the FEED under a
+   * note address — and, with a stored draft, a frame of the COMPOSER, since
+   * `composing` is gated on `!reading`. That frame appears twice: while a sweep
+   * is still filling the store, and again between the render that ends the
+   * sweep and the passive effect that rewrites the address.
+   *
+   * An ordinal that resolves to the CURRENT version renders the note rather
+   * than the version page: `#/notes/<root>/v/<N>` is on its way to
+   * `#/notes/<root>`, so the destination is what to draw — and drawing it means
+   * no frame ever offers «Вернуть» for a version that is already current.
+   */
+  const screen: 'feed' | 'holding' | 'note' | 'version' =
+    targetRoot === null ? 'feed'
+      : readingChain === null ? 'holding'
+        : targetOrdinal === null ? 'note'
+          : shownVersion === null ? (sweepInFlight ? 'holding' : 'note')
+            : shownIsCurrent ? 'note'
+              : 'version';
+
+  const reading = screen !== 'feed';
+  /** Actions that WRITE are offered only once the snapshot has stopped moving:
+   *  acting on a version the next merge may re-resolve is the one mistake this
+   *  page must not allow. */
+  const versionActionable = screen === 'version' && !sweepInFlight;
+  /** «Версия k из N», recomputed from where the pinned version sits now. */
+  const shownOrdinal = screen === 'version' && readingChain && shownVersion
+    ? versionTotal - readingChain.versions.findIndex(v => v.id === shownVersion.id)
+    : null;
+
+  const readingNote = screen === 'version' ? shownVersion : readingCurrent;
   const readingInfo = readingNote
     ? syncStatuses[readingNote.id] ?? { status: 'queued' as const }
     : null;
@@ -141,8 +231,26 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // the restore confirm CLOSES the history modal; cancelling reopens history
   // with focus restored onto the same version row.
   const [editChainRoot, setEditChainRoot] = useState<string | null>(null);
+  /** Which version the editor was seeded from. `null` = the current one, the
+   *  ordinary edit; set only when the editor was opened from a version page. */
+  const [editSeed, setEditSeed] = useState<EditSeed | null>(null);
   const [historyChainRoot, setHistoryChainRoot] = useState<string | null>(null);
-  const [historyFocusVersionId, setHistoryFocusVersionId] = useState<string | null>(null);
+  /**
+   * «Open the index once the route has settled on this note.»
+   *
+   * Entering the history from the feed's card menu has to open the NOTE first,
+   * or Back from a version page would land in the feed while the control on it
+   * says «‹ Заметка». But `openNote()` and `setHistoryChainRoot()` in one
+   * handler are batched into a single update, and the render-phase reset below
+   * — which clears `historyChainRoot` on every route change — would then wipe
+   * the index in the very commit that was supposed to open it.
+   *
+   * So the intent is parked with the route key it is waiting for and consumed
+   * on a later render, in that same reset block. An EFFECT cannot do this:
+   * `react-hooks/set-state-in-effect` is an error here (eslint.config.js), and
+   * `npm run lint` is a gate.
+   */
+  const [historyIntent, setHistoryIntent] = useState<{ key: string; root: string } | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<{ root: string; version: NoteData } | null>(null);
 
   // PWA update toast (Phase 8): the waiting SW activates only on user consent.
@@ -188,6 +296,46 @@ export function Main({ theme, onThemeChange }: MainProps) {
    * button. The WRITE is never cancelled; only its tail is invalidated.
    */
   const restoreOpRef = useRef(0);
+
+  /**
+   * The same token for the EDIT flow, and it needs saying why a second one.
+   *
+   * `editNote` does not throw when the vault epoch changed under it — it
+   * returns, quietly (store.tsx). So `await editNote(...)` resolves normally
+   * even when the app has locked mid-save, and everything written after that
+   * await runs regardless: closing a dialog, navigating, moving focus. Over a
+   * PIN screen, that is a stranger's app being driven by a finished operation.
+   *
+   * Both tokens are bumped from three places, and all three are needed:
+   *   - the route-change effect below (the backstop for system Back, which
+   *     reaches us through popstate and not through any handler of ours);
+   *   - every handler that opens, closes or cancels a dialog, or navigates —
+   *     synchronously, because a passive effect is NOT a barrier a promise
+   *     continuation has to wait behind;
+   *   - the unmount cleanup right here, in a LAYOUT effect, which runs in the
+   *     same commit that takes this screen away.
+   */
+  const editSessionRef = useRef(0);
+  const mountedRef = useRef(true);
+  useLayoutEffect(() => {
+    // The ref OBJECTS are copied, not their values: the cleanup wants the live
+    // counters, which is the opposite of the DOM-node case exhaustive-deps
+    // warns about.
+    const mounted = mountedRef;
+    const editSession = editSessionRef;
+    const restoreOp = restoreOpRef;
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      editSession.current++;
+      restoreOp.current++;
+    };
+  }, []);
+
+  /** «История» in the reader's action bar — where focus goes when the index is
+   *  closed and whatever opened it (a card menu in a feed that has since
+   *  unmounted) is gone. */
+  const historyBtnRef = useRef<HTMLButtonElement>(null);
 
   /** The feed's scroll position across a trip into a note (it unmounts). */
   const feedElRef = useRef<HTMLDivElement | null>(null);
@@ -301,20 +449,27 @@ export function Main({ theme, onThemeChange }: MainProps) {
   const firstSectionRender = useRef(true);
   const prevReadingRootRef = useRef<string | null>(null);
   useEffect(() => {
+    // Tracked from the ADDRESS, not from the resolved chain: during a sweep the
+    // chain arrives later than the address does, and a lookup-based «where were
+    // we» would read null for a note that was on screen the whole time.
     const leftReading = prevReadingRootRef.current;
-    prevReadingRootRef.current = readingRoot;
+    prevReadingRootRef.current = targetRoot;
     // Not on the very first render — that would steal focus at app start,
     // including a cold start straight into a note.
     if (firstSectionRender.current) { firstSectionRender.current = false; return; }
     // Coming BACK from a note: focus the card it was opened from, not the
     // section title. Same contract as the modal stack — the control that
     // started the trip gets the focus that ends it.
-    if (!readingRoot && leftReading) {
+    if (!targetRoot && leftReading) {
       const back = previewBtnRefs.current.get(leftReading)?.current;
       if (back) { back.focus(); return; }
     }
     (document.querySelector('.main-content .section-title') as HTMLElement | null)?.focus();
-  }, [view, readingRoot]);
+    // Keyed on the FULL target, not on the root: note → version → note keeps
+    // one root throughout, and focus has to follow all three moves. `targetRoot`
+    // is a function of `routeKey` and cannot move on its own — it is listed to
+    // satisfy the dependency check, not because it adds a trigger.
+  }, [routeKey, targetRoot]);
 
   /**
    * A route transition closes every modal and DISCARDS its unwritten buffer.
@@ -328,7 +483,6 @@ export function Main({ theme, onThemeChange }: MainProps) {
    * `useLayoutEffect`, not `useEffect`: a passive one would let a frame paint
    * with the dialog still on top of the feed.
    */
-  const routeKey = `${view}|${readingRoot ?? ''}`;
   const [modalRouteKey, setModalRouteKey] = useState(routeKey);
   if (modalRouteKey !== routeKey) {
     // ADJUSTED DURING RENDER, not in an effect — the same shape EditNoteModal
@@ -337,20 +491,44 @@ export function Main({ theme, onThemeChange }: MainProps) {
     // cascading re-render it causes.
     setModalRouteKey(routeKey);
     setEditChainRoot(null);
+    setEditSeed(null);
     setHistoryChainRoot(null);
-    setHistoryFocusVersionId(null);
     setRestoreTarget(null);
     setOpenMenuId(null);
+    // THE PIN GOES WITH THEM. Its key is a string, and the same address visited
+    // twice produces the same string — so a pin left standing across the trip
+    // away would match again on re-entry and resurrect the version that was
+    // shown last time, ignoring everything that arrived in between. Clearing it
+    // on every transition is what makes a second visit identical to a first.
+    setVersionPin(null);
+    // The parked intent survives exactly the transition it was created for.
+    if (historyIntent && historyIntent.key !== routeKey) setHistoryIntent(null);
+  } else if (historyIntent && historyIntent.key === routeKey) {
+    // The route has settled and the reset above has already run for this key,
+    // so opening the index now cannot be undone by it.
+    setHistoryIntent(null);
+    setHistoryChainRoot(historyIntent.root);
   }
 
-  // Invalidate any restore still in flight: the WRITE is never cancelled, but
-  // its UI tail must not steal focus after we have left. See `confirmRestore`.
-  // In an effect rather than in the block above, because a ref may not be
-  // touched during render — and an effect is early enough regardless: the tail
-  // it guards resolves on a later task, never between render and effect.
+  // Pin the version this address resolved to — once per visit, and only once
+  // the snapshot has stopped moving. Pinning mid-sweep would hold whichever
+  // version happened to occupy the position at that instant, which is exactly
+  // the guess this pin exists to avoid.
+  if (screen === 'version' && !sweepInFlight && shownVersion
+      && (versionPin === null || versionPin.key !== routeKey)) {
+    setVersionPin({ key: routeKey, versionId: shownVersion.id });
+  }
+
+  // The route-change backstop for both generation tokens. System Back arrives
+  // as a popstate and passes through no handler of ours, so this is the only
+  // place that hears it — every in-app navigation bumps them synchronously as
+  // well, because a passive effect is not a barrier a promise continuation has
+  // to wait behind. A ref may not be written during render, which is why this
+  // is an effect and not part of the block above.
   useEffect(() => {
     restoreOpRef.current++;
-  }, [view, readingRoot]);
+    editSessionRef.current++;
+  }, [routeKey]);
 
   /**
    * Put the feed back where it was standing.
@@ -385,15 +563,29 @@ export function Main({ theme, onThemeChange }: MainProps) {
   // stop on the way back.
   //
   // It is also the ONLY place a bad note id is dealt with: `readingRoot` is
-  // null for a param that resolves to nothing, so the same line strips it.
-  // While a restore sweep is still filling the store, though, an id that has
-  // not arrived YET is not the same as a bad one — the address is held until
-  // the sweep ends, or the deep link would bounce out from under the user.
+  // null for a param that resolves to nothing, so the same line strips it, and
+  // an ordinal that names no version (or names the CURRENT one) is dropped the
+  // same way.
+  //
+  // While a sweep is still filling the store, though, an id that has not
+  // arrived YET is not the same as a bad one, and neither is an ordinal that
+  // does not resolve yet — the whole note address is held until the sweep ends,
+  // or a deep link would bounce out from under the user. `sweepInFlight` and
+  // not `restoring`: the manual check publishes versions without ever setting
+  // that flag, so watching it alone would both bounce a live deep link AND —
+  // because `checking → done` moves nothing else this effect depends on —
+  // leave a genuinely dead address standing forever once the check finished.
   useEffect(() => {
-    if (restoring && param && !readingRoot) return;
-    const wanted = view === 'notes' ? readingRoot : null;
+    if (sweepInFlight && targetRoot) return;
+    const wanted = view === 'notes' && readingRoot
+      // The ordinal is carried over AS WRITTEN. This effect never renumbers it:
+      // a rewrite is indistinguishable from a user's own move to another
+      // version, and it would take the open dialogs, the buffer and the focus
+      // with it. See the pin above for how the caption stays truthful instead.
+      ? noteTarget(readingRoot, screen === 'version' ? targetOrdinal : null)
+      : null;
     if (hash !== canonicalHash(view, wanted)) navigate(view, { replace: true, param: wanted });
-  }, [hash, view, param, readingRoot, restoring]);
+  }, [hash, view, targetRoot, targetOrdinal, readingRoot, screen, sweepInFlight]);
 
   // Hydrate the encrypted draft on mount — dirty-guarded (§2): it only fills a
   // composer the user has NOT touched (typing and deleting counts as touched),
@@ -479,12 +671,35 @@ export function Main({ theme, onThemeChange }: MainProps) {
     return parts;
   }
 
+  /** Every in-app navigation ends the sessions of whatever was in flight.
+   *  Synchronously, in the handler: a promise continuation does not wait for a
+   *  passive effect, so the effect keyed on the route is a backstop for system
+   *  Back and nothing more. */
+  function endSessions() {
+    restoreOpRef.current++;
+    editSessionRef.current++;
+  }
+
   /** Open a note: push an entry so the system Back gesture closes it, and
    *  remember where the feed was standing. */
   function openNote(root: string) {
+    endSessions();
     feedScrollRef.current = feedElRef.current?.scrollTop ?? 0;
     restoreFeedScrollRef.current = true;
     navigate('notes', { param: root });
+  }
+
+  /** Open one version, by its position in the index. The CURRENT version has
+   *  no page of its own — there is nothing to bring back from it — so it routes
+   *  to the note itself. The index is closed HERE and not left to the route
+   *  reset: navigating to the note we already stand on is a no-op inside
+   *  `navigate` (same hash, no push, no emit), and then nothing would close it. */
+  function openVersion(ordinal: number) {
+    if (!readingChain) return;
+    setHistoryChainRoot(null);
+    endSessions();
+    const isCurrent = ordinal === readingChain.versions.length;
+    navigate('notes', { param: noteTarget(readingChain.root, isCurrent ? null : ordinal) });
   }
 
   /**
@@ -498,53 +713,128 @@ export function Main({ theme, onThemeChange }: MainProps) {
    * tells the two apart, and this is its first real reader.
    */
   function closeNote() {
+    endSessions();
     const state = window.history.state as RouteHistoryState | null;
     if (state?.enSection === true) window.history.back();
     else navigate('notes', { replace: true });
   }
 
+  /**
+   * Leave a version page for its note — the same two cases as `closeNote`, one
+   * step shallower.
+   *
+   * Used by «‹ Заметка» AND by a successful restore/edit, and the latter is why
+   * it must not be a plain push: pushing `#/notes/<root>` would leave the stale
+   * version page sitting directly behind the note the user just changed, one
+   * Back away.
+   */
+  function leaveVersionPage() {
+    endSessions();
+    const state = window.history.state as RouteHistoryState | null;
+    if (state?.enSection === true) window.history.back();
+    else navigate('notes', { replace: true, param: targetRoot });
+  }
+
   const editChain = editChainRoot ? chains.find(c => c.root === editChainRoot) ?? null : null;
   const historyChain = historyChainRoot ? chains.find(c => c.root === historyChainRoot) ?? null : null;
 
+  /**
+   * The address AS IT IS RIGHT NOW, re-read rather than remembered.
+   *
+   * The third guard on every async tail, and the only one that survives a
+   * `popstate`: the browser changes the address without passing through any
+   * handler of ours, and the effect that would bump the session tokens is
+   * passive — a promise continuation does not wait behind it. Comparing the
+   * live address with the one captured before the await closes that window.
+   *
+   * The shape matches `routeKey` exactly, so the two are comparable.
+   */
+  function liveRoute(): { key: string; onVersion: boolean } {
+    const h = window.location.hash;
+    const live = parseNoteTarget(h);
+    return {
+      key: `${parseHash(h)}|${live ? noteTarget(live.root, live.ordinal) : ''}`,
+      onVersion: live?.ordinal != null,
+    };
+  }
+
+  function openEditor(root: string, seed: EditSeed | null) {
+    endSessions();
+    setEditSeed(seed);
+    setEditChainRoot(root);
+  }
+
+  function closeEditor() {
+    endSessions();
+    setEditSeed(null);
+    setEditChainRoot(null);
+  }
+
+  /**
+   * The editor's ENTIRE success tail lives here, not in the dialog.
+   *
+   * `EditNoteModal` deliberately stops after the write: its `onClose` is a
+   * closure over this live component, so a save resolving after the user has
+   * closed that dialog and opened another would close the NEW one and take its
+   * unsaved buffer along. Unmounting the dialog does not help — a prop outlives
+   * the component that received it.
+   *
+   * The three guards below are three different failures, and none of them
+   * covers another: the screen may be gone (a lock unmounts Main while
+   * `editNote` returns quietly on the epoch change), the dialog may have been
+   * closed and reopened, or the address may have moved.
+   */
+  async function saveEdit(rootId: string, newText: string) {
+    const session = editSessionRef.current;
+    const from = liveRoute();
+    // No fmt: the editor is markdown, and a plain old version edited in it must
+    // be saved as what it now is — otherwise the markup just typed would render
+    // as literal text. «Вернуть» is the path that preserves the source format.
+    await editNote(rootId, newText);
+    if (!mountedRef.current) return;
+    if (session !== editSessionRef.current) return;
+    if (liveRoute().key !== from.key) return;
+    closeEditor();
+    // ONLY from a version page. The same editor opens from the reader and from
+    // the feed's card menu, and leaving from either of those would close a note
+    // the user never asked to leave, or spend a Back they still needed.
+    if (from.onVersion) leaveVersionPage();
+  }
+
   function requestRestore(version: NoteData) {
-    if (!historyChainRoot) return;
+    if (!readingChain) return;
     // A NEW flow invalidates the previous one's tail — otherwise a restore the
     // user backed out of could still steal focus from the one they started
     // instead.
-    restoreOpRef.current++;
-    // Modal-stack discipline: close history BEFORE the confirm opens.
-    setRestoreTarget({ root: historyChainRoot, version });
-    setHistoryChainRoot(null);
+    endSessions();
+    setRestoreTarget({ root: readingChain.root, version });
   }
 
   function cancelRestore() {
     if (!restoreTarget) return;
-    restoreOpRef.current++;
-    // Reopen history with focus back on the version row the user came from.
-    setHistoryFocusVersionId(restoreTarget.version.id);
-    setHistoryChainRoot(restoreTarget.root);
+    endSessions();
+    // No reopening to arrange: the confirm stood over the version PAGE, not
+    // over the index, and `useModalA11y` puts focus back on «Вернуть» itself.
     setRestoreTarget(null);
   }
 
   async function confirmRestore() {
     if (!restoreTarget) return;
     const op = ++restoreOpRef.current;
+    const from = liveRoute();
     // Preserve the SOURCE version's fmt: restoring a plain note must not
     // re-interpret its literal *stars* as markdown forever.
     await editNote(restoreTarget.root, restoreTarget.version.text, { fmt: restoreTarget.version.fmt });
-    // Success: close the whole stack, focus the card's stable ⋯ trigger (the
-    // «Восстановить» button that opened this no longer exists in the DOM).
-    const root = restoreTarget.root;
     // The write is done and permanent. Everything below is UI, and it belongs
-    // to a flow the user may already have left — see `restoreOpRef`.
+    // to a flow the user may already have left — same three guards as `saveEdit`.
+    if (!mountedRef.current) return;
     if (op !== restoreOpRef.current) return;
+    if (liveRoute().key !== from.key) return;
     setRestoreTarget(null);
-    setHistoryFocusVersionId(null);
-    requestAnimationFrame(() => {
-      // Re-checked inside the frame: the cleanup effect can fire between the
-      // state updates above and this callback.
-      if (op === restoreOpRef.current) menuBtnRefs.current.get(root)?.current?.focus();
-    });
+    // Back to the note, whose current version now carries this text. Focus is
+    // the route effect's job from here — it lands on the note's title, and the
+    // card's ⋯ trigger this used to aim at is not even mounted.
+    if (from.onVersion) leaveVersionPage();
   }
 
 
@@ -615,15 +905,27 @@ export function Main({ theme, onThemeChange }: MainProps) {
           «Заметка» — the date is what names this particular entry, so the date
           IS the screen title: same 15px as the back control, quiet in tone
           because it labels rather than leads. */}
-      {reading && readingNote ? (
+      {/* A VERSION PAGE NAMES ITSELF DIFFERENTLY, on purpose. A note is named
+          by its date (above); a version is named by which one it is — the exact
+          moment moves down into the facts row, where «where does this live»
+          already lives. Its way out is one step shallower: back to the note,
+          not to the list. */}
+      {reading ? (
         <div className="notes-topbar notes-topbar--reading">
-          <button className="btn btn-ghost note-back" onClick={closeNote}>
+          <button
+            className="btn btn-ghost note-back"
+            onClick={screen === 'version' ? leaveVersionPage : closeNote}
+          >
             <IconChevronLeft />
-            Заметки
+            {screen === 'version' ? 'Заметка' : 'Заметки'}
           </button>
           <span className="note-meta-gap" />
           <h2 className="section-title note-reader-title" tabIndex={-1}>
-            {formatNoteDate(readingNote.createdAt)}
+            {screen === 'version' && shownOrdinal !== null
+              ? `Версия ${shownOrdinal} из ${versionTotal}`
+              : readingNote
+                ? formatNoteDate(readingNote.createdAt)
+                : 'Заметка'}
           </h2>
         </div>
       ) : (
@@ -701,11 +1003,26 @@ export function Main({ theme, onThemeChange }: MainProps) {
       </div>
       )}
 
+      {/* HELD. The address names a note this screen cannot draw yet — the chain
+          has not arrived, or the version has not — and the address is what the
+          screen follows. Drawing the feed here would flash the wrong screen
+          under a live address; with a stored draft it would flash the COMPOSER,
+          since `composing` is only gated on `!reading`. */}
+      {screen === 'holding' && (
+        <div className="note-reader-body">
+          <p className="note-holding" role="status">
+            {sweepInFlight
+              ? 'Загружаем заметку…'
+              : 'Заметка не найдена.'}
+          </p>
+        </div>
+      )}
+
       {/* Reading one note, full screen. The chain is re-resolved on every
           render rather than snapshotted into state, so a version arriving from
           sync — or a restore performed right here — updates the text and the
           version count under the reader instead of going stale. */}
-      {reading && readingChain && readingNote && readingInfo && (
+      {(screen === 'note' || screen === 'version') && readingChain && readingNote && readingInfo && (
           <>
             {/* FACTS ONLY. The date left this row for the header, the ⋯ menu
                 left for the action bar; what remains states where the note
@@ -720,7 +1037,14 @@ export function Main({ theme, onThemeChange }: MainProps) {
                     : undefined
                 }
               />
-              {readingChain.versions.length > 1 && (
+              {/* On a version page the moment is a FACT about this version and
+                  belongs here; on the note it is the header's job and what
+                  belongs here is how many versions there are. */}
+              {screen === 'version' ? (
+                <span className="state state--quiet">
+                  {formatVersionStamp(readingNote.createdAt)}
+                </span>
+              ) : readingChain.versions.length > 1 && (
                 <span className="state state--quiet">
                   {readingChain.versions.length}-я версия
                 </span>
@@ -738,6 +1062,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
                 </a>
               )}
             </div>
+            {/* AN ADMISSION, NOT A GATE. Nothing here is blocked on it: «the
+                snapshot may be missing something» is the permanent condition of
+                an app whose other device can be offline for a week. It is worth
+                SAYING on a page that counts versions, though — «Версия 2 из 3»
+                is a claim about a list, and the last sweep already told us the
+                list may be short. */}
+            {screen === 'version' && (lastSweepOutcome === 'partial' || lastSweepOutcome === 'error') && (
+              <p className="note-reader-caveat">
+                Список версий может быть неполным — последняя сверка прошла не до конца.
+              </p>
+            )}
             <div className="note-reader-body">
               {/* `.note-text` is the wrapper here too — it carries the 18px
                   reading size AND the `pre-wrap` that unformatted notes depend
@@ -760,11 +1095,44 @@ export function Main({ theme, onThemeChange }: MainProps) {
               what it means in the feed.
             */}
             <div className="note-reader-actions">
-              {V3_WRITER_ENABLED && (
+              {/* WRITING ACTIONS EXIST ONLY WHEN THE SNAPSHOT HAS SETTLED.
+                  Acting on a version the next merge may re-resolve is the one
+                  mistake this page must not let anyone make, so while a sweep
+                  is running the version can be read and copied and nothing
+                  else. */}
+              {screen === 'version' ? (
+                <>
+                  {V3_WRITER_ENABLED && versionActionable && (
+                    <button
+                      type="button"
+                      className="note-action"
+                      onClick={() => requestRestore(readingNote)}
+                    >
+                      <IconRestore />
+                      <span>Вернуть</span>
+                    </button>
+                  )}
+                  {V3_WRITER_ENABLED && versionActionable && shownOrdinal !== null && (
+                    <button
+                      type="button"
+                      className="note-action note-action--quiet"
+                      onClick={() => openEditor(readingChain.root, {
+                        versionId: readingNote.id,
+                        text: readingNote.text,
+                        ordinal: shownOrdinal,
+                        total: versionTotal,
+                      })}
+                    >
+                      <IconEdit />
+                      <span>Изменить</span>
+                    </button>
+                  )}
+                </>
+              ) : V3_WRITER_ENABLED && (
                 <button
                   type="button"
                   className="note-action"
-                  onClick={() => setEditChainRoot(readingChain.root)}
+                  onClick={() => openEditor(readingChain.root, null)}
                 >
                   <IconEdit />
                   <span>Изменить</span>
@@ -778,14 +1146,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
                 <IconCopy />
                 <span>{copyFeedback === 'ok' ? 'Скопировано' : copyFeedback === 'fail' ? 'Не вышло' : 'Копировать'}</span>
               </button>
-              {V3_WRITER_ENABLED && readingChain.versions.length > 1 && (
+              {screen === 'note' && V3_WRITER_ENABLED && readingChain.versions.length > 1 && (
                 <button
+                  ref={historyBtnRef}
                   type="button"
                   className="note-action note-action--quiet"
-                  onClick={() => {
-                    setHistoryFocusVersionId(null);
-                    setHistoryChainRoot(readingChain.root);
-                  }}
+                  onClick={() => setHistoryChainRoot(readingChain.root)}
                 >
                   <IconHistory />
                   <span>История</span>
@@ -894,7 +1260,7 @@ export function Main({ theme, onThemeChange }: MainProps) {
                             key: 'edit',
                             icon: <IconEdit />,
                             label: 'Редактировать',
-                            onSelect: () => setEditChainRoot(chain.root),
+                            onSelect: () => openEditor(chain.root, null),
                           }]
                         : []),
                       ...(V3_WRITER_ENABLED && chain.versions.length > 1
@@ -902,9 +1268,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
                             key: 'history',
                             icon: <IconHistory />,
                             label: `История версий (${chain.versions.length})`,
+                            // OPEN THE NOTE FIRST, then the index on top of it.
+                            // Otherwise the stack reads feed → version, and Back
+                            // from a version page would drop into the feed while
+                            // the control on that page says «‹ Заметка».
+                            // The index cannot be opened in this handler: the
+                            // two updates are batched and the route reset would
+                            // wipe it in the same commit. It is parked as an
+                            // intent and consumed once the route has settled.
                             onSelect: () => {
-                              setHistoryFocusVersionId(null);
-                              setHistoryChainRoot(chain.root);
+                              setHistoryIntent({ key: `notes|${chain.root}`, root: chain.root });
+                              openNote(chain.root);
                             },
                           }]
                         : []),
@@ -994,31 +1368,44 @@ export function Main({ theme, onThemeChange }: MainProps) {
 
 
 
-      {/* W3: edit + history + restore-version (one aria-modal layer at a time) */}
-      <EditNoteModal
-        open={editChain !== null}
-        chain={editChain}
-        onClose={() => setEditChainRoot(null)}
-        onSave={(rootId, newText) => editNote(rootId, newText)}
-      />
+      {/* W3: edit + history + restore-version (one aria-modal layer at a time).
+          RENDERED ONLY WHILE OPEN. They used to be unconditional siblings that
+          returned null when closed, which meant the INSTANCE outlived every
+          closing: a save resolving after the user had closed one dialog and
+          opened another wrote its `busy`/`error` into the new one. Unmounting
+          settles the component's own state; the tail that reaches ACROSS
+          components — closing, navigating, focus — is guarded by the session
+          tokens instead, because a prop outlives the component it was given to. */}
+      {editChain !== null && (
+        <EditNoteModal
+          open
+          chain={editChain}
+          seed={editSeed}
+          onClose={closeEditor}
+          onSave={saveEdit}
+        />
+      )}
 
-      <VersionHistoryModal
-        open={historyChain !== null && restoreTarget === null}
-        chain={historyChain}
-        syncStatuses={syncStatuses}
-        syncActive={arweave.enabled && arweave.registered}
-        onClose={() => { setHistoryChainRoot(null); setHistoryFocusVersionId(null); }}
-        onRequestRestore={requestRestore}
-        focusVersionId={historyFocusVersionId}
+      {historyChain !== null && restoreTarget === null && (
+        <VersionHistoryModal
+          open
+          chain={historyChain}
+          syncStatuses={syncStatuses}
+          syncActive={arweave.enabled && arweave.registered}
+          onClose={() => setHistoryChainRoot(null)}
+          onOpenVersion={openVersion}
+          returnFocusRef={historyBtnRef}
+        />
+      )}
 
-      />
-
-      <RestoreVersionDialog
-        open={restoreTarget !== null}
-        version={restoreTarget?.version ?? null}
-        onConfirm={confirmRestore}
-        onCancel={cancelRestore}
-      />
+      {restoreTarget !== null && (
+        <RestoreVersionDialog
+          open
+          version={restoreTarget.version}
+          onConfirm={confirmRestore}
+          onCancel={cancelRestore}
+        />
+      )}
 
       {/* Unmounted while composing. The composer is a place you finish or
           leave by «Свернуть», and a tab bar under it is both a distraction and

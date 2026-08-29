@@ -99,6 +99,7 @@ function baseStore() {
     retryRestore: vi.fn(),
     clearRestoreStatus: vi.fn(),
     updateCheck: { status: 'idle' as const },
+    lastSweepOutcome: null as 'ok' | 'partial' | 'error' | null,
     checkForUpdates: vi.fn(),
     syncStatuses: { n1: { status: 'confirmed' as const, txId: 'TX123' } },
     dismissError: vi.fn(),
@@ -944,5 +945,22 @@ describe('Main — чтение при выключенном писателе',
     expect(screen.queryByRole('button', { name: 'История' })).toBeNull();
     // Copying is writer-independent and stays — the panel is not empty.
     expect(screen.getByRole('button', { name: 'Копировать' })).toBeTruthy();
+  });
+
+  it('адрес версии сворачивается в заметку: страницы версии тут нет', () => {
+    // Единственная заметка в этой фикстуре одноверсионная, так что /v/1 — это
+    // её же текущая версия, и возвращать там нечего ни при каком флаге.
+    window.history.replaceState(null, '', '#/notes/n1/v/1');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(window.location.hash).toBe('#/notes/n1');
+    expect(document.querySelector('.note-reader-body')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Вернуть' })).toBeNull();
+  });
+
+  it('мусор в номере версии не открывает ничего странного', () => {
+    window.history.replaceState(null, '', '#/notes/n1/v/0');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(window.location.hash).toBe('#/notes/n1');
+    expect(document.querySelector('.note-reading')?.textContent).toContain('привет мир');
   });
 });

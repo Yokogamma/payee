@@ -75,6 +75,67 @@ export function parseParam(hash: string): string | null {
   return param === '' ? null : param;
 }
 
+/** A positive integer JavaScript can hold exactly.
+ *
+ *  BOTH halves are load-bearing. `'9'.repeat(30)` satisfies any «digits only»
+ *  regex and comes back from `Number` as 1e30 — past `MAX_SAFE_INTEGER`, where
+ *  arithmetic and comparison stop meaning what they say. A regex alone lets
+ *  that through; `isSafeInteger` alone lets `2.0` and `'0x2'` through. */
+function isOrdinal(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * The address of one version: `<root>/v/<n>`, or just `<root>` without one.
+ *
+ * `n` is the version's ORDINAL — 1 is the oldest, N the current — the same
+ * numbering the history prints, so the address and the caption agree.
+ *
+ * WHY AN ORDINAL AND NOT THE VERSION'S ID. The v3 envelope keeps the chain
+ * graph (`root`/`rev`/`prev`) INSIDE the ciphertext (see `crypto.ts`), and a
+ * transaction carries only `Note-Id` and `Owner-Hash` (`arweave.ts`). The
+ * network therefore does NOT reveal that two transactions belong to one note.
+ * An address `<root>/v/<versionId>` would put exactly that link into browser
+ * history, beside the chain root already disclosed there — a new class of
+ * leak, not another instance of the accepted one. An ordinal cannot: it names
+ * a POSITION, and a position links nothing on-chain.
+ *
+ * THE PRICE, stated so nobody «fixes» it back to an id: a position is only as
+ * stable as the snapshot it was read from. A version arriving out of order (a
+ * second device with a lagging clock) shifts the ordinals of everything newer
+ * than itself. So the number means «the position in the snapshot available
+ * when this address was RESOLVED», and it is resolved afresh on reload, on a
+ * cold start, and on every new entry to the same address. `Main` pins the
+ * version it resolved for as long as the page stays open, so the text under
+ * the reader never changes; only the caption is recomputed.
+ *
+ * An out-of-range or malformed ordinal is NOT an error here — it degrades to
+ * the chain itself and the canonicaliser rewrites the address, the same way
+ * every other unknown shape in this file degrades to a default.
+ */
+export function noteTarget(root: string, ordinal?: number | null): string {
+  return isOrdinal(ordinal) ? `${root}/v/${ordinal}` : root;
+}
+
+/** The chain and (optionally) the version an address names. `null` when there
+ *  is no chain in it at all — an unknown section, a bare `#/notes`, or a
+ *  param that starts with the separator. */
+export function parseNoteTarget(hash: string): { root: string; ordinal: number | null } | null {
+  const param = parseParam(hash);
+  if (param === null) return null;
+  const [root, marker, digits, ...extra] = param.split('/');
+  if (root === '') return null;
+  if (marker === undefined) return { root, ordinal: null };
+  // Exactly three segments, and the middle one is exactly `v`. Anything else
+  // — a longer path, an unknown marker, a missing number — is the chain.
+  if (marker !== 'v' || digits === undefined || extra.length > 0) return { root, ordinal: null };
+  // No leading zeros and no sign: `02` and `+2` would give two addresses for
+  // one version, and the canonicaliser would have nothing to compare against.
+  if (!/^[1-9][0-9]*$/.test(digits)) return { root, ordinal: null };
+  const ordinal = Number(digits);
+  return { root, ordinal: isOrdinal(ordinal) ? ordinal : null };
+}
+
 /**
  * Marker on history entries THIS APP pushed.
  *

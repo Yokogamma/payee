@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { render, act, cleanup } from '@testing-library/react';
-import { parseHash, parseParam, canonicalHash, navigate, useRoute, SECTIONS, DEFAULT_SECTION } from './route';
+import { parseHash, parseParam, canonicalHash, navigate, useRoute, noteTarget, parseNoteTarget, SECTIONS, DEFAULT_SECTION } from './route';
 
 // jsdom, not node: `location` and `history` do not exist in the node
 // environment, and stubbing them would test the stub.
@@ -190,5 +190,78 @@ describe('useRoute', () => {
       window.dispatchEvent(new HashChangeEvent('hashchange'));
     });
     expect(seen).toBe(last); // the unmounted probe stopped hearing
+  });
+});
+
+describe('parseNoteTarget — the chain and the version an address names', () => {
+  it('a bare chain address carries no ordinal', () => {
+    expect(parseNoteTarget('#/notes/abc')).toEqual({ root: 'abc', ordinal: null });
+  });
+
+  it('reads the ordinal of a version address', () => {
+    expect(parseNoteTarget('#/notes/abc/v/1')).toEqual({ root: 'abc', ordinal: 1 });
+    expect(parseNoteTarget('#/notes/abc/v/2')).toEqual({ root: 'abc', ordinal: 2 });
+    // Three digits, to prove nothing is single-character about the parse.
+    expect(parseNoteTarget('#/notes/abc/v/128')).toEqual({ root: 'abc', ordinal: 128 });
+  });
+
+  it.each([
+    ['a zero', '#/notes/abc/v/0'],
+    ['a negative', '#/notes/abc/v/-1'],
+    ['a fraction', '#/notes/abc/v/2.5'],
+    ['a leading zero', '#/notes/abc/v/02'],
+    ['a word', '#/notes/abc/v/x'],
+    ['an empty number', '#/notes/abc/v/'],
+    ['a missing number', '#/notes/abc/v'],
+    ['a fourth segment', '#/notes/abc/v/2/3'],
+    ['an unknown marker', '#/notes/abc/zzz/2'],
+  ])('degrades %s to the chain — the canonicaliser rewrites the address', (_label, hash) => {
+    expect(parseNoteTarget(hash)).toEqual({ root: 'abc', ordinal: null });
+  });
+
+  it('a number too large to hold exactly is not an ordinal', () => {
+    // The reason `isOrdinal` is not just a regex. Both assertions matter: the
+    // first shows a digits-only check WOULD accept this, the second that the
+    // parser does not.
+    const huge = '9'.repeat(30);
+    expect(/^[1-9][0-9]*$/.test(huge)).toBe(true);
+    expect(Number.isSafeInteger(Number(huge))).toBe(false);
+    expect(parseNoteTarget(`#/notes/abc/v/${huge}`)).toEqual({ root: 'abc', ordinal: null });
+  });
+
+  it('is null when the address names no chain at all', () => {
+    expect(parseNoteTarget('#/notes')).toBeNull();
+    expect(parseNoteTarget('#/notes/')).toBeNull();
+    // Unknown section: degrading to «the notes section AND a note» would make a
+    // junk address do something. Same rule as parseParam.
+    expect(parseNoteTarget('#/zzz/abc')).toBeNull();
+    expect(parseNoteTarget('#/zzz/abc/v/2')).toBeNull();
+    // A param that starts with the separator has no root to name.
+    expect(parseNoteTarget('#/notes//v/2')).toBeNull();
+  });
+});
+
+describe('noteTarget — the address a version page is written to', () => {
+  it('composes both shapes', () => {
+    expect(noteTarget('abc')).toBe('abc');
+    expect(noteTarget('abc', null)).toBe('abc');
+    expect(noteTarget('abc', 2)).toBe('abc/v/2');
+  });
+
+  it.each([0, -1, 2.5, NaN, Infinity, 2 ** 60])(
+    'drops an ordinal that is not one, rather than writing a junk address: %s',
+    ordinal => {
+      expect(noteTarget('abc', ordinal)).toBe('abc');
+    },
+  );
+
+  it('round-trips with the parser — the canonicaliser compares these two', () => {
+    // The canonicaliser rewrites whenever `hash !== canonicalHash(view, target)`.
+    // If the builder and the parser disagreed on ANY shape, that comparison
+    // would rewrite the address on every render.
+    for (const ordinal of [null, 1, 2, 128]) {
+      const target = noteTarget('abc', ordinal);
+      expect(parseNoteTarget(canonicalHash('notes', target))).toEqual({ root: 'abc', ordinal });
+    }
   });
 });

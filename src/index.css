@@ -967,11 +967,13 @@ h1 {
   flex: 1;
 }
 
-/* The feed stopped using this when the date moved to the top of the entry, and
-   I deleted the rule with it — but both history modals still print version
-   dates through it, so they lost their styling and inherited 16.5px body text
-   inside a dense list of rows. The modals get their real pass later; this is
-   the date treatment they had. */
+/* ONE caller left: the safebox history. The feed stopped using this when the
+   date moved to the top of the entry, and the NOTES history stopped when it
+   became an index — its rows print `formatVersionStamp` in the body face now,
+   because a version list needs a moment and not a marginal note. The safebox
+   history keeps its own shape (short fields, expanded in place) and with it
+   this treatment; changing what its rows say is a product decision, not part of
+   this pass. Delete this rule when that decision is made. */
 .note-time {
   font-family: var(--mono);
   font-size: 13px;
@@ -1023,9 +1025,16 @@ h1 {
      compositing pass on the phones that need it most. */
 }
 
+/* A SHEET LAID ON THE DESK, not a card in a dashboard. The 1px rule around it
+   was the last frame in the app that fenced content off for no reason: the
+   scrim already separates the layers. What the rule DID carry was definition on
+   the dark theme, where --bg-card sits a few points off a scrimmed --bg — so
+   the shadow takes that job instead. Not a new vocabulary: .toast already
+   carries exactly this one, and a shadow is not the glass the redesign banned
+   (see the note on backdrop-filter above). */
 .modal {
   background: var(--bg-card);
-  border: 1px solid var(--border);
+  box-shadow: 0 8px 32px var(--scrim);
   border-radius: var(--radius);
   padding: 24px;
   width: 100%;
@@ -1037,8 +1046,12 @@ h1 {
   gap: 16px;
 }
 
+/* 22px, not 18. The old size predates the type scale and belonged to a
+   language where a dialog was a small box; 22px is `.note-md h1`, a step this
+   design already declares, and it sits below the 30px screen title without
+   inventing a rung. */
 .modal h2 {
-  font-size: 18px;
+  font-size: 22px;
   font-weight: 600;
 }
 
@@ -1617,7 +1630,11 @@ mark {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  box-shadow: 0 4px 20px var(--accent-glow);
+  /* --scrim, not --accent-glow. On the dark theme the accent IS the paper
+     colour, so the old value drew a pale HALO around a dark menu — a glow from
+     the previous language, found by reading the file rather than by looking at
+     it. The toast and the modal sheet carry the same shadow. */
+  box-shadow: 0 4px 20px var(--scrim);
   overflow: hidden;
 }
 
@@ -1801,9 +1818,12 @@ mark {
   gap: 14px;
 }
 
+/* THE QUESTION IS NOT AN ASIDE. It was set at 14px in the secondary ink —
+   quieter than the body text of every screen it opens over — while being the
+   one sentence the user has to read before answering. */
 .confirm-message {
-  font-size: 14px;
-  color: var(--text-dim);
+  font-size: 15.5px;
+  color: var(--text);
   line-height: 1.5;
   white-space: pre-line;
 }
@@ -2287,6 +2307,28 @@ mark {
   min-height: 0;
   overflow-y: auto;
 }
+
+/* The HELD reader: the address names a note whose chain (or whose version) has
+   not arrived, or has just stopped existing. The screen follows the address, so
+   something has to stand here — the alternative is a frame of the feed under a
+   live note address, and, with a stored draft, a frame of the composer. */
+.note-holding {
+  margin: 0;
+  padding: 28px var(--pad-screen);
+  font-size: 15px;
+  font-style: italic;
+  color: var(--text-dim);
+}
+
+/* Said, never enforced: the version list may be short because the last sweep
+   did not finish. Same italic aside as every other admission in this design. */
+.note-reader-caveat {
+  margin: 0;
+  padding: 10px var(--pad-screen) 0;
+  font-size: 13.5px;
+  font-style: italic;
+  color: var(--text-dim);
+}
 .note-reader-body .note-text { flex: 1 0 auto; padding: 20px var(--pad-screen) 8px; }
 
 /* A reading measure, not a screen width. At 980px the shell would set lines of
@@ -2335,13 +2377,11 @@ mark {
   cursor: pointer;
 }
 
-/* Version-count badge on the card meta row */
-/* Superseded by .state — the feed prints «2-я версия» in words now. Kept
-   until the history modals stop reaching for it. */
-.note-rev-badge {
-  font-size: 13px;
-  color: var(--text-dim);
-}
+/* `.note-rev-badge` stood here — the version-count badge from the card meta
+   row, superseded by `.state` when the feed started printing «2-я версия» in
+   words, and kept alive only «until the history modals stop reaching for it».
+   They have: the version index states the count in `.state` like everywhere
+   else. Deleted, with nothing left referring to it. */
 
 /* Composer toolbar (W3) */
 /* Seven 38px buttons plus «Превью» need ~398px and a 360px phone offers 320.
@@ -2441,9 +2481,12 @@ mark {
   margin-bottom: 12px;
 }
 .modal-header h2 { margin: 0; }
+/* Italic, like `.settings-footnote` and the composer's intro: an aside says so
+   by its slant, without a second colour or a smaller size. */
 .modal-note {
   margin: 12px 0 0;
   font-size: 13.5px;
+  font-style: italic;
   color: var(--text-muted);
 }
 .edit-note-modal { width: min(640px, 94vw); }
@@ -2453,45 +2496,64 @@ mark {
 .history-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   max-height: 60vh;
   overflow-y: auto;
 }
+
+/* AN ENTRY SEPARATED BY A RULE, not a box — the same move the feed made, and
+   for the same reason: three nested frames (modal, row, expanded body) is a
+   dashboard, not an index.
+
+   `flex: none` IS THE LOAD-BEARING PART, and it is a bug fix rather than a
+   style. This row is a flex item, and the `overflow: hidden` that used to sit
+   here (for the rounded corners) zeroes a flex item's automatic minimum size —
+   which means the flex algorithm was ALLOWED to shrink it below its content.
+   The list above is a scroll container too, so it has the same property: when
+   the modal hit its `max-height`, the shortfall was passed down instead of
+   scrolling, and the rows were crushed. Measured in a browser at 17.6px of row
+   around a 37.3px button, with «Вернуть эту версию» cut off entirely. The
+   safebox history — which still expands in place — needs this just as much. */
 .history-row {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
+  flex: none;
+  border-bottom: 1px solid var(--border-inner);
 }
-.history-row--current { border-color: var(--border-focus); }
+.history-row:last-child { border-bottom: none; }
+
+/* TWO FLOORS, in the feed's order: the moment leads, the facts sit under it.
+   A single row could not hold both — the meta never shrinks, so the title was
+   squeezed into a wrap on any phone. */
 .history-row-head {
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
   width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 10px 12px;
+  min-height: 44px;
+  padding: 11px 2px;
   background: none;
   border: none;
   color: var(--text);
   font-family: inherit;
-  font-size: 15px;
+  font-size: 16.5px;
   cursor: pointer;
   text-align: left;
 }
-.history-row-head:hover { background: var(--bg-hover); }
-/* 0.8em ОТ 0.9rem — это 11.5px, третье исключение из пола, спрятанное за
-   двумя относительными единицами. Размер задан явно: в этом файле font-size
-   объявляется в px именно для того, чтобы его можно было проверить. */
-.history-current-mark { color: var(--green); font-size: 13px; }
+.history-row-head:hover { background: var(--accent-glow); }
+/* Size comes from `.state` around it. It used to be declared here as `0.8em`
+   of `0.9rem` — 11.5px, a third exception to the 13px floor hidden behind two
+   relative units. Ink, because «текущая» is the one word in the row that
+   answers «which of these am I reading now». */
+.history-current-mark { color: var(--green); }
 .history-row-meta {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 4px 12px;
 }
+/* Safebox only: the notes history opens a page instead. A continuation of the
+   row, indented under its floors — not a card inside a card. */
 .history-row-body {
-  padding: 0 12px 12px;
-  border-top: 1px solid var(--border);
+  padding: 0 0 12px 2px;
 }
 .history-row-body .note-text { padding-top: 10px; }
 .history-restore-btn { margin-top: 10px; }

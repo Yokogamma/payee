@@ -56,6 +56,35 @@ export function formatNoteDateFull(ts: number, now: number = Date.now()): string
   return d.getFullYear() === new Date(now).getFullYear() ? text : `${text} ${d.getFullYear()}`;
 }
 
+/** «14:22». `hourCycle: 'h23'`, NOT `hour12: false`.
+ *
+ *  They are not synonyms: `hour12: false` selects the h24 cycle in several ICU
+ *  builds, which prints midnight as «24:00» — a time that does not exist and
+ *  that sorts after every other hour of the day it belongs to. `h23` is the
+ *  cycle Russian actually uses. Pinned by a test at exactly midnight, because
+ *  this is invisible at every other hour. */
+const hourMinute = new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+/**
+ * The stamp of ONE version — «13 августа, 14:22», «13 августа 2025, 14:22».
+ *
+ * The version index needs a moment, not a bearing. Three versions written
+ * within an hour of each other print «40 мин назад / 41 мин назад / 42 мин
+ * назад» under the relative formatter: ordered, but placed nowhere — and the
+ * order is already carried by the list. The clock time is what tells them
+ * apart, so this formatter has no relative branch at all.
+ *
+ * No relative branch also means a FUTURE timestamp prints its own date here
+ * rather than clamping to «только что», the same way `formatNoteDateFull`
+ * behaves and for the same reason.
+ */
+export function formatVersionStamp(ts: number, now: number = Date.now()): string {
+  const d = new Date(ts);
+  const date = dayMonth.format(d);
+  const dated = d.getFullYear() === new Date(now).getFullYear() ? date : `${date} ${d.getFullYear()}`;
+  return `${dated}, ${hourMinute.format(d)}`;
+}
+
 export function formatNoteDate(ts: number, now: number = Date.now()): string {
   const diff = now - ts;
 
