@@ -1,22 +1,38 @@
-import { useEffect, useRef, useState } from 'react';
-import { formatNoteDate } from '../lib/format-date';
+import { useEffect, useRef, useState, type RefObject } from 'react';
+import { formatVersionStamp } from '../lib/format-date';
 import { useModalA11y } from '../lib/useModalA11y';
-import { NoteMarkdown } from './NoteMarkdown';
 import { badgeFor } from './syncBadge';
 import { type NoteSyncInfo } from '../lib/store';
 import { classifySaveError, SAVE_FALLBACK } from '../lib/save-errors';
 import type { NoteChain } from '../lib/chains';
 import type { NoteData } from '../lib/crypto';
-import { IconClose, IconRestore, InfinityMark } from './icons';
+import { IconClose, InfinityMark } from './icons';
 
 /**
- * Version history of one chain (current-first). Versions are numbered by
- * ORDINAL position («Версия k из N»), not by raw rev — duplicate revs from a
- * fork must never render confusingly. Tapping a row expands its content
- * (rendered per its OWN fmt); «Восстановить эту версию» hands off to the
- * async restore-confirm dialog (Main closes THIS modal first — never two
- * aria-modal layers at once — and reopens it with focus on the same row if
- * the user cancels).
+ * The version INDEX of one chain, current-first.
+ *
+ * It used to be a reader as well: a row expanded in place and offered
+ * «Восстановить эту версию» at the bottom of what it revealed. Two things were
+ * wrong with that, and only one of them was a bug.
+ *
+ * The bug: every row is a flex item, and `overflow: hidden` (there to clip the
+ * rounded corners) zeroes a flex item's automatic minimum size. The list, being
+ * a scroll container itself, has the same property — so when the modal hit its
+ * `max-height` the shortfall was passed down and the rows were CRUSHED instead
+ * of the list scrolling. Measured at 17.6px of row around a 37.3px button; the
+ * restore control was simply cut off. `.history-row { flex: none }` is the fix,
+ * and the safebox history — which still expands in place — needed it too.
+ *
+ * The design mistake outlived the bug: even uncrushed, the expanded body ran to
+ * 687px inside a 342px window, so the button sat half a screen below the fold
+ * of a scroller inside a modal. A version is a page. So a row NAVIGATES now:
+ * the index says when and which, the version opens on its own screen, and the
+ * decision to bring it back is taken there, after reading it.
+ *
+ * What went with the expansion: `expandedId`, `focusVersionId`, and the dance
+ * where Main closed this modal, opened the confirm, and reopened this modal
+ * focused on the same row. The version page is a grid state, not a layer, so
+ * the confirm opens straight over it.
  */
 
 interface VersionHistoryModalProps {
@@ -25,9 +41,13 @@ interface VersionHistoryModalProps {
   syncStatuses: Record<string, NoteSyncInfo>;
   syncActive: boolean;
   onClose: () => void;
-  onRequestRestore: (version: NoteData) => void;
-  /** Version row to focus on (re)open — the cancel path of the confirm. */
-  focusVersionId?: string | null;
+  /** Open the version at `ordinal` (1 = oldest). Main routes the CURRENT one
+   *  to the note itself — there is nothing to bring back from it. */
+  onOpenVersion: (ordinal: number) => void;
+  /** Where focus goes on close when whatever opened this is gone. Entering from
+   *  the feed's card menu unmounts the whole feed, so «back to the trigger»
+   *  would land on `document.body`. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function VersionHistoryModal({
@@ -36,30 +56,18 @@ export function VersionHistoryModal({
   syncStatuses,
   syncActive,
   onClose,
-  onRequestRestore,
-  focusVersionId,
+  onOpenVersion,
+  returnFocusRef,
 }: VersionHistoryModalProps) {
-  const containerRef = useModalA11y<HTMLDivElement>(open, onClose);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const rowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const containerRef = useModalA11y<HTMLDivElement>(open, onClose, { fallbackRef: returnFocusRef });
+  const firstRowRef = useRef<HTMLButtonElement>(null);
 
-  // Cancel-from-confirm path: expand the row the user came from. State is
-  // adjusted DURING render (the documented alternative to setState-in-effect);
-  // only the DOM focus itself stays in an effect below.
-  const [appliedFocusId, setAppliedFocusId] = useState<string | null>(null);
-  if (open && focusVersionId && appliedFocusId !== focusVersionId) {
-    setAppliedFocusId(focusVersionId);
-    setExpandedId(focusVersionId);
-  }
-  if (!open && appliedFocusId !== null) setAppliedFocusId(null);
-
-  // Explicit focus restore: the row button is re-mounted by then, so
-  // useModalA11y's "previous element" cannot find it.
+  // Initial focus is the caller's job — the hook never steals it. The first
+  // row is the current version, which is both the top of the list and the most
+  // likely destination.
   useEffect(() => {
-    if (open && focusVersionId) {
-      requestAnimationFrame(() => rowRefs.current.get(focusVersionId)?.focus());
-    }
-  }, [open, focusVersionId]);
+    if (open) requestAnimationFrame(() => firstRowRef.current?.focus());
+  }, [open]);
 
   if (!open || !chain) return null;
 
@@ -90,24 +98,29 @@ export function VersionHistoryModal({
             const ordinal = total - i; // current-first → «Версия N из N» on top
             const isCurrent = i === 0;
             const badge = badgeFor(syncStatuses[version.id], syncActive);
-            const expanded = expandedId === version.id;
+            // ABSOLUTE, with the clock. Three versions written within an hour
+            // print «40 / 41 / 42 мин назад» under the relative formatter —
+            // ordered, but placed nowhere, and the order is already the list's
+            // job.
+            const stamp = formatVersionStamp(version.createdAt);
             return (
-              <div key={version.id} className={`history-row ${isCurrent ? 'history-row--current' : ''}`}>
+              <div key={version.id} className="history-row">
                 <button
-                  ref={el => {
-                    if (el) rowRefs.current.set(version.id, el);
-                    else rowRefs.current.delete(version.id);
-                  }}
+                  ref={isCurrent ? firstRowRef : undefined}
                   className="history-row-head"
-                  onClick={() => setExpandedId(expanded ? null : version.id)}
-                  aria-expanded={expanded}
+                  onClick={() => onOpenVersion(ordinal)}
+                  aria-label={`Открыть версию ${ordinal} из ${total} от ${stamp}`}
                 >
-                  <span className="history-row-title">
-                    Версия {ordinal} из {total}
-                    {isCurrent && <span className="history-current-mark"> · текущая</span>}
-                  </span>
+                  <span className="history-row-title">{stamp}</span>
                   <span className="history-row-meta">
-                    <span className="note-time">{formatNoteDate(version.createdAt)}</span>
+                    <span className="state state--quiet">
+                      Версия {ordinal} из {total}
+                      {/* Текущую называет СЛОВО, а не рамка вокруг строки:
+                          записи здесь разделены линейкой, как в ленте, и
+                          коробки, которую можно было бы подсветить, больше
+                          нет. */}
+                      {isCurrent && <span className="history-current-mark"> · текущая</span>}
+                    </span>
                     <span
                       className={`state sync-state ${badge.className}`}
                       title={badge.label}
@@ -118,25 +131,6 @@ export function VersionHistoryModal({
                     </span>
                   </span>
                 </button>
-                {expanded && (
-                  <div className="history-row-body">
-                    <div className="note-text">
-                      {version.fmt === 'md'
-                        ? <NoteMarkdown text={version.text} />
-                        : version.text}
-                    </div>
-                    {!isCurrent && (
-                      <button
-                        className="btn btn-ghost history-restore-btn"
-                        onClick={() => onRequestRestore(version)}
-                      >
-                        {/* «Вернуть», не «Восстановить» — восстановление в
-                            продукте уже значит restore-по-seed из блокчейна. */}
-                        <IconRestore /> Вернуть эту версию
-                      </button>
-                    )}
-                  </div>
-                )}
               </div>
             );
           })}

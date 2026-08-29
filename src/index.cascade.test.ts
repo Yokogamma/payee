@@ -699,3 +699,49 @@ describe('base layer, as the browser resolves it', () => {
     }
   });
 });
+
+describe('dialogs, after the «Архив» pass', () => {
+  it('a history row cannot be crushed by the flex it lives in', () => {
+    // THE DEFECT THIS FILE CANNOT SEE, pinned by the declarations that fix it.
+    // jsdom does not lay out flex, so the crush itself is unreproducible here;
+    // it was measured in a browser — 17.6px of row around a 37.3px button,
+    // with the restore control cut off — because `overflow: hidden` zeroes a
+    // flex item's automatic minimum size and the list above passes its own
+    // shortfall down instead of scrolling.
+    expect(declaresIn('.history-row', /flex:\s*none/)).toBe(true);
+    expect(declaresIn('.history-row', /overflow/)).toBe(false);
+    // And the box it was clipping is gone: entries are separated by a rule.
+    expect(declaresIn('.history-row', /border-radius/)).toBe(false);
+    expect(declaresIn('.history-row', /border-bottom:\s*1px solid var\(--border-inner\)/)).toBe(true);
+  });
+
+  it('the modal is a sheet on a scrim, not a card with a frame', () => {
+    expect(declaresIn('.modal', /border:/)).toBe(false);
+    expect(declaresIn('.modal', /box-shadow:\s*0 8px 32px var\(--scrim\)/)).toBe(true);
+    // Same shadow token as the toast — one vocabulary, not two.
+    expect(declaresIn('.toast', /box-shadow:\s*0 8px 32px var\(--scrim\)/)).toBe(true);
+  });
+
+  it('a dialog title is a declared step of the scale, not the old 18px', () => {
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    const h2 = document.createElement('h2');
+    modal.appendChild(h2);
+    document.body.appendChild(modal);
+    const size = getComputedStyle(h2).fontSize;
+    modal.remove();
+    expect(size).toBe('22px');
+  });
+
+  it('the card menu no longer glows', () => {
+    // On the dark theme the accent IS the paper colour, so `--accent-glow`
+    // drew a pale halo around a dark menu — the last one left over from the
+    // previous language.
+    expect(declaresIn('.card-menu', /box-shadow:\s*0 4px 20px var\(--scrim\)/)).toBe(true);
+    expect(declaresIn('.card-menu', /accent-glow/)).toBe(false);
+  });
+
+  it('the question in a confirm is not set quieter than the text around it', () => {
+    expect(resolved('confirm-message', 'font-size')).toBe('15.5px');
+  });
+});

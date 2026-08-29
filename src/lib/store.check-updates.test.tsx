@@ -790,3 +790,136 @@ describe('sanitizeFullSweepAt', () => {
     expect(sanitizeFullSweepAt(NOW - 1000, NOW)).toBe(NOW - 1000);
   });
 });
+
+// ─── lastSweepOutcome: можно ли доверять полноте снимка ─────────────
+
+/**
+ * Отдельный семантический факт, а не сумма баннеров.
+ *
+ * До него на вопрос «полон ли список версий» отвечали четыре поля, каждое
+ * половиной: `restoreError` гасится закрытием баннера, успешная проверка не
+ * снимает старый `restoreError`, успешный restore не снимает старый
+ * `updateCheck.partial`, а `updateCheck` вообще описывает только ручную
+ * проверку. Экран, которому нужна оговорка «показанное может быть неполным»,
+ * читает теперь одно поле.
+ */
+describe('lastSweepOutcome', () => {
+  it('до первой сверки в этой сессии — null', async () => {
+    renderStore();
+    await openMain();
+    expect(store.lastSweepOutcome).toBeNull();
+  });
+
+  it('чистая сверка → ok', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('ok');
+  });
+
+  it('недостижимые страницы → partial, и это НЕ ошибка', async () => {
+    renderStore();
+    await openMain();
+    vi.mocked(fetchAllNotes).mockResolvedValue({ ...EMPTY, incomplete: true });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('partial');
+    expect(store.updateCheck).toMatchObject({ status: 'done', partial: true });
+  });
+
+  it('провал сверки → error (его updateCheck.partial не показывает вовсе)', async () => {
+    renderStore();
+    await openMain();
+    vi.mocked(fetchAllNotes).mockRejectedValue(new ArweaveIndexUnavailableError());
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('error');
+    expect(store.updateCheck.status).toBe('error');
+  });
+
+  it('итог публикуется в том же коммите, что терминальный статус', async () => {
+    // Между ними нет await: иначе свежий статус какое-то время стоял бы рядом
+    // с оговоркой от ПРОШЛОЙ сверки. Проверяется тем, что после первой
+    // (неполной) сверки вторая (чистая) меняет оба поля разом.
+    renderStore();
+    await openMain();
+    vi.mocked(fetchAllNotes).mockResolvedValue({ ...EMPTY, incomplete: true });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('partial');
+
+    vi.mocked(fetchAllNotes).mockResolvedValue(EMPTY);
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('ok');
+    expect(store.updateCheck).toMatchObject({ status: 'done', partial: false });
+  });
+
+  it('следующая сверка перекрывает прошлый итог в обе стороны', async () => {
+    renderStore();
+    await openMain();
+
+    vi.mocked(fetchAllNotes).mockRejectedValue(new ArweaveIndexUnavailableError());
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('error');
+
+    vi.mocked(fetchAllNotes).mockResolvedValue(EMPTY);
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('ok');
+
+    vi.mocked(fetchAllNotes).mockResolvedValue({ ...EMPTY, incomplete: true });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('partial');
+  });
+
+  it('clearRestoreStatus его НЕ трогает: закрытый баннер не делает снимок полным', async () => {
+    renderStore();
+    await openMain();
+    vi.mocked(fetchAllNotes).mockResolvedValue({ ...EMPTY, incomplete: true });
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('partial');
+
+    act(() => { store.clearRestoreStatus(); });
+    expect(store.lastSweepOutcome).toBe('partial');
+  });
+
+  it('блокировка сбрасывает итог — он принадлежал закрытой сессии', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.checkForUpdates(); });
+    expect(store.lastSweepOutcome).toBe('ok');
+
+    act(() => { store.lockApp(); });
+    expect(store.lastSweepOutcome).toBeNull();
+  });
+
+  it('сверка, чью эпоху сменила блокировка, итог не публикует', async () => {
+    // Без guard'а по эпохе опоздавшая сверка выставила бы 'partial' ПОСЛЕ
+    // того, как блокировка обнулила поле, — то есть в чужую сессию.
+    renderStore();
+    await openMain();
+    const gate = parkSweep();
+
+    let run!: Promise<void>;
+    await act(async () => { run = store.checkForUpdates(); });
+    await waitFor(() => expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(1));
+    act(() => { store.lockApp(); });
+
+    await act(async () => { gate.release({ ...EMPTY, incomplete: true }); await run; });
+    expect(store.lastSweepOutcome).toBeNull();
+  });
+
+  it('сверка, у которой сменилось ТОЛЬКО поколение БД, итог не публикует', async () => {
+    // Эпоха хранилища здесь не меняется — меняется база под ней. Guard по
+    // эпохе такой случай пропускает, поэтому у записи есть второй.
+    renderStore();
+    await openMain();
+    const generationBefore = getDbGeneration();
+    const gate = parkSweep();
+
+    let run!: Promise<void>;
+    await act(async () => { run = store.checkForUpdates(); });
+    await waitFor(() => expect(vi.mocked(fetchAllNotes)).toHaveBeenCalledTimes(1));
+    await act(async () => { await resetAll(); });
+    expect(getDbGeneration()).not.toBe(generationBefore);
+
+    await act(async () => { gate.release({ ...EMPTY, incomplete: true }); await run; });
+    expect(store.lastSweepOutcome).toBeNull();
+  });
+});
