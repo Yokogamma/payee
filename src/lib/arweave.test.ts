@@ -687,69 +687,160 @@ describe('uploadViaProxy v3_disabled classification', () => {
   });
 });
 
-describe('getWorkerCapabilities (strict /health validation, per version)', () => {
+describe('getWorkerCapabilities — the full verdict table (PR-3a)', () => {
+  // Resuming a persisted upload pause is a DECISION, so the answer it is made
+  // on must be fresh, from a worker that implements the semantics this client
+  // expects, over the same gateway pool. Anything less is 'unknown' and the
+  // pause simply stays up.
   const proxyEnv = () => vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
-  const health = (body: unknown, status = 200) =>
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), { status })));
 
-  it('enabled ONLY on ok + versions containing the version + its own flag true', async () => {
-    proxyEnv();
-    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true, v4Uploads: true });
-    const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toEqual({ v3: 'enabled', v4: 'enabled' });
+  /** A worker that answers correctly, echoing whatever nonce it was sent. */
+  function healthy(overrides: Record<string, unknown> = {}, status = 200) {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const nonce = new URL(String(input)).searchParams.get('nonce');
+      const { QUORUM_POLICY_ID } = await import('./status-quorum');
+      const { serializeStatusOrigins } = await import('./gateways-parse');
+      const { STATUS_GATEWAYS } = await import('./gateways');
+      const digest = new Uint8Array(await crypto.subtle.digest(
+        'SHA-256', new TextEncoder().encode(serializeStatusOrigins(STATUS_GATEWAYS))));
+      const hash = [...digest].map(x => x.toString(16).padStart(2, '0')).join('').slice(0, 16);
+      return new Response(JSON.stringify({
+        ok: true,
+        versions: ['1', '2', '3', '4'],
+        uploads: true,
+        v3Uploads: true,
+        v4Uploads: true,
+        statusQuorumPolicy: QUORUM_POLICY_ID,
+        statusGatewaysHash: hash,
+        statusGatewaysCount: STATUS_GATEWAYS.length,
+        nonce,
+        ...overrides,
+      }), { status });
+    }));
+  }
+  const caps = async () => (await import('./arweave')).getWorkerCapabilities();
+  const UNKNOWN = { v3: 'unknown', v4: 'unknown' };
+
+  it('enabled when EVERY condition holds', async () => {
+    proxyEnv(); healthy();
+    expect(await caps()).toEqual({ v3: 'enabled', v4: 'enabled' });
   });
 
-  it('disabled when the worker reports a gate off', async () => {
-    proxyEnv();
-    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: false, v4Uploads: false });
-    const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toEqual({ v3: 'disabled', v4: 'disabled' });
+  // THE hole this closes: the global switch was ignored, so an emergency build
+  // that refuses every upload would have had its pause lifted.
+  it('uploads:false disables BOTH versions even with per-version flags true', async () => {
+    proxyEnv(); healthy({ uploads: false });
+    expect(await caps()).toEqual({ v3: 'disabled', v4: 'disabled' });
   });
 
-  it('the two gates are INDEPENDENT (v4 off must not disable v3)', async () => {
-    proxyEnv();
-    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true, v4Uploads: false });
-    const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toEqual({ v3: 'enabled', v4: 'disabled' });
+  it('per-version gates stay independent under uploads:true', async () => {
+    proxyEnv(); healthy({ v4Uploads: false });
+    expect(await caps()).toEqual({ v3: 'enabled', v4: 'disabled' });
   });
 
-  it('a worker that lists v4 but omits v4Uploads is UNKNOWN (pause stays)', async () => {
-    proxyEnv();
-    health({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true });
-    const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toEqual({ v3: 'enabled', v4: 'unknown' });
+  it('a MISSING flag is unknown, never a decision', async () => {
+    proxyEnv(); healthy({ v4Uploads: undefined });
+    expect(await caps()).toEqual({ v3: 'enabled', v4: 'unknown' });
+    vi.resetModules(); proxyEnv(); healthy({ uploads: undefined });
+    expect(await caps()).toEqual(UNKNOWN);
   });
 
-  it('unknown for an OLD worker ({ok:true} without capability fields)', async () => {
-    proxyEnv();
-    health({ ok: true });
-    const { getWorkerCapabilities } = await import('./arweave');
-    expect(await getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
+  it('a non-boolean flag is unknown', async () => {
+    proxyEnv(); healthy({ uploads: 'true' });
+    expect(await caps()).toEqual(UNKNOWN);
   });
 
-  it('unknown for malformed bodies, non-200 and network errors (pause stays)', async () => {
+  it('a foreign or missing quorum policy is unknown', async () => {
+    proxyEnv(); healthy({ statusQuorumPolicy: 'legacy-single-v0' });
+    expect(await caps()).toEqual(UNKNOWN);
+    vi.resetModules(); proxyEnv(); healthy({ statusQuorumPolicy: undefined });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('a gateway pool that disagrees with ours is unknown', async () => {
+    proxyEnv(); healthy({ statusGatewaysHash: 'deadbeefdeadbeef' });
+    expect(await caps()).toEqual(UNKNOWN);
+    vi.resetModules(); proxyEnv(); healthy({ statusGatewaysCount: 99 });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('a version absent from the versions list is unknown despite a true flag', async () => {
+    proxyEnv(); healthy({ versions: ['1', '2'] });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('ok:false is unknown', async () => {
+    proxyEnv(); healthy({ ok: false });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  // Freshness: no-store keeps an intermediary from serving a stale answer, but
+  // only the echo proves the answer we HOLD is the one we just asked for.
+  it('a missing or wrong nonce echo is unknown, however valid the rest is', async () => {
+    proxyEnv(); healthy({ nonce: undefined });
+    expect(await caps()).toEqual(UNKNOWN);
+    vi.resetModules(); proxyEnv(); healthy({ nonce: '0000000000000000' });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('sends a FRESH nonce on every attempt', async () => {
+    proxyEnv();
+    const seen: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      seen.push(new URL(String(input)).searchParams.get('nonce') ?? '');
+      return new Response('{}', { status: 500 }); // force all retries
+    }));
+    expect(await caps()).toEqual(UNKNOWN);
+    expect(seen).toHaveLength(3);
+    expect(new Set(seen).size).toBe(3); // a retry must not replay the same request
+    expect(seen.every(n => /^[0-9a-f]{16}$/.test(n))).toBe(true);
+  });
+
+  it('asks with cache: no-store', async () => {
+    proxyEnv();
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 500 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await caps();
+    expect((fetchMock.mock.calls[0][1] as RequestInit).cache).toBe('no-store');
+  });
+
+  it('an OLD worker (no attestation fields) is unknown — the pause stays', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, versions: ['1', '2', '3', '4'], v3Uploads: true }), { status: 200 })));
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('an oversized body is unknown', async () => {
+    proxyEnv();
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, pad: 'x'.repeat(9000) }), { status: 200 })));
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('malformed bodies, non-200 and network errors are unknown', async () => {
     proxyEnv();
     vi.stubGlobal('fetch', vi.fn(async () => new Response('not json', { status: 200 })));
-    let mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
-
-    vi.resetModules(); proxyEnv();
-    health({ ok: true, versions: ['1', '2'], v3Uploads: true, v4Uploads: true });
-    mod = await import('./arweave');
-    // versions without '3'/'4' → unknown even though the flags say true
-    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
+    expect(await caps()).toEqual(UNKNOWN);
 
     vi.resetModules(); proxyEnv();
     vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 500 })));
-    mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
+    expect(await caps()).toEqual(UNKNOWN);
 
     vi.resetModules(); proxyEnv();
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
-    mod = await import('./arweave');
-    expect(await mod.getWorkerCapabilities()).toEqual({ v3: 'unknown', v4: 'unknown' });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
+  it('unknown when no proxy is configured (no request at all)', async () => {
+    vi.stubEnv('VITE_PROXY_URL', '');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await caps()).toEqual(UNKNOWN);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
 
 describe('fetchAllNotes v3 (chain meta through restore)', () => {
   it('restores a v3 note with its meta and authenticated createdAt', async () => {

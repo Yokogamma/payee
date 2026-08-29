@@ -20,7 +20,8 @@ import {
   UnsupportedNoteVersionError,
 } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
-import { INDEX_QUERY_URL, PAYLOAD_GATEWAYS, STATUS_GATEWAYS } from './gateways';
+import { INDEX_QUERY_URL, PAYLOAD_GATEWAYS, QUORUM_POLICY_ID, STATUS_GATEWAYS } from './gateways';
+import { serializeStatusOrigins } from './gateways-parse';
 import { statusVerdict, toTxStatusKind, type StatusVote } from './status-quorum';
 import {
   HEADER_CAP_BYTES,
@@ -259,6 +260,17 @@ export type TxStatusResult =
   | { kind: 'dropped' }     // not found — fell out of the mempool
   | { kind: 'invalid' }     // malformed tx id
   | { kind: 'unavailable' };// gateway degraded — status unknown
+
+/**
+ * First 16 hex of SHA-256 over the canonical, SORTED status-origin list — the
+ * value /health attests. Computing it here from the CLIENT's own configuration
+ * is what turns the attestation into an agreement check rather than a report.
+ */
+async function statusGatewaysHash(): Promise<string> {
+  const bytes = new TextEncoder().encode(serializeStatusOrigins(STATUS_GATEWAYS));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes as BufferSource));
+  return [...digest].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+}
 
 /** Best-effort read of a capped response body. `null` = over the cap. */
 async function readCapped(response: Response, cap: number): Promise<Uint8Array | null> {
@@ -527,27 +539,79 @@ const UNKNOWN_CAPABILITIES: WorkerCapabilities = { v3: 'unknown', v4: 'unknown' 
  */
 export async function getWorkerCapabilities(): Promise<WorkerCapabilities> {
   if (!PROXY_URL) return UNKNOWN_CAPABILITIES;
-  try {
-    const response = await fetch(`${PROXY_URL}/health`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) return UNKNOWN_CAPABILITIES;
-    const data: unknown = await response.json();
-    if (typeof data !== 'object' || data === null) return UNKNOWN_CAPABILITIES;
-    const d = data as { ok?: unknown; versions?: unknown; v3Uploads?: unknown; v4Uploads?: unknown };
-    if (d.ok !== true) return UNKNOWN_CAPABILITIES;
-    const versions = d.versions;
-    const readOne = (version: string, flag: unknown): UploadsCapability => {
-      if (!Array.isArray(versions) || !versions.includes(version)) return 'unknown';
-      if (flag === true) return 'enabled';
-      if (flag === false) return 'disabled';
-      return 'unknown';
-    };
-    return { v3: readOne('3', d.v3Uploads), v4: readOne('4', d.v4Uploads) };
-  } catch {
-    return UNKNOWN_CAPABILITIES;
+
+  const expectedHash = await statusGatewaysHash();
+  for (let attempt = 0; attempt < HEALTH_ATTEMPTS; attempt++) {
+    // A NEW nonce every attempt: reusing one would let a retry reproduce the
+    // very cached answer the retry exists to get past.
+    const nonce = randomNonce();
+    try {
+      const response = await fetch(`${PROXY_URL}/health?nonce=${nonce}`, {
+        method: 'GET',
+        // Belt and braces with the server's own no-store: this answer decides
+        // whether a persisted upload pause may be lifted.
+        cache: 'no-store',
+        signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+      });
+      if (!response.ok) continue;
+      const body = await readCapped(response, HEALTH_CAP_BYTES);
+      if (body === null) continue; // over the ceiling — not a health answer
+      const verdict = readCapabilities(JSON.parse(new TextDecoder().decode(body)), nonce, expectedHash);
+      if (verdict !== null) return verdict;
+    } catch {
+      // network / timeout / malformed JSON — try again, then give up closed
+    }
   }
+  return UNKNOWN_CAPABILITIES;
+}
+
+/** How many /health attempts before the pause simply stays up. */
+const HEALTH_ATTEMPTS = 3;
+const HEALTH_TIMEOUT_MS = 15_000;
+/** A health body is a few hundred bytes; anything larger is not one. */
+const HEALTH_CAP_BYTES = 8192;
+
+function randomNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The normative capability table. Checks run IN ORDER and the first failure
+ * decides; `null` means «this answer proved nothing, try again».
+ *
+ *   1. exact nonce echo      — proves the answer is FRESH, not merely uncached
+ *   2. ok === true
+ *   3. statusQuorumPolicy    — the worker implements the semantics we expect
+ *   4. gateway hash + count  — client and worker agree on the SAME pool
+ *   5. version ∈ versions
+ *   6. uploads / vNUploads are strictly boolean
+ *   7. both true → enabled; either strictly false → disabled
+ *
+ * `disabled` is reported ONLY for a fresh, fully validated answer whose flag is
+ * strictly `false`. Anything missing, malformed or unverifiable is `unknown`,
+ * which leaves the pause up — the global `uploads` switch is exactly what an
+ * emergency build sets, so misreading it would resume uploads against a worker
+ * that refuses them all.
+ */
+function readCapabilities(data: unknown, nonce: string, expectedHash: string): WorkerCapabilities | null {
+  if (typeof data !== 'object' || data === null) return null;
+  const d = data as Record<string, unknown>;
+  if (d.nonce !== nonce) return null;                       // stale or unproven
+  if (d.ok !== true) return UNKNOWN_CAPABILITIES;
+  if (d.statusQuorumPolicy !== QUORUM_POLICY_ID) return UNKNOWN_CAPABILITIES;
+  if (d.statusGatewaysHash !== expectedHash) return UNKNOWN_CAPABILITIES;
+  if (d.statusGatewaysCount !== STATUS_GATEWAYS.length) return UNKNOWN_CAPABILITIES;
+
+  const versions = d.versions;
+  const readOne = (version: string, flag: unknown): UploadsCapability => {
+    if (!Array.isArray(versions) || !versions.includes(version)) return 'unknown';
+    // Strictly boolean, checked BEFORE the conjunction below: a missing or
+    // garbage flag must read as unknown, never as a decision.
+    if (typeof d.uploads !== 'boolean' || typeof flag !== 'boolean') return 'unknown';
+    return d.uploads && flag ? 'enabled' : 'disabled';
+  };
+  return { v3: readOne('3', d.v3Uploads), v4: readOne('4', d.v4Uploads) };
 }
 
 // ─── Download (Restore from Arweave) ─────────────────────────────────

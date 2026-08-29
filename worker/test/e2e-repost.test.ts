@@ -22,7 +22,7 @@ const baseEnv = env as unknown as WorkerEnv;
 
 // Outbound Arweave HTTP mock — shared harness, see helpers/outbound-mock.ts
 // (single-use routes; unconsumed or duplicate paid requests fail the test).
-const { mockRoute, mockStatusOnAll } = setupOutboundMock();
+const { mockRoute } = setupOutboundMock();
 
 const NOTE_ID = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
 const C = 'AAAA';
