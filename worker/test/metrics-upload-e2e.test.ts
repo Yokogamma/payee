@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { addressOfJwk } from '../test-stubs/wallet-address';
 import { setupOutboundMock, b64, sha256, statusUrlRe } from './helpers/outbound-mock';
 
 // PR-2 e2e: metric emission through the REAL /upload route (direct dispatch —
@@ -35,6 +36,7 @@ beforeAll(async () => {
     true, ['sign', 'verify'],
   );
   realJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
+  realWalletOwners = await addressOfJwk(realJwk);
 });
 
 async function makeIdentity() {
@@ -91,8 +93,19 @@ function capture() {
   return { points, dataset, byEvent };
 }
 
+// `realWalletOwners` is the address realJwk derives to: /upload refuses while
+// the signing wallet is outside TRUSTED_OWNERS (D2/D9), and these tests sign
+// with a wallet they generate themselves. `extra` still wins, so the JWK-matrix
+// cases below can substitute a broken key without also being told it is
+// trusted — a key that cannot derive an address cannot sign, and keeps its own
+// 502/`arweave_throw` outcome.
+let realWalletOwners = '';
+
 const metricsEnv = (dataset: AnalyticsEngineDataset, extra: Record<string, unknown> = {}): WorkerEnv =>
-  ({ ...baseEnv, ARWEAVE_JWK: realJwk, METRICS_ENABLED: 'true', METRICS: dataset, ...extra }) as WorkerEnv;
+  ({
+    ...baseEnv, ARWEAVE_JWK: realJwk, TRUSTED_OWNERS: realWalletOwners,
+    METRICS_ENABLED: 'true', METRICS: dataset, ...extra,
+  }) as WorkerEnv;
 
 function mockPaidLegs(priceBody = '3049039377', opts: { postDelayMs?: number } = {}) {
   const anchor = mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, ANCHOR);

@@ -15,6 +15,7 @@ import { readAllowCache } from './allowlist';
 // client-parity.test.ts already imports src/lib/crypto.ts.
 import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
 import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
+import { parseTrustedOwners } from '../../src/lib/trusted-owners';
 import {
   ARWEAVE_HOST,
   assertStructurallyCompleteJwk,
@@ -62,6 +63,22 @@ interface Env {
    *  Self-reported SHA cannot distinguish a re-deploy of the same commit; this
    *  can. Optional so tests and older configs keep working. */
   CF_VERSION_METADATA?: { id?: string; tag?: string; timestamp?: string };
+  /** EVERY Arweave wallet address this project has ever posted under, comma
+   *  separated (D2/D9). The worker authenticates a publication before binding
+   *  its `txId` to a payload fingerprint, and `address ∈ TRUSTED_OWNERS` is one
+   *  of the D9 steps.
+   *
+   *  Deliberately NOT derived from `ARWEAVE_JWK`: that is the CURRENT wallet,
+   *  and after a rotation it cannot confirm the project's OWN older
+   *  transactions — every one of them would stop authenticating and healthy
+   *  records would start answering conflicts. This is a HISTORICAL list, and
+   *  entries are never removed.
+   *
+   *  Optional in the TYPE, mandatory in FACT: missing, empty or malformed
+   *  answers 503 on /upload rather than skipping the check. What it must
+   *  contain is pinned in scripts/owner-pins.mjs and gated on deploy by
+   *  scripts/check-trusted-owners.mjs. */
+  TRUSTED_OWNERS?: string;
   MAX_BODY_BYTES: string;
   RATE_LIMIT_PER_HOUR: string;
   ARWEAVE_JWK: string;
@@ -252,17 +269,84 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
 // Isolate-level cache: the address is constant per deployment, so derive it once
 // instead of parsing the full JWK on every request.
-let walletAddressPromise: Promise<string> | null = null;
+//
+// KEYED ON THE JWK, not merely «computed once». The address used to feed a
+// diagnostic endpoint, where a stale value was only confusing; it now decides
+// whether /upload is allowed to sign at all (D2/D9), and a cache that ignores
+// which key it derived from would answer for the PREVIOUS wallet — passing the
+// trust check for a key that was never checked.
+let walletAddressCache: { jwk: string; address: Promise<string> } | null = null;
 
 function getWalletAddress(env: Env): Promise<string> {
-  if (!walletAddressPromise) {
-    walletAddressPromise = (async () => {
-      const wallet = JSON.parse(env.ARWEAVE_JWK);
-      const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
-      return arweave.wallets.jwkToAddress(wallet);
-    })();
+  const jwk = env.ARWEAVE_JWK;
+  if (walletAddressCache?.jwk !== jwk) {
+    walletAddressCache = {
+      jwk,
+      address: (async () => {
+        const wallet = JSON.parse(jwk);
+        const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
+        return arweave.wallets.jwkToAddress(wallet);
+      })(),
+    };
   }
-  return walletAddressPromise;
+  return walletAddressCache.address;
+}
+
+/**
+ * The historical trusted-owner set, or `null` when it is unusable.
+ *
+ * Fail-closed by construction: missing, empty and malformed all collapse to
+ * `null`, and every caller turns `null` into a 503. Treating an absent list as
+ * «no constraint» would silently weaken D9 to «some well-formed transaction
+ * exists», which an attacker satisfies by posting their own.
+ *
+ * NOT cached at isolate level: the value is a plain string on `env`, so
+ * re-parsing it costs a split of a short list, and a cache would be one more
+ * thing to invalidate on a config change.
+ */
+export function resolveTrustedOwners(env: Env): string[] | null {
+  const raw = env.TRUSTED_OWNERS;
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  try {
+    const owners = parseTrustedOwners(raw);
+    return owners.length > 0 ? owners : null;
+  } catch {
+    // A malformed entry is a CONFIGURATION defect, and dropping it silently
+    // would leave a set that looks fine and is quietly narrower.
+    return null;
+  }
+}
+
+/**
+ * Refuse uploads while the server's own wallet is outside the trusted set.
+ *
+ * The asymmetry is the point of the rotation runbook: a publication this
+ * worker makes RIGHT NOW is signed by `ARWEAVE_JWK`, so if that address is not
+ * trusted, the worker is about to create transactions that neither half will
+ * ever be able to authenticate. Posting them is worse than refusing — the
+ * money is spent and the record is unverifiable forever.
+ *
+ * Hence the order in the runbook: add the new address to both sets, deploy,
+ * and only THEN switch the key.
+ */
+export async function walletTrust(
+  env: Env,
+  owners: string[],
+): Promise<'trusted' | 'untrusted' | 'undeterminable'> {
+  let address: string;
+  try {
+    address = await getWalletAddress(env);
+  } catch {
+    walletAddressCache = null; // never cache a failure
+    // A JWK whose address cannot be derived is a JWK that cannot SIGN either,
+    // so it creates no untrusted transaction and this guard has nothing to
+    // protect against. Deliberately NOT refused here: the malformed-JWK paths
+    // have their own typed outcome further down (502 / `arweave_throw`, §R4),
+    // and answering «misconfigured» here would relabel them from one true
+    // statement into a less precise one.
+    return 'undeterminable';
+  }
+  return owners.includes(address) ? 'trusted' : 'untrusted';
 }
 
 async function handleWalletAddress(request: Request, env: Env): Promise<Response> {
@@ -275,7 +359,7 @@ async function handleWalletAddress(request: Request, env: Env): Promise<Response
   try {
     return json({ address: await getWalletAddress(env) });
   } catch {
-    walletAddressPromise = null; // never cache a failure
+    walletAddressCache = null; // never cache a failure
     return error('Wallet not configured', 503);
   }
 }
@@ -622,6 +706,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // recovery hint, and once the reservation TTL lapses the recheck degrades into
   // a duplicate paid POST. Refuse to post at all rather than post unrecoverably.
   if (typeof env.RECOVERY_HMAC_SECRET !== 'string' || env.RECOVERY_HMAC_SECRET.length < 16) {
+    return error('Server misconfigured', 503);
+  }
+  // TRUSTED_OWNERS is MANDATORY for uploads (D2/D9): it is what a publication
+  // is authenticated against before the worker binds an existing txId to a
+  // payload fingerprint. An absent list is not «no constraint» — it is a
+  // missing root of trust, so it fails closed here rather than being skipped
+  // at the point of use.
+  const trustedOwners = resolveTrustedOwners(env);
+  if (trustedOwners === null) return error('Server misconfigured', 503);
+  // …and the wallet about to SIGN must itself be trusted, or this request
+  // would create a transaction nobody can ever authenticate. Only a DERIVABLE
+  // address that is absent from the set refuses here — see walletTrust.
+  if ((await walletTrust(env, trustedOwners)) === 'untrusted') {
     return error('Server misconfigured', 503);
   }
 

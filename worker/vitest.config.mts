@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
+import { TEST_ARWEAVE_JWK, TEST_WALLET_ADDRESS } from './test-stubs/test-wallet.mjs';
 
 // Runs tests inside the real workerd runtime (via Miniflare) so Durable Objects,
 // KV, and outbound fetch behave as in production. Reads bindings from wrangler.toml.
@@ -26,7 +27,11 @@ export default defineConfig({
           // construction, and the redrop suites are about reaching it.
           STATUS_GATEWAYS: 'https://arweave.net,https://g2.test',
           ADMIN_SECRET: 'test-admin-secret',
-          ARWEAVE_JWK: '{}',
+          // A JWK whose ADDRESS is knowable: /upload refuses while the signing
+          // wallet is outside TRUSTED_OWNERS, so the two must agree. Still not
+          // structurally complete — the transport rejects it exactly as before.
+          ARWEAVE_JWK: TEST_ARWEAVE_JWK,
+          TRUSTED_OWNERS: TEST_WALLET_ADDRESS,
           RECOVERY_HMAC_SECRET: 'test-recovery-secret',
         },
       },
@@ -42,6 +47,7 @@ export default defineConfig({
       'test/arweave-transport.test.ts',
       'test/metrics-upload-e2e.test.ts',
       'test/admin-metrics.test.ts',
+      'test/trusted-owners.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that

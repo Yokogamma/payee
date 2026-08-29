@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 import { setupOutboundMock, b64, sha256, STATUS_ORIGINS, statusUrlRe } from './helpers/outbound-mock';
+import { withTrustedWallet } from '../test-stubs/wallet-address';
 
 // Residual reviewer gaps:
 // 1) invalid env config must 503 through the real /upload route (fail closed);
@@ -203,7 +204,7 @@ describe('e2e: lost commit → posted anchor → TTL → redrop → successful r
 
     const r = await worker.fetch(
       await recheckRequest(id, `e2e-${crypto.randomUUID().slice(0, 6)}`),
-      { ...baseEnv, ARWEAVE_JWK: jwk },
+      { ...baseEnv, ...(await withTrustedWallet(jwk)) },
     );
     expect(r.status).toBe(200);
     const body = await r.json() as { txId: string; committed: boolean };

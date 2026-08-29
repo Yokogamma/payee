@@ -167,6 +167,7 @@ jobs:
       # root's copy instead would wave through a historical rollback carrying an
       # unapproved pool and only fail after it was live.
       - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
+      - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
       # ── Emergency preflight, BEFORE anything is activated ──
@@ -227,6 +228,7 @@ jobs:
       # Re-run the gates on the restored tree, so the verdict describes exactly
       # the bytes about to ship.
       - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
+      - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
       - name: Re-verify the emergency switches after the restore

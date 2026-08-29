@@ -91,6 +91,13 @@ jobs:
       - run: node scripts/check-gateways-vs-worker.mjs
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      # Both halves authenticate the SAME on-chain history, so their trusted
+      # owner sets must agree — and both must contain every wallet the project
+      # has ever posted under (scripts/owner-pins.mjs). A narrowed set does not
+      # fail loudly: it makes healthy old publications unverifiable.
+      - run: node scripts/check-trusted-owners.mjs
+        env:
+          VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
       # ── Quality gates ──
       - run: npm ci
       - run: npm run lint

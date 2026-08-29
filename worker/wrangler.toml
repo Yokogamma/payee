@@ -61,6 +61,24 @@ V3_UPLOADS_ENABLED = "true"
 # Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
 V4_UPLOADS_ENABLED = "true"
+# ── Trusted Arweave owners (D2/D9) ──
+# EVERY wallet address this project has ever posted under, comma separated.
+# The worker authenticates a publication before binding its txId to a payload
+# fingerprint, and `address in TRUSTED_OWNERS` is one of the D9 steps.
+#
+# NOT the current ARWEAVE_JWK: after a rotation that address cannot confirm the
+# project's OWN older transactions, and every one of them would stop
+# authenticating. This is a HISTORICAL list and entries are never removed.
+#
+# Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
+# deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
+# of it, and refuses a set that disagrees with the client's
+# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+#
+# Rotation order, and it is not symmetric: add the new address HERE and to the
+# client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker
+# refuses /upload while its own wallet is outside this set.
+TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # ── Status gateways (PR-3a) ──
 # Bare https origins, comma separated. MUST equal the client's
 # VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
@@ -168,6 +186,25 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
+# ── Trusted Arweave owners (D2/D9) ──
+# EVERY wallet address this project has ever posted under, comma separated.
+# The worker authenticates a publication before binding its txId to a payload
+# fingerprint, and `address in TRUSTED_OWNERS` is one of the D9 steps.
+#
+# NOT the current ARWEAVE_JWK: after a rotation that address cannot confirm the
+# project's OWN older transactions, and every one of them would stop
+# authenticating. This is a HISTORICAL list and entries are never removed.
+#
+# Declared explicitly for staging too: a named environment inherits NOTHING.
+# Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
+# deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
+# of it, and refuses a set that disagrees with the client's
+# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+#
+# Rotation order, and it is not symmetric: add the new address HERE and to the
+# client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker
+# refuses /upload while its own wallet is outside this set.
+TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # ── Status gateways (PR-3a) ──
 # Bare https origins, comma separated. MUST equal the client's
 # VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
