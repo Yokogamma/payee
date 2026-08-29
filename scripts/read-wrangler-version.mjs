@@ -19,6 +19,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { WORKER_NAME } from '../worker/scripts/smoke-target.mjs';
 
 /** Wrangler's deploy record; the key name has varied across versions. */
 const DEPLOY_TYPES = new Set(['deploy', 'deployment']);
@@ -43,7 +44,10 @@ export function parseWranglerOutput(text) {
     if (typeof parsed !== 'object' || parsed === null) continue;
     const type = typeof parsed.type === 'string' ? parsed.type : '';
     const versionId = parsed.version_id ?? parsed.versionId;
-    if (DEPLOY_TYPES.has(type) || typeof versionId === 'string') {
+    // The TYPE decides. Accepting "any record carrying a version_id" would let
+    // an unrelated line (a preview upload, a future record shape) stand in for
+    // the deployment — identity has to come from the record that means deploy.
+    if (DEPLOY_TYPES.has(type)) {
       records.push({
         workerName: parsed.worker_name ?? parsed.workerName ?? null,
         versionId: typeof versionId === 'string' ? versionId : null,
@@ -57,6 +61,12 @@ export function parseWranglerOutput(text) {
   }
   const [record] = records;
   if (!record.versionId) return { error: 'the deploy record carries no version id' };
+  // The name is CHECKED against the repo pin, not just carried through: a
+  // deploy that landed on a different worker is the one case an identity check
+  // exists to catch, and credentials pointing elsewhere produce exactly that.
+  if (record.workerName !== null && record.workerName !== WORKER_NAME) {
+    return { error: `deploy landed on worker "${record.workerName}", expected "${WORKER_NAME}"` };
+  }
   return record;
 }
 

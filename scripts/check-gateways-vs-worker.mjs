@@ -39,17 +39,44 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
  * the staging one — a named environment inherits NOTHING, so the two are
  * genuinely separate declarations and both are checked.
  */
-export function readWorkerStatusGateways(toml, blockPrefix = '') {
+export function readTomlVar(toml, blockPrefix, key) {
   const header = blockPrefix === '' ? '[vars]' : `[${blockPrefix}vars]`;
   const start = toml.indexOf(header);
   if (start < 0) return { error: `missing ${header} block in wrangler.toml` };
-  // The block ends at the next table header at line start.
+  // The block ends at the next table header at line start. Scoping matters: a
+  // bare grep over the file would happily match a line from [env.staging.vars]
+  // and report it as the production value.
   const rest = toml.slice(start + header.length);
   const nextTable = rest.search(/^\[/m);
   const block = nextTable < 0 ? rest : rest.slice(0, nextTable);
-  const match = /^STATUS_GATEWAYS\s*=\s*"([^"]*)"/m.exec(block);
-  if (!match) return { error: `missing STATUS_GATEWAYS in ${header}` };
+  const match = new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, 'm').exec(block);
+  if (!match) return { error: `missing ${key} in ${header}` };
   return { value: match[1] };
+}
+
+export function readWorkerStatusGateways(toml, blockPrefix = '') {
+  return readTomlVar(toml, blockPrefix, 'STATUS_GATEWAYS');
+}
+
+/**
+ * Every upload switch of ONE block must be exactly "false".
+ *
+ * This is what DEFINES an emergency release, and it is checked BEFORE the
+ * deploy — discovering it afterwards would mean the unsafe build was already
+ * activated. Block-scoped on purpose: the staging table legitimately carries
+ * the same key names, so a file-wide grep would let a production "true" pass
+ * because staging happened to say "false".
+ */
+export function checkUploadSwitchesOff(toml, blockPrefix = '') {
+  const problems = [];
+  for (const key of ['UPLOADS_ENABLED', 'V3_UPLOADS_ENABLED', 'V4_UPLOADS_ENABLED']) {
+    const read = readTomlVar(toml, blockPrefix, key);
+    if (read.error) { problems.push(read.error); continue; }
+    if (read.value !== 'false') {
+      problems.push(`${key} is "${read.value}", the emergency profile requires "false"`);
+    }
+  }
+  return { ok: problems.length === 0, problems };
 }
 
 /**
@@ -117,7 +144,12 @@ export function checkGateways(clientCsv, toml, { repoOnly = false } = {}) {
 // ── CLI ──────────────────────────────────────────────────────────────
 if (process.argv[1]?.endsWith('check-gateways-vs-worker.mjs')) {
   const repoOnly = process.argv.includes('--repo-only');
-  const toml = readFileSync(join(ROOT, 'worker', 'wrangler.toml'), 'utf8');
+  // --config points at the wrangler.toml that will ACTUALLY be deployed. For a
+  // candidate deploy that is candidate/worker/wrangler.toml, not the trusted
+  // root's copy: checking the wrong file would let a historical rollback ship
+  // an unapproved pool and only fail the post-deploy smoke.
+  const configArg = process.argv.find(a => a.startsWith('--config='))?.split('=')[1];
+  const toml = readFileSync(configArg ?? join(ROOT, 'worker', 'wrangler.toml'), 'utf8');
   const { ok, problems } = checkGateways(process.env.VITE_STATUS_GATEWAYS, toml, { repoOnly });
   if (!ok) {
     console.error('✗ gateway config gate failed:');

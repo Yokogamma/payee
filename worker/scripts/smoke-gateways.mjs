@@ -34,6 +34,8 @@ const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 /** A health body is a few hundred bytes; anything larger is not one. */
 export const BODY_CAP_BYTES = 8192;
 export const DEADLINE_MS = 15_000;
+/** Bound on ONE attempt, inside the shared budget above. */
+export const ATTEMPT_TIMEOUT_MS = 7_000;
 /** Total attempts, not retries-after-the-first. */
 export const ATTEMPTS = 3;
 
@@ -130,23 +132,59 @@ export async function expectationsFromRepo(blockPrefix = '') {
   return { statusGatewaysHash: await statusGatewaysHash(origins), statusGatewaysCount: origins.length };
 }
 
-/** One attempt: fetch with a fresh nonce, cap the body, parse. */
-async function probe(origin, nonce) {
+/**
+ * One attempt, under the SHARED deadline.
+ *
+ * The smoke has to honour the transport contract it is checking, or it is not
+ * evidence of anything: no redirects (a 302 to another host is not this worker
+ * answering), exactly 200, a cap measured in BYTES and enforced while reading
+ * rather than after, and one budget across all attempts instead of one each.
+ */
+async function probe(origin, nonce, deadline) {
   const response = await fetch(`${origin}/health?nonce=${nonce}`, {
     method: 'GET',
-    signal: AbortSignal.timeout(DEADLINE_MS),
+    redirect: 'error',
+    signal: AbortSignal.any([deadline, AbortSignal.timeout(ATTEMPT_TIMEOUT_MS)]),
   });
-  if (!response.ok) return { error: `HTTP ${response.status}` };
+  if (response.status !== 200) return { error: `HTTP ${response.status}` };
   if (response.headers.get('Cache-Control') !== 'no-store') {
     return { error: 'health answered without Cache-Control: no-store' };
   }
-  const text = await response.text();
-  if (text.length > BODY_CAP_BYTES) return { error: 'health body over the size ceiling' };
+  const bytes = await readCapped(response, BODY_CAP_BYTES);
+  if (bytes === null) return { error: 'health body over the size ceiling' };
   try {
-    return { body: JSON.parse(text) };
+    return { body: JSON.parse(new TextDecoder().decode(bytes)) };
   } catch {
     return { error: 'health body is not JSON' };
   }
+}
+
+/**
+ * Read a body under a cap measured in BYTES, refusing as soon as it is
+ * exceeded. `text.length` counts UTF-16 code units, so a multi-byte body could
+ * slip past a byte ceiling — and reading it all first defeats the ceiling's
+ * purpose anyway.
+ */
+export async function readCapped(response, cap) {
+  if (!response.body) return null;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) { await reader.cancel(); return null; }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+  return out;
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -166,14 +204,18 @@ if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
       ? { workerVersionId: process.env.EXPECT_WORKER_VERSION_ID } : {}),
   };
 
+  // ONE budget for the whole smoke: three attempts with their own 15 s each
+  // would let a stalled worker hold the deploy for 45.
+  const deadline = AbortSignal.timeout(DEADLINE_MS);
   let last = null;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    if (deadline.aborted) { last = ['deadline exhausted']; break; }
     // A NEW nonce every attempt: reusing one would let the retry reproduce the
     // very cached answer the retry exists to get past.
     const nonce = randomNonce();
     let result;
     try {
-      result = await probe(origin, nonce);
+      result = await probe(origin, nonce, deadline);
     } catch (e) {
       result = { error: e instanceof Error ? e.message : String(e) };
     }

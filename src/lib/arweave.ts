@@ -567,7 +567,9 @@ export async function getWorkerCapabilities(): Promise<WorkerCapabilities> {
         redirect: 'error',
         signal: AbortSignal.any([deadline, AbortSignal.timeout(HEALTH_ATTEMPT_TIMEOUT_MS)]),
       });
-      if (!response.ok) continue;
+      // Strictly 200: a 201/206 carrying a plausible body must not lift a
+      // persisted pause. Fail-closed means exactly the expected answer.
+      if (response.status !== 200) continue;
       const body = await readCapped(response, HEALTH_CAP_BYTES);
       if (body === null) continue; // over the ceiling — not a health answer
       const verdict = readCapabilities(JSON.parse(new TextDecoder().decode(body)), nonce, expectedHash);

@@ -139,11 +139,9 @@ jobs:
       - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-      # Same pool on both halves. Run from the TRUSTED checkout — the candidate
-      # does not get to supply the script that judges it.
-      - run: node scripts/check-gateways-vs-worker.mjs
-        env:
-          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      # (The gateway check needs the candidate's own config, so it runs after
+      # materialization — see below. The SCRIPT still comes from the trusted
+      # root; only the file it judges comes from the candidate.)
       # ── The candidate: only now, and only in its own directory ─────
       # A worktree, not a second checkout: the commit is already here (the gate
       # proved it is reachable from this run's head), so there is nothing to
@@ -180,22 +178,26 @@ jobs:
         working-directory: candidate
       - run: npm --prefix worker test
         working-directory: candidate
+      # ── Config gates over the CANDIDATE, still executed by TRUSTED code ──
+      #
+      # What ships is candidate/worker/wrangler.toml. Checking the trusted
+      # root's copy instead would wave through a historical rollback carrying an
+      # unapproved pool and only fail after it was live.
+      - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
+        env:
+          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
       # ── Emergency preflight, BEFORE anything is activated ──
       #
       # Read by the TRUSTED checkout out of the CANDIDATE's own wrangler.toml:
       # an emergency release is defined by every upload switch being off, and
       # discovering otherwise from a post-deploy smoke would mean the unsafe
       # build was already live. A grep is enough and keeps this dependency-free.
+      # A block-scoped parser, NOT a grep: [env.staging.vars] carries the same
+      # key names, so a file-wide match would let a production "true" pass
+      # because staging happened to say "false".
       - name: Emergency profile requires every upload switch off
         if: ${{ inputs.profile == 'emergency' }}
-        run: |
-          for flag in UPLOADS_ENABLED V3_UPLOADS_ENABLED V4_UPLOADS_ENABLED; do
-            if ! grep -qE "^${flag} = \"false\"" candidate/worker/wrangler.toml; then
-              echo "emergency profile: ${flag} must be \"false\" in the candidate's wrangler.toml" >&2
-              exit 1
-            fi
-          done
-          echo "emergency preflight OK: all three upload switches are off"
+        run: node scripts/check-emergency-flags.mjs candidate/worker/wrangler.toml
       # ── Deploy ──
       # RELEASE_SHA is injected from the VERIFIED candidate input, never from
       # github.sha — that one is the SHA of this workflow's own trusted head,

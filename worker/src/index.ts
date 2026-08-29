@@ -1295,6 +1295,12 @@ async function probeStatusOrigin(origin: string, txId: string, emit: Emit): Prom
   try {
     r = await fetch(`${origin}/tx/${txId}/status`, {
       method: 'GET',
+      // NO REDIRECTS — and this is the half that spends money. `fetch` follows
+      // them by default, so a gateway answering 302 -> another gateway would
+      // give TWO configured origins carrying ONE host's opinion, and unanimity
+      // over the pool is exactly what authorizes a paid redrop. The client was
+      // fixed first; leaving the authoritative side unfixed fixed nothing.
+      redirect: 'error',
       signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {

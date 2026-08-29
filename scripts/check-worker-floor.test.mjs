@@ -38,9 +38,8 @@ const HEAD = 'd'.repeat(40);
  *  everything is reachable from HEAD, everything carries a tag, and the pinned
  *  minimum is below the configured floor. A test that wants one of those to
  *  fail says so. */
-const fakeGit = ({ present = [A, B, C, HEAD, MINIMUM_FLOOR], ancestors = {}, tagged = true } = {}) => ({
+const fakeGit = ({ present = [A, B, C, HEAD, MINIMUM_FLOOR], ancestors = {} } = {}) => ({
   hasCommit: sha => present.includes(sha),
-  isTagged: () => tagged,
   isAncestor: (ancestor, descendant) => {
     if (ancestor === MINIMUM_FLOOR) return true;
     if (descendant === HEAD) return present.includes(ancestor);
@@ -48,9 +47,11 @@ const fakeGit = ({ present = [A, B, C, HEAD, MINIMUM_FLOOR], ancestors = {}, tag
   },
 });
 
-/** The floor decision, with the trust boundary satisfied unless stated. */
-const decide = ({ floor, candidate, trustedHead = HEAD, git = fakeGit() }) =>
-  checkWorkerFloor({ floor, candidate, trustedHead, git });
+/** The floor decision, with the trust boundary satisfied unless stated.
+ *  `isAllowed` defaults to permissive so each test states only the rule it is
+ *  about; the allowlist itself is exercised in its own describe below. */
+const decide = ({ floor, candidate, trustedHead = HEAD, git = fakeGit(), isAllowed = () => true }) =>
+  checkWorkerFloor({ floor, candidate, trustedHead, git, isAllowed });
 
 describe('what may be a floor at all', () => {
   it('an unset floor is a REFUSAL — a floor already exists', () => {
@@ -182,27 +183,27 @@ describe('the trust boundary', () => {
 });
 
 describe('which commits are deployable at all', () => {
-  it('an untagged commit that is not the head is refused', () => {
+  it('a commit that is neither the head nor allowlisted is refused', () => {
     // Every intermediate commit of every merged pull request is an ancestor of
     // the default branch. Those states were never judged as deployable, and
     // «reachable from main» alone cannot tell them from a release.
     const verdict = decide({
-      floor: A, candidate: B, git: fakeGit({ ancestors: { [A]: [B] }, tagged: false }),
+      floor: A, candidate: B, git: fakeGit({ ancestors: { [A]: [B] } }), isAllowed: () => false,
     });
     expect(verdict.ok).toBe(false);
-    expect(verdict.reason).toMatch(/neither the trusted head nor a tagged commit/);
+    expect(verdict.reason).toMatch(/neither the trusted head nor an allowlisted release/);
   });
 
   it('the head itself needs no tag', () => {
     const verdict = decide({
-      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] }, tagged: false }),
+      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] } }),
     });
     expect(verdict.ok).toBe(true);
   });
 
-  it('a tagged commit below the head passes — that is what a rollback is', () => {
+  it('an ALLOWLISTED commit below the head passes — that is what a rollback is', () => {
     const verdict = decide({
-      floor: A, candidate: B, git: fakeGit({ ancestors: { [A]: [B] }, tagged: true }),
+      floor: A, candidate: B, git: fakeGit({ ancestors: { [A]: [B] } }),
     });
     expect(verdict.ok).toBe(true);
   });
@@ -217,7 +218,6 @@ describe('the floor has a floor', () => {
       candidate: B,
       git: {
         hasCommit: () => true,
-        isTagged: () => true,
         isAncestor: (ancestor, descendant) => (
           ancestor === MINIMUM_FLOOR ? false : (ancestor === A && descendant === B) || descendant === HEAD
         ),
@@ -292,7 +292,9 @@ describe('against a real repository, built for the purpose', () => {
   // The pinned minimum belongs to THIS repository, so the hermetic one supplies
   // its own — the rule under test is «not below the minimum», not the value.
   const real = over =>
-    checkWorkerFloor({ trustedHead: third, git: gitIn(repo), minimumFloor: first, ...over });
+    checkWorkerFloor({
+      trustedHead: third, git: gitIn(repo), minimumFloor: first, isAllowed: () => true, ...over,
+    });
 
   it('the fixture is what the tests think it is', () => {
     for (const sha of [first, second, third, offBranch]) expect(SHA_RE.test(sha)).toBe(true);
@@ -323,13 +325,21 @@ describe('against a real repository, built for the purpose', () => {
     expect(real({ floor: first, candidate: 'f'.repeat(40) }).ok).toBe(false);
   });
 
-  it('an untagged commit in the history is refused, a tagged one is not', () => {
-    // On real git, with real `git tag --points-at`.
+  // A TAG NO LONGER GRANTS ANYTHING (PR-3a). Tags are not branch protection:
+  // unless a tag ruleset is configured and proven, anyone able to push one can
+  // make an arbitrary mid-review commit deployable — and every such commit is
+  // an ancestor of the default branch. Deployability now comes from a file on
+  // the protected branch, so adding a rollback target is a reviewed change.
+  it('a tag does NOT make a historical commit deployable', () => {
     const run = (...args) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
-    run('tag', '-d', 'release-2');
-    expect(real({ floor: first, candidate: second }).ok, 'untagged').toBe(false);
-    run('tag', 'release-2', second);
-    expect(real({ floor: first, candidate: second }).ok, 'tagged again').toBe(true);
+    run('tag', '-f', 'release-2', second); // tagged, and still refused
+    expect(real({ floor: first, candidate: second, isAllowed: () => false }).ok).toBe(false);
+  });
+
+  it('the allowlist is what makes a historical commit deployable', () => {
+    expect(real({ floor: first, candidate: second, isAllowed: sha => sha === second }).ok).toBe(true);
+    // …and only that exact SHA.
+    expect(real({ floor: first, candidate: second, isAllowed: sha => sha === third }).ok).toBe(false);
   });
 
   it('a floor below the pinned minimum is refused on real git too', () => {

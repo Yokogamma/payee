@@ -150,15 +150,32 @@ jobs:
         env:
           EXPECT_RELEASE_SHA: ${{ inputs.worker_candidate }}
           EXPECT_WORKER_VERSION_ID: ${{ inputs.worker_version_id }}
-      - name: Verify the worker release is at or above the floor
+      # EQUALITY, not ancestry.
+      #
+      # "candidate is a descendant of the floor" is satisfied by the OLD floor
+      # too, so it cannot catch the one mistake this gate exists for: shipping
+      # the client while WORKER_FLOOR_SHA still points at the previous release.
+      # The floor must BE the release this client goes out on top of.
+      #
+      # Both halves of the two-stage raise are checked: the Environment
+      # variable (stage 2) and the repo-pinned MINIMUM_FLOOR (stage 3, the
+      # separate protected commit) — the Environment value alone can be lowered
+      # back to the old repo pin at any time.
+      - name: Verify the floor was raised to this release
         run: |
           if [ -z "$FLOOR" ]; then
             echo "WORKER_FLOOR_SHA is not set — the floor is configuration, not an absent constraint." >&2
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$FLOOR" "$CANDIDATE"; then
-            echo "worker_candidate $CANDIDATE is below the recorded floor $FLOOR." >&2
-            echo "Raise WORKER_FLOOR_SHA to the smoked release before publishing the client." >&2
+          if [ "$FLOOR" != "$CANDIDATE" ]; then
+            echo "WORKER_FLOOR_SHA is $FLOOR but this client ships against $CANDIDATE." >&2
+            echo "Raise the Environment floor to the smoked release before publishing." >&2
+            exit 1
+          fi
+          MINIMUM=$(node -e "import('./scripts/check-worker-floor.mjs').then(m => console.log(m.MINIMUM_FLOOR))")
+          if [ "$MINIMUM" != "$CANDIDATE" ]; then
+            echo "MINIMUM_FLOOR is $MINIMUM but this client ships against $CANDIDATE." >&2
+            echo "Land the protected commit raising MINIMUM_FLOOR before publishing." >&2
             exit 1
           fi
         env:
@@ -189,3 +206,6 @@ jobs:
       - run: node scripts/smoke-csp-origins.mjs "$DEPLOY_URL"
         env:
           DEPLOY_URL: ${{ steps.deploy.outputs.deployment-url }}
+          # env does NOT carry over between steps: without this the smoke exits
+          # 2 on usage AFTER the deploy already happened.
+          VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}

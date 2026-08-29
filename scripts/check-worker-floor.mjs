@@ -95,6 +95,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { isAllowedRelease } from './release-allowlist.mjs';
 
 export const SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -175,7 +176,13 @@ export function checkFloorInputs({ floor, candidate }) {
  * and defaulting it to «anything» is exactly the mistake this parameter
  * exists to prevent.
  */
-export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFloor = MINIMUM_FLOOR }) {
+export function checkWorkerFloor({
+  floor, candidate, trustedHead, git,
+  minimumFloor = MINIMUM_FLOOR,
+  // Injectable so the test can describe an allowlist without editing the
+  // shipped one — the real default is the file on the protected branch.
+  isAllowed = isAllowedRelease,
+}) {
   const inputs = checkFloorInputs({ floor, candidate });
   if (!inputs.ok) return inputs;
 
@@ -219,14 +226,21 @@ export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFl
     };
   }
 
-  if (inputs.candidate !== head && !git.isTagged(inputs.candidate)) {
+  // An ALLOWLIST, not a tag (PR-3a).
+  //
+  // "any tagged ancestor" reads as a review gate but is not one: unless a tag
+  // ruleset is configured and proven, anyone able to push a tag can make an
+  // arbitrary intermediate commit of a merged PR deployable — and every such
+  // commit is an ancestor of the default branch. The allowlist is a file on the
+  // protected branch, so adding a rollback target is a reviewed change.
+  if (inputs.candidate !== head && !isAllowed(inputs.candidate)) {
     return {
       ok: false,
-      reason: `candidate ${inputs.candidate} is neither the trusted head nor a tagged commit. `
+      reason: `candidate ${inputs.candidate} is neither the trusted head nor an allowlisted release. `
         + 'Every intermediate commit of every merged pull request is an ancestor of the default '
-        + 'branch, and those states were never judged as deployable. Deploy the head, or a '
-        + 'release tag — and if this commit really must ship, tag it first, which the runbook '
-        + 'requires of every deploy anyway.',
+        + 'branch, and those states were never judged as deployable — and a tag is not branch '
+        + 'protection. Deploy the head, or add this SHA to scripts/release-allowlist.mjs in a '
+        + 'reviewed pull request that says why it may ship.',
     };
   }
 
