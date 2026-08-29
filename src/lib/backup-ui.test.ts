@@ -256,7 +256,7 @@ describe('the report is three lines by what the user did (§7)', () => {
     const summary = importSummary(REPORT({ added: 1, quotaStopped: 2 }, true), false);
 
     expect(summary.blocking).toBeUndefined();
-    expect(summary.storeIncomplete).toContain('Хранилище помечено');
+    expect(summary.storeIncomplete).toContain('больше нельзя подтвердить');
     expect(summary.storeIncomplete).toContain('Не удаляйте файл копии');
   });
 
@@ -370,6 +370,26 @@ describe('a verify has THREE answers, not two', () => {
     expect(summary.headline).not.toContain('проблемы');
   });
 
+  it('an incomplete SOURCE is reported even when the file also has problems', () => {
+    // The two are orthogonal: «where this file came from» and «what is wrong
+    // inside it». Folded into one verdict, a file that was both incomplete and
+    // damaged lost the origin warning entirely — the worse tone won — and with
+    // it the only hint that an older source file is still worth hunting for.
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      incompleteRestore: true,
+      issues: [{ kind: 'note', id: 'a', problem: 'undecryptable' }],
+    }), at);
+
+    expect(summary.tone).toBe('bad');
+    expect(summary.sourceIncomplete).toBe(INCOMPLETE_SOURCE_WARNING);
+    expect(summary.issues).toHaveLength(1);
+  });
+
+  it('…and on a healthy file there is nothing to report about its origin', () => {
+    expect(verifySummary(VERIFY(), at).sourceIncomplete).toBeUndefined();
+  });
+
   it('a damaged record is NOT told to wait for a newer version', () => {
     // The advice that used to be given for every failure. It is true for one
     // reason only — a record this build is too old to read — and false for
@@ -416,7 +436,16 @@ describe('the sticky marker is described as sticky', () => {
     const summary = importSummary(REPORT({ added: 1, quotaStopped: 1 }, true), false);
 
     expect(summary.storeIncomplete).toContain('ЛИПКАЯ');
-    expect(summary.storeIncomplete).toContain('чистом устройстве');
+    // Names the real path — a reset, then a full import into a store that does
+    // not carry the mark — rather than «another clean device», which the plan
+    // never required and which most people cannot do.
+    expect(summary.storeIncomplete).toContain('после сброса приложения');
     expect(summary.storeIncomplete).not.toContain('пометка снимется, когда');
+    // And it claims only what the marker proves. The mark may have been
+    // standing before this import, which applied its file in full — so
+    // «часть данных не применена» would be a statement about this run that
+    // this run did not establish.
+    expect(summary.storeIncomplete).toContain('больше нельзя подтвердить');
+    expect(summary.storeIncomplete).not.toContain('так и не применена');
   });
 });
