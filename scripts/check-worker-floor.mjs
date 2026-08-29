@@ -111,12 +111,19 @@ export const SHA_RE = /^[0-9a-f]{40}$/;
  *
  * So the floor has a floor, and it is pinned HERE, in a file on the protected
  * default branch where lowering it is a reviewed change. `worker-r3` — the
- * v4-acceptor — is absolute for a reason that has nothing to do with the
+ * v4-acceptor — was absolute for a reason that has nothing to do with the
  * backup track: safebox data exists on chain, and every build below it rejects
  * those uploads (docs/ROLLBACK.md). The same repo-pinned monotonicity D2a
  * requires of the trusted-owner registry, applied to the thing it guards.
+ *
+ * RAISED to the PR-3a release (`ff0954d`, smoked green by run 33243712840).
+ * Below it a lone gateway 404 means `dropped` again — ONE host's opinion
+ * authorizing a PAID re-post — and `/health` carries no attestation, so a
+ * client cannot tell the safe quorum semantics from the old single-host ones.
+ * That is a money-and-integrity boundary, not a feature level, which is why it
+ * belongs here and not in the Environment variable alone.
  */
-export const MINIMUM_FLOOR = '931949150f6145b6c79d36dbadc66b482c1cb6d1';
+export const MINIMUM_FLOOR = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
 
 /**
  * Everything decidable without touching git.
@@ -280,8 +287,9 @@ export function checkWorkerFloor({
         ok: false,
         reason: `WORKER_FLOOR_SHA ${inputs.floor} is BELOW the minimum pinned in this file `
           + `(${minimumFloor}). Lowering the floor is a reviewed change to the repository, not `
-          + 'an edit to a variable: below that commit the worker rejects every App-Version=4 '
-          + 'upload, and safebox data exists.',
+          + 'an edit to a variable. Below the pin a lone gateway 404 authorizes a PAID '
+          + 're-post again, /health carries no attestation, and every build below worker-r3 '
+          + 'still rejects the App-Version=4 uploads whose safebox data exists on chain.',
       };
     }
   }
