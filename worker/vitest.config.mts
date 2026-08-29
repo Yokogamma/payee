@@ -22,6 +22,9 @@ export default defineConfig({
       miniflare: {
         // Test-only stand-ins for secrets (real values come from `wrangler secret`).
         bindings: {
+          // Two origins: with a single one the dead quorum is unreachable by
+          // construction, and the redrop suites are about reaching it.
+          STATUS_GATEWAYS: 'https://arweave.net,https://g2.test',
           ADMIN_SECRET: 'test-admin-secret',
           ARWEAVE_JWK: '{}',
           RECOVERY_HMAC_SECRET: 'test-recovery-secret',

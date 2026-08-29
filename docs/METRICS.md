@@ -27,6 +27,24 @@ independent sampling per event type) and `blob1`.
 | `gateway_call` | event, kind (`anchor`/`price`/`post`/`status`), host, statusClass (`2xx`/`404`/`4xx`/`5xx`/`timeout`/`network`/`invalid_response`) | latencyMs; for kind=`price` a second double — quotedWinston |
 | `upload_outcome` | event, outcome (`accepted`/`arweave_error`/`arweave_throw`), appVersion | — |
 | `status_verdict` | event, verdict (`alive`/`dead`/`unavailable`), host | confirmations (from a 200 body, else −1) |
+
+**PR-3a — the status leg is now a POOL.** The blob schema is unchanged; the
+number of rows and the host values are:
+
+- one `gateway_call` and one `status_verdict` per CONFIGURED origin;
+- plus ONE aggregated `status_verdict` under the sentinel host **`_quorum`**,
+  carrying the verdict the shared formula produced. A leading underscore cannot
+  occur in a bare origin, so it can never collide with a real gateway's series.
+- `host` stays a BARE hostname (`arweave.net`), NOT the canonical origin
+  (`https://arweave.net`) — switching it would split the historical series in
+  two for no gain.
+- `confirmations` on a per-host row is that host's value or −1; on the
+  `_quorum` row it is the conservative aggregate (the LOWEST count among
+  valid 200s) or −1.
+- a 200 whose body fails the schema is classified `invalid_response` and is
+  NOT alive — under the quorum it is an ordinary non-404 outcome, and it blocks
+  `dead` rather than causing it. A `400` behaves the same way; it used to be
+  classified `dead` outright.
 | `post_accepted` | event, host | — |
 | `redrop_new_tx` | event, host | — |
 
@@ -137,5 +155,31 @@ those, not on PR-2 data alone.
 
 ## Capacity
 
+**Recount after PR-3a.** One recheck used to emit 1 `gateway_call` + 1
+`status_verdict`. With the approved five status origins it emits **5
+`gateway_call` + 6 `status_verdict`** (five per-host rows plus `_quorum`) —
+about 5.5× the status-leg volume. The paid-path legs (anchor/price/post) are
+unchanged. Analytics Engine on Workers Free allows 100k datapoints/day, so the
+headroom stays large at this contour's traffic; revisit the sampling note above
+if the pool ever grows substantially.
+
 Workers Free: 100k writes/day, 10k SQL reads/day — a large margin for this
 schema (≤ ~6 points per upload, 2 per status check).
+
+
+## What PR-3a deliberately does NOT measure
+
+D9 verification runs in the CLIENT, and D5 keeps telemetry server-side. So the
+plan's fleet-wide `payload_hash_mismatch` KPI is **not obtainable** here, and
+pretending otherwise with a client beacon would trade a real privacy boundary
+for a number.
+
+What exists instead is a LOCAL diagnostic: `fetchAllNotes` returns per-gateway
+failure counts and logs one aggregated line naming hosts and counts only —
+never a txId, never an Owner-Hash. Nothing is transmitted.
+
+This is the same line the plan already drew for `incomplete=true` (§5: «restore
+c `incomplete=true` — недоступна с клиента (D5); прокси-метрику по серверным
+пробам сознательно НЕ вводим»). Revisit conditions: a confirmed mismatch
+reported by a user, or an extension of `PAYLOAD_GATEWAYS` beyond the approved
+four — either would justify an ADR for server-side probes.
