@@ -86,6 +86,37 @@ before anyone «simplifies» a URL to http.
 - Cloudflare, GitHub and registrar logins with 2FA recovery codes;
 - a register of «who holds what» and last-rotation dates.
 
+## What `main` is actually protected by (checked 2026-08-29)
+
+The PR-3a floor construction rests on two assumptions — that `main` cannot be
+rewritten, and that a protected variable is not edited casually. The first one
+is now recorded rather than assumed, because the plan made it a release
+blocker (§7a) and nothing in the repository can verify it from inside.
+
+Ruleset `main-require-pr` (id 21101277), enforcement `active`, on
+`refs/heads/main`:
+
+| Field | Value | What it means here |
+|---|---|---|
+| `bypass_actors` | `[]` | **This is the «admins do not bypass» decision.** Nobody — owner included — can push straight to `main`; the floor commit is therefore a reviewed change for everyone. |
+| rules | `deletion`, `non_fast_forward`, `pull_request` | `main` cannot be deleted or force-pushed, so `MINIMUM_FLOOR`'s history cannot be rewritten under the gate. |
+
+Two properties are NOT what «protected branch» usually implies, and the floor
+argument must not silently borrow them:
+
+- **`required_approving_review_count: 0`** — a PR can be merged by its own
+  author with no approval. The gate that PR-3a actually relies on is «the
+  change is a PR against `main`, visible in history», not «somebody else read
+  it».
+- **No `required_status_checks` rule** — green CI is not enforced by the
+  ruleset. Gates run on every PR and have been green, but merging a red one is
+  mechanically possible. Adding the `gates` context here is the obvious
+  hardening; it is deliberately NOT claimed as done.
+
+Neither gap breaks the floor: lowering `MINIMUM_FLOOR` still requires a commit
+on `main`, which is what makes it reviewable after the fact. They are recorded
+so that a future reader does not infer a stronger guarantee than exists.
+
 ## Guarding `CLOUDFLARE_API_TOKEN`
 
 Guard it **like `ARWEAVE_JWK`** — the radius is transitively the same (see
