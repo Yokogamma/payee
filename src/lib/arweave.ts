@@ -201,6 +201,11 @@ export type UploadResult =
   /** 503 {code:'v4_uploads_disabled'} — the worker's SAFEBOX kill switch is on.
    *  Same contract as v3_disabled, on its own independent pause marker. */
   | { kind: 'v4_disabled'; error: string }
+  /** 503 {code:'uploads_disabled'} — the GLOBAL kill switch (§1.9). Unlike the
+   *  per-version switches this stops v1–v4 alike, before the body is read, so
+   *  the client pauses EVERY version rather than retrying the backlog against a
+   *  worker that refuses all of it. */
+  | { kind: 'uploads_disabled'; error: string }
   /** 400 {code:'recovery_invalid'} — the server REJECTED the signed recovery
    *  proof (forged, corrupt, or signed under a rotated key). PERMANENT for
    *  this record: a retry reproduces the same rejection, so the caller
@@ -498,6 +503,7 @@ export async function uploadViaProxy(
         const parsed: unknown = JSON.parse(text);
         if (typeof parsed === 'object' && parsed !== null) {
           const code = (parsed as { code?: unknown }).code;
+          if (code === 'uploads_disabled') return { kind: 'uploads_disabled', error: text };
           if (code === 'v3_uploads_disabled') return { kind: 'v3_disabled', error: text };
           if (code === 'v4_uploads_disabled') return { kind: 'v4_disabled', error: text };
         }

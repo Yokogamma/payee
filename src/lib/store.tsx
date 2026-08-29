@@ -132,6 +132,7 @@ import {
   commitSyncUnlessTerminal,
   commitV3PausedFailure,
   commitV4PausedFailure,
+  commitGlobalPausedFailure,
   readV3PauseMeta,
   readV4PauseMeta,
   clearV3UploadsPaused,
@@ -2292,6 +2293,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           commitV4PausedFailure: async (noteId, build, pausedAt) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
             await commitV4PausedFailure(noteId, build, pausedAt);
+          },
+          commitGlobalPausedFailure: async (noteId, build, pausedAt) => {
+            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
+            await commitGlobalPausedFailure(noteId, build, pausedAt);
           },
           signPayload,
           uploadViaProxy,

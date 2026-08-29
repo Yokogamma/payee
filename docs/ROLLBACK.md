@@ -1667,6 +1667,22 @@ the attestation worth anything. Staging keeps `npm run deploy:staging`.
 
 _(none yet)_
 
+### The global kill switch now actually stops the queue
+
+`UPLOADS_ENABLED = "false"` makes the worker answer
+`503 {code:'uploads_disabled'}` to v1–v4 alike, before the body is read. Until
+PR-3a the client only understood the PER-VERSION codes, so it recorded a plain
+retryable failure and the queue kept marching through the backlog — burning the
+per-IP budget against a worker refusing all of it, and making the incident lever
+look like it had done nothing.
+
+The client now pauses EVERY version, in one transaction. Resume is unchanged and
+needs no new lever: both markers lift only once `/health` reports the version
+usable, and that verdict already requires the global `uploads` flag to be true.
+
+Operator consequence: after flipping the switch back, uploads resume on the next
+`/health` probe — no manual un-pause, and no per-version bookkeeping.
+
 ### The post-deploy smoke is a DETECTOR
 
 Cloudflare activates a version before any smoke can answer. A red smoke

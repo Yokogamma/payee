@@ -890,7 +890,7 @@ export function readV4PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
  * vN_disabled regardless of what happened to the row.
  */
 async function commitPausedFailure(
-  key: string,
+  keys: readonly string[],
   noteId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
@@ -902,7 +902,13 @@ async function commitPausedFailure(
     if (fresh?.terminalError === undefined) {
       await syncStore.put(buildRecord(fresh));
     }
-    await tx.objectStore('meta').put({ pausedAt } satisfies PauseMeta, key);
+    // All markers in the SAME transaction: the global kill switch pauses every
+    // version at once, and writing the two halves separately would reopen the
+    // crash window this function exists to close.
+    const metaStore = tx.objectStore('meta');
+    for (const key of keys) {
+      await metaStore.put({ pausedAt } satisfies PauseMeta, key);
+    }
     await tx.done;
   } catch (e) {
     // Same rollback discipline as saveNoteWithSync: an error on the SECOND put
@@ -918,14 +924,34 @@ export function commitV3PausedFailure(
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure(V3_PAUSE_META_KEY, noteId, buildRecord, pausedAt);
+  return commitPausedFailure([V3_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
 }
 export function commitV4PausedFailure(
   noteId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure(V4_PAUSE_META_KEY, noteId, buildRecord, pausedAt);
+  return commitPausedFailure([V4_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
+}
+
+/**
+ * The GLOBAL kill switch (503 {code:'uploads_disabled'}) pauses EVERY version.
+ *
+ * It is not «v3 and v4 happen to both be off»: the worker refuses v1–v4 alike,
+ * before the body is even read. Without this the queue would keep marching
+ * through the backlog, burning the per-IP budget against a worker that answers
+ * 503 to all of it — and the incident lever would not actually stop anything.
+ *
+ * Both markers are set, so the existing resume path applies unchanged: they
+ * lift only once /health reports the version usable again, and after PR-3a
+ * that verdict already requires the global `uploads` flag to be true.
+ */
+export function commitGlobalPausedFailure(
+  noteId: string,
+  buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
+  pausedAt: number,
+): Promise<void> {
+  return commitPausedFailure([V3_PAUSE_META_KEY, V4_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
 }
 
 /**
