@@ -181,16 +181,22 @@ export function sizeNotice(expectedFileBytes: number, overCap: boolean): SizeNot
     return {
       text,
       overCap: false,
-      // The second sentence is measured, and says only what was measured
-      // (step 13): near the ceiling a desktop spends ~3 s exporting and ~3.4 s
-      // verifying, with a peak of ~1.2 GB RSS. The memory is the part that
-      // decides a phone's fate, so it is named; «the interface freezes» is NOT
-      // claimed, because the chain mixes synchronous serialization with
-      // WebCrypto calls a browser may run off-thread and nobody measured that.
+      // Measured in a BROWSER now, not inferred from Node (step 13,
+      // `scripts/main-thread-probe.html`): near the ceiling Chrome spends
+      // ~0.7 s exporting and ~0.8 s verifying — four times faster than the
+      // Node figure — and every step of the chain holds the main thread, the
+      // longest single stretch being ~0.5 s. So the freeze is real but it is
+      // half a second, not «several seconds»: the earlier wording overstated
+      // it, and an overstatement here is the kind a user stops believing.
+      //
+      // The memory is the part that decides a phone's fate and is stated
+      // plainly: ~0.9 GB of JS heap against a 4 GB desktop limit — a mobile
+      // limit is a fraction of that.
       warning: `Копия приближается к пределу в ${formatBytes(BACKUP_CAP_BYTES)}. `
         + 'Записи не удаляются, поэтому объём только растёт. Рядом с пределом создание и '
-        + 'проверка копии занимают несколько секунд и требуют больше гигабайта памяти — '
-        + 'на телефоне вкладка может не справиться, делайте копию на компьютере.',
+        + 'проверка копии занимают около полутора секунд, интерфейс на это время подвисает, '
+        + 'и нужно почти гигабайт памяти — на телефоне вкладка может не справиться, '
+        + 'делайте копию на компьютере.',
     };
   }
   return { text, overCap: false };
