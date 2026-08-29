@@ -1222,8 +1222,46 @@ Three things follow, and all three are acted on in the code:
    advises making the copy on a computer, and why «users above the cap are not
    supported until container v2» is a statement about memory, not about disk.
 
+### …and the same chain in a BROWSER (step 13)
+
+Node answers «what does it cost»; it cannot answer «does the interface freeze»,
+because a browser might run WebCrypto off the main thread. Measured with
+`scripts/main-thread-probe.html` (open it from disk — no build, no server
+needed), Chrome 148 on the same desktop:
+
+```
+file produced        30.6 MB
+export                724 ms      verify                752 ms
+longest single block  465 ms      (base64 encoding)
+peak JS heap          932 MB      of a 4096 MB limit
+every step of the chain holds the main thread — none of it is off-thread
+```
+
+Three things this settles, and one of them corrects an earlier claim here:
+
+1. **The browser is four times faster than Node** (0.7 s vs 2.9 s to export).
+   The «several seconds» in the settings warning was an overstatement carried
+   over from the Node figure; it now says about a second and a half, which is
+   what the browser does.
+2. **The freeze is real, and it is half a second.** Every step holds the main
+   thread — WebCrypto included — so the tab does stop responding, in stretches
+   up to 465 ms. The earlier text had dropped that claim as unmeasured; it is
+   measured now, and stated at the size it actually is.
+3. **base64 is 465 of the 724 ms.** The dominant cost of an export is neither
+   the crypto nor the JSON — it is turning bytes into a string. If this ever
+   needs to be faster, that is the one place to look.
+
+The probe validates itself before reporting: it runs two controls (awaiting a
+timer must tick the heartbeat; a synchronous loop must not) and refuses to
+print a reading if either fails. That is not ceremony — the first two attempts
+at this measurement reported «nothing blocked» because `requestAnimationFrame`
+does not fire in a hidden tab, so «no frame gaps» and «no frames at all» looked
+identical. A heartbeat on `MessageChannel` is not throttled by visibility.
+
 **Still owed by the operator:** the same measurement on a real phone, recorded
-here as a number (§13 — no device in this contour).
+here as a number (§13 — no device in this contour). The desktop peak of 932 MB
+against a 4 GB limit is the reason it matters: a mobile heap limit is a
+fraction of that.
 
 ## Section density — `client-nav2` (client-only)
 
