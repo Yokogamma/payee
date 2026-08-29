@@ -40,16 +40,44 @@ export interface SignedTx {
 
 const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
 
-let cached: Promise<TestWallet> | null = null;
-
-/** The default wallet, memoized for the lifetime of the module instance. */
-export function testWallet(): Promise<TestWallet> {
-  cached ??= newWallet();
-  return cached;
+/**
+ * Wallet cache — deliberately on `globalThis`, not in module scope.
+ *
+ * These suites call `vi.resetModules()` in `afterEach` (config.ts reads its env
+ * at module load, so each test re-imports the module under test). A module-level
+ * cache is discarded with it, which would mean a fresh RSA-4096 keygen — ~0.6 s —
+ * for EVERY test rather than every file. Under a parallel run that is enough to
+ * trip the default timeout, and it did: two suites failed only in the full run
+ * and passed in isolation. The cache therefore lives where module resets cannot
+ * reach it.
+ */
+interface WalletCache { default?: Promise<TestWallet>; other?: Promise<TestWallet> }
+const CACHE_KEY = '__eternalNotesTestWallets__';
+function cache(): WalletCache {
+  const g = globalThis as Record<string, unknown>;
+  g[CACHE_KEY] ??= {};
+  return g[CACHE_KEY] as WalletCache;
 }
 
-/** A SECOND, independent wallet — for the «correctly signed by an attacker»
- *  case, where every step but the trusted-owner check must pass. */
+/** The default wallet, generated once per test PROCESS. */
+export function testWallet(): Promise<TestWallet> {
+  const c = cache();
+  c.default ??= newWallet();
+  return c.default;
+}
+
+/**
+ * A SECOND, independent wallet — for the «correctly signed by an attacker»
+ * case, where every step but the trusted-owner check must pass. The tests need
+ * it to be a DIFFERENT wallet, not a fresh one on every call.
+ */
+export function otherWallet(): Promise<TestWallet> {
+  const c = cache();
+  c.other ??= newWallet();
+  return c.other;
+}
+
+/** A brand-new wallet on every call. Prefer `otherWallet()` in tests. */
 export async function newWallet(): Promise<TestWallet> {
   const jwk = await arweave.wallets.generate();
   return { jwk, address: await arweave.wallets.jwkToAddress(jwk) };

@@ -31,7 +31,7 @@ describe('readWorkerStatusGateways', () => {
 
   it('reports a missing block or a missing key instead of guessing', () => {
     expect(readWorkerStatusGateways('[vars]\nX = "1"\n', '').error).toMatch(/missing STATUS_GATEWAYS/);
-    expect(readWorkerStatusGateways('', '').error).toMatch(/missing \[vars\]/);
+    expect(readWorkerStatusGateways('', '').error).toMatch(/missing table/);
   });
 });
 

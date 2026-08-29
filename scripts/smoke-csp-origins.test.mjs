@@ -57,4 +57,9 @@ describe('checkConnectSrc', () => {
     const shuffled = ["'self'", PROXY, ...[...APPROVED].reverse()].join(' ');
     expect(checkConnectSrc(csp(shuffled), PROXY).ok).toBe(true);
   });
+  // `startsWith('connect-src')` would also match a longer directive name.
+  it('does not mistake connect-src-foo for connect-src', () => {
+    const policy = `default-src 'self'; connect-src-foo ${["'self'", ...APPROVED, PROXY].join(' ')}`;
+    expect(checkConnectSrc(policy, PROXY).problems).toEqual(['CSP has no connect-src directive']);
+  });
 });

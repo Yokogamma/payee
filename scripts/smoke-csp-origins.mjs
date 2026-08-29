@@ -30,10 +30,12 @@ export function checkConnectSrc(headerValue, proxyOrigin) {
   const problems = [];
   if (!headerValue) return { ok: false, problems: ['no Content-Security-Policy header'] };
 
+  // `startsWith` would also match `connect-src-foo`; the directive name has to
+  // end where the name ends.
   const directive = headerValue
     .split(';')
     .map(part => part.trim())
-    .find(part => part.startsWith('connect-src'));
+    .find(part => /^connect-src(\s|$)/.test(part));
   if (!directive) return { ok: false, problems: ['CSP has no connect-src directive'] };
 
   const actual = directive.split(/\s+/).slice(1);
@@ -74,7 +76,16 @@ if (process.argv[1]?.endsWith('smoke-csp-origins.mjs')) {
     process.exit(2);
   }
 
-  const response = await fetch(url, { redirect: 'manual' });
+  // Exactly 200, no redirects, bounded: a 3xx or a 404 carrying plausible
+  // headers must not be read as «the deployment is fine».
+  const response = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (response.status !== 200) {
+    console.error(`✗ smoke-csp-origins: ${url} answered HTTP ${response.status}`);
+    process.exit(1);
+  }
   const { ok, problems } = checkConnectSrc(
     response.headers.get('content-security-policy'),
     proxyOrigin,

@@ -461,9 +461,14 @@ client floor in force is still `client-r4`.
     immediately and a floor that depends on a shifting precondition is not a
     floor. **The floor is now absolute:** `worker-r2` and below 400 every
     App-Version=4 upload and would silently stop safebox sync.
-  - **Allowed rollback targets = tags in this list that are descendants of
-    the floor** (`git merge-base --is-ancestor`). Never deploy anything else
-    once the floor Worker has run even once.
+  - **SUPERSEDED BY PR-3a: a tag no longer makes a commit deployable.** Tags
+    are not branch protection — unless a tag ruleset is configured and proven,
+    anyone able to push one can make an arbitrary mid-review commit deployable,
+    and every such commit is an ancestor of the default branch. Allowed
+    rollback targets are now the SHAs listed in `scripts/release-allowlist.mjs`
+    (empty by default: the normal path deploys the trusted head), and they must
+    still be descendants of the floor. The list below stays as the RELEASE
+    HISTORY it always was.
   - **The deploy workflow now checks this itself — see «The floor as a gate»
     below.** Two consequences, and both are operational rather than technical:
     a rollback goes through that workflow with the target's SHA, and
@@ -1545,8 +1550,13 @@ legitimately answer 503 «Recheck deferred» — the status metric is already
 written); (d) `/admin/metrics` shows ALL FOUR legs (anchor/price/post from
 the smoke, status from the recheck). The SQL API is not strictly
 read-after-write: poll with backoff, ceiling ~2 min, then the smoke is RED —
-never an endless loop; (e) redeploy the PREVIOUS worker — an upload passes
-again (the rollback is rehearsed, not postulated).
+never an endless loop; (e) **SUPERSEDED BY PR-3a.** This step used to rehearse
+a rollback by redeploying the previous worker. That is now forbidden: the floor
+is absolute, an empty release allowlist admits nothing but the trusted head, and
+a local `npm run deploy` refuses outright. Rehearse the SANCTIONED path
+instead — a descendant of the floor deployed through the trusted workflow — or
+skip the rehearsal and say so, rather than leaving an instruction that the gates
+will refuse.
 
 ### Launch gate for the REAL production contour (M r19 — carry into part 2)
 
@@ -1676,9 +1686,14 @@ retryable failure and the queue kept marching through the backlog — burning th
 per-IP budget against a worker refusing all of it, and making the incident lever
 look like it had done nothing.
 
-The client now pauses EVERY version, in one transaction. Resume is unchanged and
-needs no new lever: both markers lift only once `/health` reports the version
-usable, and that verdict already requires the global `uploads` flag to be true.
+The client now writes a DEDICATED global marker and consults it before every
+dispatch — for every version, not only the gated ones. Writing the v3 and v4
+markers instead would have looked right and still let v1/v2 keep uploading: the
+queue reads a version marker only for v3/safebox items.
+
+Resume needs no new lever. The marker lifts once `/health` reports any version
+`enabled`, and the capability table already requires the global `uploads` flag
+to be true before it says that — so «enabled anywhere» proves «switch back on».
 
 Operator consequence: after flipping the switch back, uploads resume on the next
 `/health` probe — no manual un-pause, and no per-version bookkeeping.

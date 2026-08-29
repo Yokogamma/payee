@@ -3,8 +3,8 @@ import {
   buildSignedTx,
   edgeFor,
   gatewayFetchMock,
-  newWallet,
   notesTags,
+  otherWallet,
   testWallet,
 } from '../test-stubs/signed-tx';
 
@@ -349,7 +349,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
     // by either wallet must come back in one sweep — and now that D9 checks the
     // SIGNING wallet, this is a real two-key test rather than two labels.
     const oldWallet = await testWallet();
-    const newWallet_ = await newWallet();
+    const newWallet_ = await otherWallet();
     vi.stubEnv('VITE_TRUSTED_OWNERS', oldWallet.address + ',' + newWallet_.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
@@ -416,7 +416,7 @@ describe('fetchAllNotes v2 envelope (C2 truth-after-decryption)', () => {
   // decryption, and without claiming the Note-Id.
   it('a foreign-owner candidate is skipped and does not mark the sweep incomplete', async () => {
     const trusted = await testWallet();
-    const attacker = await newWallet();
+    const attacker = await otherWallet();
     vi.stubEnv('VITE_TRUSTED_OWNERS', trusted.address);
 
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');

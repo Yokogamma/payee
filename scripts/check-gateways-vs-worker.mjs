@@ -24,34 +24,28 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseOriginList } from './gateways-parse.mjs';
+import { readTomlString } from './toml-scan.mjs';
 import { EXPECTED_STATUS_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
- * Read `STATUS_GATEWAYS` out of a wrangler.toml block.
- *
- * A tiny targeted reader rather than a TOML parser: this script runs BEFORE
- * `npm ci` in the deploy workflows (that is the whole point of an early gate),
- * so it must stay dependency-free.
+ * Read one key out of a wrangler.toml table.
  *
  * `blockPrefix` is '' for the production `[vars]` table and 'env.staging.' for
  * the staging one — a named environment inherits NOTHING, so the two are
  * genuinely separate declarations and both are checked.
  */
 export function readTomlVar(toml, blockPrefix, key) {
-  const header = blockPrefix === '' ? '[vars]' : `[${blockPrefix}vars]`;
-  const start = toml.indexOf(header);
-  if (start < 0) return { error: `missing ${header} block in wrangler.toml` };
-  // The block ends at the next table header at line start. Scoping matters: a
-  // bare grep over the file would happily match a line from [env.staging.vars]
-  // and report it as the production value.
-  const rest = toml.slice(start + header.length);
-  const nextTable = rest.search(/^\[/m);
-  const block = nextTable < 0 ? rest : rest.slice(0, nextTable);
-  const match = new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, 'm').exec(block);
-  if (!match) return { error: `missing ${key} in ${header}` };
-  return { value: match[1] };
+  // A SCANNER, not indexOf: `toml.indexOf('[vars]')` is exploitable — a decoy
+  // `[vars]` inside a multi-line string of another table would be read while
+  // wrangler honours the real one. See scripts/toml-scan.mjs.
+  const table = blockPrefix === '' ? 'vars' : `${blockPrefix}vars`;
+  try {
+    return readTomlString(toml, table, key);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 export function readWorkerStatusGateways(toml, blockPrefix = '') {

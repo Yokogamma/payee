@@ -28,7 +28,7 @@ const DEPLOY_TYPES = new Set(['deploy', 'deployment']);
  * Pure core: NDJSON text → `{ workerName, versionId }` or `{ error }`.
  * Exactly ONE deploy record must be present.
  */
-export function parseWranglerOutput(text) {
+export function parseWranglerOutput(text, expectedWorkerName = WORKER_NAME) {
   const records = [];
   for (const line of String(text ?? '').split('\n')) {
     const trimmed = line.trim();
@@ -64,8 +64,10 @@ export function parseWranglerOutput(text) {
   // The name is CHECKED against the repo pin, not just carried through: a
   // deploy that landed on a different worker is the one case an identity check
   // exists to catch, and credentials pointing elsewhere produce exactly that.
-  if (record.workerName !== null && record.workerName !== WORKER_NAME) {
-    return { error: `deploy landed on worker "${record.workerName}", expected "${WORKER_NAME}"` };
+  // A missing name is a REFUSAL too: identity that is optional is not identity.
+  if (record.workerName === null) return { error: 'the deploy record carries no worker name' };
+  if (record.workerName !== expectedWorkerName) {
+    return { error: `deploy landed on worker "${record.workerName}", expected "${expectedWorkerName}"` };
   }
   return record;
 }

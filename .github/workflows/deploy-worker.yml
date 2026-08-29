@@ -161,23 +161,6 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: candidate/.nvmrc
-      # ROOT deps are needed by the worker TEST suite since #104:
-      # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
-      # which resolves @scure/bip39 from the root node_modules (in ci.yml the
-      # root `npm ci` runs first, which is why CI never saw the gap; the first
-      # worker deploy after #104 did — the test step failed on module
-      # resolution). --ignore-scripts on purpose: the parity test only needs
-      # IMPORT RESOLUTION of pure-JS packages, so no lifecycle script of any
-      # root transitive dependency ever runs in this CREDENTIALED job — the
-      # accepted npm-ci residual risk (docs/SECRETS.md) does not widen.
-      - run: npm ci --ignore-scripts
-        working-directory: candidate
-      - run: npm --prefix worker ci
-        working-directory: candidate
-      - run: npm --prefix worker run typecheck
-        working-directory: candidate
-      - run: npm --prefix worker test
-        working-directory: candidate
       # ── Config gates over the CANDIDATE, still executed by TRUSTED code ──
       #
       # What ships is candidate/worker/wrangler.toml. Checking the trusted
@@ -196,6 +179,57 @@ jobs:
       # key names, so a file-wide match would let a production "true" pass
       # because staging happened to say "false".
       - name: Emergency profile requires every upload switch off
+        if: ${{ inputs.profile == 'emergency' }}
+        run: node scripts/check-emergency-flags.mjs candidate/worker/wrangler.toml
+      # ── Only NOW may candidate code run ──
+      #
+      # Everything below installs and EXECUTES the candidate: npm lifecycle
+      # scripts and its own test suite. That code can rewrite files — the
+      # trusted scripts in this checkout included — so the gates above read
+      # the config BEFORE any of it runs, and the re-verification further down
+      # runs AFTER it, from a restored tree.
+      # ROOT deps are needed by the worker TEST suite since #104:
+      # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
+      # which resolves @scure/bip39 from the root node_modules (in ci.yml the
+      # root `npm ci` runs first, which is why CI never saw the gap; the first
+      # worker deploy after #104 did — the test step failed on module
+      # resolution). --ignore-scripts on purpose: the parity test only needs
+      # IMPORT RESOLUTION of pure-JS packages, so no lifecycle script of any
+      # root transitive dependency ever runs in this CREDENTIALED job — the
+      # accepted npm-ci residual risk (docs/SECRETS.md) does not widen.
+      - run: npm ci --ignore-scripts
+        working-directory: candidate
+      - run: npm --prefix worker ci
+        working-directory: candidate
+      - run: npm --prefix worker run typecheck
+        working-directory: candidate
+      - run: npm --prefix worker test
+        working-directory: candidate
+      # ── Undo anything the candidate's own code changed ──
+      #
+      # Its install and test steps ran with write access to this runner. Tracked
+      # files are restored to the SHA that was gated, so what wrangler uploads is
+      # the reviewed state and not whatever a test left behind. node_modules are
+      # untracked and survive, which is what the deploy needs.
+      - name: Restore the candidate tree to the gated SHA
+        run: git -C candidate checkout --force -- .
+      # And prove the TRUSTED half was not rewritten either: these scripts are
+      # what judged the candidate, so a run that edited them would have judged
+      # with its own code.
+      - name: Refuse if candidate code modified the trusted checkout
+        run: |
+          DIRTY=$(git status --porcelain -- . ':!candidate')
+          if [ -n "$DIRTY" ]; then
+            echo "candidate code modified the trusted checkout — refusing to deploy:" >&2
+            echo "$DIRTY" >&2
+            exit 1
+          fi
+      # Re-run the gates on the restored tree, so the verdict describes exactly
+      # the bytes about to ship.
+      - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
+        env:
+          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      - name: Re-verify the emergency switches after the restore
         if: ${{ inputs.profile == 'emergency' }}
         run: node scripts/check-emergency-flags.mjs candidate/worker/wrangler.toml
       # ── Deploy ──
@@ -233,6 +267,29 @@ jobs:
           PROFILE: ${{ inputs.profile }}
           EXPECT_RELEASE_SHA: ${{ inputs.candidate }}
           EXPECT_WORKER_VERSION_ID: ${{ steps.version.outputs.version_id }}
+      # ── Hand the identity to the Pages release as an ARTIFACT ──
+      #
+      # A version id typed into the Pages form proves nothing: an ungated
+      # redeploy of the same SHA produces a new id that its own /health will
+      # happily confirm. Publishing it here, from the run that actually passed
+      # the gates, is what makes the Pages check an attestation rather than an
+      # echo.
+      - name: Record the release identity
+        run: |
+          {
+            echo "$CANDIDATE"
+            echo "$VERSION_ID"
+          } > release-identity.txt
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+          VERSION_ID: ${{ steps.version.outputs.version_id }}
+      # Pinned to a commit SHA like every other action here (verified against
+      # the upstream tag, not copied from memory).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-identity
+          path: release-identity.txt
+          retention-days: 30
       - name: Remind the operator to raise the floor
         if: ${{ inputs.profile == 'normal' }}
         run: |

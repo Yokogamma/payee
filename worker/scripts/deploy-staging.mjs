@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseWranglerOutput } from '../../scripts/read-wrangler-version.mjs';
+import { ACCOUNT_ID, WORKER_NAME } from './smoke-target.mjs';
 
 const WORKER_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const ROOT = dirname(WORKER_DIR);
@@ -33,11 +34,27 @@ function run(cmd, args, opts = {}) {
   if (r.status !== 0) process.exit(r.status ?? 1);
 }
 
+/** The pinned CLI from the lockfile, not whatever npx would fetch. */
+const WRANGLER_BIN = 'node_modules/wrangler/bin/wrangler.js';
+
 // 1. Config gates — the same code the deploy workflow runs.
 run(process.execPath, ['scripts/check-gateways-vs-worker.mjs', '--repo-only']);
 
+// 1b. The account is pinned: credentials pointing somewhere else are exactly
+// what an identity check exists to catch, and whoami is where that shows up.
+const whoami = spawnSync(process.execPath, [WRANGLER_BIN, 'whoami'],
+  { cwd: WORKER_DIR, encoding: 'utf8' });
+if (whoami.status !== 0 || !String(whoami.stdout).includes(ACCOUNT_ID)) {
+  console.error(`✗ wrangler is not authenticated against the pinned account ${ACCOUNT_ID}`);
+  console.error('  Check which account the token belongs to before deploying.');
+  process.exit(1);
+}
+
 // 2. A dirty tree means the artifact has no reviewable identity.
-const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: ROOT, encoding: 'utf8' }).trim();
+// TRACKED files only: an ignored local file (editor settings, a build dir)
+// is not part of the artifact and must not block a deploy.
+const dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'],
+  { cwd: ROOT, encoding: 'utf8' }).trim();
 if (dirty !== '') {
   console.error('✗ refusing to deploy from a DIRTY working tree:');
   console.error(dirty.split('\n').map(l => `    ${l}`).join('\n'));
@@ -49,13 +66,17 @@ if (dirty !== '') {
 const outDir = mkdtempSync(join(tmpdir(), 'wrangler-out-'));
 const outFile = join(outDir, 'output.ndjson');
 try {
-  run('npx', ['wrangler', 'deploy', '--env', 'staging'], {
+  // The LOCAL wrangler from the lockfile, never an auto-installed one: the
+  // tool that talks to Cloudflare should be the pinned, Dependabot-tracked one.
+  run(process.execPath, [WRANGLER_BIN, 'deploy', '--env', 'staging'], {
     cwd: WORKER_DIR,
     env: { ...process.env, WRANGLER_OUTPUT_FILE_PATH: outFile },
   });
 
   // 4. Identity: a deploy that landed elsewhere is exactly what this catches.
-  const parsed = parseWranglerOutput(readFileSync(outFile, 'utf8'));
+  // Staging lands on a DIFFERENT worker name — expecting the production one
+  // would report a failure for a perfectly correct deploy.
+  const parsed = parseWranglerOutput(readFileSync(outFile, 'utf8'), WORKER_NAME + '-staging');
   if (parsed.error) {
     console.error(`✗ ${parsed.error}`);
     process.exit(1);

@@ -8,7 +8,7 @@ import {
   verifyHeader,
   type TxHeader,
 } from './tx-verify';
-import { buildSignedTx, newWallet, notesTags, testWallet } from '../test-stubs/signed-tx';
+import { buildSignedTx, notesTags, otherWallet, testWallet } from '../test-stubs/signed-tx';
 import realTx from '../test-stubs/real-tx.fixture.json';
 
 // A REAL transaction of this project, captured from arweave.net. It is what
@@ -102,8 +102,8 @@ describe('D9 binds the header to the REQUESTED txId (review 3 H1)', () => {
 });
 
 describe('D9 step 5 — a correctly signed ATTACKER transaction (review 11)', () => {
-  it('is rejected on TRUSTED_OWNERS, with id/signature/data_root all valid', async () => {
-    const attacker = await newWallet();
+  it('is rejected on TRUSTED_OWNERS, with id/signature/data_root all valid', { timeout: 30_000 }, async () => {
+    const attacker = await otherWallet();
     const trusted = await testWallet();
     const tx = await buildSignedTx(
       JSON.stringify({ id: 'note-x', c: 'AAAA', iv: 'BBBB' }),

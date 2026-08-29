@@ -50,3 +50,41 @@ describe('emergency preflight — block-scoped, never a file-wide grep', () => {
     expect(checkUploadSwitchesOff(toml(ON, OFF), 'env.staging.').ok).toBe(true);
   });
 });
+
+// The bypass a substring search allows — a decoy table inside a multi-line
+// string of another table. `indexOf('[vars]')` reads the decoy's "false" while
+// wrangler honours the real `[vars]` and keeps uploads ON.
+describe('emergency preflight resists a TOML decoy', () => {
+  it('reads the REAL [vars], not one hidden in a multi-line string', () => {
+    const hostile = `
+[define]
+NOTE = """
+[vars]
+UPLOADS_ENABLED = "false"
+V3_UPLOADS_ENABLED = "false"
+V4_UPLOADS_ENABLED = "false"
+"""
+
+[vars]
+UPLOADS_ENABLED = "true"
+V3_UPLOADS_ENABLED = "true"
+V4_UPLOADS_ENABLED = "true"
+`;
+    const { ok, problems } = checkUploadSwitchesOff(hostile, '');
+    expect(ok).toBe(false);
+    expect(problems.join(' ')).toMatch(/UPLOADS_ENABLED is "true"/);
+  });
+
+  it('refuses a duplicated [vars] rather than picking the convenient one', () => {
+    const hostile = `
+[vars]
+UPLOADS_ENABLED = "false"
+V3_UPLOADS_ENABLED = "false"
+V4_UPLOADS_ENABLED = "false"
+
+[vars]
+UPLOADS_ENABLED = "true"
+`;
+    expect(checkUploadSwitchesOff(hostile, '').ok).toBe(false);
+  });
+});

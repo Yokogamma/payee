@@ -261,9 +261,11 @@ if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
       process.exit(0);
     }
     last = problems;
-    // A verdict about the CONTENT will not change on retry; only transport
-    // failures are worth another attempt.
-    break;
+    // A FRESHNESS failure is the one content verdict worth retrying — a new
+    // nonce is precisely the remedy for a stale answer. Every other verdict is
+    // about the release itself and will not change.
+    const stale = problems.some(p => p.includes('nonce'));
+    if (!stale || attempt === ATTEMPTS) break;
   }
 
   console.error(`✗ smoke-gateways FAILED for ${origin} (profile "${profile}"):`);

@@ -28,8 +28,10 @@ on:
         description: 'Full 40-char commit SHA of the worker release this client ships against'
         required: true
         type: string
-      worker_version_id:
-        description: 'Worker version id reported by that deploy run (from its smoke step)'
+      # The RUN, not the id. The id itself is fetched from that run's artifact,
+      # so it cannot be typed in to match whatever is currently answering.
+      worker_run_id:
+        description: 'Run id of the successful "Deploy Worker (proxy) — dev" that released this worker'
         required: true
         type: string
 
@@ -145,11 +147,37 @@ jobs:
       #   * that candidate must be an ancestor of (or equal to) the floor
       #     recorded in WORKER_FLOOR_SHA, which catches «forgot to raise the
       #     floor» before the client goes out rather than after.
+      # ── Take the release identity from the WORKER RUN, not from the form ──
+      - name: Fetch the release identity from the worker run
+        id: identity
+        run: |
+          CONCLUSION=$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)
+          WORKFLOW=$(gh run view "$RUN_ID" --json workflowName --jq .workflowName)
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "worker run $RUN_ID did not succeed (conclusion: $CONCLUSION)" >&2
+            exit 1
+          fi
+          case "$WORKFLOW" in
+            "Deploy Worker (proxy) — dev") ;;
+            *) echo "run $RUN_ID belongs to \"$WORKFLOW\", not the worker deploy" >&2; exit 1 ;;
+          esac
+          gh run download "$RUN_ID" -n release-identity -D identity
+          SHA=$(sed -n '1p' identity/release-identity.txt)
+          VERSION=$(sed -n '2p' identity/release-identity.txt)
+          if [ "$SHA" != "$CANDIDATE" ]; then
+            echo "that run released $SHA, not the requested $CANDIDATE" >&2
+            exit 1
+          fi
+          echo "version_id=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.worker_run_id }}
+          CANDIDATE: ${{ inputs.worker_candidate }}
       - name: Verify the live worker is the gated release
         run: node worker/scripts/smoke-gateways.mjs --profile=normal
         env:
           EXPECT_RELEASE_SHA: ${{ inputs.worker_candidate }}
-          EXPECT_WORKER_VERSION_ID: ${{ inputs.worker_version_id }}
+          EXPECT_WORKER_VERSION_ID: ${{ steps.identity.outputs.version_id }}
       # EQUALITY, not ancestry.
       #
       # "candidate is a descendant of the floor" is satisfied by the OLD floor

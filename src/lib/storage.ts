@@ -850,6 +850,16 @@ export const V3_PAUSE_META_KEY = 'v3-uploads-paused';
 /** Independent marker for the SAFEBOX kill switch: pausing one version must
  *  never stop the other, so the two never share a key or a lift condition. */
 export const V4_PAUSE_META_KEY = 'v4-uploads-paused';
+/**
+ * The GLOBAL kill switch marker — its OWN key, not the two version ones.
+ *
+ * Writing v3+v4 instead would still leave v1/v2 uploading: the queue only
+ * consults a version marker for v3/safebox items, so a global 503 would stop
+ * part of the backlog and let the rest keep spending the per-IP budget against
+ * a worker that refuses everything. The global pause is a different STATE, so
+ * it gets a different key and its own gate before every dispatch.
+ */
+export const GLOBAL_PAUSE_META_KEY = 'uploads-paused';
 
 export interface V3PauseMeta {
   pausedAt: number;
@@ -875,6 +885,9 @@ export function readV3PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
 }
 export function readV4PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
   return readPauseMeta(V4_PAUSE_META_KEY);
+}
+export function readGlobalPauseMeta(): Promise<PauseMeta | 'malformed' | null> {
+  return readPauseMeta(GLOBAL_PAUSE_META_KEY);
 }
 
 /**
@@ -951,7 +964,7 @@ export function commitGlobalPausedFailure(
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure([V3_PAUSE_META_KEY, V4_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
+  return commitPausedFailure([GLOBAL_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
 }
 
 /**
@@ -994,6 +1007,9 @@ async function clearUploadsPaused(
 
 export function clearV3UploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
   return clearUploadsPaused(V3_PAUSE_META_KEY, expectedPausedAt);
+}
+export function clearGlobalUploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
+  return clearUploadsPaused(GLOBAL_PAUSE_META_KEY, expectedPausedAt);
 }
 export function clearV4UploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
   return clearUploadsPaused(V4_PAUSE_META_KEY, expectedPausedAt);

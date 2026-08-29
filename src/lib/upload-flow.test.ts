@@ -118,7 +118,7 @@ function makeHarness(opts?: {
     },
     // The GLOBAL switch pauses every version in ONE transaction.
     commitGlobalPausedFailure: async (_noteId, build, pausedAt) => {
-      pauseCommit(build, pausedAt, ['v3', 'v4']);
+      pauseCommit(build, pausedAt, ['global']);
     },
     signPayload: async () => {
       if (opts?.lockDuringSign) epoch.value++;
@@ -383,12 +383,14 @@ describe('runUploadAttempt — uploads_disabled (GLOBAL kill switch)', () => {
   // Pausing only this item's version would leave the queue marching through the
   // rest of the backlog against a worker that answers 503 to all of it — the
   // incident lever would look like it did nothing.
-  it("pauses EVERY version in one commit, not just the item own version", async () => {
+  it('writes the dedicated GLOBAL marker, not the two version ones', async () => {
     const h = makeHarness({ result: GLOBAL_DISABLED });
     const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
     expect(outcome.kind).toBe('committed');
     expect(h.pausedCommits).toHaveLength(1);
-    expect(h.pausedCommits[0].markers).toEqual(['v3', 'v4']);
+    // A dedicated key, because the queue consults the version markers only for
+    // v3/safebox — writing those would have left v1/v2 uploading.
+    expect(h.pausedCommits[0].markers).toEqual(['global']);
     expect(h.pausedCommits[0].pausedAt).toBe(NOW);
     expect(h.pausedCommits[0].record.status).toBe('error');
     expect(h.pausedCommits[0].record.lastError).toContain('uploads_disabled');
