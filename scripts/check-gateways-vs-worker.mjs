@@ -25,7 +25,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseOriginList } from './gateways-parse.mjs';
 import { readTomlString } from './toml-scan.mjs';
-import { EXPECTED_STATUS_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -50,6 +50,10 @@ export function readTomlVar(toml, blockPrefix, key) {
 
 export function readWorkerStatusGateways(toml, blockPrefix = '') {
   return readTomlVar(toml, blockPrefix, 'STATUS_GATEWAYS');
+}
+
+export function readWorkerPayloadGateways(toml, blockPrefix = '') {
+  return readTomlVar(toml, blockPrefix, 'PAYLOAD_GATEWAYS');
 }
 
 /**
@@ -132,6 +136,33 @@ export function checkGateways(clientCsv, toml, { repoOnly = false } = {}) {
     }
   }
 
+  // ── The PAYLOAD pool (D2/D9) ──
+  //
+  // A separate pin from the status pool, and compared with its ORDER: the pool
+  // is tried in sequence, and the sequence is the approved one (§2.1). Order is
+  // meaningless for status probes — they run in parallel — which is why the
+  // comparison above is set-only and this one is not.
+  //
+  // Checked per BLOCK, like everything else here: a named environment inherits
+  // nothing, so a correct production table says nothing about staging.
+  const pinnedPayload = parseOriginList(EXPECTED_PAYLOAD_CSV);
+  for (const [label, prefix] of [['production', ''], ['staging', 'env.staging.']]) {
+    const read = readWorkerPayloadGateways(toml, prefix);
+    if (read.error) { problems.push(`${label}: ${read.error}`); continue; }
+    const worker = parseOriginList(read.value);
+    if (worker.length === 0) {
+      problems.push(`${label}: PAYLOAD_GATEWAYS is empty or fully unparseable`);
+      continue;
+    }
+    if (worker.join(',') !== pinnedPayload.join(',')) {
+      problems.push(
+        `${label}: worker PAYLOAD_GATEWAYS does not match the repo-pinned list in order ` +
+          `(${EXPECTED_PAYLOAD_CSV}). The order is part of the pin: the pool is tried in ` +
+          'sequence, and a reordered list silently changes which gateway is asked first.',
+      );
+    }
+  }
+
   return { ok: problems.length === 0, problems };
 }
 
@@ -155,7 +186,8 @@ if (process.argv[1]?.endsWith('check-gateways-vs-worker.mjs')) {
     process.exit(1);
   }
   console.log(
-    `✓ gateway config gate: client and worker agree on the pinned status pool` +
+    `✓ gateway config gate: client and worker agree on the pinned status pool, ` +
+      `and the worker's payload pool matches the pin in order` +
       `${repoOnly ? ' (repo-only mode)' : ''}`,
   );
 }

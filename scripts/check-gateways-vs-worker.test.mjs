@@ -1,13 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import { checkGateways, readWorkerStatusGateways } from './check-gateways-vs-worker.mjs';
-import { EXPECTED_STATUS_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
 
-const toml = (prod = EXPECTED_STATUS_CSV, staging = EXPECTED_STATUS_CSV) => `
+const toml = (
+  prod = EXPECTED_STATUS_CSV,
+  staging = EXPECTED_STATUS_CSV,
+  { payloadProd = EXPECTED_PAYLOAD_CSV, payloadStaging = EXPECTED_PAYLOAD_CSV } = {},
+) => `
 name = "eternal-notes-proxy"
 
 [vars]
 ALLOWED_ORIGINS = "https://notes.example"
 STATUS_GATEWAYS = "${prod}"
+PAYLOAD_GATEWAYS = "${payloadProd}"
 UPLOADS_ENABLED = "true"
 
 [[analytics_engine_datasets]]
@@ -19,6 +24,7 @@ name = "eternal-notes-proxy-staging"
 [env.staging.vars]
 ALLOWED_ORIGINS = "http://localhost:5173"
 STATUS_GATEWAYS = "${staging}"
+PAYLOAD_GATEWAYS = "${payloadStaging}"
 UPLOADS_ENABLED = "true"
 `;
 
@@ -79,5 +85,49 @@ describe('checkGateways — client and worker must mean the same pool', () => {
     expect(checkGateways(undefined, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [] });
     const drift = checkGateways(undefined, toml('https://arweave.net,https://b.example'), { repoOnly: true });
     expect(drift.ok).toBe(false);
+  });
+});
+
+describe('the PAYLOAD pool (D2/D9) — pinned WITH its order', () => {
+  const pinned = EXPECTED_PAYLOAD_CSV;
+  const reordered = pinned.split(',').reverse().join(',');
+
+  it('passes when both blocks match the pin exactly', () => {
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml()).ok).toBe(true);
+  });
+
+  it('refuses a REORDERED list — the order is part of the pin', () => {
+    // The pool is tried in sequence, so reordering silently changes which
+    // gateway is asked first. Contrast the status pool above, where probes run
+    // in parallel and only the SET is compared.
+    const verdict = checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { payloadProd: reordered }));
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/production: worker PAYLOAD_GATEWAYS does not match/);
+  });
+
+  it('refuses a STAGING drift even when production is right', () => {
+    const verdict = checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { payloadStaging: reordered }));
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/staging: worker PAYLOAD_GATEWAYS does not match/);
+    expect(verdict.problems.join('; ')).not.toMatch(/production: worker PAYLOAD_GATEWAYS/);
+  });
+
+  it('refuses an empty list', () => {
+    const verdict = checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { payloadProd: '' }));
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/production: PAYLOAD_GATEWAYS is empty/);
+  });
+
+  it('refuses an undeclared key rather than treating it as unconstrained', () => {
+    const withoutPayload = toml().replace(/^PAYLOAD_GATEWAYS = .*$/m, '');
+    const verdict = checkGateways(EXPECTED_STATUS_CSV, withoutPayload);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/missing PAYLOAD_GATEWAYS/);
+  });
+
+  it('a trailing slash is not a difference — comparison is on canonized origins', () => {
+    const slashed = pinned.split(',').map(o => `${o}/`).join(',');
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { payloadProd: slashed, payloadStaging: slashed })).ok)
+      .toBe(true);
   });
 });

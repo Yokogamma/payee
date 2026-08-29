@@ -282,7 +282,10 @@ async function verifySignature(
     return false; // unusable modulus — not our problem to repair
   }
   const signature = b64urlToBytes(signatureB64url);
-  const modulusLength = (key.algorithm as RsaHashedKeyAlgorithm).modulusLength;
+  // Structural, not `RsaHashedKeyAlgorithm`: this module is compiled by the
+  // WORKER too (D2/D9 runs server-side), and workers-types carries no such
+  // name. The shape is what matters, and it is identical at runtime.
+  const modulusLength = (key.algorithm as unknown as { modulusLength: number }).modulusLength;
   // Derived from the KEY, not from the signature length: the formula is the
   // PKCS#1 v2.1 maximum, exactly as arweave-js computes it.
   const maxSalt = Math.ceil((modulusLength - 1) / 8) - 32 - 2;

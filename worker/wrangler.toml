@@ -89,6 +89,21 @@ TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# ── Payload gateways (D2/D9) ──
+# Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
+# tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
+# first, the slower community mirrors after).
+#
+# Used ONLY to authenticate an existing publication before binding its txId to a
+# payload fingerprint: the worker fetches /tx/<id> and /raw/<id> and runs D9 over
+# them. Lying is not a threat model here — the protocol is cryptographic, so a
+# wrong answer costs a retry against the next origin, never a wrong verdict.
+#
+# permagate.io is deliberately ABSENT while it is a STATUS origin: its cold /raw
+# timed out past 25 s in the acceptance probes, and only the HTTP code matters
+# for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
+# the deploy gate compares them.
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
 # ── Metrics (PR-2) ── Telemetry is fail-closed, the request path fail-open:
 # writes happen STRICTLY when METRICS_ENABLED = "true" AND the METRICS binding
 # exists; ANY other value (missing, garbage, no binding) disables writes
@@ -215,6 +230,21 @@ TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# ── Payload gateways (D2/D9) ──
+# Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
+# tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
+# first, the slower community mirrors after).
+#
+# Used ONLY to authenticate an existing publication before binding its txId to a
+# payload fingerprint: the worker fetches /tx/<id> and /raw/<id> and runs D9 over
+# them. Lying is not a threat model here — the protocol is cryptographic, so a
+# wrong answer costs a retry against the next origin, never a wrong verdict.
+#
+# permagate.io is deliberately ABSENT while it is a STATUS origin: its cold /raw
+# timed out past 25 s in the acceptance probes, and only the HTTP code matters
+# for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
+# the deploy gate compares them.
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
 # Metrics (PR-2) — same contract as production vars above; staging writes go
 # to its OWN dataset (explicit different name, M6 r14).
 METRICS_ENABLED = "true"

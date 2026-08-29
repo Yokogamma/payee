@@ -55,6 +55,16 @@ interface Env {
    *  Empty/unset falls back to a lone arweave.net, where `dead` is unreachable
    *  by construction. */
   STATUS_GATEWAYS?: string;
+  /** Bare https origins for D9 publication authentication, comma separated,
+   *  and the ORDER IS NORMATIVE — the pool is tried in sequence. Separate from
+   *  STATUS_GATEWAYS because the two answer different questions: status needs
+   *  only an HTTP code (so a slow-but-correct origin is fine), while this pool
+   *  serves `/tx/<id>` and `/raw/<id>` on the path that decides whether a txId
+   *  may be bound to a payload. MUST equal the client's VITE_PAYLOAD_GATEWAYS;
+   *  the deploy gate compares them in order. Empty/unset falls back to a lone
+   *  arweave.net, which still verifies — D9 is cryptographic, so a single
+   *  origin costs redundancy, never correctness. */
+  PAYLOAD_GATEWAYS?: string;
   /** Full 40-char commit SHA this build was deployed from, injected by the
    *  trusted deploy workflow from its verified `candidate` input — NEVER from
    *  `github.sha`, which is the SHA of the workflow's own trusted head. */
@@ -1374,6 +1384,13 @@ const QUORUM_METRIC_HOST = '_quorum';
  *  and deduplicated with the SAME parser the client compiles in. */
 function statusOrigins(env: Env): string[] {
   const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
+  return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
+}
+
+/** Configured payload origins for D9, in the pinned ORDER (unlike the status
+ *  pool, whose probes run in parallel and whose order carries no meaning). */
+export function payloadOrigins(env: Env): string[] {
+  const parsed = parseOriginList(env.PAYLOAD_GATEWAYS ?? '');
   return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
 }
 
