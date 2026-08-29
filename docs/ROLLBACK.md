@@ -360,7 +360,8 @@ flip is a **raise** rather than a first filling:
 
 | When | `WORKER_FLOOR_SHA` | Why |
 |---|---|---|
-| now, before this workflow is used again | `931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`) | the v4-acceptor; below it safebox uploads 400 |
+| ~~2026-08-28 → 2026-08-29~~ | ~~`931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)~~ | superseded by the row below |
+| **in effect since 2026-08-29** | **`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1`** (PR-3a) | below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation. `MINIMUM_FLOOR` was raised to the same SHA, so the variable can no longer be edited back down |
 | before the import flip (D2a) | the semantic-idempotency worker's SHA | the client stops accepting a `txId` without the capability marker |
 
 **What only the operator can do** (no PR can, and none should pretend to):
@@ -1721,9 +1722,29 @@ Raise `WORKER_FLOOR_SHA` to it FIRST: once the repo pin lands, every deploy is
 refused until the Environment variable matches, which is safe but stops the
 release mid-way.
 
+| Client release | Pages run 33245668734, green end to end |
+| Floor raise | `WORKER_FLOOR_SHA` → `ff0954d` at 2026-08-29T09:27:16Z; `MINIMUM_FLOOR` → same SHA in `83a19aa` |
+
+Verified on the live client after publishing: `connect-src` carries `'self'`,
+all six approved gateway origins and the proxy, and `smoke-csp-origins.mjs`
+passes against `https://notes.matamata.dev/`. The Pages run additionally
+re-checked the live worker's identity and BOTH floors immediately before
+publishing, so client and worker cannot disagree about what `dead` means.
+
 An earlier attempt on `73c5916` deployed correctly and failed its own smoke on
 Cloudflare's propagation race — the worker was right, the detector was early.
 The fix is in the smoke, not in the worker; see the propagation note above.
+
+**Still open after this release** (neither is blocking, both are honest gaps):
+
+- **Manual acceptance on the dev contour** — restoring a real note, watching
+  `/tx/<id>` and `/raw/<id>` go to pool gateways in DevTools, and confirming
+  CSP blocks nothing. Automated gates cover the shapes, not the lived path;
+  this needs a vault and a human.
+- **A release tag** is NOT authoritative any more: since PR-3a a tag no longer
+  makes a commit deployable (the gate takes the trusted head or
+  `scripts/release-allowlist.mjs`). Tag `ff0954d` for readability if you like,
+  but nothing depends on it.
 
 ### Local deploys
 
@@ -1738,8 +1759,11 @@ the attestation worth anything. Staging keeps `npm run deploy:staging`.
   even though no duplicate payment becomes possible (recovery stays
   server-authoritative). Treat this release as the client floor: below it, roll
   back only with uploads disabled.
-- **Worker**: `worker-g1` — the SHA recorded in `WORKER_FLOOR_SHA` and
-  `MINIMUM_FLOOR` — is an **absolute floor**. `wrangler rollback` and a
+- **Worker**: `ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` — the SHA recorded in
+  BOTH `WORKER_FLOOR_SHA` and `MINIMUM_FLOOR` — is an **absolute floor**. It is
+  named by SHA and not by a tag on purpose: since this release a tag no longer
+  makes a commit deployable, so naming a floor after one would point at the
+  wrong kind of thing. `wrangler rollback` and a
   redeploy of anything below it are forbidden unconditionally, not «while
   uploads are on»: a Cloudflare version carries its own bindings and vars, so
   rolling back restores the old `UPLOADS_ENABLED` along with the old code.
