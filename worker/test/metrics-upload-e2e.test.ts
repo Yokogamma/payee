@@ -2,7 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
-import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
+import { setupOutboundMock, b64, sha256, statusUrlRe } from './helpers/outbound-mock';
 
 // PR-2 e2e: metric emission through the REAL /upload route (direct dispatch —
 // env overrides inject a capturing METRICS dataset). Spec: §4.PR-2, §R4.
@@ -17,7 +17,7 @@ const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }
 type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
 
-const { mockRoute } = setupOutboundMock();
+const { mockRoute, mockStatusOnAll } = setupOutboundMock();
 
 const C = 'AAAA';
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes
@@ -327,7 +327,7 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
     });
 
     const cap = capture();
-    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${deadTxId}/status$`), 404, 'not found');
+    mockStatusOnAll(deadTxId, 404, 'not found');
     mockPaidLegs('0');
 
     const { request } = await uploadRequest(id, noteId, { recheck: true });
@@ -339,7 +339,9 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
 
     expect(cap.byEvent('redrop_new_tx')).toHaveLength(1);
     expect(cap.byEvent('post_accepted')).toHaveLength(1);
-    expect(cap.byEvent('status_verdict').map(p => p.blobs?.[1])).toEqual(['dead']);
+    // One row per configured host plus the aggregated _quorum row.
+    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.blobs?.[2]]))
+      .toEqual([['dead', 'arweave.net'], ['dead', 'g2.test'], ['dead', '_quorum']]);
     expect(cap.byEvent('upload_outcome').map(p => p.blobs?.[1])).toEqual(['accepted']);
   });
 
@@ -360,7 +362,7 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
     ));
 
     const cap = capture();
-    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${deadTxId}/status$`), 404, 'not found');
+    mockStatusOnAll(deadTxId, 404, 'not found');
     mockPaidLegs('0');
 
     // The DO has NO record (that is the triple-failure): the fresh reservation
@@ -377,12 +379,21 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
 
     expect(cap.byEvent('redrop_new_tx')).toHaveLength(1);
     expect(cap.byEvent('post_accepted')).toHaveLength(1);
-    expect(cap.byEvent('status_verdict').map(p => p.blobs?.[1])).toEqual(['dead']);
+    // One row per configured host plus the aggregated _quorum row.
+    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.blobs?.[2]]))
+      .toEqual([['dead', 'arweave.net'], ['dead', 'g2.test'], ['dead', '_quorum']]);
     expect(cap.byEvent('upload_outcome').map(p => p.blobs?.[1])).toEqual(['accepted']);
   });
 });
 
-describe('status leg: gateway_call(status) + status_verdict, body is BEST-EFFORT', () => {
+describe('status leg: per-host metrics + the _quorum row (PR-3a)', () => {
+  // PR-3a probes EVERY configured origin, so the status leg now emits one
+  // gateway_call and one status_verdict per host, plus ONE aggregated row under
+  // the sentinel host `_quorum`. The blob schema is unchanged — only the number
+  // of rows and the host values are.
+  //
+  // The `host` label deliberately stays a BARE hostname ('arweave.net'), not
+  // the canonical origin: switching it would split the historical series in two.
   async function seedCommitted(pkB64: string, noteId: string) {
     const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(pkB64));
     await runInDurableObject(stub, async (_i, state) => {
@@ -392,27 +403,53 @@ describe('status leg: gateway_call(status) + status_verdict, body is BEST-EFFORT
     });
     return `TX-${noteId.slice(0, 8)}`;
   }
+  const HOSTS = ['arweave.net', 'g2.test'];
 
-  it('valid 200 body → verdict alive, number_of_confirmations lands in the metric', async () => {
+  it('valid 200 from every host → alive per host AND on the quorum row', async () => {
     const id = await makeIdentity();
     const noteId = crypto.randomUUID();
     const txId = await seedCommitted(id.pkB64, noteId);
     const cap = capture();
-    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${txId}/status$`), 200,
+    mockStatusOnAll(txId, 200,
       JSON.stringify({ block_height: 1500000, block_indep_hash: 'H', number_of_confirmations: 120 }));
 
     const { request } = await uploadRequest(id, noteId, { recheck: true });
     const r = await worker.fetch(request, metricsEnv(cap.dataset));
     expect(r.status).toBe(200); // alive → committed answer unchanged
-    expect(cap.byEvent('gateway_call').map(p => [p.blobs?.[1], p.blobs?.[3]]))
-      .toEqual([['status', '2xx']]);
-    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.doubles?.[0]]))
-      .toEqual([['alive', 120]]);
+
+    expect(cap.byEvent('gateway_call').map(p => [p.blobs?.[1], p.blobs?.[2], p.blobs?.[3]]))
+      .toEqual(HOSTS.map(h => ['status', h, '2xx']));
+    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.blobs?.[2], p.doubles?.[0]]))
+      .toEqual([
+        ...HOSTS.map(h => ['alive', h, 120]),
+        ['alive', '_quorum', 120],
+      ]);
     // Privacy: the txId never reaches the datapoints.
     expect(JSON.stringify(cap.points)).not.toContain(txId);
   });
 
-  it('malformed / oversized / non-integer bodies → −1, verdict UNCHANGED', async () => {
+  it('disagreeing 200s put the LOWEST confirmation count on the quorum row', async () => {
+    const id = await makeIdentity();
+    const noteId = crypto.randomUUID();
+    const txId = await seedCommitted(id.pkB64, noteId);
+    const cap = capture();
+    mockRoute('GET', statusUrlRe('https://arweave.net', txId), 200,
+      JSON.stringify({ block_height: 1500000, number_of_confirmations: 120 }));
+    mockRoute('GET', statusUrlRe('https://g2.test', txId), 200,
+      JSON.stringify({ block_height: 1499000, number_of_confirmations: 7 }));
+
+    const { request } = await uploadRequest(id, noteId, { recheck: true });
+    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    expect(r.status).toBe(200);
+    const quorum = cap.byEvent('status_verdict').filter(p => p.blobs?.[2] === '_quorum');
+    expect(quorum.map(p => [p.blobs?.[1], p.doubles?.[0]])).toEqual([['alive', 7]]);
+  });
+
+  // CHANGED CONTRACT (PR-3a): a 200 whose body fails the schema is no longer
+  // "alive with −1". It is a PROTOCOL defect — classified invalid_response, not
+  // alive, and for the quorum it is a non-404 outcome. The recheck therefore
+  // answers 503 (status unknown) instead of confirming on a body it could not read.
+  it('malformed / oversized / non-integer bodies → invalid_response, NOT alive', async () => {
     const id = await makeIdentity();
     const bodies = [
       'garbage not json',
@@ -425,21 +462,26 @@ describe('status leg: gateway_call(status) + status_verdict, body is BEST-EFFORT
       const noteId = crypto.randomUUID();
       const txId = await seedCommitted(id.pkB64, noteId);
       const cap = capture();
-      mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${txId}/status$`), 200, body);
+      mockStatusOnAll(txId, 200, body);
       const { request } = await uploadRequest(id, noteId, { recheck: true });
       const r = await worker.fetch(request, metricsEnv(cap.dataset));
-      expect(r.status).toBe(200); // alive by HTTP code — the body cannot demote it
-      expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.doubles?.[0]]))
-        .toEqual([['alive', -1]]);
+      expect(r.status).toBe(503); // status unknown — never confirmed on an unreadable body
+      expect(cap.byEvent('gateway_call').map(p => p.blobs?.[3]))
+        .toEqual(HOSTS.map(() => 'invalid_response'));
+      expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.blobs?.[2]]))
+        .toEqual([
+          ...HOSTS.map(h => ['unavailable', h]),
+          ['unavailable', '_quorum'],
+        ]);
     }
   });
 
-  it('TRUNCATED body stream (connection reset mid-read) → −1, verdict alive stands', async () => {
+  it('TRUNCATED body stream (connection reset mid-read) → invalid_response', async () => {
     const id = await makeIdentity();
     const noteId = crypto.randomUUID();
     const txId = await seedCommitted(id.pkB64, noteId);
     const cap = capture();
-    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${txId}/status$`), 200, '', 1, {
+    mockStatusOnAll(txId, 200, '', {
       makeBody: () => new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode('{"number_of_confirmations":'));
@@ -450,26 +492,59 @@ describe('status leg: gateway_call(status) + status_verdict, body is BEST-EFFORT
 
     const { request } = await uploadRequest(id, noteId, { recheck: true });
     const r = await worker.fetch(request, metricsEnv(cap.dataset));
-    expect(r.status).toBe(200); // alive by HTTP code — the broken body cannot demote it
-    expect(cap.byEvent('gateway_call').map(p => [p.blobs?.[1], p.blobs?.[3]]))
-      .toEqual([['status', '2xx']]);
-    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.doubles?.[0]]))
-      .toEqual([['alive', -1]]);
+    expect(r.status).toBe(503);
+    expect(cap.byEvent('gateway_call').map(p => p.blobs?.[3]))
+      .toEqual(HOSTS.map(() => 'invalid_response'));
   });
 
-  it('404 → verdict dead with −1 (fresh commit defers the redrop)', async () => {
+  it('404 from EVERY host → dead per host and on the quorum row', async () => {
     const id = await makeIdentity();
     const noteId = crypto.randomUUID();
     const txId = await seedCommitted(id.pkB64, noteId); // committedAt is fresh
     const cap = capture();
-    mockRoute('GET', new RegExp(`^https://arweave\\.net/tx/${txId}/status$`), 404, 'not found');
+    mockStatusOnAll(txId, 404, 'not found');
 
     const { request } = await uploadRequest(id, noteId, { recheck: true });
     const r = await worker.fetch(request, metricsEnv(cap.dataset));
-    expect(r.status).toBe(503); // deferred by the 30-min age guard — unchanged
-    expect(cap.byEvent('gateway_call').map(p => [p.blobs?.[1], p.blobs?.[3]]))
-      .toEqual([['status', '404']]);
-    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.doubles?.[0]]))
-      .toEqual([['dead', -1]]);
+    // dead, but the commit is fresh → the age guard defers the redrop (503).
+    expect(r.status).toBe(503);
+    expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.blobs?.[2], p.doubles?.[0]]))
+      .toEqual([
+        ...HOSTS.map(h => ['dead', h, -1]),
+        ['dead', '_quorum', -1],
+      ]);
+  });
+
+  // The normative example of the formula, at the Worker end: agreeing 404s are
+  // not a quorum while another origin is silent — and a false dead is what
+  // authorizes a paid re-post.
+  it('404 + network failure → unavailable on the quorum row, NOT dead', async () => {
+    const id = await makeIdentity();
+    const noteId = crypto.randomUUID();
+    const txId = await seedCommitted(id.pkB64, noteId);
+    const cap = capture();
+    mockRoute('GET', statusUrlRe('https://arweave.net', txId), 404, 'not found');
+    // g2.test is left unmocked: the harness throws on an unmocked request,
+    // which is exactly the network failure this case is about.
+    const { request } = await uploadRequest(id, noteId, { recheck: true });
+    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    expect(r.status).toBe(503);
+    const quorum = cap.byEvent('status_verdict').filter(p => p.blobs?.[2] === '_quorum');
+    expect(quorum.map(p => p.blobs?.[1])).toEqual(['unavailable']);
+  });
+
+  // 400 used to be classified dead outright; under the quorum it is an ordinary
+  // non-404 outcome and can only ever BLOCK dead.
+  it('400 can never produce dead', async () => {
+    const id = await makeIdentity();
+    const noteId = crypto.randomUUID();
+    const txId = await seedCommitted(id.pkB64, noteId);
+    const cap = capture();
+    mockStatusOnAll(txId, 400, 'bad request');
+    const { request } = await uploadRequest(id, noteId, { recheck: true });
+    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    expect(r.status).toBe(503);
+    const quorum = cap.byEvent('status_verdict').filter(p => p.blobs?.[2] === '_quorum');
+    expect(quorum.map(p => p.blobs?.[1])).toEqual(['unavailable']);
   });
 });

@@ -2,7 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
-import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
+import { setupOutboundMock, b64, sha256, STATUS_ORIGINS, statusUrlRe } from './helpers/outbound-mock';
 
 // Residual reviewer gaps:
 // 1) invalid env config must 503 through the real /upload route (fail closed);
@@ -22,7 +22,7 @@ const baseEnv = env as unknown as WorkerEnv;
 
 // Outbound Arweave HTTP mock — shared harness, see helpers/outbound-mock.ts
 // (single-use routes; unconsumed or duplicate paid requests fail the test).
-const { mockRoute } = setupOutboundMock();
+const { mockRoute, mockStatusOnAll } = setupOutboundMock();
 
 const NOTE_ID = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
 const C = 'AAAA';
@@ -192,7 +192,11 @@ describe('e2e: lost commit → posted anchor → TTL → redrop → successful r
     // arweave-js builds explicit host:443 URLs → the port is optional here.
     // All routes are single-use; postTx.calls is asserted below — the whole
     // point of this test is that the recovery performs EXACTLY ONE paid POST.
-    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx\/TX-DEAD\/status$/, 404, 'not found');
+    // `dead` needs EVERY configured origin to answer 404: mocking one would
+    // describe a partial set, which can only ever be `unavailable`.
+    for (const origin of STATUS_ORIGINS) {
+      mockRoute('GET', statusUrlRe(origin, 'TX-DEAD'), 404, 'not found');
+    }
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
     const postTx = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
