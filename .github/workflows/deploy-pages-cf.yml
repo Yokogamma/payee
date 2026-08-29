@@ -19,6 +19,21 @@ name: Deploy to Cloudflare Pages — dev
 #   CLOUDFLARE_ACCOUNT_ID; secret CLOUDFLARE_API_TOKEN.
 on:
   workflow_dispatch:
+    inputs:
+      # The client is only allowed out on top of a worker release that was
+      # actually gated and smoked. A static config check cannot show that the
+      # safe worker is LIVE right now, so the identity of that release is an
+      # input and is verified against the live /health just before publishing.
+      worker_candidate:
+        description: 'Full 40-char commit SHA of the worker release this client ships against'
+        required: true
+        type: string
+      # The RUN, not the id. The id itself is fetched from that run's artifact,
+      # so it cannot be typed in to match whatever is currently answering.
+      worker_run_id:
+        description: 'Run id of the successful "Deploy Worker (proxy) — dev" that released this worker'
+        required: true
+        type: string
 
 # Least privilege for GITHUB_TOKEN (repo defaults may be write-all); the
 # Cloudflare deploy uses its own scoped API token, not this one.
@@ -31,8 +46,13 @@ permissions:
 # GitHub keeps only ONE pending run per group and promises nothing about the
 # order queued runs start in. Do not dispatch the next deploy until the
 # previous run has finished.
+# ONE group shared with "Deploy Worker (proxy) — dev". Two deploy runs must not
+# overlap: a worker activated between this run's live check and its publish
+# would leave the client pointing at something nobody gated. Serialization is
+# not ordering — the operator still waits for a run to finish before the next
+# (the same rule the worker workflow states) — but it closes the overlap.
 concurrency:
-  group: deploy-pages
+  group: release-dev
   cancel-in-progress: false
 
 jobs:
@@ -43,6 +63,10 @@ jobs:
     steps:
       # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The floor check below is ancestry, and ancestry cannot be computed
+          # from a shallow clone.
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
@@ -57,6 +81,16 @@ jobs:
           VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}
           VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+          VITE_PAYLOAD_GATEWAYS: ${{ vars.VITE_PAYLOAD_GATEWAYS }}
+          VITE_INDEX_SOURCES: ${{ vars.VITE_INDEX_SOURCES }}
+      # The client and the worker must probe the SAME status pool: the dead
+      # formula is one formula for both, and it is unanimity over «every
+      # configured origin». Differently configured halves would disagree about
+      # what `dead` even means — and `dead` is what authorizes spending money.
+      - run: node scripts/check-gateways-vs-worker.mjs
+        env:
+          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
       # Same source-only gate as CI: the forbidden backup-flag pair must not
       # reach a release artifact (D16).
       - run: node scripts/check-backup-flags.mjs
@@ -72,11 +106,17 @@ jobs:
       # operator hits it during the mandatory pre-W3 smoke.
       - run: npm --prefix worker run deploy:staging:check
       # ── Build at ROOT base for Cloudflare Pages ──
+      # The CSP is generated from these same three lists (scripts/postbuild.mjs),
+      # so omitting them here would not merely disable the multi-gateway path —
+      # it would silently ship a build whose `dead` verdict is unreachable.
       - run: npm run build
         env:
           VITE_BASE: "/"
           VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}
           VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
+          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+          VITE_PAYLOAD_GATEWAYS: ${{ vars.VITE_PAYLOAD_GATEWAYS }}
+          VITE_INDEX_SOURCES: ${{ vars.VITE_INDEX_SOURCES }}
           # SW updates are driven by Workbox content-hash revisions — no
           # BUILD_SHA stamping (removed with the vite-plugin-pwa migration).
       # Semantic check: the client we just built must TRUST the worker it is
@@ -100,6 +140,83 @@ jobs:
       # falls back silently, and a per-weight @fontsource import silently drags
       # in every subset. Both are invisible at runtime — hence a build gate.
       - run: node scripts/check-no-inlined-fonts.mjs
+      # ── LIVE floor gate: is the safe worker actually running RIGHT NOW? ──
+      #
+      # Everything above proves the repository and the Environment agree. None
+      # of it proves what is answering in production. This does — immediately
+      # before publishing, so the window in which a worker could change between
+      # the check and the release is as small as the platform allows (the shared
+      # concurrency group closes the rest).
+      #
+      # Two independent anchors:
+      #   * /health must report the release named in `worker_candidate` AND the
+      #     version id that deploy actually activated — a re-deploy of the same
+      #     commit is a DIFFERENT version, and only the id can tell;
+      #   * that candidate must be an ancestor of (or equal to) the floor
+      #     recorded in WORKER_FLOOR_SHA, which catches «forgot to raise the
+      #     floor» before the client goes out rather than after.
+      # ── Take the release identity from the WORKER RUN, not from the form ──
+      - name: Fetch the release identity from the worker run
+        id: identity
+        run: |
+          CONCLUSION=$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)
+          WORKFLOW=$(gh run view "$RUN_ID" --json workflowName --jq .workflowName)
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "worker run $RUN_ID did not succeed (conclusion: $CONCLUSION)" >&2
+            exit 1
+          fi
+          case "$WORKFLOW" in
+            "Deploy Worker (proxy) — dev") ;;
+            *) echo "run $RUN_ID belongs to \"$WORKFLOW\", not the worker deploy" >&2; exit 1 ;;
+          esac
+          gh run download "$RUN_ID" -n release-identity -D identity
+          SHA=$(sed -n '1p' identity/release-identity.txt)
+          VERSION=$(sed -n '2p' identity/release-identity.txt)
+          if [ "$SHA" != "$CANDIDATE" ]; then
+            echo "that run released $SHA, not the requested $CANDIDATE" >&2
+            exit 1
+          fi
+          echo "version_id=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.worker_run_id }}
+          CANDIDATE: ${{ inputs.worker_candidate }}
+      - name: Verify the live worker is the gated release
+        run: node worker/scripts/smoke-gateways.mjs --profile=normal
+        env:
+          EXPECT_RELEASE_SHA: ${{ inputs.worker_candidate }}
+          EXPECT_WORKER_VERSION_ID: ${{ steps.identity.outputs.version_id }}
+      # EQUALITY, not ancestry.
+      #
+      # "candidate is a descendant of the floor" is satisfied by the OLD floor
+      # too, so it cannot catch the one mistake this gate exists for: shipping
+      # the client while WORKER_FLOOR_SHA still points at the previous release.
+      # The floor must BE the release this client goes out on top of.
+      #
+      # Both halves of the two-stage raise are checked: the Environment
+      # variable (stage 2) and the repo-pinned MINIMUM_FLOOR (stage 3, the
+      # separate protected commit) — the Environment value alone can be lowered
+      # back to the old repo pin at any time.
+      - name: Verify the floor was raised to this release
+        run: |
+          if [ -z "$FLOOR" ]; then
+            echo "WORKER_FLOOR_SHA is not set — the floor is configuration, not an absent constraint." >&2
+            exit 1
+          fi
+          if [ "$FLOOR" != "$CANDIDATE" ]; then
+            echo "WORKER_FLOOR_SHA is $FLOOR but this client ships against $CANDIDATE." >&2
+            echo "Raise the Environment floor to the smoked release before publishing." >&2
+            exit 1
+          fi
+          MINIMUM=$(node -e "import('./scripts/check-worker-floor.mjs').then(m => console.log(m.MINIMUM_FLOOR))")
+          if [ "$MINIMUM" != "$CANDIDATE" ]; then
+            echo "MINIMUM_FLOOR is $MINIMUM but this client ships against $CANDIDATE." >&2
+            echo "Land the protected commit raising MINIMUM_FLOOR before publishing." >&2
+            exit 1
+          fi
+        env:
+          FLOOR: ${{ vars.WORKER_FLOOR_SHA }}
+          CANDIDATE: ${{ inputs.worker_candidate }}
       # ── Deploy ──
       # wrangler itself comes from the ROOT lockfile (devDependency): the
       # action prefers the locally installed CLI over downloading one at
@@ -119,3 +236,12 @@ jobs:
       - run: node scripts/smoke-headers.mjs "$DEPLOY_URL"
         env:
           DEPLOY_URL: ${{ steps.deploy.outputs.deployment-url }}
+      # And that connect-src really lists the approved gateways: a policy that
+      # silently lost one would make that gateway unreachable from the browser
+      # while every local check stayed green.
+      - run: node scripts/smoke-csp-origins.mjs "$DEPLOY_URL"
+        env:
+          DEPLOY_URL: ${{ steps.deploy.outputs.deployment-url }}
+          # env does NOT carry over between steps: without this the smoke exits
+          # 2 on usage AFTER the deploy already happened.
+          VITE_PROXY_URL: ${{ vars.VITE_PROXY_URL }}

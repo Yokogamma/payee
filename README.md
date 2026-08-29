@@ -44,8 +44,28 @@ npm test               # workerd-pool (DO/KV) + отдельный direct-про
 ```bash
 VITE_TRUSTED_OWNERS=<arweave-address[,addr2]> \
 VITE_PROXY_URL=https://<proxy-origin> \
+VITE_STATUS_GATEWAYS=https://a,https://b \
+VITE_PAYLOAD_GATEWAYS=https://a,https://b \
+VITE_INDEX_SOURCES='https://a/graphql|https://b/graphql,https://c/graphql' \
 npm run build
 ```
+
+**Шлюзы (PR-3a).** Три списка задают, куда уходят запросы чтения, и из них же
+генерируется `connect-src` в CSP:
+
+- `VITE_STATUS_GATEWAYS` — bare origins через запятую. Опрашиваются
+  параллельно, поэтому порядок не значим. Вердикт `dead` требует единогласия
+  ВСЕХ настроенных и минимум двух настроенных — с одним шлюзом он недостижим
+  по построению, и деплой такой конфигурации гейт отвергает.
+- `VITE_PAYLOAD_GATEWAYS` — bare origins, **порядок значим**: перебор идёт
+  последовательно до первого ответа, прошедшего проверку `txId ↔ bytes`.
+- `VITE_INDEX_SOURCES` — полные URL. Запятая разделяет ЛОГИЧЕСКИЕ источники,
+  вертикальная черта — transport-fallback'и одного и того же индекса
+  (`a|a-fallback,b`); группировка фиксирует, что вторая ссылка не является
+  независимым мнением.
+
+Пустые значения дают одиночный `arweave.net` — годится для локальной сборки,
+но не для деплоя: там требуется утверждённый набор (`scripts/gateway-pins.mjs`).
 
 ## Стек
 

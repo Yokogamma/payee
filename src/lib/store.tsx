@@ -162,10 +162,13 @@ import {
   STALE_UPLOADING_MS,
   commitV3PausedFailure,
   commitV4PausedFailure,
+  commitGlobalPausedFailure,
   readV3PauseMeta,
   readV4PauseMeta,
   clearV3UploadsPaused,
   clearV4UploadsPaused,
+  clearGlobalUploadsPaused,
+  readGlobalPauseMeta,
   getMeta,
   setMeta,
   deleteMeta,
@@ -2263,6 +2266,28 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // know nothing). At most one initial 503 per already-open tab — after
         // that the marker short-circuits here without HTTP. The two versions
         // have INDEPENDENT markers: a v4 pause must not stall notes.
+        // The GLOBAL kill switch stops v1–v4 alike, so it is checked for EVERY
+        // item — not only the gated versions. Without this a global 503 would
+        // pause v3/v4 and let v1/v2 keep spending the per-IP budget against a
+        // worker that refuses all of it.
+        let globalPaused = false;
+        try {
+          globalPaused = (await readGlobalPauseMeta()) !== null;
+        } catch (err) {
+          console.error('global pause marker read failed — treating as paused:', err);
+          globalPaused = true; // fail closed
+        }
+        if (queueGenerationRef.current !== myGen) break;
+        if (globalPaused) {
+          uploadQueueRef.current.shift();
+          queuedIdsRef.current.delete(itemId);
+          // Both indicators go up: the UI has no separate «everything» state,
+          // and the operator lever did stop both versions.
+          setV3Paused(true);
+          setV4Paused(true);
+          continue;
+        }
+
         const gatedVersion = item.kind === 'safebox' ? 4 : (item.record.v === 3 ? 3 : null);
         if (gatedVersion !== null) {
           let paused = false;
@@ -2374,6 +2399,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           commitV4PausedFailure: async (noteId, attemptId, build, pausedAt) => {
             if (getDbGeneration() !== myDbGen) return; // reset won — refuse
             await commitV4PausedFailure(noteId, attemptId, build, pausedAt);
+          },
+          commitGlobalPausedFailure: async (noteId, attemptId, build, pausedAt) => {
+            if (getDbGeneration() !== myDbGen) return; // reset won — refuse
+            await commitGlobalPausedFailure(noteId, attemptId, build, pausedAt);
           },
           signPayload,
           uploadViaProxy,
@@ -2565,8 +2594,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // compare-and-delete on the pausedAt read BEFORE the probe — a stale
       // success can never erase a newer pause. A malformed marker is never
       // auto-lifted (manual retry only).
+      let pauseGlobal: Awaited<ReturnType<typeof readGlobalPauseMeta>> = null;
+      try {
+        pauseGlobal = await readGlobalPauseMeta();
+      } catch { /* leave it paused; a later probe retries */ }
       const liftable = (pause3 !== null && pause3 !== 'malformed')
-        || (pause4 !== null && pause4 !== 'malformed');
+        || (pause4 !== null && pause4 !== 'malformed')
+        || (pauseGlobal !== null && pauseGlobal !== 'malformed');
       if (liftable) {
         const capability = await getWorkerCapabilities();
         let resumed = false;
@@ -2579,6 +2613,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (pause4 !== null && pause4 !== 'malformed' && capability.v4 === 'enabled'
             && await clearV4UploadsPaused(pause4.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
+          setV4Paused(false);
+          resumed = true;
+        }
+        // 'enabled' on ANY version already proves the GLOBAL flag is true — the
+        // capability table requires `uploads === true` before it says enabled —
+        // so no separate probe is needed to lift the global marker.
+        if (pauseGlobal !== null && pauseGlobal !== 'malformed'
+            && (capability.v3 === 'enabled' || capability.v4 === 'enabled')
+            && await clearGlobalUploadsPaused(pauseGlobal.pausedAt)) {
+          if (vaultEpochRef.current !== myEpoch) return;
+          setV3Paused(false);
           setV4Paused(false);
           resumed = true;
         }

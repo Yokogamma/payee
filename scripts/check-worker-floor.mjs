@@ -95,6 +95,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { isAllowedRelease } from './release-allowlist.mjs';
 
 export const SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -110,12 +111,19 @@ export const SHA_RE = /^[0-9a-f]{40}$/;
  *
  * So the floor has a floor, and it is pinned HERE, in a file on the protected
  * default branch where lowering it is a reviewed change. `worker-r3` — the
- * v4-acceptor — is absolute for a reason that has nothing to do with the
+ * v4-acceptor — was absolute for a reason that has nothing to do with the
  * backup track: safebox data exists on chain, and every build below it rejects
  * those uploads (docs/ROLLBACK.md). The same repo-pinned monotonicity D2a
  * requires of the trusted-owner registry, applied to the thing it guards.
+ *
+ * RAISED to the PR-3a release (`ff0954d`, smoked green by run 33243712840).
+ * Below it a lone gateway 404 means `dropped` again — ONE host's opinion
+ * authorizing a PAID re-post — and `/health` carries no attestation, so a
+ * client cannot tell the safe quorum semantics from the old single-host ones.
+ * That is a money-and-integrity boundary, not a feature level, which is why it
+ * belongs here and not in the Environment variable alone.
  */
-export const MINIMUM_FLOOR = '931949150f6145b6c79d36dbadc66b482c1cb6d1';
+export const MINIMUM_FLOOR = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
 
 /**
  * Everything decidable without touching git.
@@ -175,7 +183,13 @@ export function checkFloorInputs({ floor, candidate }) {
  * and defaulting it to «anything» is exactly the mistake this parameter
  * exists to prevent.
  */
-export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFloor = MINIMUM_FLOOR }) {
+export function checkWorkerFloor({
+  floor, candidate, trustedHead, git,
+  minimumFloor = MINIMUM_FLOOR,
+  // Injectable so the test can describe an allowlist without editing the
+  // shipped one — the real default is the file on the protected branch.
+  isAllowed = isAllowedRelease,
+}) {
   const inputs = checkFloorInputs({ floor, candidate });
   if (!inputs.ok) return inputs;
 
@@ -219,14 +233,21 @@ export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFl
     };
   }
 
-  if (inputs.candidate !== head && !git.isTagged(inputs.candidate)) {
+  // An ALLOWLIST, not a tag (PR-3a).
+  //
+  // "any tagged ancestor" reads as a review gate but is not one: unless a tag
+  // ruleset is configured and proven, anyone able to push a tag can make an
+  // arbitrary intermediate commit of a merged PR deployable — and every such
+  // commit is an ancestor of the default branch. The allowlist is a file on the
+  // protected branch, so adding a rollback target is a reviewed change.
+  if (inputs.candidate !== head && !isAllowed(inputs.candidate)) {
     return {
       ok: false,
-      reason: `candidate ${inputs.candidate} is neither the trusted head nor a tagged commit. `
+      reason: `candidate ${inputs.candidate} is neither the trusted head nor an allowlisted release. `
         + 'Every intermediate commit of every merged pull request is an ancestor of the default '
-        + 'branch, and those states were never judged as deployable. Deploy the head, or a '
-        + 'release tag — and if this commit really must ship, tag it first, which the runbook '
-        + 'requires of every deploy anyway.',
+        + 'branch, and those states were never judged as deployable — and a tag is not branch '
+        + 'protection. Deploy the head, or add this SHA to scripts/release-allowlist.mjs in a '
+        + 'reviewed pull request that says why it may ship.',
     };
   }
 
@@ -266,8 +287,9 @@ export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFl
         ok: false,
         reason: `WORKER_FLOOR_SHA ${inputs.floor} is BELOW the minimum pinned in this file `
           + `(${minimumFloor}). Lowering the floor is a reviewed change to the repository, not `
-          + 'an edit to a variable: below that commit the worker rejects every App-Version=4 '
-          + 'upload, and safebox data exists.',
+          + 'an edit to a variable. Below the pin a lone gateway 404 authorizes a PAID '
+          + 're-post again, /health carries no attestation, and every build below worker-r3 '
+          + 'still rejects the App-Version=4 uploads whose safebox data exists on chain.',
       };
     }
   }
@@ -309,9 +331,6 @@ export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFl
  * checkout happens to have — a test that needs `HEAD~3` fails on a shallow CI
  * clone, which is exactly how the first version of this file shipped red.
  */
-/** The shape every entry in the runbook's release allowlist has. */
-export const RELEASE_TAG = /^worker-r\d+$/;
-
 export function gitIn(cwd) {
   const git = args => spawnSync('git', args, { cwd, stdio: 'ignore' });
   return {
@@ -334,12 +353,7 @@ export function gitIn(cwd) {
       // when the commit carries no tag.
       const { status, error, stdout } = spawnSync('git', ['tag', '--points-at', sha], { cwd, encoding: 'utf8' });
       if (error || status !== 0) return false;
-      // A RELEASE tag, not any tag. The runbook's allowlist is «tags in this
-      // list», and every entry in it is `worker-rN`; accepting an arbitrary
-      // name let a personal bookmark — `wip`, `before-refactor`, anything a
-      // person types while debugging — satisfy a gate whose whole purpose is
-      // that only judged states get deployed.
-      return String(stdout).split('\n').some(tag => RELEASE_TAG.test(tag.trim()));
+      return String(stdout).trim() !== '';
     },
   };
 }
