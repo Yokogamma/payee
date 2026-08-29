@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { buildSignedTx, gatewayFetchMock, notesTags, testWallet } from '../test-stubs/signed-tx';
 
 // Фаза 1 инкрементального sweep'а: sentinel-модель известных кандидатов.
 // Известный txId не скачивается, но ОСТАЁТСЯ в упорядоченном списке и занимает
@@ -35,44 +36,79 @@ async function safeboxKeyring() {
   };
 }
 
-/** GraphQL-страница (порядок edges = HEIGHT_DESC) + /raw payload'ы по txId. */
-function stubGateway(
+/**
+ * GraphQL-страница (порядок edges = HEIGHT_DESC) + подписанные payload'ы.
+ *
+ * Под D9 txId больше нельзя выдумать: он вычисляется из подписи. Поэтому
+ * хелпер подписывает транзакции НАСТОЯЩИМ ключом, а тесты продолжают
+ * оперировать своими метками ('TXKNOWN', 'TXFRESH', …) — маппинг в обе
+ * стороны живёт здесь, и семантика sentinel-модели проверяется ровно тем же
+ * набором утверждений, что и до PR-3a.
+ */
+async function stubGateway(
   edges: Array<{ txId: string; version: string; noteId: string }>,
   payloads: Record<string, unknown>,
 ) {
-  const fetchMock = vi.fn(async (url: string) => {
-    if (url.includes('/graphql')) {
-      return new Response(JSON.stringify({ data: { transactions: {
-        edges: edges.map(e => ({ cursor: e.txId, node: { id: e.txId, tags: [
-          { name: 'App-Name', value: 'EternalNotes' },
-          { name: 'App-Version', value: e.version },
-          { name: 'Note-Id', value: e.noteId },
-        ] } })),
-        pageInfo: { hasNextPage: false },
-      } } }), { status: 200 });
-    }
-    const txId = url.split('/raw/')[1];
-    if (!(txId in payloads)) return new Response('not found', { status: 404 });
-    return new Response(JSON.stringify(payloads[txId]), { status: 200 });
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  return fetchMock;
-}
+  const wallet = await testWallet();
+  // Под D9 доверие проверяется по ПОДПИСАВШЕМУ кошельку, а не по метке в env,
+  // поэтому доверенный набор согласуется с тем, чем реально подписаны фикстуры.
+  // Тесты по-прежнему стабят VITE_TRUSTED_OWNERS выше — здесь оно уточняется.
+  vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+  const realById = new Map<string, string>();   // метка → настоящий txId
+  const labelById = new Map<string, string>();  // настоящий txId → метка
+  const txs = [];
 
-/** Какие /raw/<txId> реально запрашивались. */
-function rawCalls(fetchMock: ReturnType<typeof vi.fn>): string[] {
-  return fetchMock.mock.calls
-    .map(c => String(c[0]))
-    .filter(u => u.includes('/raw/'))
-    .map(u => u.split('/raw/')[1]);
+  for (const e of edges) {
+    // Кандидат без payload'а имитирует недоступное тело: заголовок есть,
+    // /raw отвечает 404 — как и в прежнем моке.
+    const body = e.txId in payloads ? JSON.stringify(payloads[e.txId]) : '{}';
+    const tx = await buildSignedTx(
+      body,
+      notesTags({ version: e.version, ownerHash: 'oh', noteId: e.noteId }),
+      wallet,
+    );
+    realById.set(e.txId, tx.txId);
+    labelById.set(tx.txId, e.txId);
+    txs.push(tx);
+  }
+
+  const serve = gatewayFetchMock({
+    txs,
+    pages: [edges.map((e, i) => ({
+      txId: txs[i].txId,
+      cursor: txs[i].txId,
+      tags: [
+        { name: 'App-Name', value: 'EternalNotes' },
+        { name: 'App-Version', value: e.version },
+        { name: 'Note-Id', value: e.noteId },
+      ],
+    }))],
+    onRaw: (_origin, txId) =>
+      labelById.has(txId) && (labelById.get(txId)! in payloads)
+        ? undefined
+        : new Response('not found', { status: 404 }),
+  });
+  const fetchMock = vi.fn(serve);
+  vi.stubGlobal('fetch', fetchMock);
+
+  return {
+    fetchMock,
+    /** Настоящий txId по метке теста. */
+    id: (label: string) => realById.get(label)!,
+    /** Какие /raw запрашивались — В МЕТКАХ, чтобы утверждения не менялись. */
+    rawCalls: () =>
+      fetchMock.mock.calls
+        .map(c => String(c[0]))
+        .filter(u => u.includes('/raw/'))
+        .map(u => labelById.get(u.split('/raw/')[1]) ?? u.split('/raw/')[1]),
+    /** `known`-карта, построенная по меткам. */
+    known: (...entries: Array<[string, { noteId: string; kind: 'note' | 'safebox' }]>) =>
+      new Map(entries.map(([label, rec]) => [realById.get(label) ?? label, rec])),
+  };
 }
 
 const v2wire = (n: { noteId: string; ciphertext: string; iv: string }) =>
   ({ id: n.noteId, c: n.ciphertext, iv: n.iv });
-
-type Known = ReadonlyMap<string, { noteId: string; kind: 'note' | 'safebox' }>;
-const knownOf = (...entries: Array<[string, { noteId: string; kind: 'note' | 'safebox' }]>): Known =>
-  new Map(entries);
 
 describe('инкрементальный sweep: пропуск известных txId (тесты 1–2, 5)', () => {
   it('известный txId: payload не запрашивается, запись не возвращается повторно, incomplete=false', async () => {
@@ -81,17 +117,17 @@ describe('инкрементальный sweep: пропуск известны�
     const { encryptEnvelope } = await import('./crypto');
     const note = await encryptEnvelope(key, 'уже есть локально');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [{ txId: 'TXKNOWN', version: '2', noteId: note.noteId }],
       { TXKNOWN: v2wire(note) },
     );
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes, incomplete } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(['TXKNOWN', { noteId: note.noteId, kind: 'note' }]),
+      known: gw.known(['TXKNOWN', { noteId: note.noteId, kind: 'note' }]),
     });
 
-    expect(rawCalls(fetchMock)).toEqual([]);   // тест 1: ни одного /raw
+    expect(gw.rawCalls()).toEqual([]);   // тест 1: ни одного /raw
     expect(notes).toHaveLength(0);             // sentinel не возвращается как «новая»
     expect(incomplete).toBe(false);            // тест 5: пропуск — не partial
   });
@@ -103,7 +139,7 @@ describe('инкрементальный sweep: пропуск известны�
     const knownNote = await encryptEnvelope(key, 'старая');
     const freshNote = await encryptEnvelope(key, 'новая с другого устройства');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXFRESH', version: '2', noteId: freshNote.noteId },
         { txId: 'TXKNOWN', version: '2', noteId: knownNote.noteId },
@@ -113,13 +149,13 @@ describe('инкрементальный sweep: пропуск известны�
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes, incomplete } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(['TXKNOWN', { noteId: knownNote.noteId, kind: 'note' }]),
+      known: gw.known(['TXKNOWN', { noteId: knownNote.noteId, kind: 'note' }]),
     });
 
-    expect(rawCalls(fetchMock)).toEqual(['TXFRESH']);
+    expect(gw.rawCalls()).toEqual(['TXFRESH']);
     expect(notes).toHaveLength(1);
     expect(notes[0].text).toBe('новая с другого устройства');
-    expect(notes[0].txId).toBe('TXFRESH');
+    expect(notes[0].txId).toBe(gw.id('TXFRESH'));
     expect(incomplete).toBe(false);
   });
 });
@@ -135,7 +171,7 @@ describe('отставшие транзакции не теряются (тес�
     const known2 = await encryptEnvelope(key, 'известная в середине');
     const straggler = await encryptEnvelope(key, 'отставшая — попала в блок позже соседей');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         // HEIGHT_DESC: отставшая — ПОСЛЕДНЯЯ (самый низкий блок).
         { txId: 'TXK1', version: '2', noteId: known1.noteId },
@@ -147,13 +183,13 @@ describe('отставшие транзакции не теряются (тес�
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(
+      known: gw.known(
         ['TXK1', { noteId: known1.noteId, kind: 'note' }],
         ['TXK2', { noteId: known2.noteId, kind: 'note' }],
       ),
     });
 
-    expect(rawCalls(fetchMock)).toEqual(['TXSTRAGGLER']);
+    expect(gw.rawCalls()).toEqual(['TXSTRAGGLER']);
     expect(notes).toHaveLength(1);
     expect(notes[0].text).toBe('отставшая — попала в блок позже соседей');
   });
@@ -168,7 +204,7 @@ describe('прогресс (тест 4)', () => {
     const fresh1 = await encryptEnvelope(key, 'новая 1');
     const fresh2 = await encryptEnvelope(key, 'новая 2');
 
-    stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXF1', version: '2', noteId: fresh1.noteId },
         { txId: 'TXKNOWN', version: '2', noteId: known.noteId },
@@ -180,7 +216,7 @@ describe('прогресс (тест 4)', () => {
     const progress: Array<[number, number]> = [];
     const { fetchAllNotes } = await import('./arweave');
     await fetchAllNotes('oh', ring(key), (d, t) => progress.push([d, t]), {
-      known: knownOf(['TXKNOWN', { noteId: known.noteId, kind: 'note' }]),
+      known: gw.known(['TXKNOWN', { noteId: known.noteId, kind: 'note' }]),
     });
 
     // Все события — со знаменателем 2 (незнакомые), последний done === 2.
@@ -196,7 +232,7 @@ describe('прогресс (тест 4)', () => {
     const a = await encryptEnvelope(key, 'а');
     const b = await encryptEnvelope(key, 'б');
 
-    stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXA', version: '2', noteId: a.noteId },
         { txId: 'TXB', version: '2', noteId: b.noteId },
@@ -207,7 +243,7 @@ describe('прогресс (тест 4)', () => {
     const progress: Array<[number, number]> = [];
     const { fetchAllNotes } = await import('./arweave');
     const { notes, incomplete } = await fetchAllNotes('oh', ring(key), (d, t) => progress.push([d, t]), {
-      known: knownOf(
+      known: gw.known(
         ['TXA', { noteId: a.noteId, kind: 'note' }],
         ['TXB', { noteId: b.noteId, kind: 'note' }],
       ),
@@ -228,7 +264,7 @@ describe('отказы сети (тесты 6–7)', () => {
     const fresh = await encryptEnvelope(key, 'недоступная сейчас');
 
     // /raw для TXFRESH отдаёт 404 (payloads без ключа).
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXFRESH', version: '2', noteId: fresh.noteId },
         { txId: 'TXKNOWN', version: '2', noteId: known.noteId },
@@ -238,12 +274,12 @@ describe('отказы сети (тесты 6–7)', () => {
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes, incomplete } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(['TXKNOWN', { noteId: known.noteId, kind: 'note' }]),
+      known: gw.known(['TXKNOWN', { noteId: known.noteId, kind: 'note' }]),
     });
 
     expect(incomplete).toBe(true);              // реальная запись могла не доехать
     expect(notes).toHaveLength(0);
-    expect(rawCalls(fetchMock)).toEqual(['TXFRESH']);
+    expect(gw.rawCalls()).toEqual(['TXFRESH']);
   });
 
   it('падение ПЕРВОЙ страницы без отмены → ArweaveIndexUnavailableError (регрессия Фазы 0)', async () => {
@@ -253,7 +289,7 @@ describe('отказы сети (тесты 6–7)', () => {
     const { fetchAllNotes, ArweaveIndexUnavailableError } = await import('./arweave');
     const key = await noteKey();
     await expect(
-      fetchAllNotes('oh', ring(key), undefined, { known: knownOf() }),
+      fetchAllNotes('oh', ring(key), undefined, { known: new Map() }),
     ).rejects.toBeInstanceOf(ArweaveIndexUnavailableError);
   });
 });
@@ -278,7 +314,7 @@ describe('сейф v4 (тест 8)', () => {
       ...ENTRY_INPUT, title: 'НОВАЯ',
     });
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXSFRESH', version: '4', noteId: freshEntry.entryId },
         { txId: 'TXSKNOWN', version: '4', noteId: knownEntry.entryId },
@@ -288,10 +324,10 @@ describe('сейф v4 (тест 8)', () => {
 
     const { fetchAllNotes } = await import('./arweave');
     const { safeboxEntries, incomplete } = await fetchAllNotes('oh', keys, undefined, {
-      known: knownOf(['TXSKNOWN', { noteId: knownEntry.entryId, kind: 'safebox' }]),
+      known: gw.known(['TXSKNOWN', { noteId: knownEntry.entryId, kind: 'safebox' }]),
     });
 
-    expect(rawCalls(fetchMock)).toEqual(['TXSFRESH']);
+    expect(gw.rawCalls()).toEqual(['TXSFRESH']);
     expect(safeboxEntries).toHaveLength(1);
     expect(safeboxEntries[0].meta.title).toBe('НОВАЯ');
     expect(incomplete).toBe(false);
@@ -305,7 +341,7 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
     const { encryptEnvelope } = await import('./crypto');
     const note = await encryptEnvelope(key, 'redrop-пара');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         // HEIGHT_DESC: известный (новый) TX выше, старый уцелевший дубликат ниже.
         { txId: 'TXNEW', version: '2', noteId: note.noteId },
@@ -316,10 +352,10 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes, incomplete } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(['TXNEW', { noteId: note.noteId, kind: 'note' }]),
+      known: gw.known(['TXNEW', { noteId: note.noteId, kind: 'note' }]),
     });
 
-    expect(rawCalls(fetchMock)).toEqual([]); // дубликат ниже sentinel'а — ноль загрузок
+    expect(gw.rawCalls()).toEqual([]); // дубликат ниже sentinel'а — ноль загрузок
     expect(notes).toHaveLength(0);
     expect(incomplete).toBe(false);
   });
@@ -330,7 +366,7 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
     const { encryptEnvelope } = await import('./crypto');
     const note = await encryptEnvelope(key, 'перевыложенная');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXNEWER', version: '2', noteId: note.noteId },
         { txId: 'TXKNOWN', version: '2', noteId: note.noteId },
@@ -340,16 +376,16 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(['TXKNOWN', { noteId: note.noteId, kind: 'note' }]),
+      known: gw.known(['TXKNOWN', { noteId: note.noteId, kind: 'note' }]),
     });
 
     // Более новый TX побеждает, как в полном sweep'е. Обновление sync-записи —
     // дело merge на стороне store (confirmed сохраняет свой txId), поэтому на
     // СЛЕДУЮЩЕМ sweep'е TXNEWER снова будет незнакомым и снова скачается:
     // принятый остаток (план §3), зафиксированный здесь как ожидаемый.
-    expect(rawCalls(fetchMock)).toEqual(['TXNEWER']);
+    expect(gw.rawCalls()).toEqual(['TXNEWER']);
     expect(notes).toHaveLength(1);
-    expect(notes[0].txId).toBe('TXNEWER');
+    expect(notes[0].txId).toBe(gw.id('TXNEWER'));
   });
 
   it('(в) совпал только txId: чужой Note-Id тег или чужой класс версии — кандидат НЕ известен', async () => {
@@ -359,7 +395,7 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
     const noteA = await encryptEnvelope(key, 'тег не совпал');
     const noteB = await encryptEnvelope(key, 'класс версии не совпал');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXMISMATCH', version: '2', noteId: noteA.noteId },
         { txId: 'TXWRONGKIND', version: '2', noteId: noteB.noteId },
@@ -369,7 +405,7 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(
+      known: gw.known(
         // Битая sync-запись: txId совпал, но noteId в ней — другой.
         ['TXMISMATCH', { noteId: 'совсем-другой-id', kind: 'note' }],
         // Запись сейфа не может объявить известным TX с версией заметки.
@@ -377,7 +413,7 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
       ),
     });
 
-    expect(rawCalls(fetchMock).sort()).toEqual(['TXMISMATCH', 'TXWRONGKIND']);
+    expect(gw.rawCalls().sort()).toEqual(['TXMISMATCH', 'TXWRONGKIND']);
     expect(notes.map(n => n.text).sort()).toEqual(['класс версии не совпал', 'тег не совпал']);
   });
 
@@ -390,7 +426,7 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
     const foreignKey = await deriveKey(generateMnemonic());
     const rotten = await encryptEnvelope(foreignKey, 'мусор');
 
-    const fetchMock = stubGateway(
+    const gw = await stubGateway(
       [
         { txId: 'TXROTTEN', version: '2', noteId: note.noteId },  // новее, не расшифруется
         { txId: 'TXKNOWN', version: '2', noteId: note.noteId },   // sentinel
@@ -404,12 +440,12 @@ describe('дубликаты по Note-Id: sentinel-семантика (тест
 
     const { fetchAllNotes } = await import('./arweave');
     const { notes, incomplete } = await fetchAllNotes('oh', ring(key), undefined, {
-      known: knownOf(['TXKNOWN', { noteId: note.noteId, kind: 'note' }]),
+      known: gw.known(['TXKNOWN', { noteId: note.noteId, kind: 'note' }]),
     });
 
     // Битый скачался (он выше и незнаком) и intentional-skip'нулся; ниже
     // sentinel'а не скачивалось ничего; merge нет; провала sweep'а нет.
-    expect(rawCalls(fetchMock)).toEqual(['TXROTTEN']);
+    expect(gw.rawCalls()).toEqual(['TXROTTEN']);
     expect(notes).toHaveLength(0);
     expect(incomplete).toBe(false);
   });

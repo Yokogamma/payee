@@ -73,12 +73,20 @@ jobs:
       # fail-closed in the deploy workflows, which hold the real owners and run
       # the same guards again before anything is published. A CI run cannot make
       # a bad owner list green in production, because CI publishes nothing.
+      # The gateway lists are PUBLIC (they end up in the CSP), so CI builds with
+      # the real pinned set rather than a placeholder: measuring the bundle and
+      # snapshotting the CSP against a single-gateway fallback would test a
+      # configuration that never ships.
+      - run: node scripts/check-gateways-vs-worker.mjs --repo-only
       - run: npm run build
         env:
           VITE_BASE: /
           VITE_PROXY_URL: https://ci-placeholder.invalid
           # NOT A WALLET — see the note above.
           VITE_TRUSTED_OWNERS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          VITE_STATUS_GATEWAYS: https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io
+          VITE_PAYLOAD_GATEWAYS: https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz
+          VITE_INDEX_SOURCES: https://arweave.net/graphql|https://vilenarios.com/graphql,https://arweave-search.goldsky.com/graphql
       - run: node scripts/check-bundle-budget.mjs
       - run: node scripts/check-no-inlined-fonts.mjs
       # Report only, no threshold — prints what users actually download so the

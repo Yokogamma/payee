@@ -46,6 +46,7 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
   let attemptCounter = 0;
   const v3Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
   const v4Pauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
+  const globalPauses: Array<{ record: SyncRecord; pausedAt: number }> = [];
   // In-memory sync row — the «fresh» source every commit re-reads, mirroring
   // the terminal-preserving storage primitives (§1.9).
   const row: { value: SyncRecord | undefined } = { value: opts.prev };
@@ -81,6 +82,13 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
       }
       v4Pauses.push({ record: row.value!, pausedAt });
     },
+    // The GLOBAL switch: same discipline, its own ledger.
+    commitGlobalPausedFailure: async (_noteId, attemptId, build, pausedAt) => {
+      if (row.value?.terminalError === undefined && row.value?.attemptId === attemptId) {
+        row.value = build(row.value);
+      }
+      globalPauses.push({ record: row.value!, pausedAt });
+    },
     signPayload: async () => 'sig',
     uploadViaProxy: async body => {
       httpCalls++;
@@ -88,7 +96,7 @@ function harness(opts: { prev?: SyncRecord; result?: UploadResult } = {}) {
       return opts.result ?? { kind: 'accepted', txId: 'TX', committed: true };
     },
   };
-  return { deps, writes, v3Pauses, v4Pauses, row, calls: () => httpCalls, body: () => bodyText };
+  return { deps, writes, v3Pauses, v4Pauses, globalPauses, row, calls: () => httpCalls, body: () => bodyText };
 }
 
 describe('uploadItemId', () => {
