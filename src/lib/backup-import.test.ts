@@ -123,6 +123,57 @@ describe('counting', () => {
   });
 });
 
+describe('the cascade follows the BRANCH, not the root', () => {
+  it('a conflict on one fork branch leaves the other branch fully restored', async () => {
+    // A fork is ordinary history now: two devices editing offline both produce
+    // rev 2. The cascade used to be keyed by `kind:root`, so a conflict on one
+    // branch abandoned the whole root — including a sibling whose own
+    // predecessor had just been written successfully. Worse, which branch
+    // survived depended on which same-`rev` record the loop reached first, so
+    // an everyday two-device edit lost a branch at random and the report
+    // blamed a reason belonging to the other one.
+    //
+    // The rule the graph actually needs is narrower: a record may be written
+    // only if the record it NAMES as `prev` is in the store.
+    const h = harness({ outcomes: { a2: 'conflicts' } });
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      node('a2', 2, 'a1', 'a1'),   // branch A — conflicts
+      node('a3', 3, 'a1', 'a2'),   // …and its child must not be written
+      node('b2', 2, 'a1', 'a1'),   // branch B — independent, same position
+      node('b3', 3, 'a1', 'b2'),
+    ]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    // `merged` records ATTEMPTS: a2 is attempted — that is how the conflict is
+    // discovered — and only its child is never tried.
+    expect(h.merged).toEqual(['a1', 'a2', 'b2', 'b3']);
+    expect(report.counters.conflicts).toBe(2); // a2 and the child it stranded
+    expect(report.counters.added).toBe(3);     // a1, b2, b3 — branch B intact
+  });
+
+  it('and the surviving branch is the one whose ancestor was applied, whatever the order', async () => {
+    // The mirror image, with the branches swapped in the file. Under the old
+    // root-keyed rule the outcome flipped with the input order; under the
+    // predecessor rule it cannot.
+    const h = harness({ outcomes: { b2: 'conflicts' } });
+    const plan = planBackupImport([
+      node('a1', 1, 'a1'),
+      node('b2', 2, 'a1', 'a1'),
+      node('b3', 3, 'a1', 'b2'),
+      node('a2', 2, 'a1', 'a1'),
+      node('a3', 3, 'a1', 'a2'),
+    ]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(h.merged).toEqual(['a1', 'b2', 'a2', 'a3']);
+    expect(report.counters.conflicts).toBe(2);
+    expect(report.counters.added).toBe(3);
+  });
+});
+
 describe('a chain that cannot be applied is not half-written', () => {
   it('a conflict on the first version stops the rest of its chain', async () => {
     const h = harness({ outcomes: { a1: 'conflicts' } });
