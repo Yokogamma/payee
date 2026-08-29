@@ -372,6 +372,7 @@ async function aesDecrypt(
   encrypted: EncryptedNote,
   signal?: AbortSignal,
 ): Promise<string> {
+  assertNotAborted(signal); // cheap: do not start work already cancelled
   const ciphertext = base64ToBuffer(encrypted.ciphertext);
   const iv = base64ToBuffer(encrypted.iv);
   const decrypted = await crypto.subtle.decrypt(
@@ -689,6 +690,7 @@ async function aesDecryptRaw(
   ivB64: string,
   signal?: AbortSignal,
 ): Promise<string> {
+  assertNotAborted(signal); // cheap: do not start work already cancelled
   const ciphertext = base64ToBuffer(ciphertextB64);
   const iv = base64ToBuffer(ivB64);
   const decrypted = await crypto.subtle.decrypt(

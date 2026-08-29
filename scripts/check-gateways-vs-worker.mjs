@@ -70,7 +70,10 @@ export function checkGateways(clientCsv, toml, { repoOnly = false } = {}) {
   if (!repoOnly) {
     if (client.length === 0) {
       problems.push('VITE_STATUS_GATEWAYS is missing, empty or fully unparseable');
-    } else if (client.join(',') !== pinned.join(',')) {
+      // Order-insensitive below: status probes run in parallel, so only the SET
+      // is pinned. (The payload pool IS ordered — that pin lives in the deploy
+      // config gate, where the order carries meaning.)
+    } else if ([...client].sort().join(',') !== [...pinned].sort().join(',')) {
       problems.push(
         `VITE_STATUS_GATEWAYS does not match the repo-pinned set (${EXPECTED_STATUS_CSV})`,
       );
@@ -92,7 +95,7 @@ export function checkGateways(clientCsv, toml, { repoOnly = false } = {}) {
       problems.push(`${label}: STATUS_GATEWAYS is empty or fully unparseable`);
       continue;
     }
-    if (worker.join(',') !== pinned.join(',')) {
+    if ([...worker].sort().join(',') !== [...pinned].sort().join(',')) {
       problems.push(
         `${label}: worker STATUS_GATEWAYS does not match the repo-pinned set (${EXPECTED_STATUS_CSV})`,
       );

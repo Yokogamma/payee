@@ -39,6 +39,21 @@ export function b64urlToBytes(value: string): Uint8Array {
   return out;
 }
 
+/**
+ * Character-class validity is NOT decodability: "A" and "AAAAA" match the
+ * base64url alphabet and still make `atob` throw, because their length is not
+ * a valid base64 length. Everything below therefore treats a decode failure as
+ * a GATEWAY refusal rather than letting the exception escape — one malformed
+ * field from one gateway must cost that gateway its turn, not the whole sweep.
+ */
+function decodeOrNull(value: string): Uint8Array | null {
+  try {
+    return b64urlToBytes(value);
+  } catch {
+    return null;
+  }
+}
+
 export function bytesToB64url(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
@@ -128,11 +143,15 @@ export function parseTxHeader(text: string): TxHeader | null {
   // are checked for type only — an empty string decodes to zero bytes, which is
   // exactly what the signature covers.
   if (typeof h.target !== 'string' || typeof h.last_tx !== 'string') return null;
+  // Not merely "matches the alphabet": actually decodable. A field that passes
+  // the regex and throws in atob would otherwise surface as an exception in the
+  // middle of verification instead of a clean gateway rejection.
   for (const field of ['id', 'owner', 'data_root', 'signature'] as const) {
-    if (!B64URL_RE.test(h[field] as string)) return null;
+    const value = h[field] as string;
+    if (!B64URL_RE.test(value) || decodeOrNull(value) === null) return null;
   }
-  if (h.target !== '' && !B64URL_RE.test(h.target)) return null;
-  if (h.last_tx !== '' && !B64URL_RE.test(h.last_tx)) return null;
+  if (h.target !== '' && (!B64URL_RE.test(h.target) || decodeOrNull(h.target) === null)) return null;
+  if (h.last_tx !== '' && (!B64URL_RE.test(h.last_tx) || decodeOrNull(h.last_tx) === null)) return null;
   if (!DIGITS_RE.test(h.data_size as string)) return null;
   if (!DIGITS_RE.test(h.quantity as string) || !DIGITS_RE.test(h.reward as string)) return null;
   if (!Array.isArray(h.tags)) return null;
@@ -142,6 +161,7 @@ export function parseTxHeader(text: string): TxHeader | null {
     const t = tag as { name?: unknown; value?: unknown };
     if (typeof t.name !== 'string' || typeof t.value !== 'string') return null;
     if (!B64URL_RE.test(t.name) || !B64URL_RE.test(t.value)) return null;
+    if (decodeOrNull(t.name) === null || decodeOrNull(t.value) === null) return null;
     tags.push({ name: t.name, value: t.value });
   }
   return { ...(h as unknown as TxHeader), tags };
@@ -180,6 +200,21 @@ const skip = (reason: string): Rejection => ({ kind: 'skip', reason });
  * through — which is precisely the silent downgrade D9 exists to stop.
  */
 export async function verifyHeader(
+  expectedTxId: string,
+  header: TxHeader,
+  trustedOwners: readonly string[],
+): Promise<Rejection | null> {
+  try {
+    return await verifyHeaderInner(expectedTxId, header, trustedOwners);
+  } catch {
+    // TOTAL by construction: any decode or WebCrypto failure is this gateway's
+    // problem, never an exception escaping into the sweep. Letting one escape
+    // would reject the cached promise and take down every candidate with it.
+    return gateway('header verification raised');
+  }
+}
+
+async function verifyHeaderInner(
   expectedTxId: string,
   header: TxHeader,
   trustedOwners: readonly string[],
@@ -274,6 +309,14 @@ async function verifySignature(
  * a trusted wallet, so bytes that do not match it came from the transport.
  */
 export async function verifyBytes(header: TxHeader, bytes: Uint8Array): Promise<Rejection | null> {
+  try {
+    return await verifyBytesInner(header, bytes);
+  } catch {
+    return gateway('body verification raised');
+  }
+}
+
+async function verifyBytesInner(header: TxHeader, bytes: Uint8Array): Promise<Rejection | null> {
   if (header.data_size !== String(bytes.length)) return gateway('data_size does not match the body length');
   if (bytes.length > MAX_CHUNK_BYTES) return gateway('body exceeds one Arweave chunk (multi-chunk unsupported)');
   if (bytesToB64url(await dataRoot(bytes)) !== header.data_root) {
@@ -313,6 +356,17 @@ export interface TagExpectations {
  * say otherwise.
  */
 export function readVerifiedTags(
+  header: TxHeader,
+  expected: TagExpectations,
+): VerifiedTags | Rejection {
+  try {
+    return readVerifiedTagsInner(header, expected);
+  } catch {
+    return skip('tags could not be read');
+  }
+}
+
+function readVerifiedTagsInner(
   header: TxHeader,
   expected: TagExpectations,
 ): VerifiedTags | Rejection {

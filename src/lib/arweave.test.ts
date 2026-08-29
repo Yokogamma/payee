@@ -601,10 +601,13 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
     const { deriveKey, generateMnemonic } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
 
+    // A CANONICAL txId: the candidate must actually reach the network for this
+    // to be a network failure rather than a local rejection.
+    const CANONICAL = 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs';
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes('/graphql')) {
         return new Response(JSON.stringify({ data: { transactions: {
-          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
+          edges: [{ cursor: 'c1', node: { id: CANONICAL, tags: [
             { name: 'App-Name', value: 'EternalNotes' },
             { name: 'App-Version', value: '2' },
             { name: 'Note-Id', value: 'nid' },
@@ -620,6 +623,36 @@ describe('fetchAllNotes partial-restore flag (M1)', () => {
     const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
     expect(incomplete).toBe(true);
     expect(res).toHaveLength(0);
+  });
+
+  // A txId that cannot name an Arweave transaction costs NO request: asking a
+  // gateway about it is waste, and it is an intentional skip — nothing was lost,
+  // so the sweep is not partial.
+  it('a NON-CANONICAL txId is skipped without any payload request', async () => {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    const { deriveKey, generateMnemonic } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/graphql')) {
+        return new Response(JSON.stringify({ data: { transactions: {
+          edges: [{ cursor: 'c1', node: { id: 'TX1', tags: [
+            { name: 'App-Name', value: 'EternalNotes' },
+            { name: 'App-Version', value: '2' },
+            { name: 'Note-Id', value: 'nid' },
+          ] } }],
+          pageInfo: { hasNextPage: false },
+        } } }), { status: 200 });
+      }
+      throw new Error('should never be requested');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
+    expect(res).toHaveLength(0);
+    expect(incomplete).toBe(false);
+    expect(fetchMock.mock.calls.filter(c => !String(c[0]).includes('/graphql'))).toHaveLength(0);
   });
 });
 
@@ -896,5 +929,135 @@ describe('fetchAllNotes v3 (chain meta through restore)', () => {
     const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
     expect(res).toHaveLength(0);
     expect(incomplete).toBe(false); // malformed = intentional skip, not partial
+  });
+});
+
+// ── Regressions found in code review ──────────────────────────────────────
+describe('status probes must not follow redirects (quorum collapse)', () => {
+  // `fetch` follows redirects by default. A gateway answering 302 → another
+  // gateway would make TWO configured origins report the opinion of ONE host,
+  // and unanimity over the pool is what authorizes a paid redrop.
+  it('a redirecting gateway is `other`, so 404 elsewhere cannot reach dropped', async () => {
+    const TX = 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs';
+    vi.stubEnv('VITE_STATUS_GATEWAYS', 'https://g1.example,https://g2.example');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      // The mock enforces the contract a real runtime would: with
+      // redirect:'error' a 3xx becomes a rejected promise, not a followed hop.
+      if (url.startsWith('https://g1.example')) {
+        if (init?.redirect === 'error') throw new TypeError('unexpected redirect');
+        return new Response('', { status: 404 });
+      }
+      return new Response('', { status: 404 });
+    }));
+    const { getTxStatus } = await import('./arweave');
+    expect((await getTxStatus(TX)).kind).toBe('unavailable');
+  });
+
+  it('asks with redirect: error on every status probe', async () => {
+    const TX = 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs';
+    vi.stubEnv('VITE_STATUS_GATEWAYS', 'https://g1.example,https://g2.example');
+    const fetchMock = vi.fn(async () => new Response('', { status: 404 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { getTxStatus } = await import('./arweave');
+    await getTxStatus(TX);
+    for (const call of fetchMock.mock.calls) {
+      expect((call[1] as RequestInit).redirect).toBe('error');
+    }
+  });
+});
+
+describe('a malformed header must cost ONE gateway, never the sweep', () => {
+  it('falls through to the next gateway and still restores the note', async () => {
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+    vi.stubEnv('VITE_PAYLOAD_GATEWAYS', 'https://bad.example,https://good.example');
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'пережила битый заголовок');
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+
+    // "A" matches the base64url alphabet and makes atob throw — the exact shape
+    // that used to escape as an exception and reject the cached promise, taking
+    // every other candidate down with it.
+    const serve = gatewayFetchMock({
+      txs: [tx],
+      onHeader: (origin) => origin === 'https://bad.example'
+        ? new Response(JSON.stringify({ ...tx.header, signature: 'A' }), { status: 200 })
+        : undefined,
+    });
+    vi.stubGlobal('fetch', vi.fn(serve));
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete } = await fetchAllNotes('oh', ring(key));
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('пережила битый заголовок');
+    expect(incomplete).toBe(false);
+  });
+
+  it('a corrupted BODY on the first gateway is neutralized by a valid second', async () => {
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+    vi.stubEnv('VITE_PAYLOAD_GATEWAYS', 'https://bad.example,https://good.example');
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'тело со второго шлюза');
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+
+    const serve = gatewayFetchMock({
+      txs: [tx],
+      onRaw: (origin) => origin === 'https://bad.example'
+        ? new Response('{"id":"nope","c":"AAAA","iv":"BBBB"}', { status: 200 })
+        : undefined,
+    });
+    vi.stubGlobal('fetch', vi.fn(serve));
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res, incomplete, gatewayMismatches } = await fetchAllNotes('oh', ring(key));
+    expect(res).toHaveLength(1);
+    expect(incomplete).toBe(false);
+    // The failure is COUNTED locally (D5: nothing is transmitted) and named by host.
+    expect(gatewayMismatches).toMatchObject({ 'https://bad.example': 1 });
+  });
+
+  // The protocol binds header and bytes cryptographically, so mixing sources is
+  // safe by construction — and useful when one gateway is half-broken.
+  it('accepts a header and a body from DIFFERENT gateways', async () => {
+    const wallet = await testWallet();
+    vi.stubEnv('VITE_TRUSTED_OWNERS', wallet.address);
+    vi.stubEnv('VITE_PAYLOAD_GATEWAYS', 'https://headers.example,https://bodies.example');
+
+    const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const note = await encryptEnvelope(key, 'смешанные источники');
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: note.noteId, c: note.ciphertext, iv: note.iv }),
+      notesTags({ version: '2', ownerHash: 'oh', noteId: note.noteId }),
+      wallet,
+    );
+
+    const serve = gatewayFetchMock({
+      txs: [tx],
+      onHeader: (origin) => origin === 'https://bodies.example'
+        ? new Response('down', { status: 503 }) : undefined,
+      onRaw: (origin) => origin === 'https://headers.example'
+        ? new Response('down', { status: 503 }) : undefined,
+    });
+    vi.stubGlobal('fetch', vi.fn(serve));
+
+    const { fetchAllNotes } = await import('./arweave');
+    const { notes: res } = await fetchAllNotes('oh', ring(key));
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('смешанные источники');
   });
 });

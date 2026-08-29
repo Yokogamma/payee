@@ -232,3 +232,49 @@ describe('readVerifiedTags — the writer canon, mirrored exactly (R19)', () => 
     expect(isRejection(result) && result.kind).toBe('skip');
   });
 });
+
+// ── Totality (code review) ────────────────────────────────────────────────
+describe('the verifier is TOTAL — a malformed field is a rejection, never a throw', () => {
+  // "A" and "AAAAA" match the base64url alphabet and still make atob throw:
+  // character-class validity is not decodability. An escaping exception used to
+  // reject the cached promise and abort the whole sweep.
+  const UNDECODABLE = ['A', 'AAAAA'];
+
+  it('parseTxHeader rejects fields that pass the regex but cannot decode', () => {
+    for (const bad of UNDECODABLE) {
+      expect(parseTxHeader(JSON.stringify({ ...realTx.header, signature: bad }))).toBeNull();
+      expect(parseTxHeader(JSON.stringify({ ...realTx.header, owner: bad }))).toBeNull();
+      expect(parseTxHeader(JSON.stringify({ ...realTx.header, data_root: bad }))).toBeNull();
+      expect(parseTxHeader(JSON.stringify({
+        ...realTx.header, tags: [{ name: bad, value: 'AAAA' }],
+      }))).toBeNull();
+    }
+  });
+
+  it('verifyHeader returns a gateway rejection instead of raising', async () => {
+    for (const bad of UNDECODABLE) {
+      const broken = { ...REAL_HEADER, signature: bad };
+      const rejection = await verifyHeader(REAL_TX_ID, broken, [REAL_OWNER]);
+      expect(rejection?.kind).toBe('gateway');
+    }
+  });
+
+  it('verifyBytes returns a gateway rejection instead of raising', async () => {
+    const broken = { ...REAL_HEADER, data_root: 'A', data_size: String(REAL_BYTES.length) };
+    const rejection = await verifyBytes(broken, REAL_BYTES);
+    expect(rejection?.kind).toBe('gateway');
+  });
+
+  it('readVerifiedTags returns a skip instead of raising', () => {
+    const broken = { ...REAL_HEADER, tags: [{ name: 'A', value: 'A' }] };
+    const result = readVerifiedTags(broken, {
+      appName: 'EternalNotes', supportedVersions: SUPPORTED, ownerHash: OWNER_HASH,
+    });
+    expect(isRejection(result) && result.kind).toBe('skip');
+  });
+
+  it('an unusable owner modulus is a rejection, not a crash', async () => {
+    const rejection = await verifyHeader(REAL_TX_ID, { ...REAL_HEADER, owner: 'AAAA' }, [REAL_OWNER]);
+    expect(rejection?.kind).toBe('gateway');
+  });
+});

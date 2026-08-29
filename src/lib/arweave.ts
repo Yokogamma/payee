@@ -235,6 +235,7 @@ export async function isArweaveOnline(): Promise<boolean> {
       STATUS_GATEWAYS.map(async (origin) => {
         const response = await fetch(`${origin}/info`, {
           method: 'GET',
+          redirect: 'error', // a redirect to another gateway is not this one being up
           signal: AbortSignal.timeout(5000),
         });
         if (!response.ok) throw new Error(`gateway ${origin} answered ${response.status}`);
@@ -305,6 +306,11 @@ async function probeStatus(origin: string, txId: string): Promise<StatusVote> {
   try {
     const response = await fetch(`${origin}/tx/${txId}/status`, {
       method: 'GET',
+      // NO REDIRECTS. `fetch` follows them by default, so a gateway answering
+      // 302 -> another gateway would have TWO configured origins reporting the
+      // opinion of ONE host — and unanimity over the pool is exactly what
+      // authorizes a paid redrop. A redirect is not an answer.
+      redirect: 'error',
       signal: AbortSignal.timeout(10000),
     });
     if (response.status === 202) return { origin, kind: 'pending' };
@@ -312,7 +318,9 @@ async function probeStatus(origin: string, txId: string): Promise<StatusVote> {
     // 400/429/5xx all land here: `other` is never alive, and it makes `dead`
     // unreachable this round — which is the entire point (a 400 must never
     // authorize a paid re-post).
-    if (!response.ok) return { origin, kind: 'other' };
+    // Strictly 200, matching the Worker: a 201/206 is not a status answer, and
+    // the two halves must classify identically or the shared formula is a lie.
+    if (response.status !== 200) return { origin, kind: 'other' };
     const body = await readCapped(response, STATUS_BODY_CAP_BYTES);
     if (body === null) return { origin, kind: 'other' };
     const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
@@ -541,7 +549,12 @@ export async function getWorkerCapabilities(): Promise<WorkerCapabilities> {
   if (!PROXY_URL) return UNKNOWN_CAPABILITIES;
 
   const expectedHash = await statusGatewaysHash();
+  // ONE budget for the whole probe. Three attempts with a 15 s timeout EACH
+  // would let a stalled worker hold the caller for 45 s — the deadline is the
+  // total, and the per-attempt timeout only bounds a single request within it.
+  const deadline = AbortSignal.timeout(HEALTH_TIMEOUT_MS);
   for (let attempt = 0; attempt < HEALTH_ATTEMPTS; attempt++) {
+    if (deadline.aborted) break;
     // A NEW nonce every attempt: reusing one would let a retry reproduce the
     // very cached answer the retry exists to get past.
     const nonce = randomNonce();
@@ -551,7 +564,8 @@ export async function getWorkerCapabilities(): Promise<WorkerCapabilities> {
         // Belt and braces with the server's own no-store: this answer decides
         // whether a persisted upload pause may be lifted.
         cache: 'no-store',
-        signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+        redirect: 'error',
+        signal: AbortSignal.any([deadline, AbortSignal.timeout(HEALTH_ATTEMPT_TIMEOUT_MS)]),
       });
       if (!response.ok) continue;
       const body = await readCapped(response, HEALTH_CAP_BYTES);
@@ -568,6 +582,8 @@ export async function getWorkerCapabilities(): Promise<WorkerCapabilities> {
 /** How many /health attempts before the pause simply stays up. */
 const HEALTH_ATTEMPTS = 3;
 const HEALTH_TIMEOUT_MS = 15_000;
+/** Bound on ONE attempt, inside the shared budget above. */
+const HEALTH_ATTEMPT_TIMEOUT_MS = 7_000;
 /** A health body is a few hundred bytes; anything larger is not one. */
 const HEALTH_CAP_BYTES = 8192;
 
@@ -848,8 +864,8 @@ function createPayloadPool(ownerAddresses: readonly string[]) {
       const composed = signal
         ? AbortSignal.any([signal, deadline, AbortSignal.timeout(PAYLOAD_TIMEOUT_MS)])
         : AbortSignal.any([deadline, AbortSignal.timeout(PAYLOAD_TIMEOUT_MS)]);
-      const response = await fetch(`${origin}${path}`, { signal: composed });
-      if (!response.ok) return null;
+      const response = await fetch(`${origin}${path}`, { signal: composed, redirect: 'error' });
+      if (response.status !== 200) return null;
       return await readCapped(response, cap);
     } catch {
       return null;
@@ -857,6 +873,10 @@ function createPayloadPool(ownerAddresses: readonly string[]) {
   }
 
   async function resolve(txId: string, signal: AbortSignal | undefined): Promise<PayloadOutcome> {
+    // Decided WITHOUT a request: a txId that is not 43 base64url characters
+    // cannot name an Arweave transaction, so asking any gateway about it is
+    // pure waste — and it is a skip, not a fetch failure.
+    if (!TXID_RE.test(txId)) return { kind: 'skip' };
     const deadline = AbortSignal.timeout(PAYLOAD_DEADLINE_MS);
 
     // Pass 1 — a header that survives every body-independent step of D9.
@@ -895,7 +915,11 @@ function createPayloadPool(ownerAddresses: readonly string[]) {
     fetchVerified(txId: string, signal: AbortSignal | undefined): Promise<PayloadOutcome> {
       const cached = inFlight.get(txId);
       if (cached) return cached;
-      const pending = resolve(txId, signal).then((outcome) => {
+      const pending = resolve(txId, signal).catch((): PayloadOutcome => (
+        // TOTAL: a raised candidate is unavailable. Letting it escape would
+        // reject the cached promise and take every other candidate down with it.
+        { kind: 'unavailable' }
+      )).then((outcome) => {
         // Transient failures must not poison a later retry of the same txId.
         if (outcome.kind === 'unavailable') inFlight.delete(txId);
         return outcome;
