@@ -16,7 +16,15 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.mjs'],
+    include: [
+      'src/**/*.test.ts',
+      'src/**/*.test.tsx',
+      'scripts/**/*.test.mjs',
+      // The worker's own SCRIPTS are plain Node, not workerd: both worker
+      // vitest configs run in the workers pool, where `node:fs` does not
+      // exist, so their tests belong to this run.
+      'worker/scripts/**/*.test.mjs',
+    ],
     globals: false,
   },
 });
