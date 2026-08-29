@@ -1707,6 +1707,24 @@ cannot land between the client's live check and its publish. Serialization is
 not ordering: still do not dispatch the next deploy until the previous run has
 finished.
 
+### Release record — dev contour
+
+| | |
+|---|---|
+| Release SHA | `ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` |
+| Active `workerVersionId` | `222ea2c1-37f5-4eb1-bdcc-457a1db56b5e` |
+| Trusted run | 33243712840 (all steps green, `release-identity` artifact published) |
+| Worker origin | `eternal-notes-proxy.sopi-88c.workers.dev` |
+
+**`MINIMUM_FLOOR` is raised to this SHA in `scripts/check-worker-floor.mjs`.**
+Raise `WORKER_FLOOR_SHA` to it FIRST: once the repo pin lands, every deploy is
+refused until the Environment variable matches, which is safe but stops the
+release mid-way.
+
+An earlier attempt on `73c5916` deployed correctly and failed its own smoke on
+Cloudflare's propagation race — the worker was right, the detector was early.
+The fix is in the smoke, not in the worker; see the propagation note above.
+
 ### Local deploys
 
 `npm run deploy` in `worker/` **refuses**. A local wrangler deploy bypasses the
