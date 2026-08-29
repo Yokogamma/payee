@@ -1120,7 +1120,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // being legacy whatever happens next.
     const rd = await doRedrop(legacyRedrop);
     if (rd.kind === 'resolved') {
-      return json({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
@@ -1132,13 +1132,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // payload (the fp comparison above). `deduped` is additive — an older
       // client ignores it, which is safe precisely because the proof was done
       // by the server, not asserted by the client.
-      return json({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+      return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
     }
 
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!, emit, env);
     if (live === 'alive') {
-      return json({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+      return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
     }
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
@@ -1148,7 +1148,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (rd.kind === 'resolved') {
       // Superseded: another request committed this payload while we were
       // deciding. This response paid for nothing, so it is a dedupe.
-      return json({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
@@ -1166,7 +1166,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           // `deduped` only NOW: the posted state has been resolved — liveness
           // checked and the DO finalized — which is what the plan requires
           // before this answer may be given.
-          return json({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+          return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
         }
       } catch { /* fall through to retryable 503 */ }
       return error('Recheck deferred', 503); // raced / DO error — retry
@@ -1178,7 +1178,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (rd.kind === 'resolved') {
       // Superseded: another request committed this payload while we were
       // deciding. This response paid for nothing, so it is a dedupe.
-      return json({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
@@ -1234,7 +1234,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           if (commitResp.ok && commit.ok) {
             // The recovery branch reconciles an EXISTING transaction, so this
             // too returns an id it did not create.
-            return json({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true });
+            return uploadAccepted({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true });
           }
         } catch { /* fall through */ }
         await safeRelease(reserveToken);
@@ -1325,7 +1325,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // answers "how do paid publications end", not "how do requests end".
   if (committed) {
     emit('upload_outcome', ['accepted', declaredVersion], []);
-    return json({ txId, status: 'accepted', committed: true, deduped: false });
+    return uploadAccepted({ txId, status: 'accepted', committed: true, deduped: false });
   }
 
   // Not committed. If it's ANCHORED, the DO holds a `posted` record → the client
@@ -1335,7 +1335,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (anchored) {
     console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
     emit('upload_outcome', ['accepted', declaredVersion], []);
-    return json({ txId, status: 'accepted', committed: false, deduped: false });
+    return uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false });
   }
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
   // accepted is emitted only AFTER signRecovery resolves: should WebCrypto
@@ -1346,9 +1346,9 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (recoveryToken === null) {
     // Unreachable: the step-0 gate 503s uploads without RECOVERY_HMAC_SECRET.
     // Kept as defense in depth — never imply a hint exists when it doesn't.
-    return json({ txId, status: 'accepted', committed: false, deduped: false });
+    return uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false });
   }
-  return json({
+  return uploadAccepted({
     txId, status: 'accepted', committed: false, deduped: false,
     recovery: { txId, postedAt, token: recoveryToken },
   });
@@ -1417,7 +1417,32 @@ async function statusGatewaysHash(origins: readonly string[]): Promise<string> {
 function idPayloadConflict(txId: string | undefined): Response {
   return new Response(JSON.stringify({ code: 'id_payload_conflict', ...(txId ? { txId } : {}) }), {
     status: 409,
-    headers: { 'Content-Type': 'application/json' },
+    // Same reason as uploadAccepted: an intermediary replaying this verdict
+    // would replay a judgement about bytes it never saw.
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+}
+
+/**
+ * Every SUCCESSFUL /upload answer, carrying the capability marker (D2a).
+ *
+ * ── Why the marker rides on each response, not only on /health ────────
+ *
+ * A one-off `/health` probe is useless against a rollback that happens AFTER
+ * it: the client would have asked the safe worker and then stored a txId handed
+ * out by the old one. The guarantee has to be atomic with the answer it
+ * qualifies, so it travels in the answer.
+ *
+ * With it, an old worker cannot make a new client record an unproven binding —
+ * it physically cannot emit this field. For older clients the field is additive
+ * and inert, which is what makes deploying the worker before the client safe.
+ *
+ * `no-store` is part of the contract, not a nicety: an intermediary that
+ * replayed one of these responses would replay its capability claim too.
+ */
+function uploadAccepted(payload: Record<string, unknown>): Response {
+  return new Response(JSON.stringify({ ...payload, semanticIdempotency: 1 }), {
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
   });
 }
 

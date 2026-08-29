@@ -386,3 +386,55 @@ describe('a legacy record whose transaction is PROVEN gone', () => {
     expect(await storedFp(noteId)).toBe(await computePublicationFp(VERSION, dataFor(noteId)));
   });
 });
+
+describe('the capability marker rides on every successful answer (D2a)', () => {
+  it('a fresh paid upload carries semanticIdempotency and is not cacheable', async () => {
+    // A one-off /health probe cannot protect against a rollback that happens
+    // AFTER it. The guarantee has to be atomic with the answer it qualifies,
+    // so a client with import refuses to store a txId from a response without
+    // this field — which an older worker physically cannot emit.
+    const noteId = '33333333-4444-4555-8666-77777777cccc';
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
+    mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
+    mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
+
+    const signer = await newWallet();
+    const r = await worker.fetch(await uploadRequest(noteId, 'cap-1'), {
+      ...(await envFor()),
+      ARWEAVE_JWK: JSON.stringify(signer.jwk),
+      TRUSTED_OWNERS: signer.address,
+    } as never);
+
+    expect(r.status).toBe(200);
+    expect(r.headers.get('Cache-Control')).toBe('no-store');
+    expect((await r.json() as { semanticIdempotency?: number }).semanticIdempotency).toBe(1);
+  });
+
+  it('a DEDUPED answer carries it too — that is the one a rollback would forge', async () => {
+    const noteId = '33333333-4444-4555-8666-77777777dddd';
+    const wallet = await testWallet();
+    const tx = await buildSignedTx(
+      dataFor(noteId),
+      notesTags({ version: VERSION, ownerHash: identity.ownerHash, noteId }),
+      wallet,
+    );
+    await seedLegacyCommitted(noteId, tx.txId);
+    serveTx(tx);
+
+    const r = await worker.fetch(await uploadRequest(noteId, 'cap-2'), await envFor() as never);
+    const body = await r.json() as { deduped?: boolean; semanticIdempotency?: number };
+    expect(body.deduped).toBe(true);
+    expect(body.semanticIdempotency).toBe(1);
+    expect(r.headers.get('Cache-Control')).toBe('no-store');
+  });
+
+  it('/health advertises it as a CONSTANT, not a configurable var', async () => {
+    // If it came from configuration, a build carrying the old logic could be
+    // relabelled as the safe one and have uploads switched back on.
+    const r = await worker.fetch(
+      new Request('https://proxy.example.com/health'),
+      { ...(await envFor()), SEMANTIC_IDEMPOTENCY: '0' } as never,
+    );
+    expect((await r.json() as { semanticIdempotency?: number }).semanticIdempotency).toBe(1);
+  });
+});
