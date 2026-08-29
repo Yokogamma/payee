@@ -50,6 +50,18 @@ on:
         description: 'Full 40-character commit SHA of the worker build to deploy (not a branch or tag)'
         required: true
         type: string
+      # `normal` is the only profile that lets a client release follow, and the
+      # Pages workflow hardcodes it. `emergency` exists for a build that
+      # deliberately carries the PRE-quorum semantics: it must declare that
+      # honestly and have EVERY upload switch off, which is checked before the
+      # Cloudflare action runs — an unsafe build must never be activated first
+      # and rejected afterwards.
+      profile:
+        description: 'normal (default) | emergency — emergency requires all upload switches off'
+        required: false
+        default: normal
+        type: choice
+        options: [normal, emergency]
 
 # Least privilege for GITHUB_TOKEN (repo defaults may be write-all); this
 # workflow only needs to read the code it deploys.
@@ -62,8 +74,12 @@ permissions:
 # and does not promise that queued runs start in dispatch order. So the
 # ordering rule is operational and belongs to the person at the keyboard:
 # do not dispatch the next deploy until the previous run has finished.
+# ONE group shared with "Deploy client to Cloudflare Pages — dev". Beyond the
+# original reason (two dispatches of THIS workflow must not overlap), the shared
+# name stops a worker deploy from landing between the client workflow's live
+# /health check and its publish.
 concurrency:
-  group: deploy-worker
+  group: release-dev
   cancel-in-progress: false
 
 jobs:
@@ -123,6 +139,11 @@ jobs:
       - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      # Same pool on both halves. Run from the TRUSTED checkout — the candidate
+      # does not get to supply the script that judges it.
+      - run: node scripts/check-gateways-vs-worker.mjs
+        env:
+          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
       # ── The candidate: only now, and only in its own directory ─────
       # A worktree, not a second checkout: the commit is already here (the gate
       # proved it is reachable from this run's head), so there is nothing to
@@ -159,8 +180,62 @@ jobs:
         working-directory: candidate
       - run: npm --prefix worker test
         working-directory: candidate
-      - uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+      # ── Emergency preflight, BEFORE anything is activated ──
+      #
+      # Read by the TRUSTED checkout out of the CANDIDATE's own wrangler.toml:
+      # an emergency release is defined by every upload switch being off, and
+      # discovering otherwise from a post-deploy smoke would mean the unsafe
+      # build was already live. A grep is enough and keeps this dependency-free.
+      - name: Emergency profile requires every upload switch off
+        if: ${{ inputs.profile == 'emergency' }}
+        run: |
+          for flag in UPLOADS_ENABLED V3_UPLOADS_ENABLED V4_UPLOADS_ENABLED; do
+            if ! grep -qE "^${flag} = \"false\"" candidate/worker/wrangler.toml; then
+              echo "emergency profile: ${flag} must be \"false\" in the candidate's wrangler.toml" >&2
+              exit 1
+            fi
+          done
+          echo "emergency preflight OK: all three upload switches are off"
+      # ── Deploy ──
+      # RELEASE_SHA is injected from the VERIFIED candidate input, never from
+      # github.sha — that one is the SHA of this workflow's own trusted head,
+      # not of the code being deployed. /health reports it back, and the smoke
+      # below refuses anything else.
+      #
+      # WRANGLER_OUTPUT_FILE_PATH makes wrangler write structured NDJSON; the
+      # deployment's version id is read from it rather than scraped from logs.
+      - id: deploy
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: candidate/worker
+          command: deploy --var RELEASE_SHA:${{ inputs.candidate }}
+        env:
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+      # ── Read the ACTIVATED version id from the structured output ──
+      # A self-declared SHA cannot distinguish a re-deploy of the same commit
+      # from the original; the version id can. Parsed from the TRUSTED checkout.
+      - id: version
+        run: node scripts/read-wrangler-version.mjs "$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+        env:
+          OUTPUT_FILE: ${{ runner.temp }}/wrangler-output.ndjson
+      # ── Post-deploy smoke against the live worker ──
+      # Detector, not a rollback: Cloudflare activates the version before this
+      # can answer. Recovery from a red smoke is roll-forward (docs/ROLLBACK.md).
+      - name: Smoke the live worker
+        # The profile goes through env: — no `${{ }}` inside run: anywhere
+        # (§1.7): the expression expands TEXTUALLY before the shell starts.
+        run: node worker/scripts/smoke-gateways.mjs --profile="$PROFILE"
+        env:
+          PROFILE: ${{ inputs.profile }}
+          EXPECT_RELEASE_SHA: ${{ inputs.candidate }}
+          EXPECT_WORKER_VERSION_ID: ${{ steps.version.outputs.version_id }}
+      - name: Remind the operator to raise the floor
+        if: ${{ inputs.profile == 'normal' }}
+        run: |
+          echo "::notice::Smoke green for $CANDIDATE. Raise WORKER_FLOOR_SHA to it" \
+            "BEFORE releasing the client — the control plane keeps applying the" \
+            "OLD floor until the Environment variable is updated."
+        env:
+          CANDIDATE: ${{ inputs.candidate }}

@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "node -e \"console.error('Production deploys go through the trusted workflow (Deploy Worker — dev) with a candidate SHA: a local wrangler deploy bypasses the floor gate, the Environment and the release lock. Use deploy:staging for staging.'); process.exit(1)\"",
     "check:staging-config": "node scripts/check-staging-config.mjs",
     "predeploy:staging": "npm run check:staging-config",
     "deploy:staging": "wrangler deploy --env staging",
