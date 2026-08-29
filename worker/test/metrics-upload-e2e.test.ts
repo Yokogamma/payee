@@ -3,6 +3,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 import { addressOfJwk } from '../test-stubs/wallet-address';
+import { computePublicationFp } from '../src/publication-fp';
 import { setupOutboundMock, b64, sha256, statusUrlRe } from './helpers/outbound-mock';
 
 // PR-2 e2e: metric emission through the REAL /upload route (direct dispatch —
@@ -49,6 +50,17 @@ async function makeIdentity() {
 }
 
 /** Well-formed v2 upload; opts let a test corrupt tags or attach recovery. */
+/**
+ * The fp of exactly what `uploadRequest` publishes for this noteId.
+ *
+ * Injected records must carry it, or they are LEGACY: the worker would then try
+ * to authenticate a fabricated txId against the gateway pool instead of
+ * exercising the path under test. The legacy path has its own suite.
+ */
+async function fpFor(noteId: string): Promise<string> {
+  return computePublicationFp('2', JSON.stringify({ id: noteId, c: C, iv: IV }));
+}
+
 async function uploadRequest(
   id: { priv: Uint8Array; pkB64: string; ownerHash: string },
   noteId: string,
@@ -336,6 +348,7 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
       await state.storage.put(`note:${noteId}`, {
         status: 'posted', token: 'srv-token', gen: 0,
         txId: deadTxId, postedAt: Date.now() - 31 * 60_000,
+        fp: await fpFor(noteId), // POST-D2 record — see fpFor
       });
     });
 
@@ -412,6 +425,7 @@ describe('status leg: per-host metrics + the _quorum row (PR-3a)', () => {
     await runInDurableObject(stub, async (_i, state) => {
       await state.storage.put(`note:${noteId}`, {
         status: 'committed', txId: `TX-${noteId.slice(0, 8)}`, committedAt: Date.now() - 60_000, gen: 0,
+        fp: await fpFor(noteId), // POST-D2 record — see fpFor
       });
     });
     return `TX-${noteId.slice(0, 8)}`;

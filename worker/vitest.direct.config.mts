@@ -45,6 +45,9 @@ export default defineConfig({
       // Imports src/index directly and overrides ARWEAVE_JWK/TRUSTED_OWNERS
       // per request — same isolation reasoning as above.
       'test/trusted-owners.test.ts',
+      // Imports src/index directly with per-request env overrides, and drives
+      // the legacy backfill loop end to end.
+      'test/legacy-backfill-e2e.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.

@@ -1,5 +1,6 @@
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { beforeAll, afterAll, afterEach, describe, it, expect, vi } from 'vitest';
+import { computePublicationFp } from '../src/publication-fp';
 import * as ed from '@noble/ed25519';
 
 // Integration: server-authoritative reconciliation of a lost commit. The DO holds
@@ -48,6 +49,11 @@ const NOTE_ID = '22222222-3333-4444-8555-666666666666';
 const C = 'AAAA';
 const IV = 'AAAAAAAAAAAAAAAA';
 
+/** Exactly the outer `data` string recheckUpload publishes — the fingerprint
+ *  input, so injected records can be seeded as POST-D2 rather than legacy. */
+const UPLOAD_DATA = JSON.stringify({ id: NOTE_ID, c: C, iv: IV });
+const UPLOAD_VERSION = '2';
+
 /** A fixed identity so we can inject DO state for exactly this pk's shard. */
 async function makeIdentity() {
   const priv = ed.utils.randomSecretKey();
@@ -60,10 +66,10 @@ async function makeIdentity() {
 
 async function recheckUpload(id: { priv: Uint8Array; pkB64: string; ownerHash: string }, ip: string) {
   const body = JSON.stringify({
-    data: JSON.stringify({ id: NOTE_ID, c: C, iv: IV }),
+    data: UPLOAD_DATA,
     tags: [
       { name: 'App-Name', value: 'EternalNotes' },
-      { name: 'App-Version', value: '2' },
+      { name: 'App-Version', value: UPLOAD_VERSION },
       { name: 'Content-Type', value: 'application/json' },
       { name: 'Owner-Hash', value: id.ownerHash },
       { name: 'Note-Id', value: NOTE_ID },
@@ -80,10 +86,20 @@ async function recheckUpload(id: { priv: Uint8Array; pkB64: string; ownerHash: s
   });
 }
 
+/**
+ * Seed a `posted` record for this pk's shard.
+ *
+ * It carries the fp of the payload `recheckUpload` sends, i.e. a record written
+ * by a worker that already had semantic idempotency (D2). Without it the record
+ * would be LEGACY, and every test here would exercise the publication-backfill
+ * path instead of the reconciliation it is about — against fake txIds that no
+ * gateway can authenticate. The legacy path has its own suite.
+ */
 async function injectPosted(pkB64: string, txId: string, postedAt: number) {
+  const fp = await computePublicationFp(UPLOAD_VERSION, UPLOAD_DATA);
   const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(pkB64));
   await runInDurableObject(stub, async (_i, state) => {
-    await state.storage.put(`note:${NOTE_ID}`, { status: 'posted', token: 'srv-token', gen: 0, txId, postedAt });
+    await state.storage.put(`note:${NOTE_ID}`, { status: 'posted', token: 'srv-token', gen: 0, txId, postedAt, fp });
   });
 }
 

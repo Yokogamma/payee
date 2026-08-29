@@ -13,11 +13,36 @@ function stubFor(name: string) {
   return RATE_LIMITER.get(RATE_LIMITER.idFromName(`${name}-${RUN}`));
 }
 
-async function reserve(stub: DurableObjectStub, noteId: string, limit = 20) {
+/** `fp` defaults to a fixed value so the ordinary lifecycle tests describe a
+ *  POST-D2 record. Pass a different one to exercise the conflict branch, or
+ *  `undefined` explicitly to write a legacy-shaped record. */
+const FP_A = 'fp-payload-A';
+
+async function reserve(
+  stub: DurableObjectStub,
+  noteId: string,
+  limit = 20,
+  fp: string | undefined = FP_A,
+) {
   const r = await stub.fetch('http://do/check-and-reserve', {
-    method: 'POST', body: JSON.stringify({ noteId, limit }),
+    method: 'POST', body: JSON.stringify({ noteId, limit, ...(fp === undefined ? {} : { fp }) }),
   });
-  return r.json() as Promise<{ status: string; token?: string; txId?: string; committedAt?: number }>;
+  return r.json() as Promise<{
+    status: string; token?: string; txId?: string; committedAt?: number;
+    deduped?: boolean; state?: string;
+    snapshot?: { status: string; txId: string; token: string; gen: number };
+  }>;
+}
+async function backfill(
+  stub: DurableObjectStub,
+  noteId: string,
+  snapshot: { status: string; txId: string; token: string; gen: number },
+  observedFp: string,
+) {
+  const r = await stub.fetch('http://do/backfill-fp', {
+    method: 'POST', body: JSON.stringify({ noteId, snapshot, observedFp }),
+  });
+  return r.json() as Promise<{ ok: boolean; stale?: boolean; fp?: string | null }>;
 }
 async function markPosted(stub: DurableObjectStub, noteId: string, txId: string, token: string) {
   const r = await stub.fetch('http://do/mark-posted', {
@@ -219,18 +244,157 @@ describe('RateLimiter release + redrop', () => {
 });
 
 describe('RateLimiter legacy records', () => {
-  it('reports committedAt from reservedAt for a legacy committed record', async () => {
+  it('hands out a SNAPSHOT instead of a verdict — the bytes were never fingerprinted', async () => {
     const s = stubFor('pk-Legacy');
     const legacyTime = 1_000_000;
-    // Inject a pre-committedAt record (time lived in reservedAt only).
     await runInDurableObject(s, async (_inst, state) => {
       await state.storage.put('note:leg', {
         status: 'committed', token: 't', gen: 0, txId: 'tx-legacy', reservedAt: legacyTime,
       });
     });
+
     const res = await reserve(s, 'leg');
+
+    // NOT 'exists'. A record whose payload nobody fingerprinted cannot be
+    // compared, and answering `exists` would hand out a historical txId for
+    // bytes nobody checked — the defect D2 exists to close.
+    expect(res.status).toBe('legacy');
+    expect(res.snapshot).toEqual({
+      status: 'committed', txId: 'tx-legacy', token: 't', gen: 0,
+    });
+  });
+
+  it('still reports committedAt from reservedAt once the fp is backfilled', async () => {
+    const s = stubFor('pk-Legacy2');
+    const legacyTime = 1_000_000;
+    await runInDurableObject(s, async (_inst, state) => {
+      await state.storage.put('note:leg2', {
+        status: 'committed', token: 't', gen: 0, txId: 'tx-legacy', reservedAt: legacyTime,
+      });
+    });
+    await backfill(s, 'leg2', { status: 'committed', txId: 'tx-legacy', token: 't', gen: 0 }, FP_A);
+
+    const res = await reserve(s, 'leg2');
     expect(res.status).toBe('exists');
     // Falls back to reservedAt (not 0) — so the 30-min recheck guard still holds.
     expect(res.committedAt).toBe(legacyTime);
+  });
+
+  it('a legacy RESERVED record is in-progress, never a backfill candidate', async () => {
+    // It has no txId, so there is nothing to authenticate — and the plan is
+    // explicit that this branch performs no GET at all.
+    const s = stubFor('pk-Legacy3');
+    await runInDurableObject(s, async (_inst, state) => {
+      await state.storage.put('note:leg3', {
+        status: 'reserved', token: 't', gen: 0, reservedAt: Date.now(),
+      });
+    });
+    expect((await reserve(s, 'leg3')).status).toBe('reserved');
+  });
+});
+
+// ─── D2: the fingerprint, and what it refuses ────────────────────────
+
+describe('semantic idempotency — the same id under DIFFERENT bytes', () => {
+  it('a repeat with the SAME fp is a dedupe', async () => {
+    const s = stubFor('pk-Fp1');
+    const res = await reserve(s, 'n-fp');
+    await commit(s, 'n-fp', 'tx-1', res.token!);
+
+    const again = await reserve(s, 'n-fp');
+    expect(again.status).toBe('exists');
+    expect(again.txId).toBe('tx-1');
+    expect(again.deduped).toBe(true);
+  });
+
+  it('a repeat with a DIFFERENT fp is a typed conflict, not a replay', async () => {
+    // The whole point: returning `exists` here would hand out transaction A for
+    // payload B — the pair the two irreversible floors exist to make impossible.
+    const s = stubFor('pk-Fp2');
+    const res = await reserve(s, 'n-fp2');
+    await commit(s, 'n-fp2', 'tx-2', res.token!);
+
+    const conflict = await reserve(s, 'n-fp2', 20, 'fp-payload-B');
+    expect(conflict.status).toBe('id_payload_conflict');
+    expect(conflict.txId).toBe('tx-2');
+    expect(conflict.state).toBe('committed');
+  });
+
+  it('compares in the POSTED state too, not only committed', async () => {
+    // A posted record hands out a historical txId as well, so comparing one
+    // state and not the other would leave the defect reachable via recheck.
+    const s = stubFor('pk-Fp3');
+    const res = await reserve(s, 'n-fp3');
+    await markPosted(s, 'n-fp3', 'tx-3', res.token!);
+
+    expect((await reserve(s, 'n-fp3', 20, 'fp-payload-B')).status).toBe('id_payload_conflict');
+    // …and a matching fp keeps the existing protocol path rather than `exists`:
+    // `posted` still owes a liveness check and a commit.
+    expect((await reserve(s, 'n-fp3')).status).toBe('posted');
+  });
+
+  it('carries the fp UNCHANGED through mark-posted and commit', async () => {
+    const s = stubFor('pk-Fp4');
+    const res = await reserve(s, 'n-fp4');
+    await markPosted(s, 'n-fp4', 'tx-4', res.token!);
+    await commit(s, 'n-fp4', 'tx-4', res.token!);
+
+    const stored = await runInDurableObject(s, async (_i, state) =>
+      state.storage.get<{ fp?: string }>('note:n-fp4'));
+    expect(stored?.fp).toBe(FP_A);
+    expect((await reserve(s, 'n-fp4', 20, 'fp-payload-B')).status).toBe('id_payload_conflict');
+  });
+});
+
+describe('/backfill-fp — snapshot CAS', () => {
+  const seedLegacy = async (stub: DurableObjectStub, noteId: string) => {
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put(`note:${noteId}`, {
+        status: 'committed', token: 'tok', gen: 0, txId: 'tx-legacy', reservedAt: 1,
+      });
+    });
+    return { status: 'committed', txId: 'tx-legacy', token: 'tok', gen: 0 };
+  };
+
+  it('writes the observed fp when the snapshot still matches', async () => {
+    const s = stubFor('pk-Bf1');
+    const snap = await seedLegacy(s, 'bf1');
+    expect(await backfill(s, 'bf1', snap, 'fp-observed')).toEqual({ ok: true, fp: 'fp-observed' });
+    expect((await reserve(s, 'bf1', 20, 'fp-observed')).status).toBe('exists');
+  });
+
+  it('refuses when the record moved on — a stale snapshot writes nothing', async () => {
+    const s = stubFor('pk-Bf2');
+    const snap = await seedLegacy(s, 'bf2');
+    await runInDurableObject(s, async (_i, state) => {
+      await state.storage.put('note:bf2', {
+        status: 'committed', token: 'DIFFERENT', gen: 0, txId: 'tx-legacy', reservedAt: 1,
+      });
+    });
+    const r = await backfill(s, 'bf2', snap, 'fp-observed');
+    expect(r.ok).toBe(false);
+    expect(r.stale).toBe(true);
+  });
+
+  it('refuses a SECOND backfill even with an identical snapshot', async () => {
+    // Two concurrent backfills can hold snapshots identical in all four fields.
+    // Without the `fp === undefined` requirement the second would overwrite the
+    // first's result — a lost update the four-field CAS cannot see.
+    const s = stubFor('pk-Bf3');
+    const snap = await seedLegacy(s, 'bf3');
+    expect((await backfill(s, 'bf3', snap, 'fp-first')).ok).toBe(true);
+
+    const second = await backfill(s, 'bf3', snap, 'fp-second');
+    expect(second.ok).toBe(false);
+    expect(second.stale).toBe(true);
+    // The loser is told what is already there, so it need not repeat the GET.
+    expect(second.fp).toBe('fp-first');
+  });
+
+  it('refuses for a record that no longer exists', async () => {
+    const s = stubFor('pk-Bf4');
+    const r = await backfill(s, 'gone', { status: 'committed', txId: 't', token: 'k', gen: 0 }, 'fp');
+    expect(r.ok).toBe(false);
+    expect(r.stale).toBe(true);
   });
 });
