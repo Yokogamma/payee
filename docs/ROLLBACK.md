@@ -1682,6 +1682,14 @@ The floor is raised in TWO steps, and skipping the second leaves it lowerable:
    head or an allowlisted release, and refuses anything below the floor.
 2. The post-deploy smoke checks the LIVE worker: policy id, gateway hash and
    count, `releaseSha`, the activated `workerVersionId`, and the nonce echo.
+   It **waits out Cloudflare's propagation** rather than judging the first
+   answer: for a few seconds after an upload some edges still reply from the
+   PREVIOUS version, which is indistinguishable from a failed release. The
+   smoke therefore re-asks — with a new nonce each time — until the release
+   appears or the budget (`SMOKE_DEADLINE_MS`, 60 s in the workflow) runs out,
+   and reports the last real mismatch, not just «deadline exhausted».
+   This is why a red smoke is worth reading closely: the first attempt of this
+   release failed on exactly that race while the deployed worker was correct.
 3. **Raise `WORKER_FLOOR_SHA` to that SHA** in the Environment. Nothing does
    this automatically — the control plane keeps applying the OLD floor until
    the variable changes.

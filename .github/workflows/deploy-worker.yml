@@ -267,6 +267,10 @@ jobs:
           PROFILE: ${{ inputs.profile }}
           EXPECT_RELEASE_SHA: ${{ inputs.candidate }}
           EXPECT_WORKER_VERSION_ID: ${{ steps.version.outputs.version_id }}
+          # Right after a deploy some edges still answer from the previous
+          # version. That is propagation, not a bad release, so give the smoke
+          # a minute to see the new one before it calls the release broken.
+          SMOKE_DEADLINE_MS: '60000'
       # ── Hand the identity to the Pages release as an ARTIFACT ──
       #
       # A version id typed into the Pages form proves nothing: an ungated
