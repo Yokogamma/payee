@@ -4,10 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "node -e \"console.error('Production deploys go through the trusted workflow (Deploy Worker — dev) with a candidate SHA: a local wrangler deploy bypasses the floor gate, the Environment and the release lock. Use deploy:staging for staging.'); process.exit(1)\"",
     "check:staging-config": "node scripts/check-staging-config.mjs",
     "predeploy:staging": "npm run check:staging-config",
-    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:staging": "node scripts/deploy-staging.mjs",
     "deploy:staging:check": "wrangler deploy --env staging --dry-run",
     "smoke:v3": "node scripts/smoke-v3.mjs",
     "smoke:v4": "node scripts/smoke-v4.mjs",
@@ -18,10 +18,10 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20260722.1",
+    "@cloudflare/workers-types": "^5.20260823.1",
     "typescript": "~6.0.3",
-    "vitest": "^4.1.10",
-    "wrangler": "^4.124.0"
+    "vitest": "^4.1.11",
+    "wrangler": "^4.125.0"
   },
   "dependencies": {
     "@noble/ed25519": "^3.1.0",
