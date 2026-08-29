@@ -4556,36 +4556,52 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     backupOpRef.current.abort?.abort();
     const abort = new AbortController();
     backupOpRef.current.abort = abort;
+
+    const assertAlive = () => {
+      if (vaultEpochRef.current !== myEpoch) {
+        throw new BackupCancelledError('Хранилище было заблокировано — операция прервана.');
+      }
+      if (getDbGeneration() !== myDbGen) {
+        throw new BackupCancelledError('Приложение было сброшено — операция прервана.');
+      }
+      if (backupOpRef.current.generation !== myOp) {
+        throw new BackupCancelledError('Операция резервного копирования отменена.');
+      }
+    };
+
     return {
       // The SEED STAYS HERE. What the operation gets is permission to derive,
       // read from this ref at the moment it derives — so a prepared import
       // waiting on a human decision holds no copy of the phrase, and the
       // synchronous wipe in `clearVaultState` remains the whole truth about
       // where the seed lives.
+      //
+      // FOUR derivations, and a guard after each of them — not one after the
+      // batch. Each is real work, and on a phone the batch is not instant; a
+      // lock or a page hide after the first key would otherwise leave three
+      // more running, each re-reading the seed, for an operation already
+      // abandoned. The ref is read per derivation on purpose: it disappears
+      // synchronously on lock, so a wipe mid-batch stops the rest.
       deriveKeys: async () => {
-        const live = mnemonicRef.current;
-        if (!live) throw new BackupVaultLockedError();
-        return {
-          note: await deriveKey(live),
-          safeboxMeta: await deriveSafeboxMetaKey(live),
-          safeboxSecret: await deriveSafeboxSecretKey(live),
-          container: await deriveBackupKey(live),
+        const live = () => {
+          const mnemonic = mnemonicRef.current;
+          if (!mnemonic) throw new BackupVaultLockedError();
+          return mnemonic;
         };
+        const note = await deriveKey(live());
+        assertAlive();
+        const safeboxMeta = await deriveSafeboxMetaKey(live());
+        assertAlive();
+        const safeboxSecret = await deriveSafeboxSecretKey(live());
+        assertAlive();
+        const container = await deriveBackupKey(live());
+        assertAlive();
+        return { note, safeboxMeta, safeboxSecret, container };
       },
       dbGeneration: myDbGen,
       now: () => Date.now(),
       signal: abort.signal,
-      assertAlive: () => {
-        if (vaultEpochRef.current !== myEpoch) {
-          throw new BackupCancelledError('Хранилище было заблокировано — операция прервана.');
-        }
-        if (getDbGeneration() !== myDbGen) {
-          throw new BackupCancelledError('Приложение было сброшено — операция прервана.');
-        }
-        if (backupOpRef.current.generation !== myOp) {
-          throw new BackupCancelledError('Операция резервного копирования отменена.');
-        }
-      },
+      assertAlive,
     };
   }, []);
 
@@ -4638,19 +4654,31 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   const applyBackupImport = useCallback(async (prepared: PreparedImport): Promise<ImportOutcome> => {
     const myEpoch = vaultEpochRef.current;
+    const myOp = backupOpRef.current.generation;
     const report = await prepared.apply();
+
+    // The token is captured BEFORE stage B and checked across the whole tail.
+    // Epoch alone is not enough: a page hide moves neither the epoch nor the
+    // database generation, and the tail is not one operation but five —
+    // re-decrypting every note, two count passes, a safebox read and a push of
+    // the upload queue. Without this, `pagehide` during an import let the tab
+    // finish decrypting the store and START SENDING for a page nobody is
+    // looking at; and `viewRefreshed: true` claimed a repaint that the first
+    // step had already abandoned.
+    const alive = () => vaultEpochRef.current === myEpoch
+      && backupOpRef.current.generation === myOp;
 
     let viewRefreshed = false;
     try {
-      if (vaultEpochRef.current === myEpoch) {
+      if (alive()) {
         await reloadNotesAfterImport(myEpoch);
-        await refreshSyncCounts(myEpoch);
-        await refreshSafeboxPresence(myEpoch);
-        if (arweaveRef.current.enabled) {
+        if (alive()) await refreshSyncCounts(myEpoch);
+        if (alive()) await refreshSafeboxPresence(myEpoch);
+        if (alive() && arweaveRef.current.enabled) {
           await syncPendingRecords();
-          kickQueue();
+          if (alive()) kickQueue();
         }
-        viewRefreshed = true;
+        viewRefreshed = alive();
       }
     } catch {
       // The screen is stale, the data is not. The caller is told which.
