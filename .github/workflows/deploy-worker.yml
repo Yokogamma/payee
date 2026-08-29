@@ -7,26 +7,61 @@ name: Deploy Worker (proxy) — dev
 #   Release order: Worker → smoke → Pages (reader-before-writer). The first
 #   recovery-protocol rollout used a special order — recorded in ROLLBACK.md
 #   as history; the legacy GitHub Pages origin is retired.
+#
+# ── The candidate is an INPUT, and it must be ON the default branch ──
+#
+# This workflow deploys the commit named in `candidate`. It is dispatched from
+# the DEFAULT BRANCH, which is where its own steps, `check-worker-floor.mjs`
+# and `check-deploy-config.mjs` come from.
+#
+# The reason is the reason the token is not handed to repo scripts either: a
+# workflow_dispatch takes its workflow FROM THE REF IT IS DISPATCHED WITH, so a
+# gate living in the deployed code could be edited by the very commit it is
+# meant to judge. Passing the candidate as a SHA separates «the code being
+# deployed» from «the code deciding whether it may be».
+#
+# But a free-form SHA would ALSO separate the deployed code from branch
+# protection, which is worse than the arrangement it replaced: this job installs
+# and tests the candidate in a runner that holds the Cloudflare token. So the
+# gate requires the candidate to be REACHABLE FROM THE TRUSTED HEAD — every
+# commit the default branch ever contained, so rollbacks keep working, and
+# nothing else. There is no second checkout either: the candidate is
+# materialized with `git worktree` out of the history already fetched here,
+# so nothing is pulled from the network after the gate has spoken.
+#
+# The branch policy of the Environment remains the boundary for WHO may
+# dispatch this at all; the guard below is a rail for the honest mistake.
+#
 # NOTE: a workflow_dispatch workflow must already exist on the default branch
 # before it can be run from the Actions UI, so land this file in main FIRST
 # (both deploys here are manual, so merging does not auto-publish anything).
 # Requires the GitHub Environment "dev" (its deployment branch policy is the
 # real access boundary for the token — §1.7):
-#   variable CLOUDFLARE_ACCOUNT_ID, secret CLOUDFLARE_API_TOKEN.
+#   variable CLOUDFLARE_ACCOUNT_ID, secret CLOUDFLARE_API_TOKEN,
+#   variable WORKER_FLOOR_SHA (non-secret config; MUST be set — the gate
+#   refuses to run without it, because a floor already exists. It is RAISED,
+#   not first filled, before the import flip — docs/ROLLBACK.md).
 # Worker secrets must be set beforehand (wrangler secret put), incl. the
 # MANDATORY RECOVERY_HMAC_SECRET — without it /upload returns 503.
 on:
   workflow_dispatch:
+    inputs:
+      candidate:
+        description: 'Full 40-character commit SHA of the worker build to deploy (not a branch or tag)'
+        required: true
+        type: string
 
 # Least privilege for GITHUB_TOKEN (repo defaults may be write-all); this
 # workflow only needs to read the code it deploys.
 permissions:
   contents: read
 
-# Two dispatches must finish in dispatch order: without this, a rehearsal run
-# and the real deploy right after it can land in REVERSE order, putting the
-# old build on top of the new one. Never cancel a deploy mid-flight —
-# waiting beats a half-shipped worker.
+# Serialization, NOT ordering. `concurrency` prevents two runs of this
+# workflow from overlapping and `cancel-in-progress: false` stops a running
+# deploy from being killed — but GitHub keeps only ONE pending run per group
+# and does not promise that queued runs start in dispatch order. So the
+# ordering rule is operational and belongs to the person at the keyboard:
+# do not dispatch the next deploy until the previous run has finished.
 concurrency:
   group: deploy-worker
   cancel-in-progress: false
@@ -37,14 +72,49 @@ jobs:
     # vars.*/secrets.* below resolve from this environment.
     environment: dev
     steps:
+      # ── The trusted half: this ref's own code ──────────────────────
       # Actions are pinned to immutable commit SHAs (tags are movable — a
       # retagged/compromised action would run with the Cloudflare API token).
       # Version comments are what Dependabot bumps; verify with:
       #   git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>^{}'
+      #
+      # `fetch-depth: 0` is load-bearing: ancestry cannot be computed from a
+      # shallow clone, and the floor gate is ancestry.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version-file: .nvmrc
+          # Ancestry cannot be computed from a shallow clone — and both of the
+          # gate's questions are ancestry.
+          fetch-depth: 0
+          # Nothing after this step talks to the remote: the candidate comes
+          # out of the history fetched here, via `git worktree`. A credential
+          # left in the config would only be there for candidate code to find.
+          persist-credentials: false
+      # A guard rail, not a boundary — see the header. It catches the honest
+      # mistake (dispatching from a feature branch out of habit); the real
+      # restriction is the Environment's deployment branch policy.
+      # The FULL ref, not `ref_name`: a tag and a branch can share a name, and
+      # `ref_name` cannot tell them apart.
+      - name: Refuse to deploy from anything but the default branch
+        run: |
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "This workflow deploys a candidate SHA and must be dispatched from the $DEFAULT branch (was: $REF)." >&2
+            exit 1
+          fi
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+      # ── The gate ──────────────────────────────────────────────────
+      # Runs from the TRUSTED checkout, with the floor from a protected
+      # Environment variable, BEFORE any file of the candidate exists on disk.
+      # Two refusals: a candidate that is not reachable from this run's own
+      # commit, and a candidate below the floor. An unset floor is also a
+      # refusal — a floor already exists (docs/ROLLBACK.md), so a missing
+      # variable is missing configuration, not an absent constraint.
+      - run: node scripts/check-worker-floor.mjs
+        env:
+          WORKER_FLOOR_SHA: ${{ vars.WORKER_FLOOR_SHA }}
+          WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
+          WORKER_TRUSTED_HEAD: ${{ github.sha }}
       # Early config gate: presence + repo-pinned expectations for NON-SECRET
       # variables only. The deploy token is deliberately NOT passed to any
       # repo script — this workflow can be dispatched from arbitrary branches
@@ -53,6 +123,25 @@ jobs:
       - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      # ── The candidate: only now, and only in its own directory ─────
+      # A worktree, not a second checkout: the commit is already here (the gate
+      # proved it is reachable from this run's head), so there is nothing to
+      # fetch and no credential to hand out. `--detach` because a worktree of a
+      # historical commit has no branch to be on.
+      - name: Materialize the candidate
+        run: git worktree add --detach candidate "$CANDIDATE"
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+      # The CANDIDATE's Node, not this branch's. `npm ci` runs inside
+      # `candidate/` and enforces the candidate's `engines` under
+      # `engine-strict`, so a rollback to a commit that predates a Node bump
+      # would fail at install time with a message about versions — in exactly
+      # the situation where a rollback is what is needed, and where both other
+      # ways out are now banned. `.nvmrc` is data, and the gate has already
+      # proved this commit is one the default branch contains.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: candidate/.nvmrc
       # ROOT deps are needed by the worker TEST suite since #104:
       # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
       # which resolves @scure/bip39 from the root node_modules (in ci.yml the
@@ -63,11 +152,15 @@ jobs:
       # root transitive dependency ever runs in this CREDENTIALED job — the
       # accepted npm-ci residual risk (docs/SECRETS.md) does not widen.
       - run: npm ci --ignore-scripts
+        working-directory: candidate
       - run: npm --prefix worker ci
+        working-directory: candidate
       - run: npm --prefix worker run typecheck
+        working-directory: candidate
       - run: npm --prefix worker test
+        working-directory: candidate
       - uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: worker
+          workingDirectory: candidate/worker

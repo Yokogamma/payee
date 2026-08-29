@@ -25,10 +25,12 @@ on:
 permissions:
   contents: read
 
-# Two dispatches must finish in dispatch order: without this, a rehearsal run
-# and the real deploy right after it can land in REVERSE order, putting the
-# old build on top of the new one. Never cancel a deploy mid-flight —
-# waiting beats a half-shipped client.
+# Serialization, NOT ordering — the same correction made in deploy-worker.yml,
+# and for the same reason: `concurrency` keeps two runs of this workflow from
+# overlapping and `cancel-in-progress: false` protects a running deploy, but
+# GitHub keeps only ONE pending run per group and promises nothing about the
+# order queued runs start in. Do not dispatch the next deploy until the
+# previous run has finished.
 concurrency:
   group: deploy-pages
   cancel-in-progress: false
