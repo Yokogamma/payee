@@ -30,3 +30,12 @@ dist-ssr
 # The SHA-256 constant it produces IS committed (as a placeholder stub) so a
 # clean checkout compiles; the artifact itself is rebuilt deterministically.
 public/backup-viewer.html
+
+# Локальные рабочие каталоги — НЕ артефакты проекта.
+# Добавлены после того, как `git add -A` в интеграционном коммите утащил их
+# в публичную ветку вместе с вложением и PDF-ами: правило дешевле, чем
+# переписывание истории публичного репозитория.
+.codex-remote-attachments/
+.playwright-cli/
+output/
+tmp/
