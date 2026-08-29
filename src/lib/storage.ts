@@ -4,12 +4,14 @@
  * Single source of truth for all persistent data.
  * Replaces localStorage for notes/sync/meta.
  *
- * Schema: DB "eternal-notes", version 2
+ * Schema: DB "eternal-notes", version 3
  *   - notes:   { noteId (PK), ciphertext, iv, createdAt } + index by-timestamp
  *   - sync:    { noteId (PK), kind, txId?, status, transport, lastError?, updatedAt } + index by-status
  *   - meta:    { key (PK), value }
  *   - safebox: { entryId (PK), metaCiphertext, metaIv, secretCiphertext,
  *                secretIv, createdAt, v } + index by-timestamp        (v2)
+ *   v3 adds no store and no index — only the additive `attemptId` field on
+ *   `sync` rows (D14a). It exists to lock older builds out; see DB_VERSION.
  */
 
 import { openDB, deleteDB, type IDBPDatabase } from 'idb';
@@ -17,6 +19,11 @@ import type { EncryptedNote, EncryptedSafeboxEntry, PinEncryptedSeed } from './c
 import { SafeboxPinUnavailableError, assertValidPinBlob } from './crypto';
 // Runtime import is cycle-safe: sync-transitions imports ONLY types from here.
 import { toUploading } from './sync-transitions';
+// Cycle-safe as well: publication-equivalent imports arweave + crypto, never
+// storage. The payload-CAS below asks exactly the question this module answers
+// — «would these two records publish identically?» — so it must not grow a
+// second, subtly different comparison of its own.
+import { publicationEquivalent, type PublicationSubject } from './publication-equivalent';
 import {
   QUICK_UNLOCK_META_KEY,
   judgeQuickUnlock,
@@ -60,6 +67,23 @@ export interface SyncRecord {
    * without a duplicate re-post. Cleared once committed.
    */
   recovery?: { txId: string; postedAt: number; token: string };
+  /**
+   * Identity of the upload attempt that owns this 'uploading' row (D14a).
+   *
+   * Payload-CAS closes the window BEFORE the request; this closes the one
+   * AFTER it. The proxy POST has no timeout by design, so an attempt can
+   * outlive the ten-minute stale threshold, and its answer would otherwise be
+   * applied unconditionally — writing that attempt's txId next to bytes some
+   * other writer has replaced in the meantime.
+   *
+   * Written by beginUploadUnlessTerminal, checked by
+   * commitUploadResultIfAttempt, and NOT carried by any other transition: a
+   * row that left 'uploading' has no owner, so a late answer finds no match
+   * and is dropped. Additive — older builds ignore the field, which is exactly
+   * why a rollback below the release that introduced it is forbidden (they
+   * would apply the late answer).
+   */
+  attemptId?: string;
   /**
    * PERMANENT local quarantine reason. A plain status:'error' is retryable —
    * the queue re-enqueues it on every poll/reload; a record with terminalError
@@ -114,13 +138,53 @@ function normalizeSyncRecord(raw: SyncRecord | undefined): SyncRecord | undefine
   return { ...raw, kind: 'note', terminalError: 'malformed_record' };
 }
 
+/**
+ * How long an 'uploading' row is believed to belong to a LIVE attempt.
+ * Matches the server reservation timeout.
+ *
+ * Lives here, next to SyncRecord, because two very different callers must
+ * agree on it: the upload queue (which refuses to re-enqueue a fresh
+ * 'uploading') and the restore/import writers (which refuse to touch one,
+ * D12). Two copies of this number would let the two disagree about which
+ * record is in flight — and the whole point of the rule is that they cannot.
+ */
+export const STALE_UPLOADING_MS = 10 * 60 * 1000;
+
+/**
+ * True while a row still looks like a LIVE upload attempt.
+ *
+ * The freshness window is a heuristic and is treated as one: it decides only
+ * whether a writer defers, never whether a late answer may be applied. That
+ * second question is settled by `attemptId` (D14a), because the proxy POST has
+ * no timeout and time alone proves nothing about an in-flight request.
+ */
+export function isFreshUploading(record: SyncRecord | undefined, now: number): boolean {
+  return record?.status === 'uploading' && (now - record.updatedAt) < STALE_UPLOADING_MS;
+}
+
 // ─── Database ────────────────────────────────────────────────────────
 
 const DB_NAME = 'eternal-notes';
-/** v2 adds the `safebox` store. The bump happens on the FIRST launch of R4,
- *  independently of the writer flag — which is exactly why R4 is an
- *  irreversible client floor (docs/ROLLBACK.md). */
-const DB_VERSION = 2;
+/**
+ * v2 adds the `safebox` store. The bump happens on the FIRST launch of R4,
+ * independently of the writer flag — which is exactly why R4 is an
+ * irreversible client floor (docs/ROLLBACK.md).
+ *
+ * v3 adds NO store and NO index. The ONLY schema change is the additive
+ * `attemptId` field on SyncRecord (D14a) — which is precisely why the bump is
+ * free, and why it is worth spending: the version number is the only mechanism
+ * that can stop an OLDER build from opening this database.
+ *
+ * That matters because the server-side fingerprint does not make the old
+ * client-side writers safe. A pre-D12 build re-pairs a restored payload with
+ * whatever txId the sync row already held, and a pre-D14/D14a build signs a
+ * payload snapshot and then applies the answer unconditionally — both
+ * reproduce «payload B ↔ txId A» without the worker being involved at all.
+ * An old tab therefore gets the non-destructive «update the app» screen
+ * (`blocking()` below → store.tsx), and a client rollback below the release
+ * that introduced v3 is FORBIDDEN and recorded in docs/ROLLBACK.md.
+ */
+export const DB_VERSION = 3;
 
 let db: IDBPDatabase | null = null;
 let initPromise: Promise<void> | null = null;
@@ -190,6 +254,10 @@ async function doInit(opts: InitStorageOptions): Promise<void> {
         const safeboxStore = database.createObjectStore('safebox', { keyPath: 'entryId' });
         safeboxStore.createIndex('by-timestamp', 'createdAt');
       }
+      // v3: NOTHING to migrate. `attemptId` is an additive optional field on
+      // rows of the existing `sync` store, so every stored row is already
+      // valid at v3 and rewriting them would be pure risk. The version exists
+      // to lock OLD builds out, not to reshape data — see DB_VERSION above.
     },
     blocked() {
       opts.onBlocked?.();
@@ -310,14 +378,13 @@ export async function saveNoteWithSync(
   }
 }
 
-/** The per-reason quarantine decision shared by both restore writers. Runs on
- *  the row re-read INSIDE the caller's transaction (TOCTOU-safe: a quarantine
- *  set after the caller's preliminary read still wins/clears correctly). */
-async function applyRestoreQuarantineRule(
-  syncStore: { get(key: string): Promise<unknown> },
+/** The per-reason quarantine decision, as a PURE function of the row that was
+ *  read inside the writer's transaction. Pure so the merge below can make every
+ *  decision from ONE in-transaction read instead of reading twice. */
+function resolveRestoreQuarantine(
+  fresh: SyncRecord | undefined,
   record: SyncRecord,
-): Promise<SyncRecord> {
-  const fresh = normalizeSyncRecord(await syncStore.get(record.noteId) as SyncRecord | undefined);
+): SyncRecord {
   if (fresh?.terminalError === undefined) return record;
   if (fresh.terminalError === 'recovery_invalidated') {
     const cleared = { ...record };
@@ -326,6 +393,81 @@ async function applyRestoreQuarantineRule(
   }
   return { ...record, terminalError: fresh.terminalError };
 }
+
+/** The per-reason quarantine decision shared by both restore writers. Runs on
+ *  the row re-read INSIDE the caller's transaction (TOCTOU-safe: a quarantine
+ *  set after the caller's preliminary read still wins/clears correctly). */
+async function applyRestoreQuarantineRule(
+  syncStore: { get(key: string): Promise<unknown> },
+  record: SyncRecord,
+): Promise<SyncRecord> {
+  const fresh = normalizeSyncRecord(await syncStore.get(record.noteId) as SyncRecord | undefined);
+  return resolveRestoreQuarantine(fresh, record);
+}
+
+/**
+ * The D12 merge itself: ONE readwrite transaction over the payload store and
+ * `sync`, in which the row is read ONCE and every decision is made from that
+ * read — «is an attempt live?», «does the existing confirmed row name this
+ * transaction?» and the per-reason quarantine rule alike.
+ *
+ * Reading the row BEFORE the transaction (as this used to) is a TOCTOU window
+ * with real consequences: between that read and the write, another tab can
+ * begin an upload and stamp the row with its `attemptId`. The merge would then
+ * overwrite both the payload and that row — the late answer is still discarded
+ * by the attempt-CAS, but the HTTP request has already gone out against bytes
+ * the store no longer holds, which can mean a second paid publication and a DO
+ * that disagrees with the device. Deferring is only meaningful if the check and
+ * the write cannot be separated.
+ *
+ * CONTRACT, same as save*WithSync: `assertDbGeneration` and the transaction
+ * creation are adjacent and synchronous. An await between them silently
+ * reopens the reset-resurrection window.
+ */
+async function mergeRestoredPair(
+  payloadStore: 'notes' | 'safebox',
+  kind: SyncRecord['kind'],
+  id: string,
+  payload: EncryptedNote | EncryptedSafeboxEntry,
+  txId: string,
+  now: number,
+  expectedDbGeneration: number,
+): Promise<MergeRestoredOutcome> {
+  assertDbGeneration(expectedDbGeneration);
+  const tx = getDB().transaction([payloadStore, 'sync'], 'readwrite');
+  try {
+    const syncStore = tx.objectStore('sync');
+    const fresh = normalizeSyncRecord(await syncStore.get(id) as SyncRecord | undefined);
+    if (isFreshUploading(fresh, now)) {
+      await tx.done;
+      return 'deferred'; // a live attempt owns these bytes — touch nothing
+    }
+    const record: SyncRecord = fresh?.status === 'confirmed' && fresh.txId === txId
+      ? fresh
+      : { noteId: id, kind, txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
+
+    await tx.objectStore(payloadStore).put(payload);
+    await syncStore.put(resolveRestoreQuarantine(fresh, record));
+    await tx.done;
+    return 'merged';
+  } catch (e) {
+    // Same rollback discipline as save*WithSync: an error on the SECOND put
+    // must not let the transaction auto-commit with only the payload written.
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/**
+ * Did the restore merge actually write? 'deferred' means a live upload attempt
+ * owns the record and it was left completely alone (D12).
+ *
+ * The caller MUST branch on this: a deferred record has NOT been repaired, so
+ * dropping it from the «undecryptable, re-download it» set would hide a
+ * still-broken payload until the next full sweep.
+ */
+export type MergeRestoredOutcome = 'merged' | 'deferred';
 
 /**
  * Merge one successfully-decrypted on-chain note into local storage during
@@ -336,8 +478,27 @@ async function applyRestoreQuarantineRule(
  *  - the sync state: a note without a confirmed record (older app versions
  *    wrote none) would be re-queued and could re-upload an already-on-chain
  *    note (duplicate paid TX if the server's old idempotency record is gone).
- * An existing CONFIRMED record is preserved as-is (original txId/updatedAt);
- * anything else is upgraded to confirmed with the on-chain txId.
+ *
+ * THE PAIR IS WRITTEN TOGETHER OR NOT AT ALL (D12). An existing CONFIRMED
+ * record is preserved as-is — with its original txId and updatedAt — ONLY when
+ * it names the SAME transaction we are merging. Preserving it unconditionally
+ * (the previous behaviour) kept txId A next to freshly written payload B: the
+ * exact false claim «these bytes are that publication» that the whole backup
+ * track exists to make impossible, and it was created locally, without the
+ * server being involved at all. A different txId means the local row describes
+ * a different publication, so it is replaced together with the bytes it
+ * describes.
+ *
+ * A FRESH 'uploading' row is not touched at all — payload included. Rewriting
+ * the bytes under a live attempt would let its answer bind a txId to a payload
+ * that attempt never sent. A STALE one is handled normally, which is only safe
+ * because the attempt-CAS (D14a) drops the late answer: time alone proves
+ * nothing about a POST that has no timeout.
+ *
+ * All three decisions are made INSIDE one transaction, from ONE read of the
+ * row (mergeRestoredPair). Checking «is an attempt live?» before the
+ * transaction would leave a window in which another tab starts an upload and
+ * this merge overwrites it anyway.
  *
  * UI visibility is the CALLER's decision (against the currently-decrypted note
  * list, not DB presence — a corrupted-but-present note is invisible in the UI).
@@ -347,18 +508,8 @@ export async function mergeRestoredNote(
   txId: string,
   now: number,
   expectedDbGeneration: number,
-): Promise<void> {
-  const sync = await getSyncRecord(note.noteId);
-  const record: SyncRecord = sync?.status === 'confirmed'
-    ? sync
-    : { noteId: note.noteId, kind: 'note', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
-  // The CALLER's pre-merge check is not enough (P1): the getSyncRecord await
-  // above is a real suspension point, and a reset landing inside it would create
-  // its clear transaction BEFORE the write below — resurrecting the note in a
-  // database the user just wiped. Re-assert here, with nothing awaited between
-  // this line and the transaction saveNoteWithSync creates on entry.
-  assertDbGeneration(expectedDbGeneration);
-  await saveNoteWithSync(note, record);
+): Promise<MergeRestoredOutcome> {
+  return mergeRestoredPair('notes', 'note', note.noteId, note, txId, now, expectedDbGeneration);
 }
 
 /** Get all notes sorted by createdAt DESC (newest first) */
@@ -426,23 +577,18 @@ export async function saveSafeboxEntryWithSync(
   }
 }
 
-/** Restore-merge upsert-repair, mirroring mergeRestoredNote: the on-chain copy
- *  is known-good (it just decrypted in BOTH halves) while the local ciphertext
- *  may be corrupted, and a missing confirmed record would re-queue an entry
- *  that is already on chain. An existing CONFIRMED record is preserved as-is. */
+/** Restore-merge upsert-repair, mirroring mergeRestoredNote — including the
+ *  D12 rules: the (payload, txId) pair is written together, an existing
+ *  CONFIRMED record survives ONLY when it names the same transaction, and a
+ *  FRESH 'uploading' row is left completely untouched. See mergeRestoredNote
+ *  for why each of the three matters. */
 export async function mergeRestoredSafeboxEntry(
   entry: EncryptedSafeboxEntry,
   txId: string,
   now: number,
   expectedDbGeneration: number,
-): Promise<void> {
-  const sync = await getSyncRecord(entry.entryId);
-  const record: SyncRecord = sync?.status === 'confirmed'
-    ? sync
-    : { noteId: entry.entryId, kind: 'safebox', txId, status: 'confirmed', transport: 'proxy', updatedAt: now };
-  // Same P1 window as mergeRestoredNote — see the comment there.
-  assertDbGeneration(expectedDbGeneration);
-  await saveSafeboxEntryWithSync(entry, record);
+): Promise<MergeRestoredOutcome> {
+  return mergeRestoredPair('safebox', 'safebox', entry.entryId, entry, txId, now, expectedDbGeneration);
 }
 
 /** The safebox PIN configuration was replaced or removed between the start of
@@ -741,31 +887,76 @@ export async function setSyncRecord(record: SyncRecord): Promise<void> {
   await getDB().put('sync', record);
 }
 
+/** Why an atomic begin refused. Both outcomes mean the SAME thing to the
+ *  caller — dispatch no HTTP — and are distinguished only so the queue and the
+ *  tests can tell «someone quarantined this row» from «these bytes are no
+ *  longer what the store holds». */
+export type BeginUploadOutcome =
+  | { ok: true; attemptId: string }
+  | { ok: false; reason: 'blocked' | 'stale' };
+
 /**
- * ATOMIC begin of an upload attempt: ONE readwrite transaction re-reads the
- * CURRENT row, REFUSES if it is quarantined, otherwise writes the 'uploading'
- * transition built from the FRESH row. Returns false on refusal — the caller
- * must then NOT dispatch any HTTP.
+ * ATOMIC begin of an upload attempt: ONE readwrite transaction that re-reads
+ * the current sync row AND the current payload, refuses on either guard, and
+ * otherwise writes the 'uploading' transition stamped with a fresh
+ * `attemptId`. On refusal the caller must NOT dispatch any HTTP.
  *
- * Closes the enqueue/quarantine race: between the queue reading `prev` and
- * writing `toUploading`, another tab may have set `terminalError` — a plain
- * setSyncRecord would erase it before the request even started.
+ * Three things happen here, and each closes a different window:
+ *
+ *  1. QUARANTINE (pre-existing). Between the queue reading `prev` and this
+ *     write another tab may have set `terminalError`; a plain setSyncRecord
+ *     would erase it before the request even started.
+ *
+ *  2. PAYLOAD-CAS (D14). The body was serialized and SIGNED from a snapshot
+ *     the queue captured earlier (upload-flow.ts step 1). If a restore or an
+ *     import has replaced the stored bytes since then, sending the signed
+ *     snapshot would bind the resulting txId to a payload the store no longer
+ *     has. The comparison is `publicationEquivalent`, not raw deep equality:
+ *     the question is whether the two would publish identically, and a change
+ *     confined to a field that never reaches the chain (the outer `createdAt`
+ *     of a v2+ record) is not a reason to abandon a signed attempt.
+ *
+ *  3. ATTEMPT STAMP (D14a). `attemptId` identifies THIS attempt so its answer
+ *     can be matched later; see commitUploadResultIfAttempt.
+ *
+ * The CAS is synchronous by construction: only IndexedDB requests are awaited
+ * inside the transaction, and `publicationEquivalent` performs no async work
+ * and never throws. A `crypto.subtle` call or any non-IDB await here would let
+ * the transaction go inactive and turn the guard into a no-op.
  */
 export async function beginUploadUnlessTerminal(
   noteId: string,
-  kind: SyncRecord['kind'],
+  snapshot: PublicationSubject,
   now: number,
-): Promise<boolean> {
-  const tx = getDB().transaction('sync', 'readwrite');
+): Promise<BeginUploadOutcome> {
+  const payloadStore = snapshot.kind === 'note' ? 'notes' : 'safebox';
+  const tx = getDB().transaction([payloadStore, 'sync'], 'readwrite');
   const store = tx.objectStore('sync');
   const fresh = normalizeSyncRecord(await store.get(noteId) as SyncRecord | undefined);
   if (fresh?.terminalError !== undefined) {
     await tx.done;
-    return false;
+    return { ok: false, reason: 'blocked' };
   }
-  await store.put(toUploading(noteId, kind, fresh, now));
+
+  const current = await tx.objectStore(payloadStore).get(noteId);
+  if (current === undefined) {
+    // The row vanished under us (a wipe, a damaged store). Fail closed: there
+    // is nothing left to prove the snapshot still describes local data.
+    await tx.done;
+    return { ok: false, reason: 'stale' };
+  }
+  const live: PublicationSubject = snapshot.kind === 'note'
+    ? { kind: 'note', record: current as EncryptedNote }
+    : { kind: 'safebox', record: current as EncryptedSafeboxEntry };
+  if (!publicationEquivalent(snapshot, live)) {
+    await tx.done;
+    return { ok: false, reason: 'stale' };
+  }
+
+  const attemptId = crypto.randomUUID();
+  await store.put(toUploading(noteId, snapshot.kind, fresh, now, attemptId));
   await tx.done;
-  return true;
+  return { ok: true, attemptId };
 }
 
 /**
@@ -796,6 +987,61 @@ export async function commitSyncUnlessTerminal(
   if (fresh?.terminalError !== undefined) {
     await tx.done;
     return 'blocked';
+  }
+  const next = build(fresh);
+  if (next === null) {
+    await tx.done;
+    return 'noop';
+  }
+  await store.put(next);
+  await tx.done;
+  return 'applied';
+}
+
+/**
+ * The ONLY writer allowed to persist the result of an upload ATTEMPT (D14a).
+ *
+ * Payload-CAS (D14) makes sure the right bytes are sent; this makes sure the
+ * answer is applied to the row that asked for it. The proxy POST has no
+ * timeout by design, so an attempt can outlive the ten-minute stale window,
+ * another writer can legitimately take over the record in the meantime, and
+ * the answer that finally arrives then describes bytes that are no longer
+ * there. Applying it would write that attempt's txId next to someone else's
+ * payload — locally, with no server involvement.
+ *
+ * Mandatory for EVERY result branch, not merely the successful one: an
+ * `in_progress`, a quarantine verdict or a generic 5xx applied to the wrong
+ * row is just as wrong as an accepted txId.
+ *
+ * Kept SEPARATE from commitSyncUnlessTerminal on purpose. The polling paths
+ * have their own discipline and no attempt of their own; giving them an
+ * optional attemptId parameter would make «no id passed» silently mean «apply
+ * unconditionally», which is precisely the behaviour being removed here.
+ *
+ * Returns 'stale' when the row no longer belongs to this attempt, and
+ * 'blocked' when it is quarantined — two names for one behaviour (refuse
+ * before building anything), kept apart so a test can say which guard fired.
+ */
+export async function commitUploadResultIfAttempt(
+  noteId: string,
+  attemptId: string,
+  build: (fresh: SyncRecord | undefined) => SyncRecord | null,
+): Promise<'applied' | 'blocked' | 'noop' | 'stale'> {
+  const tx = getDB().transaction('sync', 'readwrite');
+  const store = tx.objectStore('sync');
+  const fresh = normalizeSyncRecord(await store.get(noteId) as SyncRecord | undefined);
+  // Quarantine is reported FIRST so 'blocked' keeps meaning exactly what it
+  // meant before D14a. The order is diagnostic only: both guards refuse before
+  // `build` runs, so neither can let a write through that the other would have
+  // stopped — and a quarantine set mid-flight would fail the attempt check too
+  // (the transition that set it rebuilt the row without `attemptId`).
+  if (fresh?.terminalError !== undefined) {
+    await tx.done;
+    return 'blocked';
+  }
+  if (fresh?.attemptId !== attemptId) {
+    await tx.done;
+    return 'stale';
   }
   const next = build(fresh);
   if (next === null) {
@@ -896,15 +1142,18 @@ export function readGlobalPauseMeta(): Promise<PauseMeta | 'malformed' | null> {
  * of the terminal-preserving result commit (never in addition — two writes
  * reopen the crash window this exists to close).
  *
- * Terminal-preserving for the RECORD half (same monotonicity contract as
- * commitSyncUnlessTerminal — a quarantined row is never overwritten), but the
- * PAUSE MARKER is written unconditionally: the pause is version-global state
- * about the WORKER, not about this record, and the server did just answer
- * vN_disabled regardless of what happened to the row.
+ * Terminal-preserving AND attempt-scoped for the RECORD half (D14a: the row is
+ * written only while it still belongs to this attempt), but the PAUSE MARKER is
+ * written unconditionally. The asymmetry is deliberate and load-bearing: the
+ * pause is version-global state about the WORKER, not about this record, and
+ * the server did answer vN_disabled regardless of who owns the row now.
+ * Dropping the marker because of a stale attemptId would let the next unlock
+ * burst the whole backlog at a worker that has already said no.
  */
 async function commitPausedFailure(
   keys: readonly string[],
   noteId: string,
+  attemptId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
@@ -912,7 +1161,7 @@ async function commitPausedFailure(
   try {
     const syncStore = tx.objectStore('sync');
     const fresh = normalizeSyncRecord(await syncStore.get(noteId) as SyncRecord | undefined);
-    if (fresh?.terminalError === undefined) {
+    if (fresh?.attemptId === attemptId && fresh.terminalError === undefined) {
       await syncStore.put(buildRecord(fresh));
     }
     // All markers in the SAME transaction: the global kill switch pauses every
@@ -934,17 +1183,19 @@ async function commitPausedFailure(
 
 export function commitV3PausedFailure(
   noteId: string,
+  attemptId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure([V3_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
+  return commitPausedFailure([V3_PAUSE_META_KEY], noteId, attemptId, buildRecord, pausedAt);
 }
 export function commitV4PausedFailure(
   noteId: string,
+  attemptId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure([V4_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
+  return commitPausedFailure([V4_PAUSE_META_KEY], noteId, attemptId, buildRecord, pausedAt);
 }
 
 /**
@@ -961,10 +1212,11 @@ export function commitV4PausedFailure(
  */
 export function commitGlobalPausedFailure(
   noteId: string,
+  attemptId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure([GLOBAL_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
+  return commitPausedFailure([GLOBAL_PAUSE_META_KEY], noteId, attemptId, buildRecord, pausedAt);
 }
 
 /**

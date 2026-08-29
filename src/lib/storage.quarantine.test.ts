@@ -6,6 +6,7 @@ import {
   resetAll,
   setSyncRecord,
   getSyncRecord,
+  saveNote,
   beginUploadUnlessTerminal,
   commitSyncUnlessTerminal,
   saveNoteWithSync,
@@ -57,11 +58,13 @@ beforeEach(async () => {
 
 describe('beginUploadUnlessTerminal', () => {
   it('без карантина: пишет uploading, построенный из СВЕЖЕЙ строки', async () => {
-    await setSyncRecord({
+    const note = { ...NOTE, noteId: 'b1' };
+    await saveNoteWithSync(note, {
       noteId: 'b1', kind: 'note', txId: 'TX-1', status: 'error', transport: 'proxy',
       updatedAt: NOW - 100, recovery: { txId: 'TX-1', postedAt: 1, token: 't' },
     });
-    expect(await beginUploadUnlessTerminal('b1', 'note', NOW)).toBe(true);
+    const began = await beginUploadUnlessTerminal('b1', { kind: 'note', record: note }, NOW);
+    expect(began.ok).toBe(true);
     const row = (await getSyncRecord('b1'))!;
     expect(row.status).toBe('uploading');
     expect(row.txId).toBe('TX-1');                 // поля свежей строки сохранены
@@ -69,15 +72,31 @@ describe('beginUploadUnlessTerminal', () => {
   });
 
   it('карантин: отказывает и НЕ пишет ничего (HTTP у вызывающего не будет)', async () => {
+    const note = { ...NOTE, noteId: 'b2' };
     const q = quarantined('b2', 'recovery_invalidated');
-    await setSyncRecord(q);
-    expect(await beginUploadUnlessTerminal('b2', 'note', NOW)).toBe(false);
+    await saveNoteWithSync(note, q);
+    // Карантин проверяется ДО чтения payload — отказ именно 'blocked'.
+    expect(await beginUploadUnlessTerminal('b2', { kind: 'note', record: note }, NOW))
+      .toEqual({ ok: false, reason: 'blocked' });
     expect(await getSyncRecord('b2')).toEqual(q);  // строка нетронута
   });
 
   it('отсутствующая строка: обычный первый uploading', async () => {
-    expect(await beginUploadUnlessTerminal('b3', 'safebox', NOW)).toBe(true);
-    expect((await getSyncRecord('b3'))?.kind).toBe('safebox');
+    const note = { ...NOTE, noteId: 'b3' };
+    await saveNote(note); // payload есть, sync-строки нет
+    const began = await beginUploadUnlessTerminal('b3', { kind: 'note', record: note }, NOW);
+    expect(began.ok).toBe(true);
+    expect((await getSyncRecord('b3'))?.status).toBe('uploading');
+  });
+
+  it('kind берётся из СНИМКА, а не из строки', async () => {
+    const entry = { ...SB_ENTRY, entryId: 'bbbbbbbb-bbbb-8ccc-8ddd-eeeeeeeeeeee' };
+    await saveSafeboxEntryWithSync(entry, {
+      noteId: entry.entryId, kind: 'safebox', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
+    });
+    const began = await beginUploadUnlessTerminal(entry.entryId, { kind: 'safebox', record: entry }, NOW);
+    expect(began.ok).toBe(true);
+    expect((await getSyncRecord(entry.entryId))?.kind).toBe('safebox');
   });
 });
 
@@ -214,68 +233,87 @@ describe('restore-писатели: решение ПО ПРИЧИНЕ внут�
 // ─── Конкурентные транзакции: интерливинг по порядку создания ────────
 //
 // IndexedDB гарантирует: readwrite-транзакции с пересекающимся scope
-// исполняются в порядке СОЗДАНИЯ. Вызов mergeRestoredNote синхронно создаёт
-// readonly-транзакцию своего pre-read; созданная СЛЕДОМ транзакция карантина
-// встаёт в очередь ПЕРЕД readwrite-транзакцией restore (та создаётся только
-// после resolve pre-read). Это даёт детерминированный барьер ровно на TOCTOU-
-// окне плана — двумя реально перекрывающимися асинхронными потоками.
+// исполняются в порядке СОЗДАНИЯ. Restore-писатель создаёт свою транзакцию
+// СИНХРОННО на входе — pre-read'а больше нет, D12 читает строку внутри той же
+// транзакции, в которой пишет. Поэтому интерливинг задаётся порядком вызовов
+// и проверяется В ОБЕ СТОРОНЫ: кто бы ни выиграл, карантин не стирается, а
+// правило по причине применяется к тому, что restore видит в транзакции.
 
 describe('конкурентные транзакции (§1.9): карантин против restore', () => {
-  it('гонка (заметка): карантин unsupported_version ставится МЕЖДУ pre-read и записью restore — сохраняется', async () => {
-    // Пустая строка на старте: pre-read restore прочитает «карантина нет».
-    const mergeP = mergeRestoredNote(NOTE, 'TX-RACE', NOW, getDbGeneration());
-    const quarP = commitSyncUnlessTerminal(NOTE.noteId, fresh => ({
-      noteId: NOTE.noteId, kind: 'note', txId: fresh?.txId, status: 'error',
-      transport: 'proxy', updatedAt: NOW, terminalError: 'unsupported_version',
-    }));
-    await Promise.all([mergeP, quarP]);
+  it.each(['quarantine-first', 'merge-first'] as const)(
+    'гонка (заметка) в порядке «%s»: карантин unsupported_version НЕ стирается', async order => {
+      const quarantine = () => commitSyncUnlessTerminal(NOTE.noteId, fresh => ({
+        noteId: NOTE.noteId, kind: 'note', txId: fresh?.txId, status: 'error',
+        transport: 'proxy', updatedAt: NOW, terminalError: 'unsupported_version' as const,
+      }));
+      const merge = () => mergeRestoredNote(NOTE, 'TX-RACE', NOW, getDbGeneration());
 
-    const row = (await getSyncRecord(NOTE.noteId))!;
-    expect(row.terminalError).toBe('unsupported_version'); // карантин пережил гонку
-    expect(await getNoteById(NOTE.noteId)).toBeTruthy();   // payload при этом записан
-    // Отпечаток ИМЕННО целевого интерливинга: restore-писатель успел после
-    // карантина и сохранил флаг поверх своей confirmed-строки. При вырожденном
-    // порядке (карантин после мержа) строка была бы карантинной, status 'error'.
-    expect(row.status).toBe('confirmed');
-  });
+      if (order === 'quarantine-first') await Promise.all([quarantine(), merge()]);
+      else await Promise.all([merge(), quarantine()]);
 
-  it('гонка (сейф): malformed_record между pre-read и записью — сохраняется', async () => {
-    const mergeP = mergeRestoredSafeboxEntry(SB_ENTRY, 'TX-RACE', NOW, getDbGeneration());
-    const quarP = commitSyncUnlessTerminal(SB_ENTRY.entryId, fresh => ({
-      noteId: SB_ENTRY.entryId, kind: 'safebox', txId: fresh?.txId, status: 'error',
-      transport: 'proxy', updatedAt: NOW, terminalError: 'malformed_record',
-    }));
-    await Promise.all([mergeP, quarP]);
+      const row = (await getSyncRecord(NOTE.noteId))!;
+      // Инвариант, не зависящий от победителя: карантин пережил гонку, а
+      // payload всё равно починен (upsert-repair).
+      expect(row.terminalError).toBe('unsupported_version');
+      expect(await getNoteById(NOTE.noteId)).toBeTruthy();
+      // Отпечаток порядка. Карантин раньше → restore увидел его в СВОЕЙ
+      // транзакции и сохранил поверх своей confirmed-строки. Merge раньше →
+      // карантин лёг последним и оставил свой status.
+      expect(row.status).toBe(order === 'quarantine-first' ? 'confirmed' : 'error');
+    });
 
-    const row = (await getSyncRecord(SB_ENTRY.entryId))!;
-    expect(row.terminalError).toBe('malformed_record');
-    expect(await getSafeboxEntryById(SB_ENTRY.entryId)).toBeTruthy();
-    expect(row.status).toBe('confirmed'); // отпечаток окна — см. тест заметки
-  });
+  it.each(['quarantine-first', 'merge-first'] as const)(
+    'гонка (сейф) в порядке «%s»: malformed_record НЕ стирается', async order => {
+      const quarantine = () => commitSyncUnlessTerminal(SB_ENTRY.entryId, fresh => ({
+        noteId: SB_ENTRY.entryId, kind: 'safebox' as const, txId: fresh?.txId, status: 'error' as const,
+        transport: 'proxy' as const, updatedAt: NOW, terminalError: 'malformed_record' as const,
+      }));
+      const merge = () => mergeRestoredSafeboxEntry(SB_ENTRY, 'TX-RACE', NOW, getDbGeneration());
 
-  it('гонка: recovery_invalidated, поставленный в TOCTOU-окно restore, корректно СНИМАЕТСЯ', async () => {
-    // Тот же интерливинг, причина другая: для recovery_invalidated restore —
-    // доказательный путь, и правило по причине применяется на перечитывании
-    // ВНУТРИ readwrite-транзакции, а не на устаревшем pre-read.
-    const mergeP = mergeRestoredNote(NOTE, 'TX-RACE2', NOW, getDbGeneration());
+      if (order === 'quarantine-first') await Promise.all([quarantine(), merge()]);
+      else await Promise.all([merge(), quarantine()]);
+
+      const row = (await getSyncRecord(SB_ENTRY.entryId))!;
+      expect(row.terminalError).toBe('malformed_record');
+      expect(await getSafeboxEntryById(SB_ENTRY.entryId)).toBeTruthy();
+      expect(row.status).toBe(order === 'quarantine-first' ? 'confirmed' : 'error');
+    });
+
+  it('гонка: recovery_invalidated, легший ДО транзакции restore, корректно СНИМАЕТСЯ', async () => {
+    // Причина другая: для recovery_invalidated restore — доказательный путь.
+    // Правило применяется к строке, прочитанной ВНУТРИ той же транзакции, где
+    // идёт запись, поэтому карантин, легший первым, снимается по правилу.
     const quarP = commitSyncUnlessTerminal(NOTE.noteId, fresh =>
       toRecoveryInvalidated(NOTE.noteId, 'note', fresh, 'late', NOW));
-    await Promise.all([mergeP, quarP]);
+    const mergeP = mergeRestoredNote(NOTE, 'TX-RACE2', NOW, getDbGeneration());
+    await Promise.all([quarP, mergeP]);
 
     const row = (await getSyncRecord(NOTE.noteId))!;
     expect(row.terminalError).toBeUndefined();
     expect(row.status).toBe('confirmed');
   });
 
+  it('гонка: recovery_invalidated, легший ПОСЛЕ restore, остаётся — и снимается следующим доказательным путём', async () => {
+    const mergeP = mergeRestoredNote(NOTE, 'TX-RACE3', NOW, getDbGeneration());
+    const quarP = commitSyncUnlessTerminal(NOTE.noteId, fresh =>
+      toRecoveryInvalidated(NOTE.noteId, 'note', fresh, 'late', NOW));
+    await Promise.all([mergeP, quarP]);
+
+    expect((await getSyncRecord(NOTE.noteId))?.terminalError).toBe('recovery_invalidated');
+    await mergeRestoredNote(NOTE, 'TX-RACE3', NOW, getDbGeneration());
+    expect((await getSyncRecord(NOTE.noteId))?.terminalError).toBeUndefined();
+  });
+
   it('перекрывающиеся begin-загрузки и карантин: в ЛЮБОМ порядке финал терминален и без uploading', async () => {
     for (const order of ['begin-first', 'quarantine-first'] as const) {
-      await setSyncRecord({
+      const raceNote = { ...NOTE, noteId: 'race-b' };
+      await saveNoteWithSync(raceNote, {
         noteId: 'race-b', kind: 'note', status: 'error', transport: 'proxy', updatedAt: NOW - 1,
       });
-      const begin = () => beginUploadUnlessTerminal('race-b', 'note', NOW);
+      const begin = () => beginUploadUnlessTerminal('race-b', { kind: 'note', record: raceNote }, NOW);
       const quarantine = () => commitSyncUnlessTerminal('race-b', fresh =>
         toRecoveryInvalidated('race-b', 'note', fresh, 'q', NOW));
-      let beginRes: boolean;
+      let beginRes: Awaited<ReturnType<typeof beginUploadUnlessTerminal>>;
       if (order === 'begin-first') {
         [beginRes] = await Promise.all([begin(), quarantine()]);
       } else {
@@ -290,7 +328,7 @@ describe('конкурентные транзакции (§1.9): каранти�
       // обязан был отказать.
       expect(row.terminalError).toBe('recovery_invalidated');
       expect(row.status).toBe('error');
-      if (order === 'quarantine-first') expect(beginRes).toBe(false);
+      if (order === 'quarantine-first') expect(beginRes.ok).toBe(false);
       await resetAll();
     }
   });

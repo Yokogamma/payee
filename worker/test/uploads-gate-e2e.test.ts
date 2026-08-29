@@ -19,7 +19,7 @@ const baseEnv = env as unknown as WorkerEnv;
 
 setupOutboundMock(); // ни одного маршрута: любой Arweave-вызов упал бы как 502
 
-const C = 'AAAA';
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA';
 
 function uuidV8(): string {

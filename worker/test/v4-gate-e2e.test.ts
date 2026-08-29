@@ -16,8 +16,8 @@ const baseEnv = env as unknown as WorkerEnv;
 
 const { mockRoute } = setupOutboundMock();
 
-const MC = 'AAAAAAAA';
-const SC = 'BBBBBBBB';
+const MC = 'QUFBQUFBQUFBQUFBQUFBQQ=='; // 16 bytes
+const SC = 'QkJCQkJCQkJCQkJCQkJCQg=='; // 16 bytes
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes
 
 function uuidV8(): string {

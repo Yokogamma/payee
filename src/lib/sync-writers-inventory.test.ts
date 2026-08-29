@@ -62,6 +62,21 @@ describe('инвентаризация писателей стора sync', () =
     expect(calls).toEqual({ 'lib/storage.ts': 1 });
   });
 
+  it('путь загрузки НЕ использует безусловный commitSyncUnlessTerminal (D14a)', () => {
+    // Результат попытки применяется ТОЛЬКО через commitUploadResultIfAttempt:
+    // он сверяет attemptId и отбрасывает ответ зависшей отправки, за время
+    // которой строку успел забрать другой писатель. commitSyncUnlessTerminal
+    // остаётся законным для poll-путей и постановки карантина — у них своей
+    // попытки нет, — но в upload-flow.ts его быть не должно вовсе: один
+    // «удобный» вызов там возвращает ровно тот дефект, ради которого введён
+    // attemptId.
+    const calls = countOccurrences(/commitSyncUnlessTerminal\(/g);
+    expect(calls['lib/upload-flow.ts']).toBeUndefined();
+    // И наоборот: сам примитив существует и объявлен в storage.ts.
+    const attemptWriter = countOccurrences(/commitUploadResultIfAttempt\(/g);
+    expect(Object.keys(attemptWriter).sort()).toEqual(['lib/storage.ts', 'lib/store.tsx']);
+  });
+
   it('сканер жив: исходники реально обойдены', () => {
     // Пустой результат «всё чисто» без обхода — это не защита. Проверяем, что
     // дерево видит и storage.ts, и store.tsx.

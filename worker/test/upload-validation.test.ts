@@ -56,7 +56,7 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
 
 const NOTE_ID = '11111111-2222-4333-8444-555555555555';    // valid UUIDv4 shape
 const NOTE_ID_V8 = '11111111-2222-8333-8444-555555555555'; // valid UUIDv8 shape (v3 namespace)
-const C = 'AAAA';                 // valid base64 (3 bytes)
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA';    // valid base64, exactly 12 bytes
 
 function v1Tags(): Tag[] {
@@ -228,6 +228,48 @@ describe('upload validation: version contract (v1/v2)', () => {
     const r = await upload(v2Tags(), { id: NOTE_ID, c: C, iv: 'AAAA' }, nextIp()); // 3 bytes
     expect(r.status).toBe(400);
     expect(await r.text()).toMatch(/iv must be 12 bytes/);
+  });
+
+  it('rejects a ciphertext shorter than the GCM tag — valid base64 is not enough', async () => {
+    // AES-GCM output is plaintext + a 128-bit tag, so 0-15 bytes is provably
+    // not a cipher envelope. Accepting one would burn a PAID, permanent
+    // transaction under this record's forever-idempotent Note-Id on bytes
+    // nobody can ever decrypt. The client refuses the same shape; this side
+    // must not depend on that.
+    for (const c of ['AAAA', 'AAAAAAAA', 'AAAAAAAAAAAAAAAAAAAA']) { // 3, 6, 15 bytes
+      const r = await upload(v2Tags(), { id: NOTE_ID, c, iv: IV }, nextIp());
+      expect(r.status, c).toBe(400);
+      expect(await r.text()).toMatch(/c must be at least 16 bytes/);
+    }
+  });
+
+  it('accepts exactly 16 bytes — an empty plaintext still carries the tag', async () => {
+    const r = await upload(v2Tags(), { id: NOTE_ID, c: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: IV }, nextIp());
+    expect(r.status).not.toBe(400);
+  });
+
+  it('rejects a NON-CANONICAL base64 spelling of otherwise valid bytes', async () => {
+    // Each of these decodes to the same 16 valid bytes; only the spelling
+    // differs. The spelling is what goes on chain, so accepting a variant would
+    // publish a different record for the same bytes under the same permanent
+    // idempotent id. Checked here independently of the client.
+    for (const c of ['AAAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAB==']) {
+      const r = await upload(v2Tags(), { id: NOTE_ID, c, iv: IV }, nextIp());
+      expect(r.status, c).toBe(400);
+      expect(await r.text()).toMatch(/canonical base64/);
+    }
+    // The IV is held to the same rule. A 12-byte IV has no spare bits (16
+    // base64 chars, no padding), so its non-canonical spellings are
+    // superfluous padding and whitespace. Which guard catches them is not the
+    // invariant: workerd's own `atob` refuses the padded form outright, before
+    // the canonical comparison is reached. What matters is that neither
+    // spelling can ever be published.
+    const NEWLINE = String.fromCharCode(10);
+    for (const iv of ['AAAAAAAAAAAAAAAA==', `AAAAAAAAAAAAAAAA${NEWLINE}`]) {
+      const r = await upload(v2Tags(), { id: NOTE_ID, c: 'AAAAAAAAAAAAAAAAAAAAAA==', iv }, nextIp());
+      expect(r.status, JSON.stringify(iv)).toBe(400);
+      expect(await r.text()).toMatch(/base64/);
+    }
   });
 
   it('rejects null data', async () => {

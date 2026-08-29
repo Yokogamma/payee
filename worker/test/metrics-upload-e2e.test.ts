@@ -19,7 +19,7 @@ const baseEnv = env as unknown as WorkerEnv;
 
 const { mockRoute, mockStatusOnAll } = setupOutboundMock();
 
-const C = 'AAAA';
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes
 const nextIp = () => `met-${crypto.randomUUID().slice(0, 8)}`;
 
