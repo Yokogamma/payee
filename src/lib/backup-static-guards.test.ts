@@ -80,21 +80,30 @@ function stripComments(relPath: string, source: string): string {
 
 type Hit = { file: string; line: number; text: string };
 
-/** All matches of `pattern` in one file's non-comment text, minus those an
- *  optional `allowed` predicate forgives. Line-oriented: every pattern below is
- *  single-line by construction, and a hit is only useful with its address. */
+/**
+ * All matches of `pattern` in one file's non-comment text, minus those an
+ * optional `allowed` predicate forgives.
+ *
+ * Scanned as ONE string rather than line by line. A line-oriented scan cannot
+ * see a formula that wraps — and wrapping is not exotic: an editor reflows a
+ * comment, a documentation sentence breaks at the margin, and the banned
+ * phrasing is then split across two lines while meaning exactly what it meant
+ * before. The line number is recovered from the match offset, because a hit is
+ * only useful with its address.
+ */
 function scanText(
   relPath: string,
   source: string,
   pattern: RegExp,
   allowed: (match: string) => boolean = () => false,
 ): Hit[] {
+  const text = stripComments(relPath, source);
   const hits: Hit[] = [];
-  stripComments(relPath, source).split(/\r?\n/).forEach((line, i) => {
-    for (const m of line.matchAll(pattern)) {
-      if (!allowed(m[0])) hits.push({ file: relPath, line: i + 1, text: m[0].trim() });
-    }
-  });
+  for (const m of text.matchAll(pattern)) {
+    if (allowed(m[0])) continue;
+    const line = text.slice(0, m.index).split(/\r?\n/).length;
+    hits.push({ file: relPath, line, text: m[0].trim().replace(/\s+/g, ' ') });
+  }
   return hits;
 }
 
@@ -120,7 +129,12 @@ const DOES_NOTHING = '(?:no[\\s-]?op\\p{L}*'
  * before it returns verbatim.
  */
 const QUARANTINE_TXID_NOOP = new RegExp(
-  `(?:${QUARANTINE}[^\\n]{0,48}?${TX_ID}|${TX_ID}[^\\n]{0,48}?${QUARANTINE})[^\\n]{0,64}?${DOES_NOTHING}`,
+  // `[\s\S]`, not `[^\n]`: the formula comes back wrapped across two lines as
+  // readily as on one — a comment reflowed by an editor, a sentence in a
+  // paragraph of documentation — and a single-line pattern would have called
+  // that clean. The span stays short, so the looser class does not start
+  // matching unrelated prose several lines apart.
+  `(?:${QUARANTINE}[\\s\\S]{0,48}?${TX_ID}|${TX_ID}[\\s\\S]{0,48}?${QUARANTINE})[\\s\\S]{0,64}?${DOES_NOTHING}`,
   'giu',
 );
 
@@ -132,7 +146,22 @@ const QUARANTINE_TXID_NOOP = new RegExp(
  * documented way through: state the rule as a denial, or do not state it.
  */
 const NEGATED = /(?<!\p{L})(?:не|нет|not|never|no longer|вместо|rather than)(?!\p{L})/iu;
-const isDenial = (match: string) => NEGATED.test(match);
+
+/**
+ * A denial has a negator OUTSIDE the verdict it denies — and the first version
+ * of this predicate did not check that.
+ *
+ * The banned phrasings contain their own «не»: «карантин с txId ничего не
+ * меняет» is the formula itself, positively asserted, and a bare search for a
+ * negator anywhere in the span forgave it. That is a false NEGATIVE in a guard
+ * whose entire job is to fire — the worst kind, because it is invisible until
+ * the day the formula comes back.
+ *
+ * So the verdict is removed from the span first. What is left is the subject
+ * («карантин с txId …»), and a negator surviving there is a real denial:
+ * «карантин с txId — это НЕ no-op».
+ */
+const isDenial = (match: string) => NEGATED.test(match.replace(new RegExp(DOES_NOTHING, 'giu'), ' '));
 
 /**
  * …and the second escape, which the first version of this guard lacked and
@@ -167,14 +196,27 @@ const OLD_FRESHNESS_KEY = /last[-_]?(?:export|verified)[-_]?at(?![\p{L}\p{N}_-])
  * reader would have to decide whether that hit is «the real one». Reassembled
  * below, the fragments are the banned phrasings exactly.
  */
-const POISON_RU = ['no-op', 'карантин с ', 'txId → '] as const;
-const POISON_EN = ['no-op', 'a quarantined record that carries a ', 'txId is a '] as const;
+const POISON_SUBJECT_RU = 'карантин с txId → ';
+const POISON_SUBJECT_EN = 'a quarantined record that carries a txId is a ';
+
+/*
+ * The verdict lives on the far side of this block, and the block is why.
+ *
+ * The scanner spans newlines (a wrapped formula is still the formula), so the
+ * subjects above and the verdict below would otherwise sit close enough to
+ * form a match right here — the guard reporting its own fixtures. Comment
+ * STRIPPING blanks a block comment character by character rather than deleting
+ * it, so this paragraph keeps its length after the strip and holds the two
+ * halves further apart than the sixty-four character window allows.
+ */
+
+const POISON_VERDICT = 'no-op';
 const POISON_KEY_TAIL = 'at';
 const POISON_KEY_HEADS = ['last-export', 'last-verified'] as const;
 
 const bannedFormulas = [
-  POISON_RU[1] + POISON_RU[2] + POISON_RU[0],
-  POISON_EN[1] + POISON_EN[2] + POISON_EN[0],
+  POISON_SUBJECT_RU + POISON_VERDICT,
+  POISON_SUBJECT_EN + POISON_VERDICT,
 ];
 const bannedKeys = [
   `${POISON_KEY_HEADS[0]}-${POISON_KEY_TAIL}`,
@@ -225,16 +267,47 @@ describe('the retired «quarantined + txId» formula stays out of the tree', () 
     expect(scanText('x.ts', bannedFormulas[1], QUARANTINE_TXID_NOOP, allowedFormula)).toHaveLength(1);
   });
 
+  it('a formula wrapped across two lines is still the formula', () => {
+    // It comes back reflowed as readily as on one line — an editor wraps a
+    // comment, a documentation sentence breaks at the margin — and a
+    // single-line pattern would have called that clean. `scanText` reports the
+    // line the match STARTS on, which is the line to go and read.
+    const subject = POISON_SUBJECT_RU.replace(' → ', '');
+    const wrapped = `// ${subject}
+// ничего не меняет`;
+
+    expect(scanText('a.md', wrapped, QUARANTINE_TXID_NOOP, allowedFormula)).toHaveLength(1);
+  });
+
+  it('a positive statement is NOT excused by the «не» inside its own verdict', () => {
+    // The false negative this closes. Every Russian «does nothing» phrasing
+    // carries a «не» — «ничего не меняет», «ничего не пишет» — so a negator
+    // search over the whole span forgave the formula in its most natural
+    // wording, and the guard was quietly asleep.
+    // Assembled, never written out: spelled contiguously these would sit in
+    // this file forever and the tree scan would report them — the same trap
+    // the banned formulas above are built from fragments to avoid.
+    const subject = POISON_SUBJECT_RU.replace(' → ', ' ');
+    const positives = ['ничего не меняет', 'ничего не пишет', 'ничего не происходит']
+      .map(verdict => `${subject}${verdict}`);
+    for (const line of positives) {
+      expect(scanText('x.ts', line, QUARANTINE_TXID_NOOP, allowedFormula), line).toHaveLength(1);
+    }
+  });
+
   it('the correct rule may still be stated as a denial', () => {
     // Named explicitly so the escape hatch is a decision, not an accident: the
     // reason the formula is banned has to be sayable in the file that bans it.
     const denials = [
       'карантин с txId — это НЕ no-op: решение принимает таблица D5a',
+      'карантин с txId — не тот случай, когда ничего не меняется',
       'a quarantined row that carries a txId is not a no-op',
     ];
     for (const line of denials) expect(scanText('x.ts', line, QUARANTINE_TXID_NOOP, allowedFormula)).toEqual([]);
     // But only because of the denial — strip it and the same sentence is a hit.
-    expect(scanText('x.ts', denials[1].replace(' not', ''), QUARANTINE_TXID_NOOP, allowedFormula)).toHaveLength(1);
+    const english = denials.find(d => d.includes(' not '))!;
+    expect(scanText('x.ts', english.replace(' not', ''), QUARANTINE_TXID_NOOP, allowedFormula))
+      .toHaveLength(1);
   });
 
   it('the merge rules cannot consult a txId: outside their comments they never name one', () => {

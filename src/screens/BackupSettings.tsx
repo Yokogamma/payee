@@ -10,11 +10,13 @@ import {
   importPreview,
   importSummary,
   sizeNotice,
+  verifySummary,
   PHASE_ONE_SCOPE,
   VIEWER_INSTRUCTION,
   type BackupFreshness,
   type ImportPreview,
   type ImportSummary,
+  type VerifySummary,
 } from '../lib/backup-ui';
 import type { PreparedImport } from '../lib/backup-adapter';
 import type { VerifyReport } from '../lib/backup-actions';
@@ -65,7 +67,11 @@ export function BackupSettings() {
     setFreshness,
     // A chip that cannot be read is a chip that says «не создавалась» — the
     // conservative reading, and never a reason to take the block away.
-    () => setFreshness({}),
+    // A read that FAILED is «unknown», not «nothing was ever exported». The
+    // adapter already draws that distinction for a marker it cannot believe;
+    // turning a rejection into `{}` here threw it away again and put the same
+    // false claim back on screen.
+    () => setFreshness({ unreadable: true }),
   ), [readBackupFreshness]);
 
   useEffect(() => {
@@ -90,6 +96,17 @@ export function BackupSettings() {
     setBusy(name);
     setError(null);
     setNotice(null);
+    // Every operation bumps the cancellation token, which silently invalidates
+    // a preview prepared before it (D15). Leaving that preview on screen would
+    // offer a «Восстановить» button whose session is already dead — and the
+    // refusal would arrive as an error the user cannot connect to anything
+    // they did.
+    setPending(null);
+    setVerified(null);
+    // …and the previous import's report. Leaving it up means a verify or an
+    // export shows its own result NEXT TO the outcome of an import that
+    // finished minutes ago, and the two read as one screen.
+    setSummary(null);
     try {
       await work();
     } catch (e) {
@@ -103,11 +120,13 @@ export function BackupSettings() {
     const { exported, markerRecorded } = await exportBackupFile();
     saveText(exported.text, exported.fileName, 'application/json');
     await refreshFreshness();
-    if (!markerRecorded) {
-      // The file exists and is fine. Only the note-to-self about it failed —
-      // and saying nothing would leave the chip silently wrong.
-      setNotice('Файл сохранён, но отметку о нём записать не удалось — чип ниже может отставать.');
-    }
+    // «Передан браузеру», not «сохранён»: `<a download>.click()` starts a
+    // download and reports nothing about how it ended. Claiming the file is
+    // saved is the app asserting something only the browser knows — and the
+    // sentence would be a lie for a download the user cancelled.
+    setNotice(markerRecorded
+      ? 'Файл передан браузеру. Проверьте, что он появился в папке загрузок.'
+      : 'Файл передан браузеру, но отметку о нём записать не удалось — чип ниже может отставать.');
   });
 
   const onDownloadViewer = () => run('viewer', async () => {
@@ -116,15 +135,20 @@ export function BackupSettings() {
   });
 
   const onVerify = (file: File) => run('verify', async () => {
-    setVerified(null);
-    const { report } = await verifyBackupFile(file);
+    const { report, markerRecorded } = await verifyBackupFile(file);
     setVerified(report);
     await refreshFreshness();
+    // A verify whose mark could not be stored is a verify that happened and
+    // will not be remembered. Silence here would leave the chip saying «не
+    // проверена» about a file the user just checked, with no way to tell that
+    // from «the check failed».
+    if (report.ok && !markerRecorded) {
+      setNotice('Файл проверен, но отметку об этом записать не удалось — чип ниже её не покажет.');
+    }
   });
 
   const onPrepare = (file: File) => run('prepare', async () => {
     setSummary(null);
-    setPending(null);
     const prepared = await prepareBackupImport(file);
     setPending({ prepared, preview: importPreview(prepared.report) });
   });
@@ -132,11 +156,26 @@ export function BackupSettings() {
   const onApply = (prepared: PreparedImport) => run('apply', async () => {
     // The session from stage A, never a new one: it carries the vault the
     // preview was computed against.
+    //
+    // The file's own completeness claim comes from stage A's report, not from
+    // the import's: `ImportReport.incompleteRestore` is the state of the local
+    // MARKER afterwards, which is also raised by anything this import left
+    // unapplied. Explaining that as «the device that made this file was itself
+    // partially restored» would be a fact about somebody else's device,
+    // invented here.
+    const sourceIncomplete = prepared.report.incompleteRestore;
     const { report, viewRefreshed } = await applyBackupImport(prepared);
-    setPending(null);
-    setSummary(importSummary(report));
+    setSummary(importSummary(report, sourceIncomplete));
     if (!viewRefreshed) {
       setNotice('Данные восстановлены, но экран обновить не удалось — перезагрузите страницу.');
+    }
+    // The store just grew. A cap warning computed before the import describes
+    // a store that no longer exists, and this is the one direction that
+    // matters: imports only add.
+    if (actions.canExport) {
+      await estimateBackupSize()
+        .then(report2 => setSize(sizeNotice(report2.expectedFileBytes, report2.overCap)))
+        .catch(() => setSize(null));
     }
   });
 
@@ -226,7 +265,7 @@ export function BackupSettings() {
       {error && <div className="error-msg" role="alert">{error}</div>}
       {notice && <div className="settings-info" role="status">{notice}</div>}
 
-      {verified && <VerifyResult report={verified} />}
+      {verified && <VerifyResult summary={verifySummary(verified)} />}
 
       {pending && (
         <ImportPreviewPanel
@@ -244,23 +283,25 @@ export function BackupSettings() {
   );
 }
 
-/** The dry-run's answer. `ok` already means intact AND complete AND every
- *  record readable, so anything else gets the warning rather than a tick. */
-function VerifyResult({ report }: { report: VerifyReport }) {
-  if (report.ok) {
-    return (
-      <div className="settings-info" role="status">
-        Файл проверен: {report.counts.notes} заметок, {report.counts.safebox} записей сейфа.
-        Повреждений не найдено.
-      </div>
-    );
-  }
+/**
+ * The dry-run's answer — THREE outcomes, not two.
+ *
+ * `report.ok` folds «intact», «complete» and «every record readable» into one
+ * boolean, which is right for deciding whether to write a freshness marker and
+ * wrong for talking to a person. A file that is cryptographically perfect and
+ * merely narrower than the vault it came from used to land in the same red box
+ * as a corrupted one, under the same advice to look for a newer app version —
+ * advice true for exactly one of the reasons a file can fail.
+ */
+function VerifyResult({ summary }: { summary: VerifySummary }) {
+  const blocking = summary.tone !== 'ok';
   return (
-    <div className="error-msg" role="alert">
-      Файл проверен и НЕ в порядке. Не удаляйте его: часть данных может быть восстановлена, а более
-      новая версия приложения может понять больше.
-      {report.incompleteRestore && ' Кроме того, эта копия заведомо неполна.'}
-      {report.issues.length > 0 && ` Записей с проблемами: ${report.issues.length}.`}
+    <div
+      className={blocking ? 'error-msg' : 'settings-info'}
+      role={blocking ? 'alert' : 'status'}
+    >
+      <div>{summary.headline}</div>
+      {summary.issues.map(issue => <div key={issue.text}>{issue.text}</div>)}
     </div>
   );
 }
@@ -279,7 +320,18 @@ function ImportPreviewPanel({ preview, busy, onConfirm, onCancel }: {
       {preview.blocking && <div className="error-msg" role="alert">{preview.blocking}</div>}
       <div><strong>{preview.headline}</strong></div>
       {preview.body.map(line => <div key={line}>{line}</div>)}
-      {preview.issues && <div>{preview.issues}</div>}
+      {preview.issues.map(issue => (
+        // Blocking ones are ALERTS: those records are not restored by this
+        // import, so a user who deletes the file afterwards deletes the only
+        // copy of them. The rest are prose — true, but not decision-changing.
+        <div
+          key={issue.text}
+          className={issue.blocking ? 'error-msg' : undefined}
+          role={issue.blocking ? 'alert' : undefined}
+        >
+          {issue.text}
+        </div>
+      ))}
       <div className="backup-actions">
         <button type="button" className="btn btn-primary full-width" onClick={onConfirm} disabled={busy}>
           {busy ? 'Восстанавливаем…' : 'Восстановить из файла'}
@@ -297,6 +349,9 @@ function ImportResult({ summary }: { summary: ImportSummary }) {
   return (
     <div className="settings-info">
       {summary.blocking && <div className="error-msg" role="alert">{summary.blocking}</div>}
+      {summary.storeIncomplete && (
+        <div className="error-msg" role="alert">{summary.storeIncomplete}</div>
+      )}
       <div role="status">{summary.restored}</div>
       {summary.notApplied && <div className="error-msg" role="alert">{summary.notApplied}</div>}
       {summary.notAppliedReasons && (

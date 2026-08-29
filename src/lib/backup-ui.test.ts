@@ -20,6 +20,7 @@ import {
   importSummary,
   sizeNotice,
   BACKUP_NEAR_CAP_FRACTION,
+  verifySummary,
   INCOMPLETE_SOURCE_WARNING,
   PHASE_ONE_SCOPE,
   VIEWER_INSTRUCTION,
@@ -78,6 +79,28 @@ describe('the freshness chip says only what is known (D21)', () => {
     });
   });
 
+  it('says «unknown» when a marker could not be read — never «not created»', () => {
+    // The two are different claims, and only one of them is available: an
+    // unreadable marker says nothing about whether copies exist. Rendering it
+    // as «ещё не создавалась» would state a fact nobody established, about the
+    // very thing the user would check before deleting an original.
+    const summary = freshnessSummary({ unreadable: true }, at);
+
+    expect(summary.chip).toBe('статус неизвестен');
+    expect(summary.lines.join(' ')).toContain('неизвестно');
+    expect(summary.lines.join(' ')).not.toContain('ещё не создавалась');
+  });
+
+  it('«unknown» wins even when one marker survived', () => {
+    // Half an answer is not an answer: showing the surviving export marker
+    // alone would read as a complete picture of the copies.
+    const summary = freshnessSummary(
+      { lastExport: { createdAt: 1, sha256: 'a', at: 2 }, unreadable: true },
+      at,
+    );
+    expect(summary.chip).toBe('статус неизвестен');
+  });
+
   it('calls an export checked ONLY when the checked bytes were those bytes', () => {
     // The dangerous sentence. «Checked» said about an export whose bytes were
     // never the ones checked is what a user relies on before deleting an
@@ -129,11 +152,15 @@ describe('size is stated in the units the cap is charged in (D17)', () => {
     const notice = sizeNotice(Math.ceil(BACKUP_CAP_BYTES * BACKUP_NEAR_CAP_FRACTION), false);
     expect(notice.warning).toContain('приближается к пределу');
     expect(notice.overCap).toBe(false);
-    // And it says what «near the ceiling» actually costs — measured, not
-    // guessed (step 13): seconds of frozen interface and about a gigabyte of
-    // peak memory. Learning that by watching a phone kill the tab is the
-    // wrong way to learn it, and the warning exists to prevent exactly that.
+    // And it says what «near the ceiling» actually costs — measured in a
+    // browser, not inferred (step 13): about a second and a half, a visible
+    // pause, and close to a gigabyte of memory. Learning that by watching a
+    // phone kill the tab is the wrong way to learn it.
     expect(notice.warning).toContain('на телефоне');
+    expect(notice.warning).toContain('подвисает');
+    // NOT «несколько секунд»: the browser is four times faster than Node, and
+    // an overstatement here is the kind a user stops believing.
+    expect(notice.warning).not.toContain('несколько секунд');
   });
 
   it('an over-cap measurement is over cap even if the NUMBER looks fine', () => {
@@ -175,14 +202,14 @@ describe('the report is three lines by what the user did (§7)', () => {
   it('sums the four repair counters into one «восстановлено»', () => {
     const summary = importSummary(REPORT({
       added: 2, repaired: 1, quarantinedRepaired: 1, quarantinedDataRepaired: 1, quarantineStale: 1,
-    }));
+    }), false);
     expect(summary.restored).toBe('Добавлено: 2, восстановлено: 4.');
   });
 
   it('sums everything unapplied into ONE number with «не удаляйте файл»', () => {
     const summary = importSummary(REPORT({
       conflicts: 1, unsupported: 2, unsupportedLocal: 3, skipped: 4, quotaStopped: 5,
-    }));
+    }), false);
     expect(summary.notApplied).toBe('Не восстановлено: 15 — не удаляйте файл копии.');
     expect(summary.success).toBeUndefined();
   });
@@ -190,7 +217,7 @@ describe('the report is three lines by what the user did (§7)', () => {
   it('keeps the repeatable outcomes apart from the lost ones', () => {
     // «Try again» is true for these two and false for the other five; merging
     // them would send the user to retry something no retry can fix.
-    const summary = importSummary(REPORT({ deferred: 1, concurrentChange: 2 }));
+    const summary = importSummary(REPORT({ deferred: 1, concurrentChange: 2 }), false);
     expect(summary.retryable).toContain('Требуется повторный импорт: 3');
     expect(summary.notApplied).toBeUndefined();
   });
@@ -201,7 +228,7 @@ describe('the report is three lines by what the user did (§7)', () => {
     // that the number reaches one of the three lines — a counter added to the
     // report and forgotten by both groups here would silently vanish, and the
     // report would say «Не восстановлено: 0» over data still only in the file.
-    const summary = importSummary(REPORT({ [counter]: 7 }));
+    const summary = importSummary(REPORT({ [counter]: 7 }), false);
 
     expect(summary.success).toBeUndefined();
     expect([summary.restored, summary.notApplied, summary.retryable].join(' ')).toContain('7');
@@ -210,20 +237,41 @@ describe('the report is three lines by what the user did (§7)', () => {
   it('withholds it for a partial SOURCE too, at seven zeroes', () => {
     // Different question: everything in the file was applied, and the file was
     // never a complete backup of the vault it descends from.
-    const summary = importSummary(REPORT({ added: 5 }, true));
+    const summary = importSummary(REPORT({ added: 5 }, true), true);
     expect(summary.success).toBeUndefined();
     expect(summary.blocking).toBe(INCOMPLETE_SOURCE_WARNING);
+    // One sentence, not two: the file IS the reason, so repeating it as a
+    // fact about the store would say the same thing twice and neither would
+    // be read.
+    expect(summary.storeIncomplete).toBeUndefined();
+  });
+
+  it('does NOT blame the file when the mark was raised by this import', () => {
+    // The bug this replaces: `ImportReport.incompleteRestore` is the state of
+    // the local marker afterwards — also raised by anything left unapplied —
+    // and it was being rendered as «the device that made this file was itself
+    // partially restored». That is a fact about somebody else's device,
+    // invented from a boolean that never said it, and it sends the user
+    // looking for a problem that is not there.
+    const summary = importSummary(REPORT({ added: 1, quotaStopped: 2 }, true), false);
+
+    expect(summary.blocking).toBeUndefined();
+    expect(summary.storeIncomplete).toContain('Хранилище помечено');
+    expect(summary.storeIncomplete).toContain('Не удаляйте файл копии');
   });
 
   it('splits «не восстановлено» by reason, because the reasons have different answers', () => {
     // One number is the right headline and the wrong whole answer: «не хватило
     // места» is fixed by freeing space, «не понимает эта версия» by updating,
     // «конфликт публикации» by neither.
-    const summary = importSummary(REPORT({ conflicts: 1, unsupported: 2, quotaStopped: 4 }));
+    const summary = importSummary(REPORT({ conflicts: 1, unsupported: 2, quotaStopped: 4 }), false);
 
     expect(summary.notApplied).toContain('7');
     expect(summary.notAppliedReasons?.map(r => [r.label, r.count])).toEqual([
-      ['Конфликт публикации', 1],
+      // Named by what actually happened: `conflicts` is «the local bytes and
+      // the file's bytes differ», which is not the same thing as a publication
+      // conflict and must not be labelled as one.
+      ['Локальная запись отличается от записи в файле', 1],
       ['Эта версия приложения не понимает запись из файла', 2],
       ['Не хватило места в хранилище', 4],
     ]);
@@ -233,16 +281,16 @@ describe('the report is three lines by what the user did (§7)', () => {
 
   it('omits the reasons that did not happen', () => {
     // A list padded with zeroes is a list nobody reads to the end.
-    const summary = importSummary(REPORT({ skipped: 1 }));
+    const summary = importSummary(REPORT({ skipped: 1 }), false);
     expect(summary.notAppliedReasons).toHaveLength(1);
   });
 
   it('has no breakdown when nothing went unapplied', () => {
-    expect(importSummary(REPORT({ deferred: 1 })).notAppliedReasons).toBeUndefined();
+    expect(importSummary(REPORT({ deferred: 1 }), false).notAppliedReasons).toBeUndefined();
   });
 
   it('shows it only at seven zeroes AND a complete source', () => {
-    const summary = importSummary(REPORT({ added: 5 }));
+    const summary = importSummary(REPORT({ added: 5 }), false);
     expect(summary.success).toBe('Восстановление завершено полностью.');
     expect(summary.blocking).toBeUndefined();
   });
@@ -298,5 +346,77 @@ describe('failures become sentences that claim nothing extra', () => {
     const message = backupErrorMessage(new Error('QuotaExceededError'));
     expect(message).toContain('Файл копии не изменялся');
     expect(message).not.toMatch(/поврежд/i);
+  });
+});
+
+describe('a verify has THREE answers, not two', () => {
+  it('a healthy file is simply in order', () => {
+    const summary = verifySummary(VERIFY(), at);
+    expect(summary.tone).toBe('ok');
+    expect(summary.issues).toEqual([]);
+  });
+
+  it('«intact but narrower» is its own answer, not a defect', () => {
+    // `report.ok` folds three questions into one boolean — intact, complete,
+    // every record readable — which is right for the freshness marker and
+    // wrong for a person. Nothing about this file is broken, and putting it in
+    // the same red box as a corrupted one invites its owner to throw away the
+    // best copy they have.
+    const summary = verifySummary(VERIFY({ ok: false, incompleteRestore: true }), at);
+
+    expect(summary.tone).toBe('incomplete');
+    expect(summary.headline).toContain('цел и читается целиком');
+    expect(summary.headline).toContain('ЗАВЕДОМО НЕПОЛОН');
+    expect(summary.headline).not.toContain('проблемы');
+  });
+
+  it('a damaged record is NOT told to wait for a newer version', () => {
+    // The advice that used to be given for every failure. It is true for one
+    // reason only — a record this build is too old to read — and false for
+    // damage, which no version will ever open.
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      issues: [{ kind: 'note', id: 'a', problem: 'undecryptable' }],
+    }), at);
+
+    expect(summary.tone).toBe('bad');
+    expect(summary.issues).toHaveLength(1);
+    expect(summary.issues[0].text).toContain('не лечится обновлением');
+    expect(summary.issues[0].text).not.toContain('более новая версия приложения сможет');
+  });
+
+  it('…but a record from a NEWER build is, and blocks', () => {
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      issues: [{ kind: 'note', id: 'a', problem: 'unsupported_version' }],
+    }), at);
+
+    expect(summary.issues[0].blocking).toBe(true);
+    expect(summary.issues[0].text).toContain('более новая версия приложения');
+  });
+
+  it('a broken graph gets the reason that fits it, and no upgrade advice', () => {
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      issues: [{ kind: 'note', id: 'a', problem: 'chain', detail: 'missing_prev' }],
+    }), at);
+
+    expect(summary.issues[0].text).toContain('несходящимися связями');
+    expect(summary.issues[0].text).not.toContain('обновит');
+  });
+});
+
+describe('the sticky marker is described as sticky', () => {
+  it('does not promise a removal the import can never perform', () => {
+    // `incompleteRestore` is cleared only when the import STARTED with the
+    // mark absent — so once a store carries it, no repeat import takes it off.
+    // Telling the user «повторите импорт и пометка снимется» sends them to do
+    // something that cannot work, twice, on the data they are most worried
+    // about.
+    const summary = importSummary(REPORT({ added: 1, quotaStopped: 1 }, true), false);
+
+    expect(summary.storeIncomplete).toContain('ЛИПКАЯ');
+    expect(summary.storeIncomplete).toContain('чистом устройстве');
+    expect(summary.storeIncomplete).not.toContain('пометка снимется, когда');
   });
 });

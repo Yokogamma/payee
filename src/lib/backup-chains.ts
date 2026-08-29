@@ -58,8 +58,6 @@ export type ChainProblem =
   /** `prev` exists, but it is not the immediately preceding version of THIS
    *  chain: another chain, or the wrong revision. A loop lands here too. */
   | 'broken_link'
-  /** Two records claim the same position in one chain. */
-  | 'conflicting_rev'
   /** A link points into the OTHER collection's id space. */
   | 'cross_kind';
 
@@ -84,6 +82,24 @@ export interface ChainIssue {
  * make them fix and re-check one record at a time.
  *
  * Linear in the number of records, whatever the values inside them.
+ *
+ * ── A FORK IS NOT A DEFECT ───────────────────────────────────────────
+ *
+ * Two records may share one position (`root` + `rev`), and this validator says
+ * nothing about it. That is not leniency, it is the app's actual data model:
+ * `rev` is assigned locally as `current.rev + 1` (`store.tsx`), so two devices
+ * editing the same note while offline necessarily produce the same revision
+ * number, and `chains.ts` keeps both — «the accepted fork rule: a device with
+ * the later clock wins; history preserves everything».
+ *
+ * An earlier revision of this module refused the second record at a position.
+ * The consequence was not a stricter format but a false accusation: an ordinary
+ * two-device edit produced a container that the app's own verify called
+ * damaged, and a user told their emergency copy is corrupt does the wrong thing
+ * with it. The rule was introduced to make ordering by `rev` topological, and
+ * it turns out not to be needed for that — every record names its predecessor
+ * by id and the link is checked individually, so a child still sorts after its
+ * own parent whichever branch it belongs to.
  */
 export function validateChains(nodes: readonly ChainNode[]): ChainIssue[] {
   const issues: ChainIssue[] = [];
@@ -95,9 +111,6 @@ export function validateChains(nodes: readonly ChainNode[]): ChainIssue[] {
     safebox: new Map<string, ChainNode>(),
   };
   for (const node of nodes) byKind[node.kind].set(node.id, node);
-
-  /** `kind:root:rev` → the record that claimed that position first. */
-  const positions = new Set<string>();
 
   for (const node of nodes) {
     const own = byKind[node.kind];
@@ -118,10 +131,6 @@ export function validateChains(nodes: readonly ChainNode[]): ChainIssue[] {
     if (!own.has(node.root)) {
       add(node, foreign.has(node.root) ? 'cross_kind' : 'bad_root');
     }
-
-    const position = `${node.kind}:${node.root}:${node.rev}`;
-    if (positions.has(position)) add(node, 'conflicting_rev');
-    else positions.add(position);
 
     // A chain's first version names itself and has no predecessor. Getting
     // this wrong means the chain has no beginning, and every consumer that

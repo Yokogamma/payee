@@ -163,6 +163,18 @@ describe('export', () => {
     );
   });
 
+  it('says the file was HANDED OVER, not that it was saved', async () => {
+    // `<a download>.click()` starts a download and reports nothing about how
+    // it ended. «Файл сохранён» is the app asserting something only the
+    // browser knows — and it is simply false for a download the user
+    // cancelled or a disk that filled up during it.
+    await open();
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Скачать резервную копию' })); });
+
+    expect(screen.getByText(/передан браузеру/)).toBeTruthy();
+    expect(screen.queryByText(/Файл сохранён/)).toBeNull();
+  });
+
   it('a marker that could not be written does NOT read as a failed export', async () => {
     // The moment this feature exists for is also the moment storage is most
     // likely to be full. The file is the result; the note about it is not.
@@ -176,7 +188,7 @@ describe('export', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Скачать резервную копию' })); });
 
     expect(saveText).toHaveBeenCalledWith('C', 'f.json', 'application/json');
-    expect(screen.getByText(/Файл сохранён, но отметку о нём записать не удалось/)).toBeTruthy();
+    expect(screen.getByText(/отметку о нём записать не удалось/)).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
@@ -215,17 +227,59 @@ describe('verify', () => {
     await open();
     await choose('Файл резервной копии для проверки');
 
-    expect(screen.getByText(/Повреждений не найдено/)).toBeTruthy();
+    expect(screen.getByText(/в порядке/)).toBeTruthy();
   });
 
   it('a file that is not ok is an ALERT that tells the user to keep it', async () => {
-    fill({ verifyBackupFile: vi.fn(async () => ({ report: VERIFY({ ok: false }), markerRecorded: false })) });
+    fill({
+      verifyBackupFile: vi.fn(async () => ({
+        report: VERIFY({ ok: false, issues: [{ kind: 'note', id: 'a', problem: 'undecryptable' }] }),
+        markerRecorded: false,
+      })),
+    });
     await open();
     await choose('Файл резервной копии для проверки');
 
     const alert = screen.getByRole('alert');
-    expect(alert.textContent).toContain('НЕ в порядке');
+    expect(alert.textContent).toContain('есть проблемы');
     expect(alert.textContent).toContain('Не удаляйте');
+  });
+
+  it('«intact but incomplete» is not shown as a broken file', async () => {
+    // Nothing about this file is damaged — it is simply narrower than the
+    // vault it came from. Putting it in the same red box as a corrupted one
+    // invites its owner to throw away the best copy they have.
+    fill({
+      verifyBackupFile: vi.fn(async () => ({
+        report: VERIFY({ ok: false, incompleteRestore: true }),
+        markerRecorded: false,
+      })),
+    });
+    await open();
+    await choose('Файл резервной копии для проверки');
+
+    expect(screen.getByText(/цел и читается целиком/)).toBeTruthy();
+    expect(screen.queryByText(/есть проблемы/)).toBeNull();
+  });
+
+  it('a verify whose mark could not be stored says so', async () => {
+    // Otherwise the chip goes on saying «не проверена» about a file the user
+    // just checked, with nothing to distinguish that from a failed check.
+    fill({ verifyBackupFile: vi.fn(async () => ({ report: VERIFY(), markerRecorded: false })) });
+    await open();
+    await choose('Файл резервной копии для проверки');
+
+    expect(screen.getByText(/отметку об этом записать не удалось/)).toBeTruthy();
+  });
+
+  it('says «status unknown» when the markers cannot be read at all', async () => {
+    // A rejected read is not «nothing was ever exported» — that is a claim
+    // about the user's copies which this failure cannot support.
+    fill({ readBackupFreshness: vi.fn(async () => { throw new Error('idb is gone'); }) });
+    await open();
+
+    await waitFor(() => { expect(screen.getByText(/состояние копий неизвестно/)).toBeTruthy(); });
+    expect(screen.queryByText(/ещё не создавалась/)).toBeNull();
   });
 });
 
@@ -302,6 +356,20 @@ describe('import — two stages with a decision between them', () => {
     expect(disclosure?.textContent).toContain('Не хватило места в хранилище: 4');
     expect(disclosure?.textContent).toContain('Освободите место');
     expect(disclosure?.textContent).toContain('Обновите приложение');
+  });
+
+  it('an earlier import report does not survive the next operation', async () => {
+    // Two results on one screen read as one screen. The import token is bumped
+    // by every operation anyway, so the old report describes a session that no
+    // longer exists.
+    await open();
+    await choose('Файл резервной копии для импорта');
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Восстановить из файла' })); });
+    expect(screen.getByText(/Добавлено:/)).toBeTruthy();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Скачать резервную копию' })); });
+
+    expect(screen.queryByText(/Добавлено:/)).toBeNull();
   });
 
   it('offers no disclosure when everything was applied', async () => {

@@ -173,13 +173,28 @@ export async function applyBackupImport(
 }
 
 async function runPlan(deps: ImportDeps, plan: ImportPlan, counters: ImportCounters): Promise<void> {
-  /** Chains already abandoned, with the reason that abandoned them. */
-  const stoppedChains = new Map<string, keyof ImportCounters>();
+  /**
+   * Records that were not applied, with the reason — keyed by the RECORD, not
+   * by its chain.
+   *
+   * It used to be keyed by `kind:root`, which was correct only while a chain
+   * was a line. Now that a fork is ordinary history, one root holds two
+   * independent branches: a conflict on A2 must not take B2 down with it, and
+   * B2's own predecessor (A1) was applied perfectly. Keying by root made the
+   * outcome depend on which of two same-`rev` records the loop happened to
+   * reach first — so an everyday two-device edit lost a whole branch, and the
+   * report blamed a reason that belonged to the other one.
+   *
+   * The rule the graph actually needs is narrower: a record may be written
+   * only if the record it NAMES as `prev` is in the store. That is what keeps
+   * every committed prefix a valid graph (D12a), and it says nothing about
+   * siblings.
+   */
+  const stoppedRecords = new Map<string, keyof ImportCounters>();
   let quotaStop = false;
 
   for (let i = 0; i < plan.ordered.length; i++) {
     const planned = plan.ordered[i];
-    const chain = chainKey(planned.kind, planned.root);
 
     if (quotaStop) {
       counters.quotaStopped++;
@@ -189,11 +204,16 @@ async function runPlan(deps: ImportDeps, plan: ImportPlan, counters: ImportCount
     // A descendant of a record that was not applied is not attempted at all:
     // writing it would leave a version whose predecessor the store does not
     // have, and any committed prefix must be a valid graph (D12a). It is
-    // counted under the reason that stopped the chain, which tells the user
-    // WHY a whole chain is missing rather than just that it is.
-    const stoppedBy = stoppedChains.get(chain);
+    // counted under the reason that stopped its ANCESTOR, which tells the user
+    // why the version is missing rather than just that it is.
+    const stoppedBy = planned.prev === undefined
+      ? undefined
+      : stoppedRecords.get(chainKey(planned.kind, planned.prev));
     if (stoppedBy !== undefined) {
       counters[stoppedBy]++;
+      // Propagates down the branch: this record is now missing too, for the
+      // same reason, and its own children inherit it.
+      stoppedRecords.set(chainKey(planned.kind, planned.id), stoppedBy);
       continue;
     }
 
@@ -215,7 +235,9 @@ async function runPlan(deps: ImportDeps, plan: ImportPlan, counters: ImportCount
     deps.assertAlive();
 
     if (outcome !== 'noop') counters[outcome]++;
-    if (cascades(outcome)) stoppedChains.set(chain, outcome as keyof ImportCounters);
+    if (cascades(outcome)) {
+      stoppedRecords.set(chainKey(planned.kind, planned.id), outcome as keyof ImportCounters);
+    }
   }
 }
 

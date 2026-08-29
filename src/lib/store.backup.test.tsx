@@ -316,6 +316,34 @@ describe('an operation belongs to the vault that started it (D15)', () => {
     expect(winner.report.ok).toBe(true);
   });
 
+  it('a lock releases an operation that is WAITING, not only one that is working', async () => {
+    // The epoch stops the next `assertAlive` — but a tab queued behind another
+    // tab's Web Lock has no next check to reach until its turn comes, and that
+    // turn may be a 30 MB import away. Locking the app has to release the
+    // queue slot too, and say so by name rather than as a bare platform
+    // AbortError the UI would render as «не удалось выполнить действие».
+    await openMain();
+    const { file, note } = await containerWith('WAITING-WHEN-LOCKED');
+    const prepared = await act(async () => store.prepareBackupImport(file));
+
+    let release!: () => void;
+    let requested!: () => void;
+    const waiting = new Promise<void>(r => { requested = r; });
+    const seen = installLocks(new Promise<void>(r => { release = r; }), () => requested());
+
+    const pending = prepared.apply();
+    const settled = expect(pending).rejects.toBeInstanceOf(BackupCancelledError);
+    await act(async () => {
+      await waiting;
+      store.lockApp();
+      release();
+      await settled;
+    });
+
+    expect(seen[0].signal?.aborted).toBe(true);
+    expect(await getNoteById(note.noteId)).toBeUndefined();
+  });
+
   it('stops WAITING for another tab, not only working', async () => {
     // The wait can be long — another tab may be importing 30 MB — and a tab
     // that has gone away must stop queueing for a turn it no longer wants.
@@ -342,6 +370,39 @@ describe('an operation belongs to the vault that started it (D15)', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0].signal?.aborted).toBe(true);
     expect(await getNoteById(note.noteId)).toBeUndefined();
+  });
+});
+
+describe('a tab that leaves during the tail stops the tail (D15)', () => {
+  it('does not keep decrypting, counting and SENDING for a page nobody is looking at', async () => {
+    // The import itself is committed — cancelling it is stage B's own job and
+    // it does that correctly. What this covers is everything AFTER: the app
+    // catching up, which is not one operation but five — re-decrypting every
+    // note, two count passes, a safebox read and a push of the upload queue.
+    //
+    // Neither the epoch nor the database generation moves on `pagehide`, so
+    // without the operation token that whole tail ran on for a page already
+    // declared closed — and `viewRefreshed: true` claimed a repaint the very
+    // first step had abandoned. The queue push is the part that mattered: a
+    // hidden tab would start SENDING.
+    await openMain();
+    const { file, note } = await containerWith('TAIL-ABANDONED');
+    const prepared = await act(async () => store.prepareBackupImport(file));
+
+    // Leave the page at the first step of the tail, not during stage B.
+    vi.mocked(getAllNotes).mockImplementationOnce(async () => {
+      window.dispatchEvent(new Event('pagehide'));
+      return [];
+    });
+
+    const outcome = await act(async () => store.applyBackupImport(prepared));
+
+    // The data landed and the report is honest about it…
+    expect(outcome.report.counters.added).toBe(1);
+    expect(await getNoteById(note.noteId)).toBeDefined();
+    // …and the screen is NOT claimed to be up to date.
+    expect(outcome.viewRefreshed).toBe(false);
+    expect(uploadViaProxy).not.toHaveBeenCalled();
   });
 });
 

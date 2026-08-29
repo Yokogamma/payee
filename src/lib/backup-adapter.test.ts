@@ -21,6 +21,7 @@ import {
   withImportLock,
   BackupCancelledError,
   BackupLockUnavailableError,
+  BackupVaultLockedError,
   LAST_EXPORT_ARTIFACT_KEY,
   LAST_VERIFIED_ARTIFACT_KEY,
   type BackupStorage,
@@ -29,6 +30,8 @@ import {
 import { encodeBackup, deriveBackupKey, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
 import {
   deriveKey,
+  deriveSafeboxMetaKey,
+  deriveSafeboxSecretKey,
   encryptEnvelopeV3,
   type EncryptedNote,
   type EncryptedSafeboxEntry,
@@ -51,8 +54,15 @@ const MNEMONIC =
 const NOW = 1_756_000_000_000;
 const DB_GENERATION = 7;
 
+const vaultKeys = async () => ({
+  note: await deriveKey(MNEMONIC),
+  safeboxMeta: await deriveSafeboxMetaKey(MNEMONIC),
+  safeboxSecret: await deriveSafeboxSecretKey(MNEMONIC),
+  container: await deriveBackupKey(MNEMONIC),
+});
+
 const vault = (over: Partial<BackupVault> = {}): BackupVault => ({
-  mnemonic: MNEMONIC,
+  deriveKeys: vaultKeys,
   dbGeneration: DB_GENERATION,
   assertAlive: () => {},
   now: () => NOW,
@@ -379,17 +389,16 @@ describe('what counts as success', () => {
 });
 
 describe('what the block asks before offering anything', () => {
-  it('reads both D21 markers raw, and needs no vault to do it', async () => {
+  it('returns both D21 markers, and needs no vault to do it', async () => {
     // Deliberately vault-free: the chip is two `meta` keys, and asking for the
     // seed to render a date would tie a label to an unlock.
+    const exported = { createdAt: 1, sha256: 'a'.repeat(64), at: 2 };
+    const verified = { createdAt: 1, sha256: 'a'.repeat(64), at: 3 };
     const { storage: store, meta } = storage();
-    meta.set(LAST_EXPORT_ARTIFACT_KEY, { createdAt: 1, sha256: 'a', at: 2 });
-    meta.set(LAST_VERIFIED_ARTIFACT_KEY, { createdAt: 1, sha256: 'a', at: 3 });
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, exported);
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, verified);
 
-    expect(await readBackupFreshness(store)).toEqual({
-      lastExport: { createdAt: 1, sha256: 'a', at: 2 },
-      lastVerified: { createdAt: 1, sha256: 'a', at: 3 },
-    });
+    expect(await readBackupFreshness(store)).toEqual({ lastExport: exported, lastVerified: verified });
   });
 
   it('an empty store answers «nothing known», not an error', async () => {
@@ -397,6 +406,48 @@ describe('what the block asks before offering anything', () => {
       lastExport: undefined,
       lastVerified: undefined,
     });
+  });
+
+  it.each([
+    ['two half-written records', {}, {}],
+    ['a digest that is not a digest', { createdAt: 1, sha256: 'nope', at: 2 }, { createdAt: 1, sha256: 'nope', at: 3 }],
+    ['a digest of the wrong length', { createdAt: 1, sha256: 'ab', at: 2 }, { createdAt: 1, sha256: 'ab', at: 3 }],
+    ['uppercase hex, which the build never writes', { createdAt: 1, sha256: 'A'.repeat(64), at: 2 }, { createdAt: 1, sha256: 'A'.repeat(64), at: 3 }],
+    ['a timestamp that is not a number', { createdAt: 'x', sha256: 'a'.repeat(64), at: 2 }, { createdAt: 'x', sha256: 'a'.repeat(64), at: 3 }],
+    ['NaN', { createdAt: NaN, sha256: 'a'.repeat(64), at: 2 }, { createdAt: NaN, sha256: 'a'.repeat(64), at: 3 }],
+    ['an array', [], []],
+    ['null', null, null],
+    ['a string', 'last-export', 'last-verified'],
+  ])('refuses %s rather than believing it', async (_name, exported, verified) => {
+    // `getMeta<T>` is an assertion, not a check. Believing it here is
+    // fail-OPEN in the one place that must not be: two `{}` compare as
+    // `undefined === undefined`, and the chip then says «этот экспорт
+    // проверен» about a file nobody ever checked — the exact sentence a user
+    // relies on before deleting an original.
+    const { storage: store, meta } = storage();
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, exported);
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, verified);
+
+    // …and it SAYS it could not read them, rather than reporting «nothing was
+    // ever exported» — a claim this read is in no position to make.
+    expect(await readBackupFreshness(store)).toEqual({
+      lastExport: undefined,
+      lastVerified: undefined,
+      unreadable: true,
+    });
+  });
+
+  it('a corrupt marker does not drag a healthy one down with it', async () => {
+    // «Unknown» is per record: an unreadable verify marker must not erase a
+    // perfectly good export marker, or a storage glitch would silently reset
+    // the chip to «не создавалась» for a copy that exists.
+    const good = { createdAt: 1, sha256: 'c'.repeat(64), at: 2 };
+    const { storage: store, meta } = storage();
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, good);
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, { createdAt: 1, sha256: 'oops', at: 3 });
+
+    expect(await readBackupFreshness(store))
+      .toEqual({ lastExport: good, lastVerified: undefined, unreadable: true });
   });
 
   it('states the size in FILE bytes, not plaintext bytes (D17)', async () => {
@@ -432,5 +483,70 @@ describe('what the block asks before offering anything', () => {
     await estimateBackupSize({ ...base, estimateSize });
 
     expect(estimateSize).toHaveBeenCalledWith(BACKUP_PLAINTEXT_BUDGET_BYTES);
+  });
+});
+
+describe('the session carries permission to derive, never the seed itself', () => {
+  it('the vault it holds exposes no seed to hold', async () => {
+    // Stage A and stage B are separated by a human decision, so the session
+    // sits in React state for as long as the preview is on screen — through a
+    // lock, through `pagehide`, past the store's synchronous wipe of every
+    // vault reference. That wipe is the app's actual guarantee about the seed;
+    // a copy living outside it would quietly make the guarantee false.
+    //
+    // Asserted on the CONTRACT rather than by serializing the session: a
+    // private `#field` is invisible to `JSON.stringify`, so a scan of the
+    // serialized object would stay green no matter what the session held —
+    // a test that could not fail, about the thing that matters most here.
+    const v = vault();
+    expect(Object.keys(v)).not.toContain('mnemonic');
+    expect(Object.values(v).some(x => typeof x === 'string' && x.includes('abandon'))).toBe(false);
+
+    // And what the derivation hands over is opaque by construction: keys are
+    // imported non-extractable (`crypto.ts`), so possession of them is not
+    // possession of the phrase.
+    const keys = await v.deriveKeys();
+    expect(Object.values(keys).every(k => (k as CryptoKey).extractable === false)).toBe(true);
+  });
+
+  it('derives at APPLY time, so a vault that has since been locked cannot produce keys', async () => {
+    // The strongest form of the same property: the session cannot reconstruct
+    // the keys on its own, because the derivation reads the store's live
+    // reference and that reference is gone.
+    const { file } = countedFile(await container([await makeNote()]));
+    const { storage: store, merges } = storage();
+    let open = true;
+    const prepared = await prepareImport(
+      from(vault({
+        deriveKeys: async () => {
+          if (!open) throw new BackupVaultLockedError();
+          return vaultKeys();
+        },
+      })),
+      file,
+      store,
+    );
+
+    open = false;
+    await expect(prepared.apply()).rejects.toBeInstanceOf(BackupVaultLockedError);
+    expect(merges).toEqual([]);
+  });
+
+  it('checks the lifecycle AFTER derivation, which is the slowest step there is', async () => {
+    // Four key derivations are the first thing every backup operation does and
+    // are not instant on a phone. Without a guard behind them, a lock during
+    // derivation is noticed only once the work is already spent.
+    const { file } = countedFile(await container([await makeNote()]));
+    let derived = false;
+    const boom = new BackupCancelledError('locked mid-derivation');
+
+    await expect(prepareImport(
+      from(vault({
+        deriveKeys: async () => { derived = true; return vaultKeys(); },
+        assertAlive: () => { if (derived) throw boom; },
+      })),
+      file,
+      storage().storage,
+    )).rejects.toBe(boom);
   });
 });

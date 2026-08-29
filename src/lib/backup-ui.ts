@@ -37,6 +37,17 @@ export interface BackupArtifactMarker {
 export interface BackupFreshness {
   lastExport?: BackupArtifactMarker;
   lastVerified?: BackupArtifactMarker;
+  /**
+   * Something WAS stored under one of the keys and could not be believed —
+   * or the read itself failed.
+   *
+   * Distinct from «absent», and the distinction is the whole point: an
+   * unreadable marker silently rendered as «резервная копия ещё не
+   * создавалась» tells the user a fact about their copies that nobody
+   * established. «Не знаю» is the honest chip, and it is also the one that
+   * makes a person check.
+   */
+  unreadable?: boolean;
 }
 
 /** Dates as words, injectable so the rules can be tested without a timezone. */
@@ -89,9 +100,20 @@ export interface FreshnessSummary {
  * deleting an original.
  */
 export function freshnessSummary(
-  { lastExport, lastVerified }: BackupFreshness,
+  { lastExport, lastVerified, unreadable }: BackupFreshness,
   format: MomentFormatter = formatMoment,
 ): FreshnessSummary {
+  if (unreadable) {
+    // Deliberately not «не создавалась»: that is a claim, and the one thing
+    // known here is that nothing can be claimed.
+    return {
+      chip: 'статус неизвестен',
+      lines: [
+        'Отметки о резервных копиях прочитать не удалось — состояние копий неизвестно.',
+        'Это не значит, что копий нет: проверьте файл копии кнопкой ниже.',
+      ],
+    };
+  }
   if (!lastExport) {
     return {
       chip: 'не создавалась',
@@ -159,18 +181,77 @@ export function sizeNotice(expectedFileBytes: number, overCap: boolean): SizeNot
     return {
       text,
       overCap: false,
-      // The second sentence is a measurement, not a guess: at the ceiling a
-      // desktop spends ~5.5 s exporting and ~6.6 s importing with the tab
-      // frozen and about a gigabyte of peak memory (step 13). A phone has
-      // neither the seconds nor the memory, and finding that out by watching
-      // the tab die is the wrong way to learn it.
+      // Measured in a BROWSER now, not inferred from Node (step 13,
+      // `scripts/main-thread-probe.html`): near the ceiling Chrome spends
+      // ~0.7 s exporting and ~0.8 s verifying — four times faster than the
+      // Node figure — and every step of the chain holds the main thread, the
+      // longest single stretch being ~0.5 s. So the freeze is real but it is
+      // half a second, not «several seconds»: the earlier wording overstated
+      // it, and an overstatement here is the kind a user stops believing.
+      //
+      // The memory is the part that decides a phone's fate and is stated
+      // plainly: ~0.9 GB of JS heap against a 4 GB desktop limit — a mobile
+      // limit is a fraction of that.
       warning: `Копия приближается к пределу в ${formatBytes(BACKUP_CAP_BYTES)}. `
         + 'Записи не удаляются, поэтому объём только растёт. Рядом с пределом создание и '
-        + 'проверка копии занимают несколько секунд с замершим интерфейсом и требуют около '
-        + 'гигабайта памяти — на телефоне вкладка может не справиться, делайте копию на компьютере.',
+        + 'проверка копии занимают около полутора секунд, интерфейс на это время подвисает, '
+        + 'и нужно почти гигабайт памяти — на телефоне вкладка может не справиться, '
+        + 'делайте копию на компьютере.',
     };
   }
   return { text, overCap: false };
+}
+
+// ─── The dry-run's answer ───────────────────────────────────────────
+
+export interface VerifySummary {
+  /** Three ANSWERS, not two: «fine», «intact but narrower than a full
+   *  backup», and «something in it is wrong». Folding the middle one into the
+   *  last is the mistake this type exists to prevent. */
+  tone: 'ok' | 'incomplete' | 'bad';
+  headline: string;
+  /** Reason by reason, with the advice each one actually implies. */
+  issues: PreviewIssue[];
+}
+
+/**
+ * What a verify may say about a file.
+ *
+ * `report.ok` folds three questions into one boolean — intact, complete, every
+ * record readable — which is right for deciding whether to write the freshness
+ * marker and wrong for talking to a person. A file that is cryptographically
+ * perfect and merely narrower than the vault it came from is not «НЕ в
+ * порядке»: nothing about it is broken, and telling its owner otherwise
+ * invites them to throw away a copy that is the best one they have.
+ */
+export function verifySummary(
+  report: VerifyReport,
+  format: MomentFormatter = formatMoment,
+): VerifySummary {
+  const issues = previewIssues(report);
+  const counts = `${plural(report.counts.notes, 'заметка', 'заметки', 'заметок')}, `
+    + `${plural(report.counts.safebox, 'запись сейфа', 'записи сейфа', 'записей сейфа')}`;
+
+  if (report.ok) {
+    return { tone: 'ok', headline: `Файл от ${format(report.createdAt)} в порядке: ${counts}.`, issues };
+  }
+  if (issues.length === 0 && report.incompleteRestore) {
+    // Intact, readable, and honest about being partial. The distinction is the
+    // whole reason `incompleteRestore` travels inside the container.
+    return {
+      tone: 'incomplete',
+      headline: `Файл от ${format(report.createdAt)} цел и читается целиком (${counts}), `
+        + 'но он ЗАВЕДОМО НЕПОЛОН: устройство, которое его создало, само восстанавливалось '
+        + 'не полностью. Храните его, но не считайте единственной копией.',
+      issues,
+    };
+  }
+  return {
+    tone: 'bad',
+    headline: `Файл от ${format(report.createdAt)} проверен, и с ним есть проблемы (${counts}). `
+      + 'Не удаляйте его: остальные записи в нём целы.',
+    issues,
+  };
 }
 
 // ─── The import preview ─────────────────────────────────────────────
@@ -182,9 +263,29 @@ export interface ImportPreview {
   headline: string;
   /** What the import will and will not do, in the user's terms. */
   body: string[];
-  /** Records this build cannot read at all — worth naming before the import,
-   *  because their fate is decided by the user's decision to keep the file. */
-  issues?: string;
+  /**
+   * What is wrong with the file, BY REASON — because the advice differs.
+   *
+   * A single «сохраните файл, более новая версия может открыть» for every
+   * problem is right for exactly one of them. A record this build cannot read
+   * because it is NEWER will open in a later version; a record whose bytes are
+   * damaged will not open in any version, ever; and a broken chain link is
+   * neither — the version is missing from the file altogether.
+   */
+  issues: PreviewIssue[];
+}
+
+export interface PreviewIssue {
+  text: string;
+  /**
+   * Delivered as an alert rather than a line of prose.
+   *
+   * Reserved for the case where continuing costs something the user cannot
+   * get back later: records this build cannot read are NOT restored by this
+   * import, and a user who deletes the file afterwards deletes the only copy
+   * of them. «Blocking» here means «must be read», not «must be obeyed».
+   */
+  blocking: boolean;
 }
 
 export const INCOMPLETE_SOURCE_WARNING =
@@ -206,11 +307,45 @@ export function importPreview(
       + 'запись уже принята сервером, повторная отправка бесплатна. В редких авариях (запись о ней '
       + 'утрачена на сервере) возможна новая платная публикация.',
     ],
-    issues: report.issues.length > 0
-      ? `Записей с проблемами в файле: ${report.issues.length}. Они не будут восстановлены — `
-        + 'сохраните файл, более новая версия приложения может их открыть.'
-      : undefined,
+    issues: previewIssues(report),
   };
+}
+
+/** One sentence per REASON present, and only for reasons present. */
+function previewIssues(report: VerifyReport): PreviewIssue[] {
+  const count = (problem: string) => report.issues.filter(i => i.problem === problem).length;
+  const out: PreviewIssue[] = [];
+
+  const unsupported = count('unsupported_version');
+  if (unsupported > 0) {
+    // Blocking: these records are NOT restored by this import, and a user who
+    // deletes the file afterwards deletes the only copy of them.
+    out.push({
+      blocking: true,
+      text: `Записей, которые эта версия приложения не понимает: ${unsupported}. `
+        + 'Они НЕ будут восстановлены. Не удаляйте файл — более новая версия приложения '
+        + 'сможет их открыть.',
+    });
+  }
+
+  const damaged = count('undecryptable') + count('malformed');
+  if (damaged > 0) {
+    out.push({
+      blocking: false,
+      text: `Повреждённых записей в файле: ${damaged}. Их не восстановит и более новая версия — `
+        + 'повреждение не лечится обновлением.',
+    });
+  }
+
+  const broken = count('chain');
+  if (broken > 0) {
+    out.push({
+      blocking: false,
+      text: `Записей с несходящимися связями: ${broken}. Обычно это значит, что в файле нет `
+        + 'какой-то промежуточной версии — остальные версии восстановятся.',
+    });
+  }
+  return out;
 }
 
 // ─── The report: three lines by what the USER did ───────────────────
@@ -245,8 +380,13 @@ export interface ImportSummary {
   retryable?: string;
   /** Shown ONLY at seven zeroes AND a source that was not itself partial. */
   success?: string;
-  /** The file's own admission, repeated here (D11a). */
+  /** The FILE's own admission, repeated here (D11a). Shown only when the
+   *  container itself carried the flag. */
   blocking?: string;
+  /** The STORE is now marked incomplete for a reason that is NOT the file's
+   *  origin — this import left something unapplied, or the mark was already
+   *  there. A different sentence, because it points at a different problem. */
+  storeIncomplete?: string;
 }
 
 /** The counters that mean «this record was put right», in the plan's order. */
@@ -268,9 +408,9 @@ const RESTORED_KEYS = [
 const NOT_APPLIED_REASONS = [
   {
     key: 'conflicts',
-    label: 'Конфликт публикации',
-    advice: 'Локальная запись и запись из файла разошлись на цепочке. Автоматического '
-      + 'разрешения в этой версии нет — сохраните файл.',
+    label: 'Локальная запись отличается от записи в файле',
+    advice: 'Обе читаются, но их содержимое разное — импорт ничего не перезаписывает молча. '
+      + 'Автоматического разрешения в этой версии нет: сохраните файл, локальные данные на месте.',
   },
   {
     key: 'unsupported',
@@ -287,7 +427,8 @@ const NOT_APPLIED_REASONS = [
   {
     key: 'skipped',
     label: 'Запись повреждена или неправильной формы',
-    advice: 'Восстановить её эта версия не может. Файл сохраните: более новая может.',
+    advice: 'Такую запись не восстановит и более новая версия — повреждение не лечится обновлением. '
+      + 'Файл всё равно сохраните: остальные записи в нём целы.',
   },
   {
     key: 'quotaStopped',
@@ -303,7 +444,22 @@ const NOT_APPLIED_KEYS = NOT_APPLIED_REASONS.map(r => r.key);
  *  Both are answered by importing the same file again. */
 const RETRYABLE_KEYS = ['deferred', 'concurrentChange'] as const;
 
-export function importSummary(report: ImportReport): ImportSummary {
+/**
+ * The report, and the ONE thing it cannot tell you on its own.
+ *
+ * `report.incompleteRestore` is the state of the local completeness marker
+ * AFTER this import: true if the store was already marked, OR the file
+ * declared itself partial, OR anything at all went unapplied. Three different
+ * causes, one boolean — so using it to explain the FILE's origin («устройство,
+ * которое её создало, само восстанавливалось не полностью») is wrong in two
+ * of the three cases, and wrong in the direction that sends the user looking
+ * for a problem on a device that never had one.
+ *
+ * The file's own claim is a different value, and it is available: it comes
+ * from stage A's `VerifyReport`, which read it out of the container. So it is
+ * passed in rather than inferred.
+ */
+export function importSummary(report: ImportReport, sourceIncomplete: boolean): ImportSummary {
   const sum = (keys: readonly (keyof ImportReport['counters'])[]) =>
     keys.reduce((total, key) => total + report.counters[key], 0);
 
@@ -334,7 +490,16 @@ export function importSummary(report: ImportReport): ImportSummary {
     success: everythingApplied && !report.incompleteRestore
       ? 'Восстановление завершено полностью.'
       : undefined,
-    blocking: report.incompleteRestore ? INCOMPLETE_SOURCE_WARNING : undefined,
+    // About the FILE, and only when the file said so itself.
+    blocking: sourceIncomplete ? INCOMPLETE_SOURCE_WARNING : undefined,
+    // About the STORE, and only when the file was NOT the reason — otherwise
+    // the two sentences say the same thing twice and neither is heard.
+    storeIncomplete: report.incompleteRestore && !sourceIncomplete
+      ? 'Хранилище помечено как восстановленное не полностью: часть данных так и не применена. '
+        + 'Не удаляйте файл копии. Пометка ЛИПКАЯ: повторный импорт её уже не снимет — '
+        + 'она уйдёт только вместе с полным восстановлением на чистом устройстве, — '
+        + 'и до тех пор каждый экспорт отсюда честно несёт её дальше.'
+      : undefined,
   };
 }
 
