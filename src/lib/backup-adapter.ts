@@ -235,12 +235,13 @@ export async function withImportLock<T>(run: () => Promise<T>, signal?: AbortSig
 }
 
 /**
- * Four derivations, four `await`s — and a guard after each (D15).
+ * The keys, plus the guard that belongs AFTER them.
  *
- * Argon2-grade work, four times over, is not instant on a phone, and it is
- * the FIRST thing every backup operation does. Without the guards a lock or a
- * page hide during derivation is noticed only afterwards, by which time the
- * operation has already spent the time and holds the keys.
+ * The per-derivation guards live where the derivations do — in the store's
+ * `deriveKeys`, which checks between each of the four (D15). This one is the
+ * boundary check for the caller: derivation is the first thing every backup
+ * operation does, and without it a lock during that work is noticed only once
+ * the time has already been spent.
  */
 async function vaultKeys(vault: BackupVault): Promise<BackupVaultKeys> {
   const keys = await vault.deriveKeys();
