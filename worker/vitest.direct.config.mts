@@ -14,6 +14,9 @@ export default defineConfig({
       wrangler: { configPath: './wrangler.toml' },
       miniflare: {
         bindings: {
+          // Two origins: with a single one the dead quorum is unreachable by
+          // construction, and the redrop suites are about reaching it.
+          STATUS_GATEWAYS: 'https://arweave.net,https://g2.test',
           ADMIN_SECRET: 'test-admin-secret',
           ARWEAVE_JWK: '{}',
           RECOVERY_HMAC_SECRET: 'test-recovery-secret',
@@ -32,6 +35,8 @@ export default defineConfig({
       'test/arweave-transport.test.ts',
       'test/metrics-upload-e2e.test.ts',
       'test/admin-metrics.test.ts',
+      // Imports src/index directly with per-test env overrides — same reason.
+      'test/health-attestation.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.
