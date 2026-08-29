@@ -191,10 +191,41 @@ export async function readCapped(response, cap) {
 if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
   const args = process.argv.slice(2);
   const profile = (args.find(a => a.startsWith('--profile='))?.split('=')[1]) ?? 'normal';
-  const blockPrefix = args.includes('--staging') ? 'env.staging.' : '';
-  // The target is repo-pinned, not an argument: a smoke pointed wherever the
-  // caller likes proves nothing about the release that was gated.
-  const origin = AUTO_ALLOWED_WORKER_ORIGINS[0];
+  const staging = args.includes('--staging');
+  const blockPrefix = staging ? 'env.staging.' : '';
+
+  // PRODUCTION: the target is repo-pinned, never an argument — a smoke pointed
+  // wherever the caller likes proves nothing about the release that was gated.
+  //
+  // STAGING: there is no pinned origin, because staging is not provisioned (see
+  // AUTO_ALLOWED_WORKER_ORIGINS). Silently reusing the production origin would
+  // be worse than useless: the smoke would report on the WRONG worker while
+  // claiming to describe staging. So it must be named explicitly, and it must
+  // be a bare https origin.
+  let origin;
+  if (staging) {
+    const raw = process.env.SMOKE_STAGING_ORIGIN;
+    if (!raw) {
+      console.error(
+        '✗ --staging needs SMOKE_STAGING_ORIGIN: staging has no pinned origin yet.\n' +
+        '  Add its exact origin to AUTO_ALLOWED_WORKER_ORIGINS in the same change\n' +
+        '  that provisions [env.staging], and this flag stops needing an override.',
+      );
+      process.exit(2);
+    }
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== 'https:' || url.pathname !== '/' || url.search || url.hash) {
+        throw new Error('not a bare https origin');
+      }
+      origin = url.origin;
+    } catch {
+      console.error('✗ SMOKE_STAGING_ORIGIN must be a bare https origin');
+      process.exit(2);
+    }
+  } else {
+    origin = AUTO_ALLOWED_WORKER_ORIGINS[0];
+  }
 
   const expected = {
     profile,
