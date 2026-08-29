@@ -915,3 +915,34 @@ describe('Main — фокус следует за разделом', () => {
     expect(document.activeElement).toBe(document.body);
   });
 });
+
+/**
+ * The rollback half of the reading view.
+ *
+ * `flags.ts` states it as a contract, not as a style: with the writer off
+ * `editNote` THROWS, and «edit/history controls are hidden» — while «readers
+ * are never gated». So the note still opens and still reads; only the two
+ * write-adjacent controls are absent.
+ */
+describe('Main — чтение при выключенном писателе', () => {
+  const openFirstNote = () => {
+    fireEvent.click(screen.getByRole('button', { name: /^Открыть заметку от/ }));
+  };
+
+  it('заметка открывается и читается', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(document.querySelector('.note-reader-body')).toBeTruthy();
+    expect(document.querySelector('.note-reading')?.textContent).toContain('привет мир');
+    expect(document.querySelector('.notes-feed')).toBeNull();
+  });
+
+  it('но панель не предлагает ни правку, ни историю', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(screen.queryByRole('button', { name: 'Изменить' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'История' })).toBeNull();
+    // Copying is writer-independent and stays — the panel is not empty.
+    expect(screen.getByRole('button', { name: 'Копировать' })).toBeTruthy();
+  });
+});

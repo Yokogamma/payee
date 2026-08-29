@@ -2,12 +2,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { render, act, cleanup } from '@testing-library/react';
-import { parseHash, canonicalHash, navigate, useRoute, SECTIONS, DEFAULT_SECTION } from './route';
+import { parseHash, parseParam, canonicalHash, navigate, useRoute, SECTIONS, DEFAULT_SECTION } from './route';
 
 // jsdom, not node: `location` and `history` do not exist in the node
 // environment, and stubbing them would test the stub.
 
-let seen: { hash: string; section: string } | undefined;
+let seen: { hash: string; section: string; param: string | null } | undefined;
 
 function Probe() {
   const route = useRoute();
@@ -44,8 +44,35 @@ describe('parseHash', () => {
   });
 
   it('does not accept a prefix of a real section', () => {
+    // THE BACK-COMPAT PROOF for the item segment: the section is still matched
+    // WHOLE, not by prefix, even though the hash is now split on the first
+    // slash. Do not weaken these two.
     expect(parseHash('#/safeboxes')).toBe(DEFAULT_SECTION);
     expect(parseHash('#/note')).toBe(DEFAULT_SECTION);
+  });
+
+  it('reads the section off an addressed item', () => {
+    expect(parseHash('#/notes/abc')).toBe('notes');
+    expect(parseHash('#/settings/x')).toBe('settings');
+  });
+});
+
+describe('parseParam', () => {
+  it('reads the item a known section is addressing', () => {
+    expect(parseParam('#/notes/abc-123')).toBe('abc-123');
+  });
+
+  it('is null when there is no item', () => {
+    expect(parseParam('#/notes')).toBeNull();
+    expect(parseParam('')).toBeNull();
+    // An empty param is not an id — the canonicaliser rewrites it away.
+    expect(parseParam('#/notes/')).toBeNull();
+  });
+
+  it('is null when the SECTION is unknown', () => {
+    // Load-bearing: `#/zzz` degrades to the notes section, so reading a param
+    // off it would make a junk address OPEN A NOTE.
+    expect(parseParam('#/zzz/abc')).toBeNull();
   });
 });
 
@@ -53,6 +80,15 @@ describe('canonicalHash', () => {
   it('is the only shape the app writes', () => {
     expect(canonicalHash('safebox')).toBe('#/safebox');
     expect(parseHash(canonicalHash('safebox'))).toBe('safebox');
+  });
+
+  it('round-trips an addressed item', () => {
+    expect(canonicalHash('notes', 'abc')).toBe('#/notes/abc');
+    expect(parseHash('#/notes/abc')).toBe('notes');
+    expect(parseParam('#/notes/abc')).toBe('abc');
+    // A null/absent param is the plain section, not a trailing slash.
+    expect(canonicalHash('notes', null)).toBe('#/notes');
+    expect(canonicalHash('notes')).toBe('#/notes');
   });
 });
 
@@ -80,20 +116,43 @@ describe('navigate', () => {
     navigate('safebox');
     expect(window.history.length).toBe(after);
   });
+
+  it('pushes an addressed item as a Back-able entry, marked as ours', () => {
+    // The mark is what lets the reader tell «we pushed this» from «the user
+    // arrived here directly», and therefore whether Back is safe to call.
+    const before = window.history.length;
+    navigate('notes', { param: 'abc' });
+    expect(window.location.hash).toBe('#/notes/abc');
+    expect(window.history.state).toEqual({ enSection: true });
+    expect(window.history.length).toBe(before + 1);
+  });
+
+  it('ignores a repeat of the ACTIVE item too', () => {
+    navigate('notes', { param: 'abc' });
+    const after = window.history.length;
+    navigate('notes', { param: 'abc' });
+    expect(window.history.length).toBe(after);
+  });
+
+  it('replacing the item away leaves the plain section', () => {
+    navigate('notes', { param: 'abc' });
+    navigate('notes', { replace: true });
+    expect(window.location.hash).toBe('#/notes');
+  });
 });
 
 describe('useRoute', () => {
   it('reports the section the address already carries', () => {
     window.history.replaceState(null, '', '#/safebox');
     render(<Probe />);
-    expect(seen).toEqual({ hash: '#/safebox', section: 'safebox' });
+    expect(seen).toEqual({ hash: '#/safebox', section: 'safebox', param: null });
   });
 
   it('re-renders on navigate — pushState fires no hashchange, so the emit is manual', () => {
     render(<Probe />);
     expect(seen?.section).toBe('notes');
     act(() => { navigate('safebox'); });
-    expect(seen).toEqual({ hash: '#/safebox', section: 'safebox' });
+    expect(seen).toEqual({ hash: '#/safebox', section: 'safebox', param: null });
   });
 
   it('notices a JUNK hash typed over an ACTIVE section', () => {

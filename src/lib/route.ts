@@ -28,19 +28,51 @@ export const SECTIONS = ['notes', 'safebox', 'settings'] as const;
 export type Section = (typeof SECTIONS)[number];
 export const DEFAULT_SECTION: Section = 'notes';
 
-/** `#/safebox` — the only shape this app ever writes. */
-export function canonicalHash(section: Section): string {
-  return `#/${section}`;
+/**
+ * `#/safebox`, or `#/notes/<id>` when a section addresses one of its items —
+ * the only two shapes this app ever writes.
+ */
+export function canonicalHash(section: Section, param?: string | null): string {
+  return param ? `#/${section}/${param}` : `#/${section}`;
+}
+
+/** The section segment and the rest, split on the FIRST slash. */
+function split(hash: string): { name: string; param: string } {
+  const rest = hash.replace(/^#\/?/, '');
+  const slash = rest.indexOf('/');
+  return slash === -1
+    ? { name: rest, param: '' }
+    : { name: rest.slice(0, slash), param: rest.slice(slash + 1) };
 }
 
 /**
  * Whitelist parse. Anything unknown — a typo, a deep link to a section this
  * build does not have yet, a hash left by a newer build after a rollback —
  * degrades to the default instead of rendering nothing.
+ *
+ * Only the FIRST segment is matched, so `#/notes/<id>` is still the notes
+ * section. The old behaviour is unchanged for every shape that mattered
+ * before: `#/safeboxes` and `#/note` are still not sections (the segment is
+ * compared whole, not by prefix), and a missing slash is still tolerated.
  */
 export function parseHash(hash: string): Section {
-  const name = hash.replace(/^#\/?/, '');
+  const { name } = split(hash);
   return (SECTIONS as readonly string[]).includes(name) ? (name as Section) : DEFAULT_SECTION;
+}
+
+/**
+ * The item a section is addressing, or `null`.
+ *
+ * `null` when the SECTION is unknown, and that is the load-bearing half: were
+ * it read off an unrecognised hash, `#/zzz/<id>` would degrade to the notes
+ * section AND open a note — a junk address that does something. An empty
+ * param (`#/notes/`) is `null` too, so the canonicaliser rewrites it away
+ * rather than treating '' as an id.
+ */
+export function parseParam(hash: string): string | null {
+  const { name, param } = split(hash);
+  if (!(SECTIONS as readonly string[]).includes(name)) return null;
+  return param === '' ? null : param;
 }
 
 /**
@@ -91,8 +123,11 @@ const getServerSnapshot = (): string => '';
  * `pushState` does NOT fire `hashchange`, so the emit is manual — that is the
  * whole reason this must be the single write path.
  */
-export function navigate(section: Section, opts: { replace?: boolean } = {}): void {
-  const next = canonicalHash(section);
+export function navigate(
+  section: Section,
+  opts: { replace?: boolean; param?: string | null } = {},
+): void {
+  const next = canonicalHash(section, opts.param);
   // Tapping the active section repeatedly must not build a history stack the
   // user then has to Back through.
   if (window.location.hash === next) return;
@@ -110,7 +145,7 @@ export function navigate(section: Section, opts: { replace?: boolean } = {}): vo
  * `#/garbage` needs rewriting. Returning only the section would hide exactly
  * the transition the canonicaliser exists for.
  */
-export function useRoute(): { hash: string; section: Section } {
+export function useRoute(): { hash: string; section: Section; param: string | null } {
   const hash = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  return { hash, section: parseHash(hash) };
+  return { hash, section: parseHash(hash), param: parseParam(hash) };
 }

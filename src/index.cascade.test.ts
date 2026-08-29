@@ -208,18 +208,87 @@ describe('base layer, as the browser resolves it', () => {
     ).toEqual([]);
   });
 
-  it('a clamped note fades into the page, not into a surface that is gone', () => {
+  it('a clamped preview fades into the ground actually behind it', () => {
     // The entry stopped being a filled card in Ф3; a gradient still ending in
     // --bg-card painted a lighter band across the bottom of every long note.
-    expect(declaresIn('.note-text--clamped::after', /linear-gradient\(transparent, var\(--bg\)\)/)).toBe(true);
-    expect(declaresIn('.note-text--clamped::after', /var\(--bg-card\)/)).toBe(false);
+    // The ground is now a variable because pressing the card paints an OPAQUE
+    // --bg-hover under it — fading to --bg there would repaint the same seam.
+    expect(declaresIn('.note-preview--clamped::after', /linear-gradient\(transparent, var\(--preview-ground/)).toBe(true);
+    expect(declaresIn('.note-preview--clamped::after', /var\(--bg-card\)/)).toBe(false);
+    expect(declaresIn('.note-open-area', /--preview-ground:\s*var\(--bg\)/)).toBe(true);
   });
 
-  it('«Развернуть» is a control, not a coloured word', () => {
-    expect(resolved('note-expand-btn', 'font-size')).toBe('14px');
-    expect(declaresIn('.note-expand-btn', /border-bottom:\s*1px solid var\(--border-control\)/)).toBe(true);
-    // 44px of touch out of a ~26px box, the .status-btn trick.
-    expect(declaresIn('.note-expand-btn::after', /inset:\s*-10px -6px/)).toBe(true);
+  it('the feed reserves the scrollbar gutter — the measurement watches width', () => {
+    // Where the scrollbar takes width, its appearance narrows the line box,
+    // rewraps every preview and changes their heights — which can flip the
+    // scrollbar back off. `useTruncation` re-measures on WIDTH changes, so a
+    // width that moves by itself is the one input it cannot be robust against.
+    expect(declaresIn('.notes-feed', /scrollbar-gutter:\s*stable/)).toBe(true);
+  });
+
+  it('the preview ceiling is four lines, and it cannot drift from the reading size', () => {
+    // TWO ASSERTIONS THAT ARE ONE. The ceiling is expressed in `em` against
+    // `.note-text`'s line-height, so pinning only the calc would let a change
+    // to that line-height silently resize every card. `1lh` is deliberately
+    // not used: where it is unsupported the whole declaration is invalid and
+    // the ceiling disappears instead of degrading.
+    expect(declaresIn('.note-preview', /--preview-lines:\s*4/)).toBe(true);
+    expect(declaresIn('.note-preview--clamped', /max-height:\s*calc\(var\(--preview-lines\) \* 1\.55em\)/)).toBe(true);
+    expect(resolved('note-text', 'line-height')).toBe('1.55');
+
+    // `overflow` must be identical in both states: it establishes a block
+    // formatting context, so toggling it would change how margins collapse —
+    // and therefore the very scrollHeight the measurement reads.
+    expect(declaresIn('.note-preview', /overflow:\s*hidden/)).toBe(true);
+    expect(declaresIn('.note-preview--clamped', /overflow/)).toBe(false);
+  });
+
+  it('the whole entry is the open control, and it adds no stacking context', () => {
+    expect(declaresIn('.note-open', /position:\s*absolute/)).toBe(true);
+    expect(declaresIn('.note-open', /inset:\s*0/)).toBe(true);
+    // A z-index anywhere in the card would create a stacking context, and the
+    // NEXT card's meta row would then paint over an open .card-menu.
+    expect(declaresIn('.note-open', /z-index/)).toBe(false);
+    expect(declaresIn('.note-open-area', /z-index/)).toBe(false);
+    // The tint is painted on the AREA, under the content — an overlay with a
+    // background of its own would cover the very text it highlights.
+    expect(declaresIn('.note-open', /background:\s*var\(--accent-glow\)/)).toBe(false);
+  });
+
+  it('reading is a grid state like composing, not a layer', () => {
+    expect(declaresIn('.main-screen--reading', /grid-template-areas:\s*'content'/)).toBe(true);
+    expect(declaresIn('.main-screen--reading', /grid-template-rows:\s*1fr/)).toBe(true);
+    // Same invariant the composer carries: z-index >= 100 would paint over the
+    // privacy gate, so the fullscreen states must not layer at all.
+    expect(declaresIn('.main-screen--reading', /z-index/)).toBe(false);
+    expect(declaresIn('.main-screen--reading', /position/)).toBe(false);
+  });
+
+  it('the reader anchors its own card menu and keeps the reading measure', () => {
+    // The reader carries no ⋯ menu any more — its actions are a labelled bar
+    // at the bottom, in the thumb's reach — so the meta row is facts only and
+    // needs no positioning of its own.
+    expect(declaresIn('.note-reader-meta', /position:/)).toBe(false);
+    // 13px, not the tab bar's 12.5px: that size is a named exception granted
+    // to `.app-nav-item` alone, and a third exception would end the floor.
+    expect(declaresIn('.note-action', /font-size:\s*13px/)).toBe(true);
+    expect(declaresIn('.note-action', /min-height:\s*56px/)).toBe(true);
+    // The date labels the screen at the same size as the control beside it.
+    expect(declaresIn('.note-reader-title', /font-size:\s*15px/)).toBe(true);
+    // The body keeps `.note-text` as its wrapper — that is where the 18px and
+    // the `pre-wrap` unformatted notes depend on live. `.note-reading` only
+    // opens the rhythm and sets the measure.
+    expect(declaresIn('.note-reading', /max-width:\s*34em/)).toBe(true);
+    expect(resolved('note-text note-reading', 'line-height')).toBe('1.62');
+
+    // THE BODY MUST GROW, and it must do so as a FLEX child. Its parent
+    // `.main-content` is a flex column, so a `grid-area` here is inert: the
+    // body fell back to `flex: 0 1 auto`, sized itself to its content, and on
+    // a one-line note the sticky edit FAB ended up floating mid-screen with
+    // ~540px of empty ground below it.
+    expect(declaresIn('.note-reader-body', /flex:\s*1 1 auto/)).toBe(true);
+    expect(declaresIn('.note-reader-body', /grid-area/)).toBe(false);
+    expect(declaresIn('.note-reader-body', /min-height:\s*0/)).toBe(true);
   });
 
   it('the status panel respects the floor too', () => {
@@ -298,11 +367,17 @@ describe('base layer, as the browser resolves it', () => {
       .slice(1)
       .join('\n');
     expect(desktop, 'no ≥768px block found').toBeTruthy();
+    // BOTH fullscreen states, and both must name both classes. A bare
+    // `--composing` / `--reading` there would tie on specificity with the
+    // `.main-screen` rule above it and lose on order — leaving a 220px rail
+    // for a nav that is unmounted.
     expect(
-      /\.main-screen\.main-screen--composing\s*\{[^}]*grid-template-columns:\s*1fr/.test(desktop),
-      'the ≥768px block must re-assert the composing grid, and must name BOTH ' +
-        'classes — a bare .main-screen--composing there would tie on specificity ' +
-        'with the .main-screen rule above it and lose on order',
+      /\.main-screen\.main-screen--composing[^{]*\{[^}]*grid-template-columns:\s*1fr/.test(desktop),
+      'the ≥768px block must re-assert the composing grid naming BOTH classes',
+    ).toBe(true);
+    expect(
+      /\.main-screen\.main-screen--reading[^{]*\{[^}]*grid-template-columns:\s*1fr/.test(desktop),
+      'the ≥768px block must re-assert the READING grid naming BOTH classes',
     ).toBe(true);
   });
 

@@ -142,7 +142,25 @@ const components: Components = {
   ),
 };
 
-export const NoteMarkdown = memo(function NoteMarkdown({ text }: { text: string }) {
+/**
+ * Feed-preview variant: nothing inside is focusable or clickable.
+ *
+ * The preview sits UNDER the card's stretched open button, so a link there is
+ * unreachable by pointer while staying in the tab order and in the
+ * accessibility tree — pointer and keyboard would disagree about what the card
+ * contains. Rendering links and image chips as plain spans keeps a card at
+ * exactly two tab stops: open, and the ⋯ menu. (The GFM checkboxes are already
+ * `disabled`, so they are not focusable either way.)
+ */
+const previewComponents: Components = {
+  ...components,
+  a: ({ children }) => <span>{children}</span>,
+  img: ({ alt }) => <span className="md-img-chip">{alt || 'изображение'}</span>,
+};
+
+export const NoteMarkdown = memo(function NoteMarkdown(
+  { text, preview = false }: { text: string; preview?: boolean },
+) {
   return (
     <div className="note-md">
       <ReactMarkdown
@@ -152,7 +170,7 @@ export const NoteMarkdown = memo(function NoteMarkdown({ text }: { text: string 
         allowedElements={ALLOWED_ELEMENTS}
         unwrapDisallowed
         urlTransform={httpOnly}
-        components={components}
+        components={preview ? previewComponents : components}
       >
         {text}
       </ReactMarkdown>
