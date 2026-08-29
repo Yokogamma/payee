@@ -403,11 +403,18 @@ all, and there is no SHA that both passes without a floor and is blocked by
 is done in the direction that deploys nothing dangerous:
 
 1. set `WORKER_FLOOR_SHA` to the `worker-r3` SHA above;
-2. dispatch the deploy for **the SHA that is currently live** — see «What is
-   actually deployed» below; as of 2026-08-28 that is
-   `45866b9bb9ae5c8c92d031f4e62e67be50d71949`. It passes the gate (a commit is
-   its own descendant) and genuinely redeploys what is already running, so the
-   rehearsal changes nothing.
+2. **tag the live SHA first, then dispatch it.** The gate accepts a candidate
+   only if it is the trusted head or carries a **release tag** (`worker-rN`) —
+   and the live commit
+   `45866b9bb9ae5c8c92d031f4e62e67be50d71949` has no tag, because the four
+   deploys after `worker-r3` were never tagged (see the table below). So the
+   rehearsal begins by fixing that: tag it `worker-r4`, add its row, and only
+   then dispatch it. It passes the gate (a commit is its own descendant) and
+   redeploys what is already running, so the rehearsal changes nothing.
+
+   > This is not a detour. The registry gap and the rehearsal are the same
+   > problem: an untagged live deploy is a state the gate cannot express, and
+   > the runbook already required a tag on every deploy.
 
    > **Corrected 2026-08-28.** This step used to say «dispatch `worker-r3`
    > itself — it redeploys what is already live», on the strength of a claim

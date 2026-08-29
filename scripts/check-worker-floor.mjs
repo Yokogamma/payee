@@ -309,6 +309,9 @@ export function checkWorkerFloor({ floor, candidate, trustedHead, git, minimumFl
  * checkout happens to have — a test that needs `HEAD~3` fails on a shallow CI
  * clone, which is exactly how the first version of this file shipped red.
  */
+/** The shape every entry in the runbook's release allowlist has. */
+export const RELEASE_TAG = /^worker-r\d+$/;
+
 export function gitIn(cwd) {
   const git = args => spawnSync('git', args, { cwd, stdio: 'ignore' });
   return {
@@ -331,7 +334,12 @@ export function gitIn(cwd) {
       // when the commit carries no tag.
       const { status, error, stdout } = spawnSync('git', ['tag', '--points-at', sha], { cwd, encoding: 'utf8' });
       if (error || status !== 0) return false;
-      return String(stdout).trim() !== '';
+      // A RELEASE tag, not any tag. The runbook's allowlist is «tags in this
+      // list», and every entry in it is `worker-rN`; accepting an arbitrary
+      // name let a personal bookmark — `wip`, `before-refactor`, anything a
+      // person types while debugging — satisfy a gate whose whole purpose is
+      // that only judged states get deployed.
+      return String(stdout).split('\n').some(tag => RELEASE_TAG.test(tag.trim()));
     },
   };
 }

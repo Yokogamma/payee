@@ -277,8 +277,8 @@ describe('against a real repository, built for the purpose', () => {
     third = commit('third');
     // `second` is a release; `first` is only the minimum. `third` is the head
     // and needs no tag of its own.
-    run('tag', 'release-2', second);
-    run('tag', 'release-1', first);
+    run('tag', 'worker-r2', second);
+    run('tag', 'worker-r1', first);
     // A branch that was never merged — the shape the trust boundary exists for.
     run('checkout', '-q', '-b', 'unmerged', first);
     offBranch = commit('off the default branch');
@@ -326,10 +326,25 @@ describe('against a real repository, built for the purpose', () => {
   it('an untagged commit in the history is refused, a tagged one is not', () => {
     // On real git, with real `git tag --points-at`.
     const run = (...args) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
-    run('tag', '-d', 'release-2');
+    run('tag', '-d', 'worker-r2');
     expect(real({ floor: first, candidate: second }).ok, 'untagged').toBe(false);
-    run('tag', 'release-2', second);
+    run('tag', 'worker-r2', second);
     expect(real({ floor: first, candidate: second }).ok, 'tagged again').toBe(true);
+  });
+
+  it('a personal bookmark is not a release tag', () => {
+    // `git tag --points-at` answers «yes» to any name — `wip`,
+    // `before-refactor`, whatever someone types while debugging. The runbook's
+    // allowlist is «tags in this list», and every entry in it is `worker-rN`;
+    // accepting an arbitrary name let a private bookmark satisfy a gate whose
+    // whole purpose is that only judged states get deployed.
+    const run = (...args) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
+    run('tag', '-d', 'worker-r2');
+    run('tag', 'wip-debugging', second);
+    expect(real({ floor: first, candidate: second }).ok, 'bookmark only').toBe(false);
+
+    run('tag', 'worker-r2', second);
+    expect(real({ floor: first, candidate: second }).ok, 'release tag present too').toBe(true);
   });
 
   it('a floor below the pinned minimum is refused on real git too', () => {
