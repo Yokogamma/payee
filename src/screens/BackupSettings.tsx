@@ -301,6 +301,11 @@ function VerifyResult({ summary }: { summary: VerifySummary }) {
       role={blocking ? 'alert' : 'status'}
     >
       <div>{summary.headline}</div>
+      {/* Orthogonal to everything else: «where this file came from» is a
+          different question from «what is wrong inside it», and a damaged file
+          used to lose the origin warning entirely because the worse verdict
+          won. */}
+      {summary.sourceIncomplete && <div>{summary.sourceIncomplete}</div>}
       {summary.issues.map(issue => <div key={issue.text}>{issue.text}</div>)}
     </div>
   );

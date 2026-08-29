@@ -2465,7 +2465,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return result.kind;
   }
 
-  async function syncPendingRecords() {
+  /**
+   * Re-enqueue everything the queue should be carrying.
+   *
+   * `stillWanted` is optional and exists for ONE caller: the tail after an
+   * import. Between the reads below and the enqueue there are five awaits, and
+   * `enqueueUpload` kicks the queue the moment it pushes — so a tab that went
+   * away mid-read would still start SENDING. Checking once before the call is
+   * not enough, and this is the only place that can check late enough.
+   *
+   * Everywhere else it defaults to «yes»: a backgrounded tab continuing to
+   * upload is the whole point of a sync queue, and gating that would break the
+   * feature rather than protect it.
+   */
+  async function syncPendingRecords(stillWanted: () => boolean = () => true) {
     const allNotes = await getAllNotes();
     // Safebox entries MUST be enumerated here too: without this, a pending
     // entry never returns to the queue after a reload/unlock/poll cycle.
@@ -2506,11 +2519,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     for (const note of allNotes) {
       if (skipIds.has(note.noteId)) continue;
       if (v3PausedNow && note.v === 3) continue;
+      if (!stillWanted()) return;
       enqueueUpload({ kind: 'note', record: note });
     }
     if (!v4PausedNow) {
       for (const entry of allSafebox) {
         if (skipIds.has(entry.entryId)) continue;
+        if (!stillWanted()) return;
         enqueueUpload({ kind: 'safebox', record: entry });
       }
     }
@@ -4548,8 +4563,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * `catch`, an anonymous error would become «this record is damaged».
    */
   const backupVault = useCallback((): BackupVault => {
-    const mn = mnemonicRef.current;
-    if (!mn) throw new BackupVaultLockedError();
+    // NO local binding for the seed — not even for the null check. A `const mn`
+    // here would be captured by every closure below and would keep the phrase
+    // reachable for as long as the prepared import lives, which is exactly the
+    // lifetime this design exists to avoid. Relying on an optimizer to drop an
+    // unused binding is not a guarantee; not creating it is.
+    if (!mnemonicRef.current) throw new BackupVaultLockedError();
     const myEpoch = vaultEpochRef.current;
     const myDbGen = getDbGeneration();
     const myOp = ++backupOpRef.current.generation;
@@ -4608,13 +4627,38 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // The factory is passed UNCALLED: with a release flag off, «the vault is
   // locked» is a true statement and the wrong answer, so the flag has to be
   // checked before the vault is even asked for.
+  /**
+   * Run an operation and refuse to hand back a result the app no longer wants.
+   *
+   * The adapter's last `await` is the artifact marker; after it the outcome
+   * travels straight to a download or to the screen. Two exports in flight —
+   * an impatient second click — end with the SLOWER one arriving last and
+   * overwriting the newer answer, and a tab that went away still saves a file
+   * nobody asked for twice.
+   *
+   * The token is captured from inside the factory, so the flag check still
+   * happens before the vault is built.
+   */
+  const freshest = useCallback(async <T,>(run: (make: () => BackupVault) => Promise<T>): Promise<T> => {
+    let token = -1;
+    const outcome = await run(() => {
+      const vault = backupVault();
+      token = backupOpRef.current.generation;
+      return vault;
+    });
+    if (backupOpRef.current.generation !== token) {
+      throw new BackupCancelledError('Операция резервного копирования отменена.');
+    }
+    return outcome;
+  }, [backupVault]);
+
   const exportBackupFile = useCallback(async (): Promise<ExportOutcome> => (
-    runExport(backupVault)
-  ), [backupVault]);
+    freshest(make => runExport(make))
+  ), [freshest]);
 
   const verifyBackupFile = useCallback(async (file: File): Promise<VerifyOutcome> => (
-    runVerify(backupVault, file)
-  ), [backupVault]);
+    freshest(make => runVerify(make, file))
+  ), [freshest]);
 
   const prepareBackupImport = useCallback(async (file: File): Promise<PreparedImport> => (
     prepareImport(backupVault, file)
@@ -4675,7 +4719,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         if (alive()) await refreshSyncCounts(myEpoch);
         if (alive()) await refreshSafeboxPresence(myEpoch);
         if (alive() && arweaveRef.current.enabled) {
-          await syncPendingRecords();
+          // The predicate goes IN: `syncPendingRecords` awaits five reads and
+          // `enqueueUpload` kicks the queue as soon as it pushes, so a check
+          // around the call leaves a window in which a tab that has gone away
+          // still starts uploading.
+          await syncPendingRecords(alive);
           if (alive()) kickQueue();
         }
         viewRefreshed = alive();

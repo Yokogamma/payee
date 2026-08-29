@@ -210,6 +210,18 @@ export interface VerifySummary {
    *  last is the mistake this type exists to prevent. */
   tone: 'ok' | 'incomplete' | 'bad';
   headline: string;
+  /**
+   * The file's own admission that it was made by a partial restore —
+   * INDEPENDENT of everything else.
+   *
+   * It used to be folded into `tone`, which meant a file that was both
+   * incomplete and damaged lost the incompleteness entirely: the worse tone
+   * won and the sentence about ORIGIN disappeared. The two are orthogonal by
+   * construction — «where this file came from» and «what is wrong inside it»
+   * — and the first is the one that decides whether the user keeps hunting
+   * for an older source file.
+   */
+  sourceIncomplete?: string;
   /** Reason by reason, with the advice each one actually implies. */
   issues: PreviewIssue[];
 }
@@ -232,18 +244,21 @@ export function verifySummary(
   const counts = `${plural(report.counts.notes, 'заметка', 'заметки', 'заметок')}, `
     + `${plural(report.counts.safebox, 'запись сейфа', 'записи сейфа', 'записей сейфа')}`;
 
+  // Said whenever the container says it, whatever else is true of the file.
+  const sourceIncomplete = report.incompleteRestore ? INCOMPLETE_SOURCE_WARNING : undefined;
+
   if (report.ok) {
-    return { tone: 'ok', headline: `Файл от ${format(report.createdAt)} в порядке: ${counts}.`, issues };
+    return { tone: 'ok', headline: `Файл от ${format(report.createdAt)} в порядке: ${counts}.`, issues, sourceIncomplete };
   }
   if (issues.length === 0 && report.incompleteRestore) {
-    // Intact, readable, and honest about being partial. The distinction is the
-    // whole reason `incompleteRestore` travels inside the container.
+    // Intact, readable, and honest about being partial — nothing in it is
+    // broken, which is a different sentence from «есть проблемы».
     return {
       tone: 'incomplete',
       headline: `Файл от ${format(report.createdAt)} цел и читается целиком (${counts}), `
-        + 'но он ЗАВЕДОМО НЕПОЛОН: устройство, которое его создало, само восстанавливалось '
-        + 'не полностью. Храните его, но не считайте единственной копией.',
+        + 'но он ЗАВЕДОМО НЕПОЛОН. Храните его, но не считайте единственной копией.',
       issues,
+      sourceIncomplete,
     };
   }
   return {
@@ -251,6 +266,7 @@ export function verifySummary(
     headline: `Файл от ${format(report.createdAt)} проверен, и с ним есть проблемы (${counts}). `
       + 'Не удаляйте его: остальные записи в нём целы.',
     issues,
+    sourceIncomplete,
   };
 }
 
@@ -494,11 +510,19 @@ export function importSummary(report: ImportReport, sourceIncomplete: boolean): 
     blocking: sourceIncomplete ? INCOMPLETE_SOURCE_WARNING : undefined,
     // About the STORE, and only when the file was NOT the reason — otherwise
     // the two sentences say the same thing twice and neither is heard.
+    // Careful about WHAT this proves. The marker is raised by three different
+    // causes, and after the fact they are indistinguishable: this import may
+    // have applied its file in full while the mark was already standing from
+    // an earlier one. So the sentence claims only what the marker actually
+    // means — completeness can no longer be confirmed — and names the one path
+    // that clears it, which is a reset followed by a clean full import, not
+    // «buy another device».
     storeIncomplete: report.incompleteRestore && !sourceIncomplete
-      ? 'Хранилище помечено как восстановленное не полностью: часть данных так и не применена. '
-        + 'Не удаляйте файл копии. Пометка ЛИПКАЯ: повторный импорт её уже не снимет — '
-        + 'она уйдёт только вместе с полным восстановлением на чистом устройстве, — '
-        + 'и до тех пор каждый экспорт отсюда честно несёт её дальше.'
+      ? 'Полноту этого хранилища больше нельзя подтвердить: пометка о неполном '
+        + 'восстановлении стоит. Не удаляйте файл копии. Пометка ЛИПКАЯ — повторный импорт '
+        + 'её не снимет: снять её может только полный импорт в хранилище, где пометки ещё '
+        + 'нет (то есть после сброса приложения). До тех пор каждый экспорт отсюда честно '
+        + 'несёт её дальше.'
       : undefined,
   };
 }
