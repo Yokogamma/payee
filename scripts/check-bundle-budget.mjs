@@ -11,6 +11,33 @@
  * Budget = baseline + headroom; raise it CONSCIOUSLY in this file when a
  * deliberate dependency lands, never as a green-build side effect.
  *
+ * ── RAISED 200_000 → 307_200 (300 KB) — owner's decision, 2026-08-29 ───────
+ *
+ * A tripwire set a few kilobytes above the current size stops being a
+ * tripwire and becomes a toll booth: two legitimate tracks in a row spent
+ * their whole headroom, and each time the ceiling had to be argued about
+ * before the work could land. That argument was not buying anything — nobody
+ * was ever going to answer «this feature is not worth 3 KB» — so the ceiling
+ * moves far enough out to catch what it was written for: a DEPENDENCY that
+ * balloons, not a feature that grows.
+ *
+ * Measured on the day of the decision, same fake-owner production build:
+ *   main                          191.1 KB gz
+ *   main + PR-3a (#130)           194.2 KB gz   (+3.1 — multi-gateway + D9)
+ *   backup stack tip              199.9 KB gz   (+8.8 — container, viewer, UI)
+ *   both together, projected      ~203  KB gz
+ *
+ * So ~97 KB of the new ceiling is genuinely spare. That is deliberate: at
+ * this distance a red build means something went wrong, which is the only
+ * state in which anyone reads the message.
+ *
+ * What this does NOT excuse: the gate measures GZIPPED JS ONLY, and JS is
+ * about a third of what a user actually downloads (24 precache entries,
+ * ~574 KB gz — fonts are the larger half; `scripts/report-precache.mjs`).
+ * A ceiling this generous therefore watches an even smaller share of the
+ * real cost, and the precache report — not this number — is what to look at
+ * before adding a font or an asset.
+ *
  * ── RAISED 190_000 → 200_000 for the «Архив» redesign ──────────────────────
  *
  * Measured, both with the same fake-owner production build:
@@ -41,42 +68,13 @@
  *
  * The new ceiling restores roughly 10 KB of headroom, which is what the gate
  * had before this work started.
- *
- * ── RAISED 200_000 → 210_000 for the backup UI block (step 12b) ────────────
- *
- * Measured, both with the same fake-owner production build:
- *   feat/backup-store-actions (12a)  193.4 KB gz
- *   feat/backup-ui-block      (12b)  197.9 KB gz     (+4.5 KB)
- *
- * NO DEPENDENCY WAS ADDED. The 4.5 KB is source, and most of it is prose:
- *   - src/lib/backup-ui.ts — the sentences §7 specifies, as data. Russian text
- *     costs two UTF-8 bytes per character and compresses worse than the code
- *     around it, so a screen's worth of copy is measured in kilobytes rather
- *     than in hundreds of bytes. It is also the least compressible thing here
- *     and the least optional: the plan writes these sentences out because the
- *     honest one and the comfortable one differ.
- *   - src/screens/BackupSettings.tsx — the block itself.
- *   - src/lib/viewer-delivery.ts, src/lib/download.ts — small.
- *
- * The backup MACHINERY was already in the bundle before this branch: the store
- * imports the adapter, and the adapter pulls the container, the classifier,
- * the plan and the merge rules with it. This branch adds the interface, not
- * the engine.
- *
- * Worth stating plainly, because it is a real cost with no user today: both
- * release flags ship FALSE, so in release 1 this block renders nothing and the
- * bytes are inert. That is what D16 asks for — the gate lives in the actions,
- * the code ships with them — and the alternative (a build that omits the block
- * entirely) would mean the release that flips the flags is not the release
- * that was tested. Step 13 re-measures precache and near-cap and is where this
- * ceiling gets its final look.
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
-const BUDGET_GZ_BYTES = 210_000;
+const BUDGET_GZ_BYTES = 307_200;
 
 const assetsDir = join(process.cwd(), 'dist', 'assets');
 if (!existsSync(assetsDir)) {

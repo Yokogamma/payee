@@ -13,9 +13,21 @@
  */
 import { writeFileSync } from 'node:fs';
 import { resolveProxyOrigin } from './proxy-origin.mjs';
+import { cspConnectOrigins } from './gateways-parse.mjs';
 
 const base = process.env.VITE_BASE || '/';
 const rawProxy = process.env.VITE_PROXY_URL || '';
+
+// connect-src is generated from the SAME lists the client compiles in (D8), so
+// a gateway the runtime would call can never be one the policy forbids. Index
+// entries contribute their origin only — connect-src is origin-scoped.
+// The empty-env default mirrors src/lib/gateways.ts: a lone arweave.net.
+const gatewayOrigins = cspConnectOrigins({
+  status: process.env.VITE_STATUS_GATEWAYS,
+  payload: process.env.VITE_PAYLOAD_GATEWAYS,
+  indexSources: process.env.VITE_INDEX_SOURCES,
+});
+const connectOrigins = gatewayOrigins.length > 0 ? gatewayOrigins : ['https://arweave.net'];
 
 let origin;
 try {
@@ -65,7 +77,7 @@ const csp = [
   "style-src 'self'",
   "img-src 'self' data:",
   "font-src 'self'",
-  `connect-src 'self' https://arweave.net ${origin}`,
+  `connect-src 'self' ${connectOrigins.join(' ')} ${origin}`,
   "worker-src 'self'",
   "frame-ancestors 'none'",
   "base-uri 'none'",
@@ -85,4 +97,7 @@ writeFileSync('dist/_headers', `/*
 ${VIEWER_HEADERS}`);
 
 // SW versioning is content-hash based (Workbox revisions) — no SHA stamping.
-console.log(`postbuild: base=${base} connect-src proxy=${origin}`);
+console.log(
+  `postbuild: base=${base} connect-src proxy=${origin} ` +
+    `gateways=${connectOrigins.length} (${connectOrigins.join(',')})`,
+);
