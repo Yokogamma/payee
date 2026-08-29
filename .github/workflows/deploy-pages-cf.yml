@@ -91,6 +91,9 @@ jobs:
       - run: node scripts/check-gateways-vs-worker.mjs
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      # Same source-only gate as CI: the forbidden backup-flag pair must not
+      # reach a release artifact (D16).
+      - run: node scripts/check-backup-flags.mjs
       # ── Quality gates ──
       - run: npm ci
       - run: npm run lint
