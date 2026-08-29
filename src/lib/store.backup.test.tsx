@@ -373,6 +373,39 @@ describe('an operation belongs to the vault that started it (D15)', () => {
   });
 });
 
+describe('a tab that leaves during the tail stops the tail (D15)', () => {
+  it('does not keep decrypting, counting and SENDING for a page nobody is looking at', async () => {
+    // The import itself is committed — cancelling it is stage B's own job and
+    // it does that correctly. What this covers is everything AFTER: the app
+    // catching up, which is not one operation but five — re-decrypting every
+    // note, two count passes, a safebox read and a push of the upload queue.
+    //
+    // Neither the epoch nor the database generation moves on `pagehide`, so
+    // without the operation token that whole tail ran on for a page already
+    // declared closed — and `viewRefreshed: true` claimed a repaint the very
+    // first step had abandoned. The queue push is the part that mattered: a
+    // hidden tab would start SENDING.
+    await openMain();
+    const { file, note } = await containerWith('TAIL-ABANDONED');
+    const prepared = await act(async () => store.prepareBackupImport(file));
+
+    // Leave the page at the first step of the tail, not during stage B.
+    vi.mocked(getAllNotes).mockImplementationOnce(async () => {
+      window.dispatchEvent(new Event('pagehide'));
+      return [];
+    });
+
+    const outcome = await act(async () => store.applyBackupImport(prepared));
+
+    // The data landed and the report is honest about it…
+    expect(outcome.report.counters.added).toBe(1);
+    expect(await getNoteById(note.noteId)).toBeDefined();
+    // …and the screen is NOT claimed to be up to date.
+    expect(outcome.viewRefreshed).toBe(false);
+    expect(uploadViaProxy).not.toHaveBeenCalled();
+  });
+});
+
 describe('bookkeeping never destroys the result', () => {
   it('an export records the file it produced (D21)', async () => {
     await openMain();
