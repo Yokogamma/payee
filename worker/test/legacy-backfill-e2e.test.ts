@@ -245,3 +245,103 @@ describe('an unprovable legacy record', () => {
     expect((await r.json() as { deduped?: boolean }).deduped).toBe(true);
   });
 });
+
+// ─── The recovery-token branch binds an EXISTING txId too ────────────
+
+/** The server's recovery HMAC (key = SHA-256(secret + ':recovery')). */
+async function signRecovery(noteId: string, txId: string, postedAt: number): Promise<string> {
+  const material = new Uint8Array(await crypto.subtle.digest(
+    'SHA-256', new TextEncoder().encode('test-recovery-secret:recovery')));
+  const key = await crypto.subtle.importKey('raw', material, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${noteId}:${txId}:${postedAt}`));
+  return b64(new Uint8Array(sig));
+}
+
+async function recoveryUpload(
+  noteId: string, ip: string, recovery: { txId: string; postedAt: number; token: string },
+): Promise<Request> {
+  const body = JSON.stringify({
+    data: dataFor(noteId),
+    tags: [
+      { name: 'App-Name', value: 'EternalNotes' },
+      { name: 'App-Version', value: VERSION },
+      { name: 'Content-Type', value: 'application/json' },
+      { name: 'Owner-Hash', value: identity.ownerHash },
+      { name: 'Note-Id', value: noteId },
+    ],
+    ownerHash: identity.ownerHash,
+    timestamp: Date.now(),
+    recheck: true,
+    recovery,
+  });
+  const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), identity.priv));
+  return new Request('https://proxy.example.com/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Public-Key': identity.pkB64,
+      'X-Signature': sig,
+      'CF-Connecting-IP': ip,
+    },
+    body,
+  });
+}
+
+describe('recovery token — the token proves the id, never the bytes', () => {
+  it('reconciles an alive TX whose publication IS this payload (no re-post)', async () => {
+    const noteId = '33333333-4444-4555-8666-777777777fff';
+    const wallet = await testWallet();
+    const tx = await buildSignedTx(
+      dataFor(noteId),
+      notesTags({ version: VERSION, ownerHash: identity.ownerHash, noteId }),
+      wallet,
+    );
+    const postedAt = Date.now() - 60_000;
+    // Alive on every status origin, then provable on the payload pool.
+    for (const origin of ['https://arweave.net', 'https://g2.test']) {
+      mockRoute('GET', new RegExp(`^${origin}/tx/${tx.txId}/status$`), 200,
+        JSON.stringify({ block_height: 1, number_of_confirmations: 3 }));
+    }
+    serveTx(tx);
+
+    const r = await worker.fetch(
+      await recoveryUpload(noteId, 'rc-ok', { txId: tx.txId, postedAt, token: await signRecovery(noteId, tx.txId, postedAt) }),
+      await envFor() as never,
+    );
+
+    expect(r.status).toBe(200);
+    const body = await r.json() as { txId: string; committed: boolean; deduped?: boolean };
+    expect(body.txId).toBe(tx.txId);
+    expect(body.committed).toBe(true);
+    expect(body.deduped).toBe(true);
+  });
+
+  it('REFUSES to bind when the alive publication carries different bytes', async () => {
+    // The exact defect the branch exists to stop: a valid token plus a live
+    // transaction is not evidence about the payload. Committing here would mint
+    // «payload B under transaction A» with the server's own signature on it.
+    const noteId = '33333333-4444-4555-8666-77777777aaaa';
+    const wallet = await testWallet();
+    const tx = await buildSignedTx(
+      JSON.stringify({ id: noteId, c: 'BBBBBBBBBBBBBBBBBBBBBB==', iv: IV }),
+      notesTags({ version: VERSION, ownerHash: identity.ownerHash, noteId }),
+      wallet,
+    );
+    const postedAt = Date.now() - 60_000;
+    for (const origin of ['https://arweave.net', 'https://g2.test']) {
+      mockRoute('GET', new RegExp(`^${origin}/tx/${tx.txId}/status$`), 200,
+        JSON.stringify({ block_height: 1, number_of_confirmations: 3 }));
+    }
+    serveTx(tx);
+
+    const r = await worker.fetch(
+      await recoveryUpload(noteId, 'rc-bad', { txId: tx.txId, postedAt, token: await signRecovery(noteId, tx.txId, postedAt) }),
+      await envFor() as never,
+    );
+
+    expect(r.status).toBe(409);
+    expect((await r.json() as { code: string }).code).toBe('id_payload_conflict');
+    // Reservation released, nothing bound.
+    expect(await storedFp(noteId)).toBeUndefined();
+  });
+});

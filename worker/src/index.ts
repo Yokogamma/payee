@@ -1175,6 +1175,27 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       const live = await getTxStatusWorker(recoveryHint.txId, emit, env);
       if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
       if (live === 'alive') {
+        // The token proves noteId, txId and postedAt — it says NOTHING about
+        // the bytes. Committing here binds THIS request's fingerprint to that
+        // historical txId, so without authenticating the publication it would
+        // mint exactly the pair the floors forbid: payload B under transaction
+        // A, signed off by the server. So this branch runs the SAME proof as
+        // the legacy backfill, or it refuses.
+        const auth = await authenticatePublication(recoveryHint.txId, {
+          origins: payloadOrigins(env),
+          trustedOwners,
+          ownerHash,
+        });
+        if (auth.kind === 'unproven') {
+          await safeRelease(reserveToken);
+          return error('Publication could not be authenticated', 503);
+        }
+        if (auth.kind !== 'authenticated' || auth.observedFp !== requestedFp) {
+          // Proven to be different bytes (or not ours at all). The reservation
+          // is released and NOTHING is bound to the old transaction.
+          await safeRelease(reserveToken);
+          return idPayloadConflict(recoveryHint.txId);
+        }
         try {
           const commitResp = await doCall('/commit', { noteId, txId: recoveryHint.txId, token: reserveToken });
           const commit: { ok: boolean } = await commitResp.json();

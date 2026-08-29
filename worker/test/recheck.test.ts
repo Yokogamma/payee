@@ -182,17 +182,28 @@ describe('recheck reconciliation (server-authoritative posted state)', () => {
 });
 
 describe('recovery token (triple-failure reconciliation)', () => {
-  it('reconciles an alive TX from a VALID signed recovery token (no re-post)', async () => {
+  it('a VALID token over an UNPROVABLE publication defers — and still never re-posts', async () => {
+    // The token proves noteId, txId and postedAt. It says NOTHING about the
+    // bytes, so committing on its word alone would bind THIS payload's
+    // fingerprint to that historical txId — payload B under transaction A,
+    // signed off by the server (D2). Since PR-3a the branch runs the same
+    // publication proof as the legacy backfill; here no gateway can serve
+    // `TX-REC`, so the answer is a retryable 503.
+    //
+    // The original guarantee is unchanged and is the second assertion: an alive
+    // TX is never re-posted. The reservation is released instead.
     const id = await makeIdentity(); // DO has NO record for NOTE_ID
     const postedAt = Date.now() - 60_000;
-    const token = await signRecovery(NOTE_ID, 'TX-REC', postedAt);
-    mockStatus('TX-REC', 200, JSON.stringify({ block_height: 1, number_of_confirmations: 3 }));
+    const REC_TX = 'RECRECRECRECRECRECRECRECRECRECRECRECRECRECR'; // 43 base64url chars
+    const token = await signRecovery(NOTE_ID, REC_TX, postedAt);
+    mockStatus(REC_TX, 200, JSON.stringify({ block_height: 1, number_of_confirmations: 3 }));
 
-    const r = await recoveryUpload(id, { txId: 'TX-REC', postedAt, token }, `rc-${crypto.randomUUID().slice(0, 6)}`);
-    expect(r.status).toBe(200);
-    const body = await r.json() as { txId: string; committed: boolean };
-    expect(body.committed).toBe(true);
-    expect(body.txId).toBe('TX-REC');
+    const r = await recoveryUpload(id, { txId: REC_TX, postedAt, token }, `rc-${crypto.randomUUID().slice(0, 6)}`);
+    expect(r.status).toBe(503);
+    // No record was written, so nothing was posted and nothing was bound.
+    expect(await readNote(id.pkB64)).toBeUndefined();
+    // The happy path — a token whose publication IS provable — lives in
+    // test/legacy-backfill-e2e.test.ts, where real signed transactions exist.
   });
 
   it('FAILS CLOSED (400) on a forged recovery token — no post, reservation released', async () => {
