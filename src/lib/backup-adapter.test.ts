@@ -12,8 +12,10 @@ vi.mock('./flags', () => ({
 }));
 
 import {
+  estimateBackupSize,
   importSucceeded,
   prepareImport,
+  readBackupFreshness,
   runExport,
   runVerify,
   withImportLock,
@@ -25,7 +27,7 @@ import {
   type BackupStorage,
   type BackupVault,
 } from './backup-adapter';
-import { encodeBackup, deriveBackupKey } from './backup';
+import { encodeBackup, deriveBackupKey, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
 import {
   deriveKey,
   deriveSafeboxMetaKey,
@@ -80,6 +82,7 @@ function storage(over: Partial<BackupStorage> = {}) {
       ok: true,
       snapshot: { notes: [], safebox: [], incompleteRestore: false },
     }),
+    estimateSize: async () => ({ plaintextBytes: 0, overCap: false }),
     getNote: async () => undefined,
     getEntry: async () => undefined,
     mergeRecord: async input => {
@@ -385,19 +388,125 @@ describe('what counts as success', () => {
   });
 });
 
+describe('what the block asks before offering anything', () => {
+  it('returns both D21 markers, and needs no vault to do it', async () => {
+    // Deliberately vault-free: the chip is two `meta` keys, and asking for the
+    // seed to render a date would tie a label to an unlock.
+    const exported = { createdAt: 1, sha256: 'a'.repeat(64), at: 2 };
+    const verified = { createdAt: 1, sha256: 'a'.repeat(64), at: 3 };
+    const { storage: store, meta } = storage();
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, exported);
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, verified);
+
+    expect(await readBackupFreshness(store)).toEqual({ lastExport: exported, lastVerified: verified });
+  });
+
+  it('an empty store answers «nothing known», not an error', async () => {
+    expect(await readBackupFreshness(storage().storage)).toEqual({
+      lastExport: undefined,
+      lastVerified: undefined,
+    });
+  });
+
+  it.each([
+    ['two half-written records', {}, {}],
+    ['a digest that is not a digest', { createdAt: 1, sha256: 'nope', at: 2 }, { createdAt: 1, sha256: 'nope', at: 3 }],
+    ['a digest of the wrong length', { createdAt: 1, sha256: 'ab', at: 2 }, { createdAt: 1, sha256: 'ab', at: 3 }],
+    ['uppercase hex, which the build never writes', { createdAt: 1, sha256: 'A'.repeat(64), at: 2 }, { createdAt: 1, sha256: 'A'.repeat(64), at: 3 }],
+    ['a timestamp that is not a number', { createdAt: 'x', sha256: 'a'.repeat(64), at: 2 }, { createdAt: 'x', sha256: 'a'.repeat(64), at: 3 }],
+    ['NaN', { createdAt: NaN, sha256: 'a'.repeat(64), at: 2 }, { createdAt: NaN, sha256: 'a'.repeat(64), at: 3 }],
+    ['an array', [], []],
+    ['null', null, null],
+    ['a string', 'last-export', 'last-verified'],
+  ])('refuses %s rather than believing it', async (_name, exported, verified) => {
+    // `getMeta<T>` is an assertion, not a check. Believing it here is
+    // fail-OPEN in the one place that must not be: two `{}` compare as
+    // `undefined === undefined`, and the chip then says «этот экспорт
+    // проверен» about a file nobody ever checked — the exact sentence a user
+    // relies on before deleting an original.
+    const { storage: store, meta } = storage();
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, exported);
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, verified);
+
+    // …and it SAYS it could not read them, rather than reporting «nothing was
+    // ever exported» — a claim this read is in no position to make.
+    expect(await readBackupFreshness(store)).toEqual({
+      lastExport: undefined,
+      lastVerified: undefined,
+      unreadable: true,
+    });
+  });
+
+  it('a corrupt marker does not drag a healthy one down with it', async () => {
+    // «Unknown» is per record: an unreadable verify marker must not erase a
+    // perfectly good export marker, or a storage glitch would silently reset
+    // the chip to «не создавалась» for a copy that exists.
+    const good = { createdAt: 1, sha256: 'c'.repeat(64), at: 2 };
+    const { storage: store, meta } = storage();
+    meta.set(LAST_EXPORT_ARTIFACT_KEY, good);
+    meta.set(LAST_VERIFIED_ARTIFACT_KEY, { createdAt: 1, sha256: 'oops', at: 3 });
+
+    expect(await readBackupFreshness(store))
+      .toEqual({ lastExport: good, lastVerified: undefined, unreadable: true });
+  });
+
+  it('states the size in FILE bytes, not plaintext bytes (D17)', async () => {
+    // The cap is charged on the final file, so an estimate given in plaintext
+    // would understate it by a third — and a store that cannot be exported
+    // would look comfortable right up to the refusal.
+    const { storage: base } = storage();
+    const store = { ...base, estimateSize: async () => ({ plaintextBytes: 3_000, overCap: false }) };
+
+    const report = await estimateBackupSize(store);
+
+    expect(report.overCap).toBe(false);
+    expect(report.expectedFileBytes).toBeGreaterThan(4_000);
+  });
+
+  it('carries the over-cap verdict through, because the NUMBER cannot show it', async () => {
+    // The measurement stops at the budget, so its figure is small by
+    // construction once it stops. A caller reading the number alone would call
+    // an unexportable store fine.
+    const { storage: base } = storage();
+    const store = { ...base, estimateSize: async () => ({ plaintextBytes: 10, overCap: true }) };
+
+    expect(await estimateBackupSize(store)).toMatchObject({ overCap: true });
+  });
+
+  it('asks the measurer for the plaintext budget, not for the cap', async () => {
+    // Passing the cap would let the reader keep going a third longer than the
+    // container can hold — the early stop exists to bound memory, and the
+    // bound has to be the one the format actually allows.
+    const { storage: base } = storage();
+    const estimateSize = vi.fn(async () => ({ plaintextBytes: 1, overCap: false }));
+
+    await estimateBackupSize({ ...base, estimateSize });
+
+    expect(estimateSize).toHaveBeenCalledWith(BACKUP_PLAINTEXT_BUDGET_BYTES);
+  });
+});
+
 describe('the session carries permission to derive, never the seed itself', () => {
-  it('holds no string that could be a seed phrase', async () => {
+  it('the vault it holds exposes no seed to hold', async () => {
     // Stage A and stage B are separated by a human decision, so the session
     // sits in React state for as long as the preview is on screen — through a
     // lock, through `pagehide`, past the store's synchronous wipe of every
     // vault reference. That wipe is the app's actual guarantee about the seed;
     // a copy living outside it would quietly make the guarantee false.
-    const { file } = countedFile(await container([await makeNote()]));
-    const prepared = await prepareImport(from(vault()), file, storage().storage);
+    //
+    // Asserted on the CONTRACT rather than by serializing the session: a
+    // private `#field` is invisible to `JSON.stringify`, so a scan of the
+    // serialized object would stay green no matter what the session held —
+    // a test that could not fail, about the thing that matters most here.
+    const v = vault();
+    expect(Object.keys(v)).not.toContain('mnemonic');
+    expect(Object.values(v).some(x => typeof x === 'string' && x.includes('abandon'))).toBe(false);
 
-    const reachable = JSON.stringify(prepared, (_k, v) => (typeof v === 'function' ? undefined : v));
-    expect(reachable).not.toContain('abandon');
-    expect(reachable).not.toContain(MNEMONIC);
+    // And what the derivation hands over is opaque by construction: keys are
+    // imported non-extractable (`crypto.ts`), so possession of them is not
+    // possession of the phrase.
+    const keys = await v.deriveKeys();
+    expect(Object.values(keys).every(k => (k as CryptoKey).extractable === false)).toBe(true);
   });
 
   it('derives at APPLY time, so a vault that has since been locked cannot produce keys', async () => {

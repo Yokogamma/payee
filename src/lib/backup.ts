@@ -54,6 +54,11 @@ export const READER_VERSION = 1;
  */
 export const BACKUP_CAP_BYTES = 32 * 1024 * 1024;
 
+/** The flat over-estimate charged on top of base64 for the header, the
+ *  envelope keys and the GCM tag. Named once so the budget and the estimate
+ *  below cannot drift apart. */
+const CONTAINER_OVERHEAD_BYTES = 4096;
+
 /**
  * How much PLAINTEXT can still fit under the cap, once base64 and the JSON
  * wrapper have taken their share. Deliberately conservative: base64 costs 4/3,
@@ -64,7 +69,21 @@ export const BACKUP_CAP_BYTES = 32 * 1024 * 1024;
  * Exported so the snapshot reader can stop early without knowing anything else
  * about the format — the arithmetic stays here, where the format lives.
  */
-export const BACKUP_PLAINTEXT_BUDGET_BYTES = Math.floor((BACKUP_CAP_BYTES - 4096) * 3 / 4);
+export const BACKUP_PLAINTEXT_BUDGET_BYTES = Math.floor((BACKUP_CAP_BYTES - CONTAINER_OVERHEAD_BYTES) * 3 / 4);
+
+/**
+ * The FILE size a plaintext of this size will produce — the exact inverse of
+ * the budget above.
+ *
+ * D17 insists both sides measure the cap as the final file size, and the UI
+ * has to speak the same units: «предполагаемый размер» given in plaintext
+ * bytes would understate the answer by a third and let a store that cannot be
+ * exported look comfortable. Derived from the same two constants rather than
+ * written out again, so a change to the format moves both.
+ */
+export function expectedContainerBytes(plaintextBytes: number): number {
+  return Math.ceil(plaintextBytes * 4 / 3) + CONTAINER_OVERHEAD_BYTES;
+}
 
 /** GCM contract: a FRESH 96-bit nonce per export, 128-bit tag. The key is
  *  constant for a mnemonic and exports are many, so a repeated nonce would

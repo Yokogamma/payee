@@ -212,6 +212,36 @@ describe('verifyBackupFile — the verdict', () => {
     spy.mockRestore();
   });
 
+  it('an entry whose SECRET half alone is broken turns the whole FILE red', async () => {
+    // The counting test above proves three decryptions happen; this one proves
+    // the second half is actually JUDGED. The meta half here still opens, so a
+    // verifier that formed its verdict from the meta would hand back a green
+    // tick for a container that restores an entry with no password and no
+    // attachments in it — found out at the worst possible moment.
+    //
+    // The control run is the SAME entry untouched: it is what proves the red
+    // verdict comes from the secret half and from nothing else in the file.
+    const entry = await makeEntry();
+    const control = await exportOf([], [entry]);
+    expect((await verifyBackupFile(control.deps, asFile(control.exported.text))).ok).toBe(true);
+
+    const secretBroken = {
+      ...entry,
+      secretCiphertext: `${entry.secretCiphertext.slice(0, -4)}AAAA`,
+    };
+    // Guard against a mutation that changed nothing: the test would then
+    // «pass» by verifying the healthy entry a second time.
+    expect(secretBroken.secretCiphertext).not.toBe(entry.secretCiphertext);
+    const { deps, exported } = await exportOf([], [secretBroken]);
+
+    const report = await verifyBackupFile(deps, asFile(exported.text));
+
+    expect(report.ok).toBe(false);
+    expect(report.issues).toEqual([
+      { kind: 'safebox', id: entry.entryId, problem: 'undecryptable' },
+    ]);
+  });
+
   it('a damaged record is reported as undecryptable, and the file is not green', async () => {
     const note = await makeNote();
     const damaged = { ...note, ciphertext: `${note.ciphertext.slice(0, -4)}AAAA` };
@@ -345,7 +375,118 @@ describe('verifyBackupFile — no secret leaves the dry-run (D11)', () => {
     expect(JSON.stringify(report)).not.toContain(SECRETS.noteText);
     expect(report.issues[0]).toEqual({ kind: 'note', id: damaged.noteId, problem: 'undecryptable' });
   });
+
+  it('not one secret reaches the console while every record is opened', async () => {
+    // `console` is the exit no assertion about a returned value can watch. A
+    // diagnostic left behind by debugging — «entry X did not open, payload: …»
+    // — publishes the whole vault into the browser log, where extensions,
+    // screen shares and crash reporters read it, while the report itself stays
+    // spotless and every other test in this file stays green. D11 names
+    // `console` alongside the report and the error fields for that reason.
+    const deps = await makeDeps({
+      readSnapshot: async () => ({
+        ok: true,
+        snapshot: {
+          notes: [await makeNote()],
+          safebox: [await makeEntry()],
+          incompleteRestore: false,
+        },
+      }),
+    });
+    const exported = await exportBackup(deps);
+
+    const { value: report, output } = await withConsoleCaptured(
+      () => verifyBackupFile(deps, asFile(exported.text)),
+    );
+
+    for (const [name, secret] of Object.entries(LEAK_FORMS)) {
+      expect(output, `${name} leaked into the console`).not.toContain(secret);
+    }
+    // A silent console proves nothing unless the run really decrypted: these
+    // two lines are what stop the test passing on a verification that opened
+    // nothing at all.
+    expect(report.ok).toBe(true);
+    expect(report.counts).toEqual({ notes: 1, safebox: 1 });
+  });
+
+  it('a record that fails to open logs no content either', async () => {
+    // Where a leak is actually written: the catch. `catch (e) { console.warn(e) }`
+    // around a decryption is one line, and both the error and whatever the
+    // decryption produced before it threw can carry content. Both halves of
+    // the vault are broken here so that both catch branches — the note's and
+    // the safebox entry's — run inside the capture.
+    const note = await makeNote();
+    const entry = await makeEntry();
+    const deps = await makeDeps({
+      readSnapshot: async () => ({
+        ok: true,
+        snapshot: {
+          notes: [{ ...note, ciphertext: `${note.ciphertext.slice(0, -4)}AAAA` }],
+          safebox: [{ ...entry, secretCiphertext: `${entry.secretCiphertext.slice(0, -4)}AAAA` }],
+          incompleteRestore: false,
+        },
+      }),
+    });
+    const exported = await exportBackup(deps);
+
+    const { value: report, output } = await withConsoleCaptured(
+      () => verifyBackupFile(deps, asFile(exported.text)),
+    );
+
+    for (const [name, secret] of Object.entries(LEAK_FORMS)) {
+      expect(output, `${name} leaked into the console from a failing record`).not.toContain(secret);
+    }
+    // ...and both failures really happened, so both catch branches really ran.
+    expect(report.issues).toEqual([
+      { kind: 'note', id: note.noteId, problem: 'undecryptable' },
+      { kind: 'safebox', id: entry.entryId, problem: 'undecryptable' },
+    ]);
+  });
 });
+
+/** Each sentinel in the shape a LEAK would have it, which is not always the
+ *  shape it was written in: the attachment travels as base64 inside the
+ *  decrypted entry, so scanning for its plain bytes alone would miss a dump of
+ *  the very object the decryption produced. */
+const LEAK_FORMS: Record<string, string> = {
+  ...SECRETS,
+  attachmentBase64: btoa(SECRETS.attachment),
+};
+
+const CONSOLE_CHANNELS = ['log', 'warn', 'error', 'info', 'debug'] as const;
+
+/** Run `body` with every console channel captured (and silenced), handing back
+ *  everything that was written to it. Restoration is in a `finally`: a leaking
+ *  build must fail this test, not poison every test that runs after it. */
+async function withConsoleCaptured<T>(
+  body: () => Promise<T>,
+): Promise<{ value: T; output: string }> {
+  const written: string[] = [];
+  const saved = CONSOLE_CHANNELS.map(channel => console[channel]);
+  for (const channel of CONSOLE_CHANNELS) {
+    console[channel] = (...args: unknown[]) => {
+      written.push(args.map(renderConsoleArg).join(' '));
+    };
+  }
+  try {
+    return { value: await body(), output: written.join('\n') };
+  } finally {
+    CONSOLE_CHANNELS.forEach((channel, i) => { console[channel] = saved[i]; });
+  }
+}
+
+/** An argument as the console would have shown it. Errors are rendered by
+ *  hand because `JSON.stringify(new Error(secret))` is `{}` — scanning that
+ *  would miss exactly the leak this is looking for. */
+function renderConsoleArg(arg: unknown): string {
+  if (typeof arg === 'string') return arg;
+  if (arg instanceof Error) return `${arg.name}: ${arg.message}\n${arg.stack ?? ''}`;
+  try {
+    return JSON.stringify(arg) ?? String(arg);
+  } catch {
+    return String(arg); // circular, or a getter that throws
+  }
+}
 
 /** Re-encode a container with `containsUnsupportedRecords` flipped, keeping the
  *  AEAD honest — so the test exercises the reader's own check rather than a

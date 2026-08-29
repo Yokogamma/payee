@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  estimateBackupSize,
   prepareImport,
+  readBackupFreshness,
   runExport,
   runVerify,
   PreparedImport,
@@ -37,6 +39,7 @@ const makeVault = () => vi.fn((): BackupVault => vault);
 
 const refuseEverything = (): BackupStorage => ({
   readSnapshot: vi.fn(async () => { throw new Error('storage must not be touched'); }),
+  estimateSize: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   getNote: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   getEntry: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   mergeRecord: vi.fn(async () => { throw new Error('storage must not be touched'); }),
@@ -96,5 +99,27 @@ describe('with the flags off, the actions refuse — in the action, not the mark
     await expect(prepared.apply()).rejects.toBeInstanceOf(BackupDisabledError);
     expect(storage.mergeRecord).not.toHaveBeenCalled();
     expect(storage.writeMeta).not.toHaveBeenCalled();
+  });
+});
+
+describe('the two read-only questions are gated differently, and on purpose', () => {
+  it('the size estimate refuses with the export release', async () => {
+    // It describes a file only that release can produce.
+    const storage = refuseEverything();
+    await expect(estimateBackupSize(storage)).rejects.toBeInstanceOf(BackupDisabledError);
+    expect(storage.estimateSize).not.toHaveBeenCalled();
+  });
+
+  it('the freshness markers are NOT gated — they are two meta keys and a fact', async () => {
+    // Deliberately ungated: what the keys MEAN is a decision the UI makes, and
+    // an unreadable chip is not a safer chip. The component decides whether to
+    // show anything; this call decides nothing.
+    const meta = new Map<string, unknown>();
+    const storage = { ...refuseEverything(), readMeta: async (k: string) => meta.get(k) as never };
+
+    await expect(readBackupFreshness(storage)).resolves.toEqual({
+      lastExport: undefined,
+      lastVerified: undefined,
+    });
   });
 });

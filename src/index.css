@@ -1266,6 +1266,40 @@ h1 {
   gap: 8px;
 }
 
+/* Backup block (§7). Same stack as the PIN actions; its own class because the
+   two are unrelated and one of them will move first. */
+.backup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 64 hex characters have to WRAP: on a 360px phone an unbreakable digest
+   pushes the whole settings column sideways, and this one is meant to be read
+   and copied out by hand — which is also why it does not get a smaller size
+   than everything else. */
+.backup-digest {
+  word-break: break-all;
+}
+
+/* The reasons behind «Не восстановлено: N». Closed by default — the number is
+   the headline, and this is what someone opens when they want to know what to
+   do about it. */
+.backup-reasons summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.backup-reasons ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
 /* ─── Loader ────────────────────────────────────────────────── */
 
 .loader {

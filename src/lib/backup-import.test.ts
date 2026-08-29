@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { applyBackupImport, SKIP_COUNTERS, type ImportDeps } from './backup-import';
+import { applyBackupImport, SKIP_COUNTERS, type ImportCounters, type ImportDeps } from './backup-import';
 import { planBackupImport, type PlanInput } from './backup-plan';
 import type { BackupMergeResult } from './storage';
 import type { EncryptedNote } from './crypto';
@@ -32,9 +32,26 @@ const chain = (prefix: string, length: number): PlanInput[] =>
   Array.from({ length }, (_, i) =>
     node(`${prefix}${i + 1}`, i + 1, `${prefix}1`, i === 0 ? undefined : `${prefix}${i}`));
 
+/**
+ * The full counter map with only the named fields set.
+ *
+ * Asserting against ALL twelve at once is what makes «counted at most once»
+ * checkable: a record that landed in two buckets shows up as a non-zero counter
+ * nobody named, which a per-field expectation would happily ignore.
+ */
+const counted = (set: Partial<ImportCounters>): ImportCounters => ({
+  added: 0, repaired: 0, quarantinedRepaired: 0, quarantinedDataRepaired: 0,
+  quarantineStale: 0, unsupportedLocal: 0, conflicts: 0, deferred: 0,
+  skipped: 0, unsupported: 0, concurrentChange: 0, quotaStopped: 0,
+  ...set,
+});
+
 interface Harness {
   deps: ImportDeps;
   merged: string[];
+  /** Every id the executor asked about locally — the other half of «one pass
+   *  per record», and the half that would grow quadratically first. */
+  classified: string[];
   markerWrites: boolean[];
   marker: { value: boolean };
 }
@@ -47,6 +64,7 @@ function harness(opts: {
   lockUnavailable?: boolean;
 } = {}): Harness {
   const merged: string[] = [];
+  const classified: string[] = [];
   const markerWrites: boolean[] = [];
   const marker = { value: opts.startMarker ?? false };
   const pending = new Map<string, BackupMergeResult[]>();
@@ -54,7 +72,7 @@ function harness(opts: {
   const deps: ImportDeps = {
     now: () => NOW,
     assertAlive: () => {},
-    classifyLocal: async () => ({ state: 'absent' }),
+    classifyLocal: async (_kind, id) => { classified.push(id); return { state: 'absent' }; },
     mergeRecord: async (_kind, incoming) => {
       const id = (incoming as EncryptedNote).noteId;
       const boom = opts.throwOnMerge?.(id);
@@ -79,7 +97,7 @@ function harness(opts: {
       return run();
     },
   };
-  return { deps, merged, markerWrites, marker };
+  return { deps, merged, classified, markerWrites, marker };
 }
 
 describe('counting', () => {
@@ -120,6 +138,109 @@ describe('counting', () => {
 
     const total = Object.values(report.counters).reduce((a, b) => a + b, 0);
     expect(total).toBe(3); // exactly the number of records in the file
+  });
+});
+
+describe('a file that is already here in full', () => {
+  it('applies nothing at all and still takes the mark off', async () => {
+    // Every record present locally and publication-equivalent, so rule 2
+    // answers all of them with a no-op: not one counter moves, and not one
+    // payload is written. The mark must come off anyway. Tying its removal to
+    // «did we write anything» would leave a device that is ALREADY complete
+    // flagged as incompletely restored forever — and every export it makes
+    // from then on would carry that lie forward to the next machine.
+    const h = harness({ outcomes: { a1: 'noop', a2: 'noop', b1: 'noop' } });
+    const plan = planBackupImport([...chain('a', 2), ...chain('b', 1)]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(report.counters).toEqual(counted({})); // all twelve, `added` included
+    expect(report.allFileRecordsApplied).toBe(true);
+    expect(report.incompleteRestore).toBe(false);
+    expect(h.markerWrites).toEqual([true, false]); // the run's only writes
+    expect(h.merged).toEqual(['a1', 'a2', 'b1']);  // each one was considered
+  });
+});
+
+describe('at scale: a real restore is thousands of records, not five (§8)', () => {
+  /** 500 chains of 5 versions = 2500 records, plus a fork on every tenth
+   *  chain — the shape a device that has been edited for a year produces. */
+  const many = (): PlanInput[] => {
+    const records: PlanInput[] = [];
+    for (let c = 0; c < 500; c += 1) {
+      records.push(...chain(`c${c}-`, 5));
+      // Every tenth chain forks at rev 3: two devices edited it offline.
+      if (c % 10 === 0) {
+        records.push(node(`c${c}-fork3`, 3, `c${c}-1`, `c${c}-2`));
+        records.push(node(`c${c}-fork4`, 4, `c${c}-1`, `c${c}-fork3`));
+      }
+    }
+    return records;
+  };
+
+  it('applies every one of 2600 records, exactly once, in a valid order', async () => {
+    // The §8 «Гонки» list ends with «>2000 восстановленных записей», and until
+    // now the largest run here was five. Scale is not a formality for this
+    // executor: it accumulates counters per record, maintains a cascade map
+    // keyed per record, and its ordering guarantee is stated over the whole
+    // plan — three things that a five-record run cannot distinguish from a
+    // broken version of themselves.
+    const records = many();
+    const h = harness();
+    const plan = planBackupImport(records);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(records).toHaveLength(2600);
+    expect(plan.notApplied).toEqual([]);
+    expect(report.counters).toEqual(counted({ added: 2600 }));
+    expect(report.allFileRecordsApplied).toBe(true);
+    expect(report.incompleteRestore).toBe(false);
+
+    // Exactly once each — no duplicates, nothing dropped.
+    expect(h.merged).toHaveLength(2600);
+    expect(new Set(h.merged).size).toBe(2600);
+
+    // …and every record after the predecessor it NAMES. Checked over the whole
+    // run rather than spot-checked: an ordering that holds for the first chain
+    // and fails for the four hundredth is the failure this test exists for.
+    const at = new Map(h.merged.map((id, i) => [id, i]));
+    for (const r of records) {
+      const prev = r.state === 'readable' ? r.topology.prev : undefined;
+      if (prev !== undefined) expect(at.get(r.id)!, `${r.id} after ${prev}`).toBeGreaterThan(at.get(prev)!);
+    }
+  });
+
+  it('does not do quadratic work: one classify and one merge per record', async () => {
+    // A deterministic budget rather than a timing (a clock on CI is a coin
+    // toss). The cascade map is the thing at risk: implemented as a scan of
+    // everything applied so far, it would still be correct and would turn a
+    // 30 MB restore into minutes.
+    const records = many();
+    const h = harness();
+
+    await applyBackupImport(h.deps, planBackupImport(records), true);
+
+    expect(h.classified).toHaveLength(2600);
+    expect(h.merged).toHaveLength(2600);
+  });
+
+  it('one bad record deep in the middle strands only its own descendants', async () => {
+    // The cascade at scale. Chain 250 conflicts at rev 3; its rev 4 and 5 are
+    // stranded, and the other 499 chains are untouched — including the forked
+    // ones, whose second branch shares a root with nothing that failed.
+    const records = many();
+    const h = harness({ outcomes: { 'c250-3': 'conflicts' } });
+
+    const report = await applyBackupImport(h.deps, planBackupImport(records), true);
+
+    expect(report.counters).toEqual(counted({ added: 2597, conflicts: 3 }));
+    expect(h.merged).not.toContain('c250-4');
+    expect(h.merged).not.toContain('c250-5');
+    expect(h.merged).toContain('c250-2');
+    // The neighbours, and the fork two chains over, are all fine.
+    expect(h.merged).toContain('c251-5');
+    expect(h.merged).toContain('c250-fork3');
   });
 });
 
@@ -233,6 +354,41 @@ describe('running out of space', () => {
 
     expect(report.counters.added).toBe(2);        // chain a landed
     expect(report.counters.quotaStopped).toBe(5); // b1,b2 and all of c
+    expect(report.allFileRecordsApplied).toBe(false);
+  });
+
+  it('counts the tail and NOTHING that had already been decided', async () => {
+    // Mixed outcomes before the stop are where double counting hides. A record
+    // already refused for its own reason must not also be swept into the tail,
+    // and a record stranded behind one must be counted for the reason that
+    // stopped its chain — once. Get it wrong and the report blames a full disk
+    // for records that a conflict held back: the user goes off deleting photos
+    // to make room instead of looking at the record that needs a decision.
+    const quota = Object.assign(new Error('full'), { name: 'QuotaExceededError' });
+    const h = harness({
+      outcomes: { a1: 'conflicts', b1: 'skipped', c1: 'noop' },
+      throwOnMerge: id => (id === 'd1' ? quota : undefined),
+    });
+    const plan = planBackupImport([
+      ...chain('a', 2), // a1 conflicts, a2 stranded behind it
+      ...chain('b', 2), // b1 skipped, b2 stranded behind it
+      ...chain('c', 2), // c1 already equivalent, c2 written
+      ...chain('d', 3), // d1 runs into the quota, d2/d3 go with it
+      ...chain('e', 2), // never reached at all
+    ]);
+
+    const report = await applyBackupImport(h.deps, plan, true);
+
+    expect(report.counters).toEqual(counted({
+      conflicts: 2,    // a1, a2
+      skipped: 2,      // b1, b2
+      added: 1,        // c2 — c1 was a no-op and belongs in no counter at all
+      quotaStopped: 5, // d1, d2, d3, e1, e2
+    }));
+    // Eleven records in the file, ten in the counters. The sum is deliberately
+    // NOT the assertion (§8): only the per-counter values are, because a
+    // successful no-op is honoured without being counted.
+    expect(h.merged).toEqual(['a1', 'b1', 'c1', 'c2']); // the tail was never tried
     expect(report.allFileRecordsApplied).toBe(false);
   });
 

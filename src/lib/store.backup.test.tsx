@@ -378,6 +378,32 @@ describe('an operation belongs to the vault that started it (D15)', () => {
   });
 });
 
+describe('a tab that leaves during the tail stops the tail (D15)', () => {
+  it('does not keep decrypting, counting and SENDING for a page nobody is looking at', async () => {
+    // The import itself is committed — cancelling it is stage B's own job. What
+    // this covers is everything AFTER: re-decrypting every note, two count
+    // passes, a safebox read and a push of the upload queue. Neither the epoch
+    // nor the database generation moves on `pagehide`, so without the operation
+    // token that whole tail ran on for a page already declared closed — and
+    // `viewRefreshed: true` claimed a repaint the first step had abandoned.
+    await openMain();
+    const { file, note } = await containerWith('TAIL-ABANDONED');
+    const prepared = await act(async () => store.prepareBackupImport(file));
+
+    vi.mocked(getAllNotes).mockImplementationOnce(async () => {
+      window.dispatchEvent(new Event('pagehide'));
+      return [];
+    });
+
+    const outcome = await act(async () => store.applyBackupImport(prepared));
+
+    expect(outcome.report.counters.added).toBe(1);
+    expect(await getNoteById(note.noteId)).toBeDefined();
+    expect(outcome.viewRefreshed).toBe(false);
+    expect(uploadViaProxy).not.toHaveBeenCalled();
+  });
+});
+
 describe('the freshest answer wins (D15)', () => {
   it('a superseded export does not come back and overwrite the newer one', async () => {
     // The adapter's last await is the artifact marker; after it the outcome

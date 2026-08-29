@@ -68,8 +68,10 @@ import {
 import { classifyLocalPayload } from './backup-classify';
 import { planBackupImport, type ImportPlan, type PlanInput } from './backup-plan';
 import { applyBackupImport as runStageB, type ImportReport } from './backup-import';
-import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
+import { expectedContainerBytes, BACKUP_PLAINTEXT_BUDGET_BYTES } from './backup';
+import { sha256Hex, type EncryptedNote, type EncryptedSafeboxEntry } from './crypto';
 import {
+  estimateBackupPlaintextBytes,
   getMeta,
   getNoteById,
   getSafeboxEntryById,
@@ -78,9 +80,11 @@ import {
   setMeta,
   INCOMPLETE_RESTORE_META_KEY,
   type BackupMergeResult,
+  type BackupSizeEstimate,
   type LocalPayload,
   type MergeBackupRecordInput,
 } from './storage';
+import type { BackupArtifactMarker, BackupFreshness } from './backup-ui';
 
 /** D21: which file the freshness chip is about. */
 export const LAST_EXPORT_ARTIFACT_KEY = 'last-export-artifact';
@@ -168,6 +172,7 @@ export interface BackupVault {
  *  database, and bound to the real one by `liveStorage` below. */
 export interface BackupStorage {
   readSnapshot(maxPlaintextBytes: number): ReturnType<typeof readBackupSnapshot>;
+  estimateSize(maxPlaintextBytes: number): Promise<BackupSizeEstimate>;
   getNote(id: string): Promise<EncryptedNote | undefined>;
   getEntry(id: string): Promise<EncryptedSafeboxEntry | undefined>;
   mergeRecord(input: MergeBackupRecordInput): Promise<BackupMergeResult>;
@@ -177,6 +182,7 @@ export interface BackupStorage {
 
 export const liveStorage: BackupStorage = {
   readSnapshot: readBackupSnapshot,
+  estimateSize: estimateBackupPlaintextBytes,
   getNote: getNoteById,
   getEntry: getSafeboxEntryById,
   mergeRecord: mergeBackupRecord,
@@ -249,11 +255,6 @@ async function vaultKeys(vault: BackupVault): Promise<BackupVaultKeys> {
   return keys;
 }
 
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
-}
-
 async function actionDeps(vault: BackupVault, storage: BackupStorage): Promise<BackupActionDeps> {
   return {
     now: vault.now,
@@ -321,6 +322,79 @@ export async function runVerify(
       at: vault.now(),
     }),
   };
+}
+
+/**
+ * What the freshness chip is allowed to say (D21).
+ *
+ * NOT gated by a flag and NOT needing a vault: it reads two `meta` keys and
+ * makes no claim of its own. The rule about what those keys MEAN together —
+ * «this export, checked» only on a SHA-256 match — lives in `backup-ui`, next
+ * to the sentence it authorizes.
+ */
+export async function readBackupFreshness(
+  storage: BackupStorage = liveStorage,
+): Promise<BackupFreshness> {
+  const [lastExport, lastVerified] = await Promise.all([
+    storage.readMeta<unknown>(LAST_EXPORT_ARTIFACT_KEY),
+    storage.readMeta<unknown>(LAST_VERIFIED_ARTIFACT_KEY),
+  ]);
+  const clean = { lastExport: sanitizeMarker(lastExport), lastVerified: sanitizeMarker(lastVerified) };
+  // Something was there and did not survive inspection. Reporting that as
+  // «nothing was ever exported» would answer a question this read cannot
+  // answer, so the UI is told it does not know.
+  const unreadable = (lastExport !== undefined && clean.lastExport === undefined)
+    || (lastVerified !== undefined && clean.lastVerified === undefined);
+  return unreadable ? { ...clean, unreadable } : clean;
+}
+
+/**
+ * A stored marker, believed only if it still looks like one.
+ *
+ * `getMeta<T>` is an ASSERTION, not a check — it casts whatever IndexedDB
+ * hands back. Trusting it here was fail-OPEN in the one place that must not
+ * be: two half-written records, or two `{}`, give `undefined === undefined`
+ * when the chip compares digests, and the block then says «этот экспорт
+ * проверен» about a file nobody ever checked. That sentence is the one a user
+ * relies on before deleting an original, so it has to be earned by data that
+ * survives inspection.
+ *
+ * Hence: a plain object, a digest of exactly 64 hex characters, and finite
+ * non-negative timestamps. Anything else is not a weaker marker, it is not a
+ * marker — and `undefined` reads as «nothing is known», which is the only safe
+ * reading of a value we cannot vouch for.
+ */
+function sanitizeMarker(raw: unknown): BackupArtifactMarker | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const { createdAt, sha256, at } = raw as Record<string, unknown>;
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) return undefined;
+  if (!isTimestamp(createdAt) || !isTimestamp(at)) return undefined;
+  return { createdAt, sha256, at };
+}
+
+const isTimestamp = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+export interface BackupSizeReport {
+  /** In the units the cap is charged in: the FINAL file size (D17). */
+  expectedFileBytes: number;
+  /** The measurement stopped at the budget — the real figure is larger. */
+  overCap: boolean;
+}
+
+/**
+ * How big an export would be, without making one.
+ *
+ * Gated with the export flag for the same reason the export itself is: it
+ * describes a file only that release can produce. No vault — the measurement
+ * reads ciphertext lengths and decrypts nothing.
+ */
+export async function estimateBackupSize(
+  storage: BackupStorage = liveStorage,
+): Promise<BackupSizeReport> {
+  if (!BACKUP_EXPORT_ENABLED) throw new BackupDisabledError('export');
+  const { plaintextBytes, overCap } = await storage.estimateSize(BACKUP_PLAINTEXT_BUDGET_BYTES);
+  return { expectedFileBytes: expectedContainerBytes(plaintextBytes), overCap };
 }
 
 /**

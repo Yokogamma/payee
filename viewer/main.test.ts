@@ -1155,3 +1155,111 @@ describe('an attachment saved from a container whose currentness is in doubt', (
     expect(await written!.blob.text()).toBe(SECRETS.fileA);
   });
 });
+
+describe('a hostile container is CONTENT, never markup', () => {
+  /**
+   * A copy file arrives from somewhere: a cloud folder, a chat, a machine that
+   * is no longer the user's. This page is the single moment where a decrypted
+   * seed phrase and every password are on screen together, so a record that
+   * becomes markup here is a record that can read them and carry them off.
+   *
+   * The code is safe by construction — every string goes in through
+   * `textContent` — and that is exactly why this is tested: one edit to
+   * `innerHTML` loses the property silently, and nothing else in the repo
+   * looks at the rendered document.
+   */
+  const PAYLOAD = {
+    note: '<img src=x onerror="document.title=\'pwned-note\'">',
+    title: '<img src=x onerror="document.title=\'pwned-title\'">',
+    login: '<img src=x onerror="document.title=\'pwned-login\'">',
+    password: '<img src=x onerror="document.title=\'pwned-password\'">',
+  };
+
+  async function openHostile(): Promise<void> {
+    const entry = await encryptSafeboxEntry(
+      await deriveSafeboxMetaKey(MNEMONIC),
+      await deriveSafeboxSecretKey(MNEMONIC),
+      {
+        title: PAYLOAD.title,
+        login: PAYLOAD.login,
+        url: '',
+        note: '',
+        password: PAYLOAD.password,
+        files: [],
+        rev: 1,
+      },
+    );
+    selectFile(await container({ notes: [await makeNote(PAYLOAD.note)], safebox: [entry] }));
+    await clickOpen();
+  }
+
+  it('a note whose text is a tag shows the tag and creates no element', async () => {
+    const titleBefore = document.title;
+
+    await openHostile();
+
+    // Both halves matter: no `<img>` in the document proves the string was not
+    // parsed, and the exact text proves it was not silently dropped instead.
+    expect((document.querySelector('#notes .card-text') as HTMLElement).textContent)
+      .toBe(PAYLOAD.note);
+    expect(document.querySelectorAll('img')).toHaveLength(0);
+    expect(document.title).toBe(titleBefore);
+  });
+
+  it('every safebox field is text too, the REVEALED password included', async () => {
+    // The password takes a different path from the rest — it is written into
+    // an already-rendered node when «показать» is pressed — so a fix applied
+    // to the render pass alone would leave this one behind.
+    const titleBefore = document.title;
+    await openHostile();
+
+    const reveal = Array.from(document.querySelectorAll('#safebox button'))
+      .find(b => b.textContent === 'показать') as HTMLButtonElement;
+    reveal.click();
+
+    expect((document.querySelector('#safebox .card-title') as HTMLElement).textContent)
+      .toBe(PAYLOAD.title);
+    const values = Array.from(document.querySelectorAll('#safebox .value'))
+      .map(node => node.textContent);
+    expect(values).toContain(PAYLOAD.login);
+    expect(values).toContain(PAYLOAD.password);
+    expect(document.querySelectorAll('img')).toHaveLength(0);
+    expect(document.title).toBe(titleBefore);
+  });
+});
+
+describe('the plain-text notes export carries NOTES and nothing else (D22)', () => {
+  it('holds the note text and not one field of the safebox', async () => {
+    // This is the only export that asks nothing, and it is exempt precisely
+    // because it carries no secret. Should a password, a login or the bytes of
+    // an attachment ever reach it, the user writes them to disk in the clear
+    // having been asked for no confirmation at all — and the absent dialog is
+    // the reason neither they nor anyone else would notice it happened.
+    selectFile(await container({ notes: [await makeNote()], safebox: [await makeEntry()] }));
+    await clickOpen();
+
+    $('export-notes').click();
+
+    const file = downloads.find(d => d.name === 'eternal-notes.txt');
+    expect(file, 'nothing was written as eternal-notes.txt').toBeDefined();
+    const text = await file!.blob.text();
+
+    // The positive half: an export that carried nothing at all would pass
+    // every assertion below and be useless.
+    expect(text).toContain(SECRETS.noteText);
+
+    for (const secret of [SECRETS.password, SECRETS.login, SECRETS.title, SECRETS.fileA, SECRETS.fileB]) {
+      expect(text).not.toContain(secret);
+    }
+    // Attachment bytes travel through the container base64-encoded, so that is
+    // the shape a leak would most plausibly take — a plain substring check for
+    // the decoded bytes would walk straight past it.
+    for (const bytes of [SECRETS.fileA, SECRETS.fileB]) {
+      expect(text).not.toContain(btoa(bytes));
+    }
+    // File NAMES are metadata of a secret record («паспорт.pdf» says enough on
+    // its own). The secrets export lists them; this one is not entitled to.
+    expect(text).not.toContain('a.txt');
+    expect(text).not.toContain('b.txt');
+  });
+});
