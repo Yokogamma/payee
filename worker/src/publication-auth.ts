@@ -103,6 +103,16 @@ export interface AuthDeps {
   trustedOwners: readonly string[];
   /** The vault whose record this is — bound into the signed tags. */
   ownerHash: string;
+  /**
+   * The record this publication is supposed to belong to.
+   *
+   * Without it a record for note X could be resolved against a transaction
+   * publishing note Y — same vault, same wallet, so every other D9 step passes.
+   * The fingerprint of Y's bytes would then be written onto X's record, and
+   * every later request for X would compare against it and conflict: a healthy
+   * note quarantined permanently by a mismatched pointer.
+   */
+  expectedNoteId: string;
   /** Injected so tests describe gateway behaviour without a network. */
   fetchImpl?: typeof fetch;
   /** Per-origin outcome hook (metrics). Never affects the verdict. */
@@ -200,6 +210,16 @@ export async function authenticatePublication(
     ownerHash: deps.ownerHash,
   });
   if (isRejection(tags)) return { kind: 'not-ours', txId, reason: tags.reason };
+  if (tags.noteId !== deps.expectedNoteId) {
+    // A real publication of OURS, for a different note. Proven, so not
+    // retryable — and nothing may be written against the record that pointed
+    // here.
+    return {
+      kind: 'not-ours',
+      txId,
+      reason: `publication is for Note-Id ${tags.noteId}, not ${deps.expectedNoteId}`,
+    };
+  }
 
   // ── Pass 2: bytes that hash to this header's data_root ──
   for (const origin of deps.origins) {
@@ -222,6 +242,18 @@ export async function authenticatePublication(
       // fault — it is a publication whose body is not what the current
       // canonicalization reads. Not ours to fingerprint.
       return { kind: 'not-ours', txId, reason: 'publication body is not decodable as UTF-8' };
+    }
+
+    // The INNER id must agree with the signed tag, exactly as the upload path
+    // requires of anything it accepts. A publication whose envelope names a
+    // different note is not a fingerprintable answer about this record.
+    try {
+      const inner = JSON.parse(data) as { id?: unknown };
+      if (inner?.id !== tags.noteId) {
+        return { kind: 'not-ours', txId, reason: 'inner id does not match the signed Note-Id' };
+      }
+    } catch {
+      return { kind: 'not-ours', txId, reason: 'publication body is not JSON' };
     }
 
     let observedFp: string;

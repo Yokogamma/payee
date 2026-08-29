@@ -1045,6 +1045,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       origins: payloadOrigins(env),
       trustedOwners,
       ownerHash,
+      expectedNoteId: noteId,
     });
 
     if (auth.kind === 'unproven') {
@@ -1217,6 +1218,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           origins: payloadOrigins(env),
           trustedOwners,
           ownerHash,
+          expectedNoteId: noteId,
         });
         if (auth.kind === 'unproven') {
           await safeRelease(reserveToken);

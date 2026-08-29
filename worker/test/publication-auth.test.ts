@@ -52,7 +52,10 @@ const deps = (
   origins: readonly string[] = [G1, G2],
 ) => {
   const { impl, calls } = gateways(script);
-  return { deps: { origins, trustedOwners, ownerHash: OWNER_HASH, fetchImpl: impl }, calls };
+  return {
+    deps: { origins, trustedOwners, ownerHash: OWNER_HASH, expectedNoteId: NOTE_ID, fetchImpl: impl },
+    calls,
+  };
 };
 
 describe('a genuine publication of ours', () => {
@@ -151,6 +154,39 @@ describe('«not ours» — sound, and none of our business', () => {
     );
     const { deps: d } = deps({ [G1]: { header: tx.header, raw: tx.bytes } }, [wallet.address]);
     expect((await authenticatePublication(tx.txId, d)).kind).toBe('not-ours');
+  });
+
+  it('a real publication of OURS, but for a DIFFERENT note', async () => {
+    // Same vault, same wallet, so every other D9 step passes. Without this
+    // check the fingerprint of note Y's bytes would be written onto note X's
+    // record, and every later request for X would conflict against it —
+    // a healthy note quarantined forever by a mismatched pointer.
+    const wallet = await testWallet();
+    const otherId = '11111111-2222-8333-8444-555555555555';
+    const tx = await buildSignedTx(
+      payload(otherId),
+      notesTags({ version: '3', ownerHash: OWNER_HASH, noteId: otherId }),
+      wallet,
+    );
+    const { deps: d } = deps({ [G1]: { header: tx.header, raw: tx.bytes } }, [wallet.address]);
+    const verdict = await authenticatePublication(tx.txId, d);
+    expect(verdict.kind).toBe('not-ours');
+    if (verdict.kind === 'not-ours') expect(verdict.reason).toMatch(/not 77777777/);
+  });
+
+  it('an INNER id disagreeing with the signed Note-Id tag', async () => {
+    // The upload path requires the two to agree of anything it accepts; a
+    // publication where they diverge is not a fingerprintable answer.
+    const wallet = await testWallet();
+    const tx = await buildSignedTx(
+      payload('11111111-2222-8333-8444-555555555555'), // inner id ≠ tag
+      notesTags({ version: '3', ownerHash: OWNER_HASH, noteId: NOTE_ID }),
+      wallet,
+    );
+    const { deps: d } = deps({ [G1]: { header: tx.header, raw: tx.bytes } }, [wallet.address]);
+    const verdict = await authenticatePublication(tx.txId, d);
+    expect(verdict.kind).toBe('not-ours');
+    if (verdict.kind === 'not-ours') expect(verdict.reason).toMatch(/inner id/);
   });
 
   it('a txId that cannot name a transaction at all — decided without a request', async () => {
