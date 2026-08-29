@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { checkDeployConfig, DEPLOY_VARS, EXPECTED } from './check-deploy-config.mjs';
 import { AUTO_ALLOWED_WORKER_ORIGINS } from '../worker/scripts/smoke-target.mjs';
+import {
+  EXPECTED_PAYLOAD_CSV,
+  EXPECTED_STATUS_CSV,
+  INDEX_SOURCES as PINNED_INDEX_SOURCES,
+} from './gateway-pins.mjs';
 
 // Ранний конфиг-гейт §1.7: наличие/непустота несекретных variables + сверка
 // с закоммиченными ожиданиями. Токен скрипту не передаётся ПРИНЦИПИАЛЬНО
@@ -15,6 +20,9 @@ const GOOD = {
   VITE_PROXY_URL: AUTO_ALLOWED_WORKER_ORIGINS[0],
   VITE_TRUSTED_OWNERS: DEV_OWNER,
   CLOUDFLARE_ACCOUNT_ID: 'some-account-id',
+  VITE_STATUS_GATEWAYS: EXPECTED_STATUS_CSV,
+  VITE_PAYLOAD_GATEWAYS: EXPECTED_PAYLOAD_CSV,
+  VITE_INDEX_SOURCES: PINNED_INDEX_SOURCES,
 };
 
 describe('checkDeployConfig', () => {
@@ -73,5 +81,47 @@ describe('checkDeployConfig', () => {
   it('узкий набор (воркер-деплой) проверяет только переданные имена', () => {
     const r = checkDeployConfig({ CLOUDFLARE_ACCOUNT_ID: 'x' }, ['CLOUDFLARE_ACCOUNT_ID']);
     expect(r).toMatchObject({ ok: true });
+  });
+});
+
+// ── Gateway pins (PR-3a) ──────────────────────────────────────────────
+describe('gateway sets are pinned EXACTLY, not merely present', () => {
+  it('normalization applies: trailing slashes and duplicates are not a difference', () => {
+    const withNoise = EXPECTED_STATUS_CSV.split(',').map(o => o + '/').join(',')
+      + ',https://arweave.net';
+    expect(checkDeployConfig({ ...GOOD, VITE_STATUS_GATEWAYS: withNoise })).toMatchObject({ ok: true });
+  });
+
+  it('a changed status SET fails', () => {
+    const r = checkDeployConfig({ ...GOOD, VITE_STATUS_GATEWAYS: 'https://arweave.net,https://evil.example' });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join('\n')).toMatch(/VITE_STATUS_GATEWAYS does not match/);
+  });
+
+  // Status probes run in parallel, so their order carries no meaning.
+  it('status order is NOT part of the pin', () => {
+    const reversed = EXPECTED_STATUS_CSV.split(',').reverse().join(',');
+    expect(checkDeployConfig({ ...GOOD, VITE_STATUS_GATEWAYS: reversed })).toMatchObject({ ok: true });
+  });
+
+  // The payload pool is tried in sequence, and §2.1 approved that sequence.
+  it('payload ORDER is part of the pin', () => {
+    const reversed = EXPECTED_PAYLOAD_CSV.split(',').reverse().join(',');
+    const r = checkDeployConfig({ ...GOOD, VITE_PAYLOAD_GATEWAYS: reversed });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join('\n')).toMatch(/order is part of the pin/);
+  });
+
+  it('index GROUPING is part of the pin — flattening the fallback fails', () => {
+    const flattened = PINNED_INDEX_SOURCES.replace('|', ',');
+    const r = checkDeployConfig({ ...GOOD, VITE_INDEX_SOURCES: flattened });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join('\n')).toMatch(/index sources/);
+  });
+
+  it('an empty gateway variable fails like any other missing one', () => {
+    for (const name of ['VITE_STATUS_GATEWAYS', 'VITE_PAYLOAD_GATEWAYS', 'VITE_INDEX_SOURCES']) {
+      expect(checkDeployConfig({ ...GOOD, [name]: '' }).ok).toBe(false);
+    }
   });
 });

@@ -38,7 +38,7 @@ interface Harness {
   /** Every APPLIED sync write, in order (begin + results). */
   writes: SyncRecord[];
   /** Atomic sync+meta commits for the vN_disabled branch (record, pausedAt). */
-  pausedCommits: Array<{ record: SyncRecord; pausedAt: number }>;
+  pausedCommits: Array<{ record: SyncRecord; pausedAt: number; markers: string[] }>;
   /** Result commits REFUSED because the fresh row was quarantined. */
   blockedCommits: number;
   /** Result commits REFUSED because the fresh row belongs to another attempt
@@ -76,7 +76,29 @@ function makeHarness(opts?: {
   const epoch = { value: 1 };
   let attemptCounter = 0;
   const writes: SyncRecord[] = [];
-  const pausedCommits: Array<{ record: SyncRecord; pausedAt: number }> = [];
+  const pausedCommits: Array<{ record: SyncRecord; pausedAt: number; markers: string[] }> = [];
+  /** Marker(s) unconditional; the RECORD half is terminal-preserving AND
+   *  attempt-scoped — like the real one. */
+  const pauseCommit = (
+    build: (fresh: SyncRecord | undefined) => SyncRecord,
+    pausedAt: number,
+    markers: string[],
+    attemptId: string,
+  ) => {
+    if (row.value?.terminalError !== undefined) {
+      h.blockedCommits++;
+      pausedCommits.push({ record: row.value, pausedAt, markers });
+      return;
+    }
+    if (row.value?.attemptId !== attemptId) {
+      h.staleCommits++;
+      pausedCommits.push({ record: row.value!, pausedAt, markers });
+      return;
+    }
+    const rec = build(row.value);
+    row.value = rec;
+    pausedCommits.push({ record: rec, pausedAt, markers });
+  };
   const row: { value: SyncRecord | undefined } = { value: opts?.prev };
   const h: Harness = {
     deps: null as unknown as UploadAttemptDeps,
@@ -122,24 +144,14 @@ function makeHarness(opts?: {
       }
     },
     commitV3PausedFailure: async (_noteId, attemptId, build, pausedAt) => {
-      // Marker unconditional; the RECORD half is terminal-preserving AND
-      // attempt-scoped — like the real one.
-      if (row.value?.terminalError !== undefined) {
-        h.blockedCommits++;
-        pausedCommits.push({ record: row.value, pausedAt });
-        return;
-      }
-      if (row.value?.attemptId !== attemptId) {
-        h.staleCommits++;
-        pausedCommits.push({ record: row.value!, pausedAt });
-        return;
-      }
-      const rec = build(row.value);
-      row.value = rec;
-      pausedCommits.push({ record: rec, pausedAt });
+      pauseCommit(build, pausedAt, ['v3'], attemptId);
     },
-    commitV4PausedFailure: async (noteId, attemptId, build, pausedAt) => {
-      await h.deps.commitV3PausedFailure(noteId, attemptId, build, pausedAt);
+    commitV4PausedFailure: async (_noteId, attemptId, build, pausedAt) => {
+      pauseCommit(build, pausedAt, ['v4'], attemptId);
+    },
+    // The GLOBAL switch pauses every version in ONE transaction.
+    commitGlobalPausedFailure: async (_noteId, attemptId, build, pausedAt) => {
+      pauseCommit(build, pausedAt, ['global'], attemptId);
     },
     signPayload: async () => {
       if (opts?.lockDuringSign) epoch.value++;
@@ -494,5 +506,53 @@ describe('D14a — a late answer never lands on a row this attempt no longer own
     // The row left 'uploading', so it no longer names an attempt — a replayed
     // or duplicated answer finds nothing to match.
     expect(h.row.value?.attemptId).toBeUndefined();
+  });
+});
+
+describe('runUploadAttempt — uploads_disabled (GLOBAL kill switch)', () => {
+  const GLOBAL_DISABLED: UploadResult = {
+    kind: 'uploads_disabled', error: '{"code":"uploads_disabled"}',
+  };
+
+  // The global switch refuses v1–v4 alike, before the body is even read.
+  // Pausing only this item's version would leave the queue marching through the
+  // rest of the backlog against a worker that answers 503 to all of it — the
+  // incident lever would look like it did nothing.
+  it('writes the dedicated GLOBAL marker, not the two version ones', async () => {
+    const h = makeHarness({ result: GLOBAL_DISABLED });
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(outcome.kind).toBe('committed');
+    expect(h.pausedCommits).toHaveLength(1);
+    // A dedicated key, because the queue consults the version markers only for
+    // v3/safebox — writing those would have left v1/v2 uploading.
+    expect(h.pausedCommits[0].markers).toEqual(['global']);
+    expect(h.pausedCommits[0].pausedAt).toBe(NOW);
+    expect(h.pausedCommits[0].record.status).toBe('error');
+    expect(h.pausedCommits[0].record.lastError).toContain('uploads_disabled');
+  });
+
+  it('preserves txId/recovery like every other pause branch', async () => {
+    const prev: SyncRecord = {
+      noteId: 'note-1', kind: 'note', txId: 'TX-old', status: 'accepted', transport: 'proxy',
+      updatedAt: NOW - 100_000, needsRecheck: true,
+      recovery: { txId: 'TX-old', postedAt: NOW - 200_000, token: 'tok' },
+    };
+    const h = makeHarness({ prev, result: GLOBAL_DISABLED });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    const rec = h.pausedCommits[0].record;
+    expect(rec.txId).toBe('TX-old');
+    expect(rec.recovery).toEqual(prev.recovery);
+  });
+
+  it('persists even when a lock lands mid-dispatch', async () => {
+    const h = makeHarness({ lockDuringDispatch: true, result: GLOBAL_DISABLED });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.pausedCommits).toHaveLength(1);
+  });
+
+  it('a per-version switch still pauses only its own version', async () => {
+    const h3 = makeHarness({ result: { kind: 'v3_disabled', error: 'x' } });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h3.deps);
+    expect(h3.pausedCommits[0].markers).toEqual(['v3']);
   });
 });
