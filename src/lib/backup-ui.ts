@@ -188,6 +188,58 @@ export function sizeNotice(expectedFileBytes: number, overCap: boolean): SizeNot
   return { text, overCap: false };
 }
 
+// ─── The dry-run's answer ───────────────────────────────────────────
+
+export interface VerifySummary {
+  /** Three ANSWERS, not two: «fine», «intact but narrower than a full
+   *  backup», and «something in it is wrong». Folding the middle one into the
+   *  last is the mistake this type exists to prevent. */
+  tone: 'ok' | 'incomplete' | 'bad';
+  headline: string;
+  /** Reason by reason, with the advice each one actually implies. */
+  issues: PreviewIssue[];
+}
+
+/**
+ * What a verify may say about a file.
+ *
+ * `report.ok` folds three questions into one boolean — intact, complete, every
+ * record readable — which is right for deciding whether to write the freshness
+ * marker and wrong for talking to a person. A file that is cryptographically
+ * perfect and merely narrower than the vault it came from is not «НЕ в
+ * порядке»: nothing about it is broken, and telling its owner otherwise
+ * invites them to throw away a copy that is the best one they have.
+ */
+export function verifySummary(
+  report: VerifyReport,
+  format: MomentFormatter = formatMoment,
+): VerifySummary {
+  const issues = previewIssues(report);
+  const counts = `${plural(report.counts.notes, 'заметка', 'заметки', 'заметок')}, `
+    + `${plural(report.counts.safebox, 'запись сейфа', 'записи сейфа', 'записей сейфа')}`;
+
+  if (report.ok) {
+    return { tone: 'ok', headline: `Файл от ${format(report.createdAt)} в порядке: ${counts}.`, issues };
+  }
+  if (issues.length === 0 && report.incompleteRestore) {
+    // Intact, readable, and honest about being partial. The distinction is the
+    // whole reason `incompleteRestore` travels inside the container.
+    return {
+      tone: 'incomplete',
+      headline: `Файл от ${format(report.createdAt)} цел и читается целиком (${counts}), `
+        + 'но он ЗАВЕДОМО НЕПОЛОН: устройство, которое его создало, само восстанавливалось '
+        + 'не полностью. Храните его, но не считайте единственной копией.',
+      issues,
+    };
+  }
+  return {
+    tone: 'bad',
+    headline: `Файл от ${format(report.createdAt)} проверен, и с ним есть проблемы (${counts}). `
+      + 'Не удаляйте его: остальные записи в нём целы.',
+    issues,
+  };
+}
+
 // ─── The import preview ─────────────────────────────────────────────
 
 export interface ImportPreview {
@@ -430,7 +482,9 @@ export function importSummary(report: ImportReport, sourceIncomplete: boolean): 
     // the two sentences say the same thing twice and neither is heard.
     storeIncomplete: report.incompleteRestore && !sourceIncomplete
       ? 'Хранилище помечено как восстановленное не полностью: часть данных так и не применена. '
-        + 'Не удаляйте файл копии — пометка снимется, когда импорт пройдёт без пропусков.'
+        + 'Не удаляйте файл копии. Пометка ЛИПКАЯ: повторный импорт её уже не снимет — '
+        + 'она уйдёт только вместе с полным восстановлением на чистом устройстве, — '
+        + 'и до тех пор каждый экспорт отсюда честно несёт её дальше.'
       : undefined,
   };
 }
