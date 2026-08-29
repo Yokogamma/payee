@@ -1012,3 +1012,38 @@ describe('commitQuickUnlockSeedCleanup (re-checks inside its own transaction)', 
     await expect(commitQuickUnlockSeedCleanup(stale)).rejects.toBeInstanceOf(StorageResetError);
   });
 });
+
+describe('commitGlobalPausedFailure — its OWN key, not the version ones', () => {
+  it('writes only the global marker', async () => {
+    const {
+      commitGlobalPausedFailure, readGlobalPauseMeta, readV3PauseMeta, readV4PauseMeta,
+    } = await import('./storage');
+    const record: SyncRecord = {
+      noteId: 'g1', kind: 'note', status: 'error', transport: 'proxy',
+      updatedAt: 1, needsRecheck: false, lastError: 'uploads_disabled',
+    };
+    await commitGlobalPausedFailure('g1', () => record, 4242);
+
+    expect(await readGlobalPauseMeta()).toEqual({ pausedAt: 4242 });
+    // The version markers stay untouched: they gate only v3/safebox items, so
+    // writing them instead would have left v1/v2 uploading against a worker
+    // that refuses everything.
+    expect(await readV3PauseMeta()).toBeNull();
+    expect(await readV4PauseMeta()).toBeNull();
+  });
+
+  it('is lifted by compare-and-delete, like the version markers', async () => {
+    const { commitGlobalPausedFailure, clearGlobalUploadsPaused, readGlobalPauseMeta } =
+      await import('./storage');
+    const record: SyncRecord = {
+      noteId: 'g2', kind: 'note', status: 'error', transport: 'proxy',
+      updatedAt: 1, needsRecheck: false,
+    };
+    await commitGlobalPausedFailure('g2', () => record, 100);
+    // A stale probe must never erase a NEWER pause.
+    expect(await clearGlobalUploadsPaused(99)).toBe(false);
+    expect(await readGlobalPauseMeta()).toEqual({ pausedAt: 100 });
+    expect(await clearGlobalUploadsPaused(100)).toBe(true);
+    expect(await readGlobalPauseMeta()).toBeNull();
+  });
+});

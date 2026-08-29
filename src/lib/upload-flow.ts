@@ -89,6 +89,12 @@ export interface UploadAttemptDeps {
     build: (fresh: SyncRecord | undefined) => SyncRecord,
     pausedAt: number,
   ): Promise<void>;
+  /** The GLOBAL kill switch pauses every version in ONE transaction. */
+  commitGlobalPausedFailure(
+    noteId: string,
+    build: (fresh: SyncRecord | undefined) => SyncRecord,
+    pausedAt: number,
+  ): Promise<void>;
   signPayload(privateKey: Uint8Array, payload: string): Promise<string>;
   uploadViaProxy(bodyText: string, publicKeyB64: string, signature: string): Promise<UploadResult>;
 }
@@ -213,6 +219,15 @@ export async function runUploadAttempt(
     await deps.commitResult(id, fresh =>
       afterInProgress(id, kind, fresh, deps.now())
         ?? afterFailure(id, kind, fresh, recheck, 'in_progress', deps.now()));
+  } else if (result.kind === 'uploads_disabled') {
+    // The GLOBAL switch: every version is refused, so pausing only this item's
+    // version would leave the queue marching through the rest of the backlog
+    // against a worker that answers 503 to all of it — burning the per-IP
+    // budget and making the incident lever look like it did nothing.
+    const now = deps.now();
+    await deps.commitGlobalPausedFailure(
+      id, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now,
+    );
   } else if (result.kind === 'v3_disabled' || result.kind === 'v4_disabled') {
     // Worker kill switch: a PAUSE, not an error. The failure record (which
     // preserves txId/recovery/needsRecheck via afterFailure) and the pause

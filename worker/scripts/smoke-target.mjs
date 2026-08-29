@@ -51,6 +51,51 @@ export const AUTO_ALLOWED_WORKER_ORIGINS = Object.freeze([
 ]);
 
 /**
+ * The deploy identity, pinned in the repository (PR-3a).
+ *
+ * `WORKER_NAME` and `ACCOUNT_ID` exist so a deploy smoke can prove it is
+ * talking to the worker that was just deployed BY THESE CREDENTIALS, rather
+ * than to whatever happens to answer at a hostname. Neither is a secret: the
+ * account id is already an Actions variable and a wrangler var.
+ */
+export const WORKER_NAME = 'eternal-notes-proxy';
+export const ACCOUNT_ID = '88cd072a3c0a9b861d52dcc126b9d57e';
+
+/**
+ * The App-Versions `/health` must advertise.
+ *
+ * Pinned HERE, deliberately, and not read from wrangler.toml — the list does
+ * not exist there. It is hardcoded in the worker (`versions: ['1','2','3','4']`),
+ * so the smoke needs its own independent expectation or it would be comparing
+ * the worker against itself.
+ */
+export const EXPECTED_VERSIONS = Object.freeze(['1', '2', '3', '4']);
+
+/**
+ * Deploy profiles: what `/health` must say for a release to count as good.
+ *
+ * TWO EXACT capability ids, never «any» and never «missing». An emergency
+ * build honestly declares that it carries the pre-quorum semantics and passes
+ * ITS OWN profile; it cannot pass `normal`, and `normal` is the only profile
+ * that opens the client release. That is what keeps the two apart without
+ * relying on the candidate to describe itself favourably.
+ *
+ * The emergency profile additionally requires ALL THREE upload switches off —
+ * checked before the deploy as well as after it, so an unsafe build cannot be
+ * activated first and rejected second.
+ */
+export const DEPLOY_PROFILES = Object.freeze({
+  normal: Object.freeze({
+    statusQuorumPolicy: 'all-configured-v1',
+    requireUploadsOff: false,
+  }),
+  emergency: Object.freeze({
+    statusQuorumPolicy: 'legacy-single-v0',
+    requireUploadsOff: true,
+  }),
+});
+
+/**
  * Parse and shape-check a URL that must denote a bare origin.
  * Returns { origin, protocol, hostname } or { error }.
  */

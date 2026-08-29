@@ -8,6 +8,13 @@
 import Arweave from 'arweave';
 import * as ed25519 from '@noble/ed25519';
 import { readAllowCache } from './allowlist';
+// CROSS-HALF IMPORT (deliberate): the quorum formula and the gateway parser
+// are the CLIENT's modules, imported here so there is exactly one
+// implementation of each. Both are pure, env-free and DOM-free — the wrangler
+// bundle picks them up as plain TypeScript. Precedent: worker/test/
+// client-parity.test.ts already imports src/lib/crypto.ts.
+import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
+import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
 import {
   ARWEAVE_HOST,
   assertStructurallyCompleteJwk,
@@ -40,6 +47,21 @@ interface Env {
   IP_RATE_LIMITER: DurableObjectNamespace;
   ALLOWLIST: KVNamespace;
   ALLOWED_ORIGINS: string;
+  /** Comma-separated bare https origins for TX-status probes (D8/PR-3a).
+   *  MUST equal the client's VITE_STATUS_GATEWAYS: the dead formula is one
+   *  formula for both halves, so a divergence would let one of them reach a
+   *  verdict the other cannot. The deploy gate compares the normalized lists.
+   *  Empty/unset falls back to a lone arweave.net, where `dead` is unreachable
+   *  by construction. */
+  STATUS_GATEWAYS?: string;
+  /** Full 40-char commit SHA this build was deployed from, injected by the
+   *  trusted deploy workflow from its verified `candidate` input — NEVER from
+   *  `github.sha`, which is the SHA of the workflow's own trusted head. */
+  RELEASE_SHA?: string;
+  /** Cloudflare version_metadata binding: the Worker's own ACTIVE version id.
+   *  Self-reported SHA cannot distinguish a re-deploy of the same commit; this
+   *  can. Optional so tests and older configs keep working. */
+  CF_VERSION_METADATA?: { id?: string; tag?: string; timestamp?: string };
   MAX_BODY_BYTES: string;
   RATE_LIMIT_PER_HOUR: string;
   ARWEAVE_JWK: string;
@@ -158,12 +180,35 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   // AND versions includes it (the list describes the ACCEPTOR and still
   // contains the version while its gate is off).
   if (url.pathname === '/health') {
-    return json({
+    // ── Freshness proof ──
+    // `no-store` keeps an intermediary from serving a stale answer, but it
+    // cannot tell us whether the answer WE hold is stale. So a trusted probe
+    // sends a nonce and requires it back verbatim; a browser or an operator
+    // with curl sends none and gets the same diagnostic body as always.
+    const nonce = url.searchParams.get('nonce');
+    if (nonce !== null && !/^[0-9a-f]{16}$/.test(nonce)) {
+      return error('nonce must be 16 lowercase hex characters', 400);
+    }
+    const origins = statusOrigins(env);
+    return healthJson({
       ok: true,
       versions: ['1', '2', '3', '4'],
       uploads: uploadsEnabled(env),
       v3Uploads: v3UploadsEnabled(env),
       v4Uploads: v4UploadsEnabled(env),
+      // The quorum SEMANTICS this build implements, taken from the module that
+      // implements them. Deliberately NOT a var: if it came from configuration,
+      // a build carrying the old single-gateway logic could be relabelled as
+      // the safe one and have its uploads switched back on.
+      statusQuorumPolicy: QUORUM_POLICY_ID,
+      statusGatewaysCount: origins.length,
+      statusGatewaysHash: await statusGatewaysHash(origins),
+      // Identity of what is ACTUALLY running: the SHA the trusted workflow
+      // deployed, and the version id Cloudflare activated. The SHA alone cannot
+      // distinguish a re-deploy of the same commit — the version id can.
+      releaseSha: env.RELEASE_SHA ?? null,
+      workerVersionId: env.CF_VERSION_METADATA?.id ?? null,
+      ...(nonce !== null ? { nonce } : {}),
     });
   }
 
@@ -862,7 +907,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     if (!wantsRecheck) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
 
     // Recheck: is the committed TX still alive on-chain?
-    const live = await getTxStatusWorker(checkResult.txId!, emit);
+    const live = await getTxStatusWorker(checkResult.txId!, emit, env);
     if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted', committed: true });
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
@@ -876,7 +921,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   } else if (checkResult.status === 'posted') {
     // POST succeeded but the commit was lost. Reconcile using the SERVER's txId
     // (never a client-supplied one), its CAS token, and the postedAt age guard.
-    const live = await getTxStatusWorker(checkResult.txId!, emit);
+    const live = await getTxStatusWorker(checkResult.txId!, emit, env);
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (live === 'alive') {
       try {
@@ -915,7 +960,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         // "Invalid recovery token" responses must carry the SAME code.
         return recoveryInvalid();
       }
-      const live = await getTxStatusWorker(recoveryHint.txId, emit);
+      const live = await getTxStatusWorker(recoveryHint.txId, emit, env);
       if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
       if (live === 'alive') {
         try {
@@ -1066,6 +1111,29 @@ function handleOptions(origin: string, allowedOrigins: string[]): Response {
   return new Response(null, { status: 204, headers: corsHeaders(origin, allowedOrigins) });
 }
 
+/**
+ * `/health` answers with `no-store`. This endpoint decides whether a persisted
+ * upload pause may be lifted, so a cached answer is not a stale diagnostic — it
+ * is a resume decision made on a state that may no longer exist.
+ */
+function healthJson(data: unknown): Response {
+  return new Response(JSON.stringify(data), {
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+}
+
+/**
+ * First 16 hex of SHA-256 over the canonical, SORTED serialization of the
+ * configured status origins. Sorted because the status order is not normative,
+ * so reordering `wrangler.toml` must not change the value the deploy smoke
+ * compares against the hash it computes from that same file.
+ */
+async function statusGatewaysHash(origins: readonly string[]): Promise<string> {
+  const bytes = new TextEncoder().encode(serializeStatusOrigins(origins));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...digest].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+}
+
 function json(data: unknown): Response {
   return new Response(JSON.stringify(data), {
     headers: { 'Content-Type': 'application/json' },
@@ -1177,46 +1245,117 @@ async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: 
  * PR-2 wraps the SAME fetch in a stopwatch and emits gateway_call(status) +
  * status_verdict; the verdict logic itself is unchanged (quorum is PR-3a).
  */
-async function getTxStatusWorker(txId: string, emit: Emit): Promise<'alive' | 'dead' | 'unavailable'> {
+async function getTxStatusWorker(
+  txId: string,
+  emit: Emit,
+  env: Env,
+): Promise<'alive' | 'dead' | 'unavailable'> {
+  const origins = statusOrigins(env);
+  const votes = await Promise.all(origins.map(origin => probeStatusOrigin(origin, txId, emit)));
+
+  // The SHARED formula — literally the module the client runs (src/lib/
+  // status-quorum.ts). One implementation, so the two halves cannot drift into
+  // reaching verdicts the other could not.
+  const verdict = statusVerdict(origins, votes);
+
+  // The quorum row uses a sentinel HOST rather than a new blob, so the schema
+  // is unchanged. A leading underscore cannot occur in a bare origin, so it can
+  // never collide with a real gateway's series.
+  const coarse: 'alive' | 'dead' | 'unavailable' =
+    verdict.kind === 'confirmed' || verdict.kind === 'pending' ? 'alive'
+      : verdict.kind === 'dead' ? 'dead'
+        : 'unavailable';
+  emit('status_verdict', [coarse, QUORUM_METRIC_HOST],
+    [verdict.kind === 'confirmed' ? verdict.confirmations : -1]);
+  return coarse;
+}
+
+/** Sentinel host for the aggregated row (see getTxStatusWorker). */
+const QUORUM_METRIC_HOST = '_quorum';
+
+/** Configured status origins, defaulting to the single legacy host. Canonized
+ *  and deduplicated with the SAME parser the client compiles in. */
+function statusOrigins(env: Env): string[] {
+  const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
+  return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
+}
+
+/**
+ * One origin's answer. Emits the per-host metrics PR-2 introduced — the `host`
+ * label stays a BARE hostname (`arweave.net`), not the canonical origin, so the
+ * historical time series is not split in half by this change.
+ *
+ * 400 is no longer `dead`: it is a non-404 outcome like any other, and under
+ * the quorum it now BLOCKS dead instead of causing it.
+ */
+async function probeStatusOrigin(origin: string, txId: string, emit: Emit): Promise<StatusVote> {
+  const host = new URL(origin).host;
   const started = performance.now();
   let r: Response;
   try {
-    r = await fetch(`https://${ARWEAVE_HOST}/tx/${txId}/status`, {
+    r = await fetch(`${origin}/tx/${txId}/status`, {
       method: 'GET',
+      // NO REDIRECTS — and this is the half that spends money. `fetch` follows
+      // them by default, so a gateway answering 302 -> another gateway would
+      // give TWO configured origins carrying ONE host's opinion, and unanimity
+      // over the pool is exactly what authorizes a paid redrop. The client was
+      // fixed first; leaving the authoritative side unfixed fixed nothing.
+      redirect: 'error',
       signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {
-    emit('gateway_call', ['status', ARWEAVE_HOST, classifyThrow(e)], [performance.now() - started]);
-    emit('status_verdict', ['unavailable', ARWEAVE_HOST], [-1]);
-    return 'unavailable';
+    emit('gateway_call', ['status', host, classifyThrow(e)], [performance.now() - started]);
+    emit('status_verdict', ['unavailable', host], [-1]);
+    return { origin, kind: 'other' };
   }
-  emit('gateway_call', ['status', ARWEAVE_HOST, classifyStatus(r.status)], [performance.now() - started]);
+  const elapsed = performance.now() - started;
 
-  // The verdict is decided by the HTTP code ALONE — exactly as before PR-2.
-  const verdict: 'alive' | 'dead' | 'unavailable' =
-    (r.status === 200 || r.status === 202) ? 'alive'
-      : (r.status === 404 || r.status === 400) ? 'dead'
-        : 'unavailable';
+  if (r.status === 202) {
+    emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
+    emit('status_verdict', ['alive', host], [-1]);
+    return { origin, kind: 'pending' };
+  }
+  if (r.status === 404) {
+    emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
+    emit('status_verdict', ['dead', host], [-1]);
+    return { origin, kind: 'dead404' };
+  }
+  if (r.status !== 200) {
+    emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
+    emit('status_verdict', ['unavailable', host], [-1]);
+    return { origin, kind: 'other' };
+  }
 
-  // number_of_confirmations (the exact Arweave field name, L r19) — a
-  // BEST-EFFORT read of the 200 body only: capped at 1 KiB under the fetch's
-  // own 10s AbortSignal; ANY parse failure (malformed, oversized, truncated,
-  // slow) yields −1 and NEVER changes the verdict.
+  // A 200 must carry a body that satisfies the schema to count as alive. A
+  // malformed one is a PROTOCOL defect (`invalid_response`), never a verdict.
   let confirmations = -1;
-  if (r.status === 200) {
-    try {
-      const text = await readCappedText(r, 1024);
-      if (text !== null) {
-        const doc: unknown = JSON.parse(text);
-        const n = (typeof doc === 'object' && doc !== null)
-          ? (doc as { number_of_confirmations?: unknown }).number_of_confirmations
-          : undefined;
-        if (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0) confirmations = n;
+  let blockHeight = -1;
+  try {
+    const text = await readCappedText(r, 1024);
+    if (text !== null) {
+      const doc: unknown = JSON.parse(text);
+      if (typeof doc === 'object' && doc !== null) {
+        const d = doc as { number_of_confirmations?: unknown; block_height?: unknown };
+        if (safeCount(d.number_of_confirmations) && safeCount(d.block_height)) {
+          confirmations = d.number_of_confirmations;
+          blockHeight = d.block_height;
+        }
       }
-    } catch { /* −1 stands; the verdict is already fixed */ }
+    }
+  } catch { /* stays −1 → invalid_response below */ }
+
+  if (confirmations < 0) {
+    emit('gateway_call', ['status', host, 'invalid_response'], [elapsed]);
+    emit('status_verdict', ['unavailable', host], [-1]);
+    return { origin, kind: 'other' };
   }
-  emit('status_verdict', [verdict, ARWEAVE_HOST], [confirmations]);
-  return verdict;
+  emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
+  emit('status_verdict', ['alive', host], [confirmations]);
+  return { origin, kind: 'confirmed', confirmations, blockHeight };
+}
+
+function safeCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 /**

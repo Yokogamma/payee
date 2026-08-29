@@ -46,8 +46,11 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 # v3 upload kill switch. STRICTLY "true" enables; anything else fails CLOSED
 # (v3 uploads get 503 {code:'v3_uploads_disabled'}, v1/v2 unaffected).
-# SOURCE OF TRUTH is this file: toggling = edit here + `npm run deploy` from the
-# verified v3-acceptor tag. A Cloudflare-dashboard override is EMERGENCY-ONLY
+# SOURCE OF TRUTH is this file: toggling = edit here, land it on the default
+# branch, then dispatch the trusted workflow ("Deploy Worker (proxy) — dev")
+# with that commit as `candidate`. `npm run deploy` REFUSES on purpose (PR-3a):
+# a local wrangler deploy bypasses the floor gate, the Environment and the
+# release lock. A Cloudflare-dashboard override is EMERGENCY-ONLY
 # and must be synced back here immediately (the next deploy would silently
 # restore the repo value). Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v3Uploads" matches the intended state.
@@ -58,6 +61,16 @@ V3_UPLOADS_ENABLED = "true"
 # Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
 V4_UPLOADS_ENABLED = "true"
+# ── Status gateways (PR-3a) ──
+# Bare https origins, comma separated. MUST equal the client's
+# VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
+# the deploy gate compares the normalized lists. Order is NOT normative here
+# (the probes run in parallel), which is why the /health attestation hash sorts
+# before hashing.
+# Empty/unset falls back to a lone arweave.net, where `dead` is unreachable by
+# construction — a production deploy with fewer than two origins is refused by
+# the config gate rather than shipped silently.
+STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
 # ── Metrics (PR-2) ── Telemetry is fail-closed, the request path fail-open:
 # writes happen STRICTLY when METRICS_ENABLED = "true" AND the METRICS binding
 # exists; ANY other value (missing, garbage, no binding) disables writes
@@ -78,6 +91,13 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 [[analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "eternal_notes_metrics"
+
+# The Worker's own ACTIVE version id, reported by /health. A self-declared
+# release SHA cannot tell a re-deploy of the same commit from the original;
+# this can, and the deploy smoke compares it with the version id wrangler
+# reported for the deployment it just performed.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
 
 # Secrets (via `wrangler secret put`):
 # ARWEAVE_JWK — server Arweave wallet (JSON string)
@@ -148,6 +168,16 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
+# ── Status gateways (PR-3a) ──
+# Bare https origins, comma separated. MUST equal the client's
+# VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
+# the deploy gate compares the normalized lists. Order is NOT normative here
+# (the probes run in parallel), which is why the /health attestation hash sorts
+# before hashing.
+# Empty/unset falls back to a lone arweave.net, where `dead` is unreachable by
+# construction — a production deploy with fewer than two origins is refused by
+# the config gate rather than shipped silently.
+STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
 # Metrics (PR-2) — same contract as production vars above; staging writes go
 # to its OWN dataset (explicit different name, M6 r14).
 METRICS_ENABLED = "true"
@@ -160,3 +190,9 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 [[env.staging.analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "eternal_notes_metrics_staging"
+
+# Declared explicitly for staging too: a named environment inherits NOTHING,
+# so omitting this would leave staging without the binding and make its smoke
+# structurally different from production's.
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"

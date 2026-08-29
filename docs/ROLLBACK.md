@@ -484,9 +484,14 @@ client floor in force is still `client-r4`.
     immediately and a floor that depends on a shifting precondition is not a
     floor. **The floor is now absolute:** `worker-r2` and below 400 every
     App-Version=4 upload and would silently stop safebox sync.
-  - **Allowed rollback targets = tags in this list that are descendants of
-    the floor** (`git merge-base --is-ancestor`). Never deploy anything else
-    once the floor Worker has run even once.
+  - **SUPERSEDED BY PR-3a: a tag no longer makes a commit deployable.** Tags
+    are not branch protection — unless a tag ruleset is configured and proven,
+    anyone able to push one can make an arbitrary mid-review commit deployable,
+    and every such commit is an ancestor of the default branch. Allowed
+    rollback targets are now the SHAs listed in `scripts/release-allowlist.mjs`
+    (empty by default: the normal path deploys the trusted head), and they must
+    still be descendants of the floor. The list below stays as the RELEASE
+    HISTORY it always was.
   - **The deploy workflow now checks this itself — see «The floor as a gate»
     below.** Two consequences, and both are operational rather than technical:
     a rollback goes through that workflow with the target's SHA, and
@@ -1599,8 +1604,13 @@ legitimately answer 503 «Recheck deferred» — the status metric is already
 written); (d) `/admin/metrics` shows ALL FOUR legs (anchor/price/post from
 the smoke, status from the recheck). The SQL API is not strictly
 read-after-write: poll with backoff, ceiling ~2 min, then the smoke is RED —
-never an endless loop; (e) redeploy the PREVIOUS worker — an upload passes
-again (the rollback is rehearsed, not postulated).
+never an endless loop; (e) **SUPERSEDED BY PR-3a.** This step used to rehearse
+a rollback by redeploying the previous worker. That is now forbidden: the floor
+is absolute, an empty release allowlist admits nothing but the trusted head, and
+a local `npm run deploy` refuses outright. Rehearse the SANCTIONED path
+instead — a descendant of the floor deployed through the trusted workflow — or
+skip the rehearsal and say so, rather than leaving an instruction that the gates
+will refuse.
 
 ### Launch gate for the REAL production contour (M r19 — carry into part 2)
 
@@ -1625,3 +1635,126 @@ closed, blocking reconciliation until operator intervention).
 Since PR-2 additionally: `METRICS_ADMIN_SECRET` and `CF_ANALYTICS_TOKEN`
 (both OPTIONAL for uploads — only `/admin/metrics` 503s while they are
 missing; see the PR-2 section above and `docs/SECRETS.md`).
+
+## PR-3a «Read-path multi-gateway» — release runbook
+
+The read path stops being pinned to one host: status verdicts come from a
+quorum over every configured gateway, and note payloads are fetched from a pool
+and verified cryptographically against the txId that was asked for (D9).
+
+This release **creates no paid transactions**. Its risk is the opposite one: a
+verdict that is wrong in the other direction. So the runbook below is mostly
+about not letting the two halves disagree about what `dead` means.
+
+### What changed that an operator can observe
+
+- **A lone 404 is no longer `dropped`.** `dead` now requires EVERY configured
+  origin to answer 404, and at least two to be configured. One flapping gateway
+  defers `dead` — deliberately: `dead` is the only verdict that authorizes
+  spending money, while a stuck `unavailable` merely means «try later».
+- **A gateway `400` is `unavailable`, never `invalid`.** It used to feed
+  `needsRecheck`, i.e. the paid re-post path, on one host's opinion.
+- **`invalid` is now a LOCAL verdict only** — a txId that is not 43 base64url
+  characters, decided without a request.
+- **Restore rejects payloads that do not match the requested txId**, and reads
+  attribution from the SIGNED tags rather than from the GraphQL edge.
+- **`/health` gained an attestation**: `statusQuorumPolicy`, the gateway hash
+  and count, `releaseSha`, `workerVersionId`, and a `nonce` echo. It answers
+  `no-store`. A client that cannot verify all of it keeps its upload pause up.
+
+### Required configuration before the release
+
+| Where | Variable |
+|---|---|
+| GitHub Environment `dev` + Cloudflare Pages | `VITE_STATUS_GATEWAYS`, `VITE_PAYLOAD_GATEWAYS`, `VITE_INDEX_SOURCES` |
+| `worker/wrangler.toml` (repo, both blocks) | `STATUS_GATEWAYS` |
+
+All three client variables are pinned EXACTLY in `scripts/gateway-pins.mjs`;
+the deploy gate refuses anything else, and `check-gateways-vs-worker.mjs`
+refuses a worker list that differs from the client's.
+
+### Release order — and the two-stage floor raise
+
+The floor is raised in TWO steps, and skipping the second leaves it lowerable:
+
+1. Dispatch **Deploy Worker (proxy) — dev** with `candidate = <SHA>` and
+   `profile = normal`. The gate refuses a candidate that is not the trusted
+   head or an allowlisted release, and refuses anything below the floor.
+2. The post-deploy smoke checks the LIVE worker: policy id, gateway hash and
+   count, `releaseSha`, the activated `workerVersionId`, and the nonce echo.
+3. **Raise `WORKER_FLOOR_SHA` to that SHA** in the Environment. Nothing does
+   this automatically — the control plane keeps applying the OLD floor until
+   the variable changes.
+4. **Land a separate protected commit raising `MINIMUM_FLOOR`** in
+   `scripts/check-worker-floor.mjs` to the same SHA. Without it the Environment
+   value can be edited back down to the previous repo pin, and the «absolute»
+   floor is only as absolute as its lower bound.
+5. Dispatch **Deploy client to Cloudflare Pages — dev** with
+   `worker_candidate` and `worker_version_id` from step 2. It re-checks the
+   live `/health` immediately before publishing and refuses unless BOTH floors
+   already equal that release.
+
+Both workflows share the `release-dev` concurrency group, so a worker deploy
+cannot land between the client's live check and its publish. Serialization is
+not ordering: still do not dispatch the next deploy until the previous run has
+finished.
+
+### Local deploys
+
+`npm run deploy` in `worker/` **refuses**. A local wrangler deploy bypasses the
+floor gate, the Environment and the release lock — the three things that make
+the attestation worth anything. Staging keeps `npm run deploy:staging`.
+
+### Rollback
+
+- **Client**: rolls back freely and independently. A client below this release
+  loses D9 and the strict capability check, so the integrity position regresses
+  even though no duplicate payment becomes possible (recovery stays
+  server-authoritative). Treat this release as the client floor: below it, roll
+  back only with uploads disabled.
+- **Worker**: `worker-g1` — the SHA recorded in `WORKER_FLOOR_SHA` and
+  `MINIMUM_FLOOR` — is an **absolute floor**. `wrangler rollback` and a
+  redeploy of anything below it are forbidden unconditionally, not «while
+  uploads are on»: a Cloudflare version carries its own bindings and vars, so
+  rolling back restores the old `UPLOADS_ENABLED` along with the old code.
+- **The only break-glass path** is a commit that is already on `main`, is a
+  descendant of the floor, declares `statusQuorumPolicy = legacy-single-v0`,
+  and has ALL THREE upload switches `"false"` in its own `[vars]`. Deploy it
+  with `profile = emergency`; the preflight verifies those flags from the
+  candidate's own config BEFORE the Cloudflare action, and the emergency
+  profile never opens a client release. Such a SHA goes in the list below, not
+  in the normal allowlist.
+- **Preferred emergency path is roll-FORWARD**: turn uploads off and ship the
+  fix forward.
+
+### Emergency releases — uploads permanently off
+
+_(none yet)_
+
+### The global kill switch now actually stops the queue
+
+`UPLOADS_ENABLED = "false"` makes the worker answer
+`503 {code:'uploads_disabled'}` to v1–v4 alike, before the body is read. Until
+PR-3a the client only understood the PER-VERSION codes, so it recorded a plain
+retryable failure and the queue kept marching through the backlog — burning the
+per-IP budget against a worker refusing all of it, and making the incident lever
+look like it had done nothing.
+
+The client now writes a DEDICATED global marker and consults it before every
+dispatch — for every version, not only the gated ones. Writing the v3 and v4
+markers instead would have looked right and still let v1/v2 keep uploading: the
+queue reads a version marker only for v3/safebox items.
+
+Resume needs no new lever. The marker lifts once `/health` reports any version
+`enabled`, and the capability table already requires the global `uploads` flag
+to be true before it says that — so «enabled anywhere» proves «switch back on».
+
+Operator consequence: after flipping the switch back, uploads resume on the next
+`/health` probe — no manual un-pause, and no per-version bookkeeping.
+
+### The post-deploy smoke is a DETECTOR
+
+Cloudflare activates a version before any smoke can answer. A red smoke
+therefore does not undo anything — recovery is roll-forward under the rules
+above. That is stated here rather than implied, because a check that cannot
+revert must not be mistaken for one that can.

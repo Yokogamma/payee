@@ -850,6 +850,16 @@ export const V3_PAUSE_META_KEY = 'v3-uploads-paused';
 /** Independent marker for the SAFEBOX kill switch: pausing one version must
  *  never stop the other, so the two never share a key or a lift condition. */
 export const V4_PAUSE_META_KEY = 'v4-uploads-paused';
+/**
+ * The GLOBAL kill switch marker — its OWN key, not the two version ones.
+ *
+ * Writing v3+v4 instead would still leave v1/v2 uploading: the queue only
+ * consults a version marker for v3/safebox items, so a global 503 would stop
+ * part of the backlog and let the rest keep spending the per-IP budget against
+ * a worker that refuses everything. The global pause is a different STATE, so
+ * it gets a different key and its own gate before every dispatch.
+ */
+export const GLOBAL_PAUSE_META_KEY = 'uploads-paused';
 
 export interface V3PauseMeta {
   pausedAt: number;
@@ -876,6 +886,9 @@ export function readV3PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
 export function readV4PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
   return readPauseMeta(V4_PAUSE_META_KEY);
 }
+export function readGlobalPauseMeta(): Promise<PauseMeta | 'malformed' | null> {
+  return readPauseMeta(GLOBAL_PAUSE_META_KEY);
+}
 
 /**
  * Persist a vN_disabled upload failure AND the pause marker in ONE transaction
@@ -890,7 +903,7 @@ export function readV4PauseMeta(): Promise<PauseMeta | 'malformed' | null> {
  * vN_disabled regardless of what happened to the row.
  */
 async function commitPausedFailure(
-  key: string,
+  keys: readonly string[],
   noteId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
@@ -902,7 +915,13 @@ async function commitPausedFailure(
     if (fresh?.terminalError === undefined) {
       await syncStore.put(buildRecord(fresh));
     }
-    await tx.objectStore('meta').put({ pausedAt } satisfies PauseMeta, key);
+    // All markers in the SAME transaction: the global kill switch pauses every
+    // version at once, and writing the two halves separately would reopen the
+    // crash window this function exists to close.
+    const metaStore = tx.objectStore('meta');
+    for (const key of keys) {
+      await metaStore.put({ pausedAt } satisfies PauseMeta, key);
+    }
     await tx.done;
   } catch (e) {
     // Same rollback discipline as saveNoteWithSync: an error on the SECOND put
@@ -918,14 +937,34 @@ export function commitV3PausedFailure(
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure(V3_PAUSE_META_KEY, noteId, buildRecord, pausedAt);
+  return commitPausedFailure([V3_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
 }
 export function commitV4PausedFailure(
   noteId: string,
   buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
   pausedAt: number,
 ): Promise<void> {
-  return commitPausedFailure(V4_PAUSE_META_KEY, noteId, buildRecord, pausedAt);
+  return commitPausedFailure([V4_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
+}
+
+/**
+ * The GLOBAL kill switch (503 {code:'uploads_disabled'}) pauses EVERY version.
+ *
+ * It is not «v3 and v4 happen to both be off»: the worker refuses v1–v4 alike,
+ * before the body is even read. Without this the queue would keep marching
+ * through the backlog, burning the per-IP budget against a worker that answers
+ * 503 to all of it — and the incident lever would not actually stop anything.
+ *
+ * Both markers are set, so the existing resume path applies unchanged: they
+ * lift only once /health reports the version usable again, and after PR-3a
+ * that verdict already requires the global `uploads` flag to be true.
+ */
+export function commitGlobalPausedFailure(
+  noteId: string,
+  buildRecord: (fresh: SyncRecord | undefined) => SyncRecord,
+  pausedAt: number,
+): Promise<void> {
+  return commitPausedFailure([GLOBAL_PAUSE_META_KEY], noteId, buildRecord, pausedAt);
 }
 
 /**
@@ -968,6 +1007,9 @@ async function clearUploadsPaused(
 
 export function clearV3UploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
   return clearUploadsPaused(V3_PAUSE_META_KEY, expectedPausedAt);
+}
+export function clearGlobalUploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
+  return clearUploadsPaused(GLOBAL_PAUSE_META_KEY, expectedPausedAt);
 }
 export function clearV4UploadsPaused(expectedPausedAt: number | 'any'): Promise<boolean> {
   return clearUploadsPaused(V4_PAUSE_META_KEY, expectedPausedAt);

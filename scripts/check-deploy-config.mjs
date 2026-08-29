@@ -30,12 +30,21 @@
 
 import { AUTO_ALLOWED_WORKER_ORIGINS } from '../worker/scripts/smoke-target.mjs';
 import { parseTrustedOwners } from './trusted-owners-parse.mjs';
+import { parseIndexSources, parseOriginList } from './gateways-parse.mjs';
+import {
+  EXPECTED_PAYLOAD_CSV,
+  EXPECTED_STATUS_CSV,
+  INDEX_SOURCES as EXPECTED_INDEX_SOURCES,
+} from './gateway-pins.mjs';
 
 export const DEPLOY_VARS = [
   'CF_PAGES_PROJECT',
   'VITE_PROXY_URL',
   'VITE_TRUSTED_OWNERS',
   'CLOUDFLARE_ACCOUNT_ID',
+  'VITE_STATUS_GATEWAYS',
+  'VITE_PAYLOAD_GATEWAYS',
+  'VITE_INDEX_SOURCES',
 ];
 
 /**
@@ -55,6 +64,21 @@ export const EXPECTED = {
   VITE_PROXY_URL: { equals: AUTO_ALLOWED_WORKER_ORIGINS[0] },
   VITE_TRUSTED_OWNERS: { mustInclude: 'Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE' },
   CLOUDFLARE_ACCOUNT_ID: null,
+  // ── Gateway sets: pinned EXACTLY, not merely present (D1/D7) ──
+  //
+  // Presence alone would let a Settings edit point a stable Owner-Hash, a
+  // stable IP and every txId this vault asks about at hosts nobody approved —
+  // and the CSP would allow it, because the CSP is generated from the same
+  // edited value. Comparison is on the NORMALIZED list, so a trailing slash or
+  // a repeated entry is not a difference, while a changed SET is.
+  VITE_STATUS_GATEWAYS: { equalsOrigins: EXPECTED_STATUS_CSV, ordered: false },
+  // ORDER matters here and is part of the pin: the pool is tried in sequence,
+  // and §2.1 approved this sequence (arweave.net first, slower mirrors after).
+  VITE_PAYLOAD_GATEWAYS: { equalsOrigins: EXPECTED_PAYLOAD_CSV, ordered: true },
+  // Groups AND the order within them are pinned: the grouping records which
+  // endpoints are transport-fallbacks of ONE logical index rather than
+  // independent opinions, which is what PR-4 counts completeness over.
+  VITE_INDEX_SOURCES: { equalsIndexSources: EXPECTED_INDEX_SOURCES },
 };
 
 /**
@@ -76,6 +100,33 @@ export function checkDeployConfig(env, required = DEPLOY_VARS) {
     if (expected.equals !== undefined && value !== expected.equals) {
       problems.push(`${name} does not equal the repo-pinned expected value (${expected.equals})`);
     }
+    if (expected.equalsOrigins !== undefined) {
+      const actual = parseOriginList(value);
+      const wanted = parseOriginList(expected.equalsOrigins);
+      const same = expected.ordered
+        ? actual.join(',') === wanted.join(',')
+        : [...actual].sort().join(',') === [...wanted].sort().join(',');
+      if (!same) {
+        problems.push(
+          `${name} does not match the repo-pinned gateway set` +
+            `${expected.ordered ? ' (order is part of the pin)' : ''}: ${expected.equalsOrigins}`,
+        );
+      }
+      continue;
+    }
+
+    if (expected.equalsIndexSources !== undefined) {
+      const actual = JSON.stringify(parseIndexSources(value));
+      const wanted = JSON.stringify(parseIndexSources(expected.equalsIndexSources));
+      if (actual !== wanted) {
+        problems.push(
+          `${name} does not match the repo-pinned index sources (groups and order ` +
+            `are part of the pin): ${expected.equalsIndexSources}`,
+        );
+      }
+      continue;
+    }
+
     if (expected.mustInclude !== undefined) {
       let owners;
       try {
