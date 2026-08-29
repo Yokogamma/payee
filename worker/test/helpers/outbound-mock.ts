@@ -38,6 +38,14 @@ export interface OutboundRoute {
   lastAuthorization?: string;
 }
 
+/** Status origins configured for the test isolates (vitest*.config.mts). */
+export const STATUS_ORIGINS = ['https://arweave.net', 'https://g2.test'] as const;
+
+/** Matches "<origin>/tx/<txId>/status", with the origin's dots escaped. */
+export function statusUrlRe(origin: string, txId: string): RegExp {
+  return new RegExp('^' + origin.replace(/\./g, '\\.') + '/tx/' + txId + '/status$');
+}
+
 export function setupOutboundMock() {
   const outboundRoutes: OutboundRoute[] = [];
 
@@ -83,7 +91,22 @@ export function setupOutboundMock() {
     expect(pending, `unconsumed outbound mocks: ${pending.join('; ')}`).toEqual([]);
   });
 
-  return { mockRoute };
+  /**
+   * Register the SAME status answer on EVERY configured status origin.
+   *
+   * PR-3a probes the whole pool and the dead verdict requires unanimity, so a
+   * test that mocked a single host would describe a PARTIAL set — which can
+   * only ever produce `unavailable`, never the `dead` these suites are about.
+   */
+  function mockStatusOnAll(
+    txId: string, status: number, body: string,
+    opts: { delayMs?: number; makeBody?: () => BodyInit } = {},
+  ): OutboundRoute[] {
+    return STATUS_ORIGINS.map(origin =>
+      mockRoute('GET', statusUrlRe(origin, txId), status, body, 1, opts));
+  }
+
+  return { mockRoute, mockStatusOnAll };
 }
 
 // ─── Shared crypto helpers for signed-request builders ──────────────
