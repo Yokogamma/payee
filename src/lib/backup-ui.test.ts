@@ -152,11 +152,15 @@ describe('size is stated in the units the cap is charged in (D17)', () => {
     const notice = sizeNotice(Math.ceil(BACKUP_CAP_BYTES * BACKUP_NEAR_CAP_FRACTION), false);
     expect(notice.warning).toContain('приближается к пределу');
     expect(notice.overCap).toBe(false);
-    // And it says what «near the ceiling» actually costs — measured, not
-    // guessed (step 13): seconds of frozen interface and about a gigabyte of
-    // peak memory. Learning that by watching a phone kill the tab is the
-    // wrong way to learn it, and the warning exists to prevent exactly that.
+    // And it says what «near the ceiling» actually costs — measured in a
+    // browser, not inferred (step 13): about a second and a half, a visible
+    // pause, and close to a gigabyte of memory. Learning that by watching a
+    // phone kill the tab is the wrong way to learn it.
     expect(notice.warning).toContain('на телефоне');
+    expect(notice.warning).toContain('подвисает');
+    // NOT «несколько секунд»: the browser is four times faster than Node, and
+    // an overstatement here is the kind a user stops believing.
+    expect(notice.warning).not.toContain('несколько секунд');
   });
 
   it('an over-cap measurement is over cap even if the NUMBER looks fine', () => {
