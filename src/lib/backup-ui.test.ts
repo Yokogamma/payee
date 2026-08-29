@@ -20,6 +20,7 @@ import {
   importSummary,
   sizeNotice,
   BACKUP_NEAR_CAP_FRACTION,
+  verifySummary,
   INCOMPLETE_SOURCE_WARNING,
   PHASE_ONE_SCOPE,
   VIEWER_INSTRUCTION,
@@ -341,5 +342,77 @@ describe('failures become sentences that claim nothing extra', () => {
     const message = backupErrorMessage(new Error('QuotaExceededError'));
     expect(message).toContain('Файл копии не изменялся');
     expect(message).not.toMatch(/поврежд/i);
+  });
+});
+
+describe('a verify has THREE answers, not two', () => {
+  it('a healthy file is simply in order', () => {
+    const summary = verifySummary(VERIFY(), at);
+    expect(summary.tone).toBe('ok');
+    expect(summary.issues).toEqual([]);
+  });
+
+  it('«intact but narrower» is its own answer, not a defect', () => {
+    // `report.ok` folds three questions into one boolean — intact, complete,
+    // every record readable — which is right for the freshness marker and
+    // wrong for a person. Nothing about this file is broken, and putting it in
+    // the same red box as a corrupted one invites its owner to throw away the
+    // best copy they have.
+    const summary = verifySummary(VERIFY({ ok: false, incompleteRestore: true }), at);
+
+    expect(summary.tone).toBe('incomplete');
+    expect(summary.headline).toContain('цел и читается целиком');
+    expect(summary.headline).toContain('ЗАВЕДОМО НЕПОЛОН');
+    expect(summary.headline).not.toContain('проблемы');
+  });
+
+  it('a damaged record is NOT told to wait for a newer version', () => {
+    // The advice that used to be given for every failure. It is true for one
+    // reason only — a record this build is too old to read — and false for
+    // damage, which no version will ever open.
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      issues: [{ kind: 'note', id: 'a', problem: 'undecryptable' }],
+    }), at);
+
+    expect(summary.tone).toBe('bad');
+    expect(summary.issues).toHaveLength(1);
+    expect(summary.issues[0].text).toContain('не лечится обновлением');
+    expect(summary.issues[0].text).not.toContain('более новая версия приложения сможет');
+  });
+
+  it('…but a record from a NEWER build is, and blocks', () => {
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      issues: [{ kind: 'note', id: 'a', problem: 'unsupported_version' }],
+    }), at);
+
+    expect(summary.issues[0].blocking).toBe(true);
+    expect(summary.issues[0].text).toContain('более новая версия приложения');
+  });
+
+  it('a broken graph gets the reason that fits it, and no upgrade advice', () => {
+    const summary = verifySummary(VERIFY({
+      ok: false,
+      issues: [{ kind: 'note', id: 'a', problem: 'chain', detail: 'missing_prev' }],
+    }), at);
+
+    expect(summary.issues[0].text).toContain('несходящимися связями');
+    expect(summary.issues[0].text).not.toContain('обновит');
+  });
+});
+
+describe('the sticky marker is described as sticky', () => {
+  it('does not promise a removal the import can never perform', () => {
+    // `incompleteRestore` is cleared only when the import STARTED with the
+    // mark absent — so once a store carries it, no repeat import takes it off.
+    // Telling the user «повторите импорт и пометка снимется» sends them to do
+    // something that cannot work, twice, on the data they are most worried
+    // about.
+    const summary = importSummary(REPORT({ added: 1, quotaStopped: 1 }, true), false);
+
+    expect(summary.storeIncomplete).toContain('ЛИПКАЯ');
+    expect(summary.storeIncomplete).toContain('чистом устройстве');
+    expect(summary.storeIncomplete).not.toContain('пометка снимется, когда');
   });
 });

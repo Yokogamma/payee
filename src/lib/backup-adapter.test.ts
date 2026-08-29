@@ -487,18 +487,26 @@ describe('what the block asks before offering anything', () => {
 });
 
 describe('the session carries permission to derive, never the seed itself', () => {
-  it('holds no string that could be a seed phrase', async () => {
+  it('the vault it holds exposes no seed to hold', async () => {
     // Stage A and stage B are separated by a human decision, so the session
     // sits in React state for as long as the preview is on screen — through a
     // lock, through `pagehide`, past the store's synchronous wipe of every
     // vault reference. That wipe is the app's actual guarantee about the seed;
     // a copy living outside it would quietly make the guarantee false.
-    const { file } = countedFile(await container([await makeNote()]));
-    const prepared = await prepareImport(from(vault()), file, storage().storage);
+    //
+    // Asserted on the CONTRACT rather than by serializing the session: a
+    // private `#field` is invisible to `JSON.stringify`, so a scan of the
+    // serialized object would stay green no matter what the session held —
+    // a test that could not fail, about the thing that matters most here.
+    const v = vault();
+    expect(Object.keys(v)).not.toContain('mnemonic');
+    expect(Object.values(v).some(x => typeof x === 'string' && x.includes('abandon'))).toBe(false);
 
-    const reachable = JSON.stringify(prepared, (_k, v) => (typeof v === 'function' ? undefined : v));
-    expect(reachable).not.toContain('abandon');
-    expect(reachable).not.toContain(MNEMONIC);
+    // And what the derivation hands over is opaque by construction: keys are
+    // imported non-extractable (`crypto.ts`), so possession of them is not
+    // possession of the phrase.
+    const keys = await v.deriveKeys();
+    expect(Object.values(keys).every(k => (k as CryptoKey).extractable === false)).toBe(true);
   });
 
   it('derives at APPLY time, so a vault that has since been locked cannot produce keys', async () => {

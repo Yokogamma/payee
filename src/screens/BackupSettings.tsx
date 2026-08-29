@@ -10,11 +10,13 @@ import {
   importPreview,
   importSummary,
   sizeNotice,
+  verifySummary,
   PHASE_ONE_SCOPE,
   VIEWER_INSTRUCTION,
   type BackupFreshness,
   type ImportPreview,
   type ImportSummary,
+  type VerifySummary,
 } from '../lib/backup-ui';
 import type { PreparedImport } from '../lib/backup-adapter';
 import type { VerifyReport } from '../lib/backup-actions';
@@ -65,7 +67,11 @@ export function BackupSettings() {
     setFreshness,
     // A chip that cannot be read is a chip that says «не создавалась» — the
     // conservative reading, and never a reason to take the block away.
-    () => setFreshness({}),
+    // A read that FAILED is «unknown», not «nothing was ever exported». The
+    // adapter already draws that distinction for a marker it cannot believe;
+    // turning a rejection into `{}` here threw it away again and put the same
+    // false claim back on screen.
+    () => setFreshness({ unreadable: true }),
   ), [readBackupFreshness]);
 
   useEffect(() => {
@@ -97,6 +103,10 @@ export function BackupSettings() {
     // they did.
     setPending(null);
     setVerified(null);
+    // …and the previous import's report. Leaving it up means a verify or an
+    // export shows its own result NEXT TO the outcome of an import that
+    // finished minutes ago, and the two read as one screen.
+    setSummary(null);
     try {
       await work();
     } catch (e) {
@@ -255,7 +265,7 @@ export function BackupSettings() {
       {error && <div className="error-msg" role="alert">{error}</div>}
       {notice && <div className="settings-info" role="status">{notice}</div>}
 
-      {verified && <VerifyResult report={verified} />}
+      {verified && <VerifyResult summary={verifySummary(verified)} />}
 
       {pending && (
         <ImportPreviewPanel
@@ -273,23 +283,25 @@ export function BackupSettings() {
   );
 }
 
-/** The dry-run's answer. `ok` already means intact AND complete AND every
- *  record readable, so anything else gets the warning rather than a tick. */
-function VerifyResult({ report }: { report: VerifyReport }) {
-  if (report.ok) {
-    return (
-      <div className="settings-info" role="status">
-        Файл проверен: {report.counts.notes} заметок, {report.counts.safebox} записей сейфа.
-        Повреждений не найдено.
-      </div>
-    );
-  }
+/**
+ * The dry-run's answer — THREE outcomes, not two.
+ *
+ * `report.ok` folds «intact», «complete» and «every record readable» into one
+ * boolean, which is right for deciding whether to write a freshness marker and
+ * wrong for talking to a person. A file that is cryptographically perfect and
+ * merely narrower than the vault it came from used to land in the same red box
+ * as a corrupted one, under the same advice to look for a newer app version —
+ * advice true for exactly one of the reasons a file can fail.
+ */
+function VerifyResult({ summary }: { summary: VerifySummary }) {
+  const blocking = summary.tone !== 'ok';
   return (
-    <div className="error-msg" role="alert">
-      Файл проверен и НЕ в порядке. Не удаляйте его: часть данных может быть восстановлена, а более
-      новая версия приложения может понять больше.
-      {report.incompleteRestore && ' Кроме того, эта копия заведомо неполна.'}
-      {report.issues.length > 0 && ` Записей с проблемами: ${report.issues.length}.`}
+    <div
+      className={blocking ? 'error-msg' : 'settings-info'}
+      role={blocking ? 'alert' : 'status'}
+    >
+      <div>{summary.headline}</div>
+      {summary.issues.map(issue => <div key={issue.text}>{issue.text}</div>)}
     </div>
   );
 }

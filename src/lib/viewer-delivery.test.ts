@@ -111,6 +111,32 @@ describe('a body too large to be a viewer is refused before it is trusted', () =
     await expect(fetchBackupViewer(d)).rejects.toMatchObject({ reason: 'unavailable' });
   });
 
+  it('CANCELS the stream instead of draining it', async () => {
+    // The bound has to be applied while the body arrives, not after: a check
+    // that runs once `text()` has resolved is a check the memory already paid
+    // for — on the one path whose premise is that the origin may be hostile.
+    let cancelled = false;
+    let pushed = 0;
+    const chunk = new Uint8Array(256 * 1024);
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pushed += 1;
+        controller.enqueue(chunk);
+      },
+      cancel() { cancelled = true; },
+    });
+    const d = deps({
+      fetch: vi.fn(async () => new Response(body, { status: 200 })) as unknown as typeof globalThis.fetch,
+    });
+
+    await expect(fetchBackupViewer(d)).rejects.toMatchObject({ reason: 'unavailable' });
+
+    expect(cancelled).toBe(true);
+    // Five 256 KB chunks is the first total past 1 MiB — proof it stopped
+    // rather than read an endless body to the end.
+    expect(pushed).toBeLessThanOrEqual(6);
+  });
+
   it('refuses actual bytes past the ceiling even when the header lied', async () => {
     // A hostile server controls its own headers, so the declared size is a
     // courtesy and the measured size is the rule.
