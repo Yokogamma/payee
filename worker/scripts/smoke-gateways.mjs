@@ -95,6 +95,16 @@ export function checkHealth(body, expected) {
         `profile "${expected.profile}" requires ${JSON.stringify(profile.statusQuorumPolicy)}`,
     );
   }
+  // EXACT equality again, and it cuts both ways: a normal build that does not
+  // claim the capability has not shipped what the release is for, and an
+  // emergency build that DOES claim it is mislabelled — the client would then
+  // trust a fingerprint comparison the build never performs.
+  if (body.semanticIdempotency !== profile.semanticIdempotency) {
+    problems.push(
+      `semanticIdempotency is ${JSON.stringify(body.semanticIdempotency)}, ` +
+        `profile "${expected.profile}" requires ${JSON.stringify(profile.semanticIdempotency)}`,
+    );
+  }
   if (body.statusGatewaysHash !== expected.statusGatewaysHash) {
     problems.push('statusGatewaysHash does not match the set configured in wrangler.toml');
   }

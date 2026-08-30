@@ -1522,16 +1522,39 @@ the next newer client deletes it on its first read, by the rule above.
 
 Restore trusts ONLY transactions signed by the wallets pinned in the client's
 `VITE_TRUSTED_OWNERS`. Rotating the server wallet in the wrong order makes old
-notes unrecoverable for every client built without the old owner. Order:
+notes unrecoverable for every client built without the old owner.
 
-1. **Add** the NEW wallet's address to `VITE_TRUSTED_OWNERS` (comma-separated,
-   old + new) in the deploy secrets.
-2. **Deploy the client** with both owners and VERIFY restore returns notes
+> **Updated for D2 (semantic idempotency).** There are now THREE places that
+> hold this list, not one, and the worker has a hard runtime dependency on it:
+> `/upload` answers 503 while its own signing wallet is outside `TRUSTED_OWNERS`.
+> Switching `ARWEAVE_JWK` first therefore takes uploads DOWN rather than merely
+> degrading restore. The order below is unchanged in spirit and now has one more
+> step before the switch.
+>
+>  - `scripts/owner-pins.mjs` — the repo-pinned HISTORICAL registry. Append-only;
+>    `scripts/check-trusted-owners.mjs` refuses a deploy whose configured sets do
+>    not contain all of it, and refuses a client/worker divergence.
+>  - `worker/wrangler.toml` — `TRUSTED_OWNERS` in **both** tables (`[vars]` and
+>    `[env.staging.vars]`; a named environment inherits nothing).
+>  - `VITE_TRUSTED_OWNERS` — the client build.
+
+Order:
+
+1. **Add** the NEW wallet's address to `scripts/owner-pins.mjs` (both
+   `HISTORICAL_OWNERS` and `NEVER_REMOVE`) **and** to both `TRUSTED_OWNERS`
+   tables in `worker/wrangler.toml`, in one reviewed pull request.
+2. **Add** it to `VITE_TRUSTED_OWNERS` (comma-separated, old + new) in the
+   deploy variables.
+3. **Deploy the WORKER** with both owners. Until this lands, the worker cannot
+   authenticate publications signed by the new wallet.
+4. **Deploy the client** with both owners and VERIFY restore returns notes
    posted under the old wallet.
-3. **Only then** replace `ARWEAVE_JWK` on the Worker with the new wallet.
-4. **Never remove old owners** from `VITE_TRUSTED_OWNERS` — notes posted under
-   them stop restoring the moment the address is dropped.
-5. **Do NOT rotate `RECOVERY_HMAC_SECRET` together with the JWK** — outstanding
+5. **Only then** replace `ARWEAVE_JWK` on the Worker with the new wallet.
+6. **Never remove old owners** — from any of the three places. Transactions
+   signed by a dropped address stay on chain forever and become permanently
+   unverifiable: restore loses them, and `/upload` starts answering
+   `id_payload_conflict` for records that point at them.
+7. **Do NOT rotate `RECOVERY_HMAC_SECRET` together with the JWK** — outstanding
    recovery tokens would stop verifying and fail closed (see Required secrets).
 
 ## Revocation SLO (accepted residual risk)
@@ -1808,3 +1831,72 @@ Cloudflare activates a version before any smoke can answer. A red smoke
 therefore does not undo anything — recovery is roll-forward under the rules
 above. That is stated here rather than implied, because a check that cannot
 revert must not be mistaken for one that can.
+
+## D2 «Семантическая идемпотентность» — release runbook (worker-only)
+
+The worker release that makes `/upload` compare a publication FINGERPRINT before
+handing back a historical `txId`. It is the precondition the backup track's D18
+names: this must ship and soak BEFORE the backup stack merges, because the
+client floor `client-b1` depends on the capability existing.
+
+### What changes on the wire
+
+- Every successful `/upload` answer carries `semanticIdempotency: 1` and
+  `Cache-Control: no-store`. Additive — an older client ignores both.
+- A repeat under the SAME bytes answers `deduped: true`.
+- A repeat under DIFFERENT bytes answers **409 `{code:'id_payload_conflict'}`**
+  instead of a 200 with the old `txId`. This is the point of the release.
+- `/health` gains `semanticIdempotency: 1`, and the deploy smoke now REQUIRES it
+  under the `normal` profile (and requires its ABSENCE under `emergency`).
+
+### New non-secret configuration — already in the repo, nothing to set
+
+Both live in `worker/wrangler.toml`, in BOTH tables, and are gated on every
+deploy. Neither is an Environment variable, so there is nothing to click:
+
+- `TRUSTED_OWNERS` — the historical wallet list D9 authenticates against.
+  Contents pinned in `scripts/owner-pins.mjs`; `check-trusted-owners.mjs`
+  refuses a deploy that drops any of it or that disagrees with the client.
+- `PAYLOAD_GATEWAYS` — the pool `/tx/<id>` and `/raw/<id>` are read from,
+  compared against the pin **in order** by `check-gateways-vs-worker.mjs`.
+
+### Order
+
+1. Merge the PR to `main` (branch protection; the gate runs on the candidate).
+2. Dispatch **Deploy Worker (proxy) — dev** with the merged SHA as `candidate`.
+   `WORKER_FLOOR_SHA` is NOT raised yet — see below.
+3. Watch the post-deploy smoke: it now fails a build that does not advertise
+   `semanticIdempotency`, so a green smoke is the proof the capability shipped.
+4. **Soak.** The backup stack stays unmerged and Pages undeployed throughout.
+5. Record the release row below with the real SHA, run id and version id.
+
+### The floor is NOT raised by this release
+
+Deliberately, and it is the one instruction here that is easy to get backwards.
+`WORKER_FLOOR_SHA` rises **immediately before the import flip**, not now
+(D2a): until a client with `BACKUP_IMPORT_ENABLED=true` exists, nothing depends
+on semantic idempotency, and raising the floor early would remove the safe
+rollback window for a defect found during the very soak this release is having.
+
+Raising it is also a REVIEWED change to `MINIMUM_FLOOR` in
+`scripts/check-worker-floor.mjs`, not only an Environment edit — the pin is what
+stops the variable being edited back down.
+
+### Rollback
+
+Below this release the worker answers `exists` for a changed payload again. That
+is tolerable ONLY while no released client has import enabled — which is exactly
+the window this release is deployed into, and exactly what the floor closes
+later. After the import flip, rollback below it is forbidden and the gate
+enforces it.
+
+A rollback target must be the trusted head or a SHA listed in
+`scripts/release-allowlist.mjs` (empty by default): a tag grants nothing since
+PR-3a, so a no-op redeploy of the currently-live worker costs one reviewed pull
+request.
+
+### Release row
+
+| tag | SHA | run id | worker version id | smoked |
+|---|---|---|---|---|
+| _(fill on deploy)_ | | | | |

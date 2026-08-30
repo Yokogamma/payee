@@ -22,6 +22,7 @@ const healthy = (over = {}) => ({
   v3Uploads: true,
   v4Uploads: true,
   statusQuorumPolicy: DEPLOY_PROFILES.normal.statusQuorumPolicy,
+  semanticIdempotency: DEPLOY_PROFILES.normal.semanticIdempotency,
   statusGatewaysCount: 5,
   statusGatewaysHash: HASH,
   releaseSha: SHA,
@@ -196,5 +197,45 @@ describe('runAttempts', () => {
       sleep: noSleep,
     });
     expect(result).toEqual({ ok: false, problems: ['ECONNRESET'] });
+  });
+});
+
+describe('the capability the release exists for (D2a)', () => {
+  it('a normal build that does not claim it FAILS the smoke', () => {
+    // Otherwise a deploy could report success while shipping a worker that
+    // still hands out a historical txId for bytes nobody compared.
+    const verdict = checkHealth(healthy({ semanticIdempotency: undefined }), expected);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/semanticIdempotency is undefined/);
+  });
+
+  it('a value other than 1 is refused, not treated as "at least"', () => {
+    expect(checkHealth(healthy({ semanticIdempotency: 2 }), expected).ok).toBe(false);
+    expect(checkHealth(healthy({ semanticIdempotency: true }), expected).ok).toBe(false);
+    expect(checkHealth(healthy({ semanticIdempotency: '1' }), expected).ok).toBe(false);
+  });
+
+  it('an EMERGENCY build must NOT claim it', () => {
+    // An emergency release is a pre-capability build. Letting it advertise the
+    // marker would tell a client to trust a comparison that build never makes.
+    const emergency = { ...expected, profile: 'emergency' };
+    const body = healthy({
+      statusQuorumPolicy: DEPLOY_PROFILES.emergency.statusQuorumPolicy,
+      uploads: false, v3Uploads: false, v4Uploads: false,
+      semanticIdempotency: 1,
+    });
+    const verdict = checkHealth(body, emergency);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/semanticIdempotency is 1/);
+  });
+
+  it('an emergency build WITHOUT it passes', () => {
+    const emergency = { ...expected, profile: 'emergency' };
+    const body = healthy({
+      statusQuorumPolicy: DEPLOY_PROFILES.emergency.statusQuorumPolicy,
+      uploads: false, v3Uploads: false, v4Uploads: false,
+      semanticIdempotency: undefined,
+    });
+    expect(checkHealth(body, emergency)).toEqual({ ok: true, problems: [] });
   });
 });

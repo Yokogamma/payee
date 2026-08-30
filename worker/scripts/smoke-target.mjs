@@ -87,10 +87,20 @@ export const EXPECTED_VERSIONS = Object.freeze(['1', '2', '3', '4']);
 export const DEPLOY_PROFILES = Object.freeze({
   normal: Object.freeze({
     statusQuorumPolicy: 'all-configured-v1',
+    // The capability a client with import depends on (D2a): this build compares
+    // a publication fingerprint before handing back a historical txId.
+    //
+    // Asserted by the smoke for the same reason `statusQuorumPolicy` is: the
+    // release exists BECAUSE of this property, and a deploy that cannot prove it
+    // shipped proves nothing at all. `undefined` under the emergency profile is
+    // not an omission but the truthful value — an emergency build predates the
+    // capability and must not appear to carry it.
+    semanticIdempotency: 1,
     requireUploadsOff: false,
   }),
   emergency: Object.freeze({
     statusQuorumPolicy: 'legacy-single-v0',
+    semanticIdempotency: undefined,
     requireUploadsOff: true,
   }),
 });
