@@ -20,6 +20,7 @@ import {
   UnsupportedNoteVersionError,
 } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
+import { BACKUP_IMPORT_ENABLED } from './flags';
 import { INDEX_QUERY_URL, PAYLOAD_GATEWAYS, QUORUM_POLICY_ID, STATUS_GATEWAYS } from './gateways';
 import { serializeStatusOrigins } from './gateways-parse';
 import { statusVerdict, toTxStatusKind, type StatusVote } from './status-quorum';
@@ -192,6 +193,13 @@ export type UploadResult =
   | { kind: 'rate_limited'; error: string }
   | { kind: 'not_registered'; error: string }
   | { kind: 'in_progress'; error: string }
+  /** 409 {code:'id_payload_conflict'} — this noteId is already published with
+   *  DIFFERENT bytes (D2). TERMINAL: retrying can only reproduce the same
+   *  answer. Deliberately distinct from the generic 409, which stays
+   *  `in_progress`: reading one as the other means an endless retry of a
+   *  guaranteed refusal. The conflicting txId is NOT carried into the record —
+   *  it describes bytes that are not ours. */
+  | { kind: 'publication_conflict'; error: string }
   | { kind: 'unavailable'; error: string } // 503 — retryable (recheck deferred / gateway)
   /** 503 {code:'v3_uploads_disabled'} — the worker's v3 kill switch is on.
    *  NOT an error state: the client pauses its whole v3 queue (persisted
@@ -476,11 +484,38 @@ export async function uploadViaProxy(
         'X-Public-Key': publicKeyB64,
         'X-Signature': signature,
       },
+      // Both halves refuse caching (D2a). The worker sends `Cache-Control:
+      // no-store`; this is the other half. A replayed answer would replay its
+      // capability claim and its txId with it — a cached success is
+      // indistinguishable from a fresh one, and this is the response the whole
+      // fingerprint protocol exists to make trustworthy.
+      cache: 'no-store',
       body: bodyText,
     });
 
     if (response.ok) {
       const data = await response.json();
+      // D2a — the ATOMIC half of the worker-floor guarantee.
+      //
+      // A one-off /health probe cannot protect against a rollback that happens
+      // AFTER it: the client would have asked the safe worker and then stored a
+      // txId handed out by the old one. So the proof travels in the answer, and
+      // a build that depends on it refuses to record anything without it.
+      //
+      // Gated on BACKUP_IMPORT_ENABLED deliberately, not applied always: until
+      // a released client has import on, nothing depends on semantic
+      // idempotency, and refusing here would remove the safe worker-rollback
+      // window D2a keeps open until the import flip.
+      //
+      // The outcome is `unavailable`, i.e. RETRYABLE. It is not the record's
+      // fault and not terminal — the worker is simply below the floor, and the
+      // right response is to keep the row and wait, exactly as for a 503.
+      if (BACKUP_IMPORT_ENABLED && data.semanticIdempotency !== 1) {
+        return {
+          kind: 'unavailable',
+          error: 'worker does not attest semanticIdempotency — refusing to record an unproven txId',
+        };
+      }
       // committed:false means the TX posted but the server's idempotency record
       // isn't confirmed yet → caller keeps needsRecheck.
       return {
@@ -495,7 +530,19 @@ export async function uploadViaProxy(
     const text = await response.text();
     if (response.status === 429) return { kind: 'rate_limited', error: text };
     if (response.status === 403) return { kind: 'not_registered', error: text };
-    if (response.status === 409) return { kind: 'in_progress', error: text };
+    if (response.status === 409) {
+      // The machine code is read BEFORE the generic meaning. A conflict read as
+      // «already in progress» would be retried forever against an answer that
+      // can never change.
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (typeof parsed === 'object' && parsed !== null
+            && (parsed as { code?: unknown }).code === 'id_payload_conflict') {
+          return { kind: 'publication_conflict', error: text };
+        }
+      } catch { /* not JSON → the generic in-progress 409 */ }
+      return { kind: 'in_progress', error: text };
+    }
     if (response.status === 503) {
       // The kill switches answer 503 with a machine-readable JSON code; a
       // plain-text 503 stays the generic retryable 'unavailable'.

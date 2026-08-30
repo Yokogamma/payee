@@ -556,3 +556,55 @@ describe('runUploadAttempt — uploads_disabled (GLOBAL kill switch)', () => {
     expect(h3.pausedCommits[0].markers).toEqual(['v3']);
   });
 });
+
+describe('publication_conflict — the id is spent, and the record says so', () => {
+  it('quarantines terminally and stops rechecking', async () => {
+    // Read as a generic 409 this would be `in_progress` and retried forever
+    // against an answer that can never change. The whole point of the typed
+    // code is that the queue converges instead.
+    const h = makeHarness({
+      result: { kind: 'publication_conflict', error: '{"code":"id_payload_conflict","txId":"TX-THEIRS"}' },
+    });
+
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    expect(outcome.kind).toBe('committed');
+    expect(h.row.value?.terminalError).toBe('publication_conflict');
+    expect(h.row.value?.needsRecheck).toBe(false);
+  });
+
+  it('does NOT record the conflicting txId', async () => {
+    // Storing it would write the exact binding the fingerprint protocol exists
+    // to prevent — payload B under transaction A — this time by the client.
+    const prev: SyncRecord = {
+      noteId: NOTE_ID, kind: 'note', txId: 'TX-OURS', status: 'accepted',
+      transport: 'proxy', updatedAt: NOW - 1,
+    };
+    const h = makeHarness({
+      prev,
+      result: { kind: 'publication_conflict', error: '{"code":"id_payload_conflict","txId":"TX-THEIRS"}' },
+    });
+
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    // The AUTHORITATIVE fields keep ours and gain nothing from the server.
+    expect(h.row.value?.txId).toBe('TX-OURS');
+    expect(h.row.value?.recovery?.txId).toBeUndefined();
+    // `lastError` carries the raw body, conflicting id included — deliberate,
+    // and the only place it may appear: storage.ts documents it as diagnostics.
+    // What must never happen is that id becoming the record's OWN txId.
+    expect(h.row.value?.lastError).toContain('TX-THEIRS');
+  });
+
+  it('a late conflict never lands on a row this attempt no longer owns (D14a)', async () => {
+    const h = makeHarness({
+      result: { kind: 'publication_conflict', error: 'conflict' },
+      takeoverDuringDispatch: true,
+    });
+
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    expect(h.staleCommits).toBe(1);
+    expect(h.row.value?.terminalError).toBeUndefined();
+  });
+});

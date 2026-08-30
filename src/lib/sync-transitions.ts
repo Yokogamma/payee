@@ -148,6 +148,42 @@ export function afterFailure(
  *  the (now-invalid) recovery hint are PRESERVED as evidence: the terminal row
  *  must keep everything a later seed-restore or operator reconciliation needs.
  *  Cleared ONLY by proof-bearing paths (see storage.ts save*WithSync). */
+/**
+ * The server refused to publish under this id: it already names DIFFERENT bytes
+ * (409 `id_payload_conflict`, D2).
+ *
+ * Terminal because retrying can only reproduce the same answer — the id is
+ * spent, on chain, forever. What is blocked is PUBLISHING, not reading: the
+ * local payload is untouched and the backup import may still repair it while
+ * this block stays in place.
+ *
+ * The conflicting txId is deliberately NOT written. It describes bytes that are
+ * not this record's, and storing it in `txId` would state the very binding the
+ * whole fingerprint protocol exists to prevent — «payload B ↔ transaction A»,
+ * this time recorded by the client itself. Whatever local txId the row already
+ * had is preserved as its own evidence.
+ */
+export function toPublicationConflict(
+  noteId: string,
+  kind: SyncKind,
+  prev: SyncRecord | undefined,
+  errText: string | undefined,
+  now: number,
+): SyncRecord {
+  return {
+    noteId,
+    kind,
+    txId: prev?.txId,
+    status: 'error',
+    transport: 'proxy',
+    lastError: errText,
+    updatedAt: now,
+    needsRecheck: false,
+    recovery: prev?.recovery,
+    terminalError: 'publication_conflict',
+  };
+}
+
 export function toRecoveryInvalidated(
   noteId: string,
   kind: SyncKind,

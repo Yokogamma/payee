@@ -36,6 +36,7 @@ import {
   toAccepted,
   afterInProgress,
   afterFailure,
+  toPublicationConflict,
   toRecoveryInvalidated,
 } from './sync-transitions';
 
@@ -357,6 +358,11 @@ export async function runUploadAttempt(
     } else {
       await deps.commitV4PausedFailure(id, attemptId, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
     }
+  } else if (result.kind === 'publication_conflict') {
+    // This id is already published with DIFFERENT bytes. PERMANENT: the answer
+    // cannot change, so retrying is an endless loop against a settled fact.
+    // The conflicting txId is not recorded — see toPublicationConflict.
+    await deps.commitResult(id, attemptId, fresh => toPublicationConflict(id, kind, fresh, result.error, deps.now()));
   } else if (result.kind === 'recovery_invalid') {
     // The server rejected the signed recovery proof (rotated key / forged
     // hint): PERMANENT quarantine instead of an endless recheck of a
