@@ -979,3 +979,224 @@ describe('Main — страница версии: разрешение адре�
     expect(window.location.hash).toBe('#/notes');
   });
 });
+
+/**
+ * Пункты §9 плана, которых не хватало в первом заходе.
+ *
+ * Все они про СТЫКИ: между двумя Back, между входом и выходом из указателя,
+ * между приходом версии и открытым редактором, между двумя режимами сверки.
+ * Каждый из них проверяет ровно одно место, где предыдущая редакция кода
+ * ошибалась бы молча.
+ */
+describe('Main — стыки страницы версии', () => {
+  function threeVersions(): NoteData[] {
+    return [
+      note({ id: 'root1', text: 'самая старая', fmt: 'plain', createdAt: 1000 }),
+      note({ id: 'v2', text: 'средняя', fmt: 'plain', rev: 2, root: 'root1', prev: 'root1', createdAt: 2000 }),
+      note({ id: 'v3', text: 'текущая', rev: 3, root: 'root1', prev: 'v2', createdAt: 3000 }),
+    ];
+  }
+  function withLateArrival(): NoteData[] {
+    return [
+      ...threeVersions(),
+      note({ id: 'late', text: 'опоздавшая', fmt: 'plain', rev: 2, root: 'root1', prev: 'root1', createdAt: 1500 }),
+    ];
+  }
+
+  const feed = () => document.querySelector('.notes-feed') as HTMLDivElement | null;
+  const backTo = (hash: string) => act(() => {
+    window.history.replaceState({ enSection: true }, '', hash);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  });
+
+  it('два Back со страницы версии: заметка, потом лента на прежнем месте — вход из ЛЕНТЫ', async () => {
+    h.store = makeStore(threeVersions());
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    feed()!.scrollTop = 800;
+
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('История версий (3)'));
+    await waitFor(() => expect(window.location.hash).toBe('#/notes/root1'));
+    await screen.findByRole('dialog', { name: 'История версий' });
+    fireEvent.click(screen.getByText(/Версия 1 из 3/));
+    expect(window.location.hash).toBe('#/notes/root1/v/1');
+
+    // Ради этого вход из ленты и открывает СНАЧАЛА заметку: иначе первый же
+    // Back ушёл бы в ленту под кнопкой «‹ Заметка».
+    backTo('#/notes/root1');
+    expect(document.querySelector('.note-reading')?.textContent).toContain('текущая');
+    expect(feed()).toBeNull();
+
+    backTo('#/notes');
+    expect(feed()).toBeTruthy();
+    expect(feed()?.scrollTop).toBe(800);
+  });
+
+  it('два Back со страницы версии: то же самое при входе из ЧИТАЛКИ', () => {
+    h.store = makeStore(threeVersions());
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    feed()!.scrollTop = 640;
+
+    fireEvent.click(screen.getByRole('button', { name: /^Открыть заметку от/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'История' }));
+    fireEvent.click(screen.getByText(/Версия 2 из 3/));
+    expect(window.location.hash).toBe('#/notes/root1/v/2');
+
+    backTo('#/notes/root1');
+    expect(feed()).toBeNull();
+    backTo('#/notes');
+    expect(feed()?.scrollTop).toBe(640);
+  });
+
+  it('после × указатель отдаёт фокус кнопке «История», а не роняет его в body', async () => {
+    // Вход из ленты: пункт меню, с которого пришли, размонтирован вместе с
+    // лентой, и `previous` у хука — это `document.body`, элемент подключённый
+    // и потому проходящий наивную проверку `isConnected`.
+    h.store = makeStore(threeVersions());
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByLabelText('Меню заметки'));
+    fireEvent.click(screen.getByText('История версий (3)'));
+    await waitFor(() => expect(window.location.hash).toBe('#/notes/root1'));
+    await screen.findByRole('dialog', { name: 'История версий' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
+    await waitFor(() => expect(document.activeElement)
+      .toBe(screen.getByRole('button', { name: 'История' })));
+  });
+
+  it('внеочередная версия не трогает ОТКРЫТЫЙ редактор и его буфер', () => {
+    // Адрес изнутри не переписывается именно ради этого: коррекция номера
+    // сменила бы ключ маршрута, а он сбрасывает диалоги и их буфер.
+    h.store = makeStore(threeVersions());
+    window.history.replaceState(null, '', '#/notes/root1/v/2');
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить' }));
+    const input = document.querySelector('.note-input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'недописанное' } });
+    input.focus();
+
+    h.store = makeStore(withLateArrival());
+    act(() => { rerender(<Main theme="system" onThemeChange={vi.fn()} />); });
+
+    expect(screen.getByRole('dialog', { name: 'Правка версии 2 из 3' })).toBeTruthy();
+    expect((document.querySelector('.note-input') as HTMLTextAreaElement).value)
+      .toBe('недописанное');
+    expect(document.activeElement).toBe(document.querySelector('.note-input'));
+    expect(window.location.hash).toBe('#/notes/root1/v/2');
+  });
+
+  it('«Проверить обновления» гасит действия страницы версии так же, как restore', () => {
+    // Второй режим сверки, отдельно: `checkForUpdates` делит `restoringRef` с
+    // restore, но `setRestoring` не зовёт вовсе — значит гейт, смотрящий
+    // только на `restoring`, пропустил бы доливаемые версии.
+    h.store = makeStore(threeVersions());
+    (h.store as ReturnType<typeof makeStore>).updateCheck = { status: 'checking', progress: null };
+    window.history.replaceState(null, '', '#/notes/root1/v/2');
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(screen.getByText('средняя')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Вернуть' })).toBeNull();
+
+    (h.store as ReturnType<typeof makeStore>).updateCheck =
+      { status: 'done', at: 1, addedNotes: 0, updatedNotes: 0, changedSafebox: 0, partial: false };
+    act(() => { rerender(<Main theme="system" onThemeChange={vi.fn()} />); });
+    expect(screen.getByRole('button', { name: 'Вернуть' })).toBeTruthy();
+  });
+
+  it('checking → error тоже отпускает удержанный адрес', () => {
+    // Провалившаяся проверка — такой же конец сверки, как успешная. Если бы в
+    // зависимостях каноникализатора стоял только `restoring`, мёртвый адрес
+    // остался бы в строке навсегда: `checking → error` не двигает ни hash, ни
+    // param, ни корень.
+    h.store = makeStore(threeVersions());
+    (h.store as ReturnType<typeof makeStore>).updateCheck = { status: 'checking', progress: null };
+    window.history.replaceState(null, '', '#/notes/no-such-id');
+    const { rerender } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(window.location.hash).toBe('#/notes/no-such-id');
+    expect(document.querySelector('.note-holding')).toBeTruthy();
+    expect(feed()).toBeNull();
+
+    (h.store as ReturnType<typeof makeStore>).updateCheck = { status: 'error', at: 1 };
+    act(() => { rerender(<Main theme="system" onThemeChange={vi.fn()} />); });
+    expect(window.location.hash).toBe('#/notes');
+    expect(feed()).toBeTruthy();
+  });
+
+  it('поздний хвост правки не закрывает редактор, открытый на ДРУГОЙ версии', async () => {
+    // Первый сценарий (то же открытие) ловит счётчик сессии; этот ловит
+    // сверка живого адреса — сессия к моменту разрешения промиса уже другая
+    // и по счётчику, и по маршруту, и достаточно любой из двух.
+    h.store = makeStore(threeVersions());
+    const s = h.store as ReturnType<typeof makeStore>;
+    let release!: () => void;
+    s.editNote = vi.fn(() => new Promise<void>(res => { release = res; }));
+
+    window.history.replaceState(null, '', '#/notes/root1/v/1');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить' }));
+    fireEvent.change(document.querySelector('.note-input') as HTMLTextAreaElement,
+      { target: { value: 'правка первой' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить новую версию' }));
+    expect(s.editNote).toHaveBeenCalledTimes(1);
+
+    backTo('#/notes/root1/v/2');
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить' }));
+    fireEvent.change(document.querySelector('.note-input') as HTMLTextAreaElement,
+      { target: { value: 'правка второй' } });
+
+    await act(async () => { release(); });
+
+    expect(screen.getByRole('dialog', { name: 'Правка версии 2 из 3' })).toBeTruthy();
+    expect((document.querySelector('.note-input') as HTMLTextAreaElement).value)
+      .toBe('правка второй');
+    expect(window.location.hash).toBe('#/notes/root1/v/2');
+  });
+
+  it('поздний хвост ВОЗВРАТА не переживает смену раздела', async () => {
+    // Четвёртый сценарий для confirmRestore. Пятого — «отменить и открыть
+    // заново по ходу записи» — у возврата не существует: пока промис не
+    // разрешился, диалог держит обе кнопки отключёнными, и это его
+    // собственный барьер.
+    h.store = makeStore(threeVersions());
+    const s = h.store as ReturnType<typeof makeStore>;
+    let release!: () => void;
+    s.editNote = vi.fn(() => new Promise<void>(res => { release = res; }));
+
+    window.history.replaceState(null, '', '#/notes/root1/v/2');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуть' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Вернуть' }));
+    expect(s.editNote).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      window.history.replaceState({ enSection: true }, '', '#/safebox');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+    const hashAfterSwitch = window.location.hash;
+
+    await act(async () => { release(); });
+
+    expect(s.editNote).toHaveBeenCalledTimes(1);
+    expect(window.location.hash).toBe(hashAfterSwitch);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it('отмена подтверждения не мешает следующему возврату', async () => {
+    // Отмена инкрементирует счётчик сессии. Если бы она его ЗАНУЛЯЛА или
+    // оставляла в стороне, следующий возврат ушёл бы в хвост уже погашенной
+    // сессии и просто не довёл бы навигацию.
+    h.store = makeStore(threeVersions());
+    const s = h.store as ReturnType<typeof makeStore>;
+    window.history.replaceState(null, '', '#/notes/root1/v/2');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуть' }));
+    fireEvent.click(screen.getByText('Отмена'));
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуть' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Вернуть' }));
+    await waitFor(() =>
+      expect(s.editNote).toHaveBeenCalledWith('root1', 'средняя', { fmt: 'plain' }));
+    await waitFor(() => expect(window.location.hash).toBe('#/notes/root1'));
+  });
+});
