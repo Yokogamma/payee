@@ -106,8 +106,13 @@ export function SafeboxHistoryModal({
             const isCurrent = i === 0;
             const badge = badgeFor(syncStatuses[version.id], syncActive);
             const expanded = expandedId === version.id;
+            // `history-row--current` стоял на этой строке и подсвечивал её
+            // рамку. Коробки у строки больше нет — записи разделены линейкой,
+            // как в ленте, — и правило удалено вместе с ней. Класс без правила
+            // это разметка, которая ничего не значит; текущую версию называет
+            // СЛОВО ниже по разметке.
             return (
-              <div key={version.id} className={`history-row ${isCurrent ? 'history-row--current' : ''}`}>
+              <div key={version.id} className="history-row">
                 <button
                   ref={el => {
                     if (el) rowRefs.current.set(version.id, el);
