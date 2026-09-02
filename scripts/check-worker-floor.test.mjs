@@ -193,9 +193,9 @@ describe('which commits are deployable at all', () => {
     expect(verdict.reason).toMatch(/neither the trusted head nor an allowlisted release/);
   });
 
-  it('the head itself needs no tag', () => {
+  it('the head itself needs no allowlist entry', () => {
     const verdict = decide({
-      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] } }),
+      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] } }), isAllowed: () => false,
     });
     expect(verdict.ok).toBe(true);
   });
