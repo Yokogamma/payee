@@ -64,8 +64,21 @@ describe('the capability marker gates recording a txId', () => {
 
     const result = await uploadViaProxy('{}', 'pk', 'sig');
 
-    expect(result.kind).toBe('unavailable');
+    expect(result.kind).toBe('unattested');
     expect('txId' in result).toBe(false); // nothing to store, by construction
+  });
+
+  it('WITH import on: the recovery hint SURVIVES the refusal', async () => {
+    // The refusal is about the txId, not about the proof that money was spent.
+    // Drop the hint and the triple-failure path posts again.
+    const uploadViaProxy = await loadUpload(true);
+    const hint = { txId: 'TX-1', postedAt: 123, token: 'tok' };
+    stubFetch(ok({ txId: 'TX-1', committed: false, recovery: hint }));
+
+    const result = await uploadViaProxy('{}', 'pk', 'sig');
+
+    expect(result.kind).toBe('unattested');
+    if (result.kind === 'unattested') expect(result.recovery).toEqual(hint);
   });
 
   it('WITH import on: the marker present is an ordinary success', async () => {
@@ -81,7 +94,7 @@ describe('the capability marker gates recording a txId', () => {
     const uploadViaProxy = await loadUpload(true);
     for (const value of [0, 2, '1', true, null]) {
       stubFetch(ok({ txId: 'TX-1', committed: true, semanticIdempotency: value }));
-      expect((await uploadViaProxy('{}', 'pk', 'sig')).kind, String(value)).toBe('unavailable');
+      expect((await uploadViaProxy('{}', 'pk', 'sig')).kind, String(value)).toBe('unattested');
     }
   });
 

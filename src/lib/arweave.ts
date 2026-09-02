@@ -201,6 +201,13 @@ export type UploadResult =
    *  it describes bytes that are not ours. */
   | { kind: 'publication_conflict'; error: string }
   | { kind: 'unavailable'; error: string } // 503 — retryable (recheck deferred / gateway)
+  /** A 2xx WITHOUT `semanticIdempotency: 1`, seen by a build with import on
+   *  (D2a). The worker is below the floor, so the txId is NOT recorded — but
+   *  the server-signed recovery hint, if any, IS: it proves a paid POST
+   *  happened, and dropping it would make the next attempt post again. The
+   *  hint names the txId only as evidence for the recovery branch, which the
+   *  worker now authenticates before committing. Retryable. */
+  | { kind: 'unattested'; error: string; recovery?: RecoveryHint }
   /** 503 {code:'v3_uploads_disabled'} — the worker's v3 kill switch is on.
    *  NOT an error state: the client pauses its whole v3 queue (persisted
    *  pause marker) and resumes via /health or manual retry. Registration and
@@ -531,8 +538,11 @@ export async function uploadViaProxy(
       // right response is to keep the row and wait, exactly as for a 503.
       if (BACKUP_IMPORT_ENABLED && data.semanticIdempotency !== 1) {
         return {
-          kind: 'unavailable',
+          kind: 'unattested',
           error: 'worker does not attest semanticIdempotency — refusing to record an unproven txId',
+          // Kept on purpose: refusing the txId must not also discard the proof
+          // that money was spent. Without it the triple-failure path re-posts.
+          recovery: data.recovery,
         };
       }
       // committed:false means the TX posted but the server's idempotency record

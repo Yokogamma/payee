@@ -38,6 +38,7 @@ import {
   afterFailure,
   toPublicationConflict,
   toRecoveryInvalidated,
+  toUnattested,
 } from './sync-transitions';
 
 /** Vault keys captured ONCE by the caller before the attempt — refs are never
@@ -358,6 +359,10 @@ export async function runUploadAttempt(
     } else {
       await deps.commitV4PausedFailure(id, attemptId, fresh => afterFailure(id, kind, fresh, recheck, result.error, now), now);
     }
+  } else if (result.kind === 'unattested') {
+    // Below-floor worker: no txId, but the recovery hint (if any) is kept —
+    // see toUnattested. Retryable.
+    await deps.commitResult(id, attemptId, fresh => toUnattested(id, kind, fresh, result.error, result.recovery, deps.now()));
   } else if (result.kind === 'publication_conflict') {
     // This id is already published with DIFFERENT bytes. PERMANENT: the answer
     // cannot change, so retrying is an endless loop against a settled fact.

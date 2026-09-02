@@ -608,3 +608,39 @@ describe('publication_conflict — the id is spent, and the record says so', () 
     expect(h.row.value?.terminalError).toBeUndefined();
   });
 });
+
+describe('unattested — below-floor worker, the hint is evidence and the txId is not', () => {
+  const HINT = { txId: 'TX-POSTED', postedAt: NOW - 5, token: 'tok' };
+
+  it('records the recovery hint, not the txId, and stays retryable', async () => {
+    const h = makeHarness({ result: { kind: 'unattested', error: 'no attestation', recovery: HINT } });
+
+    const outcome = await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+
+    expect(outcome.kind).toBe('committed');
+    expect(h.row.value?.txId).toBeUndefined();          // not taken
+    expect(h.row.value?.recovery).toEqual(HINT);         // kept as evidence
+    expect(h.row.value?.needsRecheck).toBe(true);        // the next attempt sends it back
+    expect(h.row.value?.terminalError).toBeUndefined();  // retryable, not a verdict
+  });
+
+  it('without a hint it is an ordinary retryable failure', async () => {
+    const h = makeHarness({ result: { kind: 'unattested', error: 'no attestation' } });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.row.value?.txId).toBeUndefined();
+    expect(h.row.value?.recovery).toBeUndefined();
+    expect(h.row.value?.status).toBe('error');
+  });
+
+  it('never downgrades a row that already holds a txId', async () => {
+    const prev: SyncRecord = {
+      noteId: NOTE_ID, kind: 'note', txId: 'TX-OURS', status: 'accepted',
+      transport: 'proxy', updatedAt: NOW - 1,
+    };
+    const h = makeHarness({ prev, result: { kind: 'unattested', error: 'no attestation', recovery: HINT } });
+    await runUploadAttempt(NOTE_ITEM, KEYS, 1, h.deps);
+    expect(h.row.value?.txId).toBe('TX-OURS');
+    expect(h.row.value?.status).toBe('accepted');
+    expect(h.row.value?.recovery).toEqual(HINT);
+  });
+});

@@ -163,6 +163,41 @@ export function afterFailure(
  * this time recorded by the client itself. Whatever local txId the row already
  * had is preserved as its own evidence.
  */
+/**
+ * The worker answered success without attesting semantic idempotency (D2a).
+ *
+ * The txId is NOT taken: the row keeps whatever it had. But a server-signed
+ * recovery hint IS kept, in the same evidence slot `toRecoveryInvalidated`
+ * uses: it proves a paid POST happened, and the next attempt sends it back so
+ * the worker's recovery branch can authenticate the publication (D9) and
+ * commit — instead of finding no anchor and posting again.
+ *
+ * Retryable and rechecked: this is the worker being below the floor, not a
+ * fact about the record.
+ */
+export function toUnattested(
+  noteId: string,
+  kind: SyncKind,
+  prev: SyncRecord | undefined,
+  errText: string | undefined,
+  recovery: RecoveryHint | undefined,
+  now: number,
+): SyncRecord {
+  const hint = recovery ?? prev?.recovery;
+  return {
+    noteId,
+    kind,
+    txId: prev?.txId,
+    status: prev?.txId ? 'accepted' : 'error',
+    transport: 'proxy',
+    lastError: errText,
+    updatedAt: now,
+    needsRecheck: hint !== undefined || prev?.txId !== undefined,
+    recovery: hint,
+    terminalError: prev?.terminalError,
+  };
+}
+
 export function toPublicationConflict(
   noteId: string,
   kind: SyncKind,
