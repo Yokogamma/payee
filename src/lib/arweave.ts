@@ -648,17 +648,6 @@ interface ArweaveEdge {
   };
 }
 
-interface GraphQLResponse {
-  data: {
-    transactions: {
-      edges: ArweaveEdge[];
-      pageInfo: {
-        hasNextPage: boolean;
-      };
-    };
-  };
-}
-
 /**
  * Fetch a single page of transactions from Arweave GraphQL.
  */
@@ -728,11 +717,37 @@ async function fetchPage(
     throw new Error(`GraphQL error: ${response.status}`);
   }
 
-  const result: GraphQLResponse = await response.json();
-  return {
-    edges: result.data.transactions.edges,
-    hasNextPage: result.data.transactions.pageInfo.hasNextPage,
-  };
+  // Streamed under a cap, then shape-checked: `response.json()` is `any`, and
+  // a page whose edges are not what the loop expects would either throw in
+  // the middle of the walk or be swallowed as «nothing more». Both read as a
+  // broken index, which is a fetch failure like any other.
+  const body = await readCapped(response, GRAPHQL_BODY_CAP_BYTES);
+  if (body === null) throw new Error('GraphQL page exceeds the size cap');
+  const page = parseGraphQLPage(new TextDecoder().decode(body));
+  if (page === null) throw new Error('GraphQL page failed the schema');
+  return page;
+}
+
+/** Runtime schema for one index page. Anything off-shape is null. */
+function parseGraphQLPage(text: string): { edges: ArweaveEdge[]; hasNextPage: boolean } | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  const tx = (parsed as { data?: { transactions?: unknown } } | null)?.data?.transactions;
+  if (typeof tx !== 'object' || tx === null) return null;
+  const t = tx as { edges?: unknown; pageInfo?: { hasNextPage?: unknown } };
+  if (!Array.isArray(t.edges) || typeof t.pageInfo?.hasNextPage !== 'boolean') return null;
+  const edges: ArweaveEdge[] = [];
+  for (const e of t.edges) {
+    const edge = e as { cursor?: unknown; node?: { id?: unknown; tags?: unknown } };
+    if (typeof edge?.cursor !== 'string' || typeof edge.node?.id !== 'string') return null;
+    if (!Array.isArray(edge.node.tags)) return null;
+    for (const tag of edge.node.tags) {
+      const tg = tag as { name?: unknown; value?: unknown };
+      if (typeof tg?.name !== 'string' || typeof tg.value !== 'string') return null;
+    }
+    edges.push({ cursor: edge.cursor, node: { id: edge.node.id, tags: edge.node.tags as { name: string; value: string }[] } });
+  }
+  return { edges, hasNextPage: t.pageInfo.hasNextPage };
 }
 
 /** A safebox entry recovered from Arweave. The record to persist plus its
@@ -800,6 +815,18 @@ const RESTORE_CONCURRENCY = 5;
 /** Per-request deadlines for the restore sweep — without them a stalled
  *  connection leaves the restore banner spinning indefinitely. */
 const GRAPHQL_TIMEOUT_MS = 20_000;
+/**
+ * Bounds on the index walk (P2 review). An index is one more party that can
+ * misbehave, and the loop below used to trust it without limit: a page that
+ * never stops claiming `hasNextPage`, a cursor that repeats, or a body of any
+ * size would run the sweep forever or exhaust memory. Each bound turns that
+ * into an INCOMPLETE sweep — which the UI already knows how to say — never
+ * into a hang.
+ */
+const GRAPHQL_BODY_CAP_BYTES = 512 * 1024; // 100 edges × ~0.5 KB is ~50 KB; ×10 headroom
+const INDEX_MAX_PAGES = 200;               // 20 000 candidates at `first: 100`
+const INDEX_MAX_CANDIDATES = 20_000;
+const INDEX_DEADLINE_MS = 120_000;
 const PAYLOAD_TIMEOUT_MS = 20_000;
 
 interface RestoreCandidate {
@@ -972,7 +999,15 @@ export async function fetchAllNotes(
   // before the sentinel is seen.
   const sentinelIds = new Set<string>();
   let cursor: string | null = null;
+  let pages = 0;
+  const indexDeadline = Date.now() + INDEX_DEADLINE_MS;
   while (true) {
+    // Every bound below ends the walk as INCOMPLETE rather than looping: a
+    // partial sweep is a state the UI already explains; a hung one is not.
+    if (pages >= INDEX_MAX_PAGES || candidates.length >= INDEX_MAX_CANDIDATES || Date.now() > indexDeadline) {
+      incomplete = true;
+      break;
+    }
     let edges: ArweaveEdge[];
     let hasNextPage: boolean;
 
@@ -1022,7 +1057,11 @@ export async function fetchAllNotes(
     }
 
     if (!hasNextPage) break;
-    cursor = edges[edges.length - 1].cursor;
+    pages++;
+    const next = edges[edges.length - 1].cursor;
+    // An index that hands back the cursor it was given would page forever.
+    if (next === cursor) { incomplete = true; break; }
+    cursor = next;
   }
 
   const pool = createPayloadPool(TRUSTED_OWNERS);
