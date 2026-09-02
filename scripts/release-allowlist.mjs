@@ -23,7 +23,18 @@ export const RELEASE_ALLOWLIST = Object.freeze([
   // Format:
   //   'a'.repeat(40), // worker-rN — why this state is deployable
   //
-  // Empty on purpose: nothing but the trusted head is deployable right now.
+  // Steady state is SHORT: the normal path deploys the trusted head, and an
+  // entry here exists so that a rollback has somewhere to go BEFORE it is
+  // needed. A red smoke is a detector, not a rollback (docs/ROLLBACK.md) — the
+  // recovery is a dispatch of a SHA this list already admits, and a list that
+  // is empty at that moment turns «roll back» into «open a pull request first».
+
+  // worker-r4 — the PR-3a release (#130), the live worker since 2026-08-29
+  // (run 33243712840, smoked green), and the value of MINIMUM_FLOOR. It is the
+  // last state proven safe on the dev contour before semantic idempotency; a
+  // D2 release found broken during its soak rolls back HERE — legitimately,
+  // because the floor is not raised until the import flip (D2a).
+  'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1',
 ]);
 
 const SHA_RE = /^[0-9a-f]{40}$/;
