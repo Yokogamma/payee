@@ -516,6 +516,12 @@ export function parseUploadOk(body: unknown): UploadOk | null {
   const b = body as Record<string, unknown>;
   if (typeof b.txId !== 'string' || !TXID_CANON.test(b.txId)) return null;
   if (b.committed !== undefined && typeof b.committed !== 'boolean') return null;
+  // An ATTESTED answer (D2a) always carries `committed`: the worker that emits
+  // the marker emits the flag on every success path. Absence there is not the
+  // legacy wire shape — it is a damaged body, and defaulting it to `true`
+  // would let a corrupted 2xx close a reconciliation early. The default below
+  // remains for UN-attested answers only, i.e. for older workers.
+  if (b.semanticIdempotency === 1 && typeof b.committed !== 'boolean') return null;
   if (b.deduped !== undefined && typeof b.deduped !== 'boolean') return null;
 
   let recovery: RecoveryHint | undefined;

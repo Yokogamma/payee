@@ -213,6 +213,29 @@ describe('the 2xx body is validated at the runtime boundary', () => {
     for (const body of bad) expect(parseUploadOk(body), JSON.stringify(body)).toBeNull();
   });
 
+  it('committed is REQUIRED on an attested answer — its absence is a protocol failure', async () => {
+    // With the marker present, «committed defaults to true» is no longer a
+    // compatibility rule but a hole: a damaged 2xx would end a reconciliation
+    // that never finished. Retryable, never accepted.
+    const { parseUploadOk } = await import('./arweave');
+    expect(parseUploadOk({ txId: TX, semanticIdempotency: 1 })).toBeNull();
+
+    const uploadViaProxy = await loadUpload(true);
+    stubFetch(ok({ txId: TX, semanticIdempotency: 1 }));
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('unavailable');
+  });
+
+  it('without the marker, a missing committed is still the legacy shape (import off)', async () => {
+    // The pre-D2 worker never sent `committed`; while import is off that
+    // answer must keep working exactly as before.
+    const { parseUploadOk } = await import('./arweave');
+    expect(parseUploadOk({ txId: TX })).toMatchObject({ txId: TX, committed: true });
+
+    const uploadViaProxy = await loadUpload(false);
+    stubFetch(ok({ txId: TX }));
+    expect(await uploadViaProxy('{}', 'pk', 'sig')).toMatchObject({ kind: 'accepted', txId: TX, committed: true });
+  });
+
   it('a malformed 2xx is a RETRYABLE protocol failure, never accepted and never terminal', async () => {
     // Once, a malformed recovery hint would be stored, sent back, refused with
     // recovery_invalid, and a healthy record quarantined for good.
