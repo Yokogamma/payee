@@ -1084,10 +1084,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // record is comparable. So the status quorum is asked, and only a
       // unanimous `dead` past the age guard opens the re-post.
       const live = await getTxStatusWorker(snapshot.txId, emit, env);
-      if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) {
-        attest('legacy_dead_redrop');
-        return { kind: 'dead' };
-      }
+      if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) return { kind: 'dead' };
       // Alive-but-unfetchable, unavailable, or too recent: retryable, and
       // nothing is written.
       attest('legacy_unproven');
@@ -1105,8 +1102,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // Proven. The fingerprint is recorded WHATEVER the comparison then says —
     // the verification is expensive and its result is a fact about the
     // publication, not a verdict about this request.
-    await doCall('/backfill-fp', { noteId, snapshot, observedFp: auth.observedFp });
-    attest('legacy_backfilled');
+    const backfill: { ok: boolean; stale?: boolean } =
+      await (await doCall('/backfill-fp', { noteId, snapshot, observedFp: auth.observedFp })).json();
+    // The metric names what HAPPENED, not what was attempted: a stale CAS means
+    // a concurrent request proved and wrote this record first, and counting it
+    // as a backfill would inflate the very number the soak reads.
+    attest(backfill.ok ? 'legacy_backfilled' : 'legacy_backfill_stale');
     return { kind: 'retry' };
   };
 
@@ -1159,7 +1160,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
     if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
-    if (rd.kind === 'defer') return error('Recheck deferred', 503);
+    if (rd.kind === 'defer') { attest('legacy_dead_deferred'); return error('Recheck deferred', 503); }
+    // Only NOW is a redrop a fact: the CAS held and a reservation carrying this
+    // payload's fp exists. The dead verdict alone proved nothing about what
+    // followed it.
+    attest('legacy_dead_redrop');
     reserveToken = rd.token;
     viaRedrop = true;
   } else if (checkResult.status === 'exists') {
@@ -1282,8 +1287,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           const commit: { ok: boolean } = await commitResp.json();
           if (commitResp.ok && commit.ok) {
             // The recovery branch reconciles an EXISTING transaction, so this
-            // too returns an id it did not create.
-            attest('deduped');
+            // too returns an id it did not create. Counted under its OWN name:
+            // `recovery_*` must be a complete family — refusals AND successes —
+            // or the share of refusals in it is not a number anyone can read.
+            attest('recovery_reconciled');
             return uploadAccepted({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true });
           }
         } catch { /* fall through */ }

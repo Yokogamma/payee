@@ -1871,30 +1871,45 @@ deploy. Neither is an Environment variable, so there is nothing to click:
    unmerged and Pages undeployed throughout. See «Soak criteria» below.
 5. Record the release row below with the real SHA, run id and version id.
 
-### Soak criteria (PROPOSED — the operator confirms the numbers before the deploy)
+### Soak criteria (CONFIRMED by review, 2026-09-02)
 
 The instrument is the `semantic_idempotency` event (docs/METRICS.md), read as
-`POST /admin/metrics {"report":"semantic_idempotency","hours":168}`. Without
-it a «soak» is a calendar, not a measurement.
+`POST /admin/metrics {"report":"semantic_idempotency","hours":24}` — **daily,
+as a 24-hour snapshot, kept**. The report is an aggregate capped at 168 hours;
+it cannot show a trend, and several criteria below are trends. A soak without
+the daily snapshots is a calendar, not a measurement.
 
-**Duration:** the LATER of 7 calendar days and 200 `upload_outcome=accepted`
-on the dev contour — enough real publications for the legacy pool to be
-exercised, not merely for the clock to run.
+This is a COVERAGE gate: it proves the release's paths were exercised and
+none refused wrongly. It is not a statistical bound on the error rate — a
+claim like «< 5 %» would need on the order of 60 relevant decisions with no
+refusal, which this window does not promise.
+
+**Window:** **168 continuous hours on ONE worker version id.** A redeploy, or
+any change to `TRUSTED_OWNERS` / `PAYLOAD_GATEWAYS` / the upload switches,
+resets the window to zero.
+
+**Volume:** at least **30** `semantic_idempotency` decisions spread over at
+least **3 distinct days**; within them at least **10** `deduped`, **3**
+`legacy_backfilled` for **distinct** legacy records, **1**
+`recovery_reconciled`; and at least **20** paid outcomes
+(`upload_outcome` total).
 
 **Exit — ALL of the following over the whole window:**
 
 | outcome | criterion | why |
 |---|---|---|
-| `conflict`, `redrop_conflict` | **0** | no released client can change bytes under a reused id, so any conflict is a defect in the protocol, not in the data |
-| `legacy_not_ours` | **0** | each one is a record pointing at a publication that is not its own — a mismatched pointer or an attack; both need a human |
-| `recovery_conflict` | **0** | same reasoning as the two above, on the recovery branch |
-| `legacy_unproven`, `recovery_unproven` | ≤ 5 % of all `legacy_*` / `recovery_*` outcomes, and NOT rising day over day | transport failures happen; a rising share means the payload pool or the verifier is broken |
-| `legacy_backfilled` | rises, then plateaus | the legacy pool drains as records are proven; a flat zero means the path was never exercised and the soak proves nothing |
-| `deduped` | > 0 | the ordinary idempotent hit still works — the most-used path of all |
-| `upload_outcome=accepted` share | within the pre-release week's range | the release did not change how paid publications end |
+| `conflict`, `redrop_conflict`, `legacy_not_ours`, `recovery_conflict` | **strictly 0** | no released client can change bytes under a reused id; each is a protocol defect, a mismatched pointer or an attack, and needs a human |
+| `arweave_throw` (`upload_outcomes`) | **strictly 0** | a throw on the paid path is a bug in the release, never weather |
+| `legacy_unproven`, `recovery_unproven` | **≤ 1 each** over the window, each one investigated, and **0 in the final 48 hours** | transport failures happen; a second one, or one near the end, means the pool or the verifier is broken |
+| paid success rate (`accepted` ÷ all `upload_outcome`) | **≥ 95 %**, and **no worse than the saved pre-release 7-day baseline by more than 5 p.p.** | the release did not change how paid publications end — save the baseline BEFORE deploying, it cannot be reconstructed after |
+
+`legacy_backfill_stale` and `legacy_dead_deferred` are informational: they say
+a race or a transient happened and was handled, not that something is wrong.
 
 A red criterion is investigated, not waited out: the floor is NOT raised and
-the backup stack stays unmerged until the cause is named.
+the backup stack stays unmerged until the cause is named. A fix to the worker
+restarts the window — which is why telemetry defects are fixed BEFORE the
+first deploy, never after.
 
 ### The floor is NOT raised by this release
 

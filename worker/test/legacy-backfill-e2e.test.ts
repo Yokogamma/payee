@@ -332,9 +332,10 @@ describe('recovery token — the token proves the id, never the bytes', () => {
     }
     serveTx(tx);
 
+    const cap = capture();
     const r = await worker.fetch(
       await recoveryUpload(noteId, 'rc-ok', { txId: tx.txId, postedAt, token: await signRecovery(noteId, tx.txId, postedAt) }),
-      await envFor() as never,
+      await envFor(cap) as never,
     );
 
     expect(r.status).toBe(200);
@@ -342,6 +343,9 @@ describe('recovery token — the token proves the id, never the bytes', () => {
     expect(body.txId).toBe(tx.txId);
     expect(body.committed).toBe(true);
     expect(body.deduped).toBe(true);
+    // Its own outcome, so `recovery_*` is a complete family and the share of
+    // refusals in it is a number.
+    expect(cap.outcomes()).toEqual(['recovery_reconciled']);
   });
 
   it('REFUSES to bind when the alive publication carries different bytes', async () => {
