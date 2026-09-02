@@ -20,6 +20,7 @@ import {
   UnsupportedNoteVersionError,
 } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
+import { BACKUP_IMPORT_ENABLED } from './flags';
 import { INDEX_QUERY_URL, PAYLOAD_GATEWAYS, QUORUM_POLICY_ID, STATUS_GATEWAYS } from './gateways';
 import { serializeStatusOrigins } from './gateways-parse';
 import { statusVerdict, toTxStatusKind, type StatusVote } from './status-quorum';
@@ -192,7 +193,21 @@ export type UploadResult =
   | { kind: 'rate_limited'; error: string }
   | { kind: 'not_registered'; error: string }
   | { kind: 'in_progress'; error: string }
+  /** 409 {code:'id_payload_conflict'} — this noteId is already published with
+   *  DIFFERENT bytes (D2). TERMINAL: retrying can only reproduce the same
+   *  answer. Deliberately distinct from the generic 409, which stays
+   *  `in_progress`: reading one as the other means an endless retry of a
+   *  guaranteed refusal. The conflicting txId is NOT carried into the record —
+   *  it describes bytes that are not ours. */
+  | { kind: 'publication_conflict'; error: string }
   | { kind: 'unavailable'; error: string } // 503 — retryable (recheck deferred / gateway)
+  /** A 2xx WITHOUT `semanticIdempotency: 1`, seen by a build with import on
+   *  (D2a). The worker is below the floor, so the txId is NOT recorded — but
+   *  the server-signed recovery hint, if any, IS: it proves a paid POST
+   *  happened, and dropping it would make the next attempt post again. The
+   *  hint names the txId only as evidence for the recovery branch, which the
+   *  worker now authenticates before committing. Retryable. */
+  | { kind: 'unattested'; error: string; recovery?: RecoveryHint }
   /** 503 {code:'v3_uploads_disabled'} — the worker's v3 kill switch is on.
    *  NOT an error state: the client pauses its whole v3 queue (persisted
    *  pause marker) and resumes via /health or manual retry. Registration and
@@ -461,6 +476,88 @@ export async function registerWithProxy(
  * Upload encrypted note data via Cloudflare Worker proxy.
  * Server handles Arweave TX creation and payment.
  */
+/**
+ * The machine-readable `code` of a worker refusal, or undefined.
+ *
+ * The worker's typed refusals (kill switches, recovery, publication conflict)
+ * all carry `{code}` in a JSON body; a plain-text body means the generic
+ * meaning of the status applies. One reader for all of them, so a new code is
+ * one comparison and not a fourth copy of the try/parse/narrow dance.
+ */
+/**
+ * A 2xx `/upload` body, validated at the RUNTIME boundary — or null.
+ *
+ * `response.json()` is `any`, and every field the caller then stores was
+ * trusted on shape alone. That is how a malformed body turns into a permanent
+ * fact: a `recovery` with the wrong shape is stored, sent back, refused with
+ * `recovery_invalid`, and a healthy record is quarantined for good; a
+ * `committed` of `"false"` reads as true; a marker without a canonical txId
+ * produces an `accepted` with nothing behind it.
+ *
+ * So: plain object; canonical 43-char base64url `txId`; strict boolean
+ * `committed`; `recovery` either absent or EXACTLY `{txId, postedAt, token}`
+ * with `recovery.txId === txId` (a hint for some other transaction is not
+ * this answer's hint); `deduped` optional strict boolean; `semanticIdempotency`
+ * passed through for the caller's gate. Anything else is a PROTOCOL failure —
+ * retryable, never a verdict about the record.
+ */
+export interface UploadOk {
+  txId: string;
+  committed: boolean;
+  recovery?: RecoveryHint;
+  deduped?: boolean;
+  semanticIdempotency?: unknown;
+}
+
+const TXID_CANON = /^[A-Za-z0-9_-]{43}$/;
+
+export function parseUploadOk(body: unknown): UploadOk | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (typeof b.txId !== 'string' || !TXID_CANON.test(b.txId)) return null;
+  if (b.committed !== undefined && typeof b.committed !== 'boolean') return null;
+  // An ATTESTED answer (D2a) always carries `committed`: the worker that emits
+  // the marker emits the flag on every success path. Absence there is not the
+  // legacy wire shape — it is a damaged body, and defaulting it to `true`
+  // would let a corrupted 2xx close a reconciliation early. The default below
+  // remains for UN-attested answers only, i.e. for older workers.
+  if (b.semanticIdempotency === 1 && typeof b.committed !== 'boolean') return null;
+  if (b.deduped !== undefined && typeof b.deduped !== 'boolean') return null;
+
+  let recovery: RecoveryHint | undefined;
+  if (b.recovery !== undefined) {
+    const r = b.recovery;
+    if (typeof r !== 'object' || r === null || Array.isArray(r)) return null;
+    const h = r as Record<string, unknown>;
+    if (typeof h.txId !== 'string' || !TXID_CANON.test(h.txId)) return null;
+    if (typeof h.postedAt !== 'number' || !Number.isFinite(h.postedAt) || h.postedAt <= 0) return null;
+    if (typeof h.token !== 'string' || h.token === '') return null;
+    if (h.txId !== b.txId) return null;
+    recovery = { txId: h.txId, postedAt: h.postedAt, token: h.token };
+  }
+
+  return {
+    txId: b.txId,
+    // Absent means committed (the pre-`committed` wire shape); only an explicit
+    // false means «posted, not yet finalized».
+    committed: b.committed !== false,
+    ...(recovery ? { recovery } : {}),
+    ...(b.deduped === undefined ? {} : { deduped: b.deduped }),
+    semanticIdempotency: b.semanticIdempotency,
+  };
+}
+
+function readCode(text: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const code = (parsed as { code?: unknown }).code;
+    return typeof code === 'string' ? code : undefined;
+  } catch {
+    return undefined; // not JSON
+  }
+}
+
 export async function uploadViaProxy(
   bodyText: string,
   publicKeyB64: string,
@@ -476,17 +573,59 @@ export async function uploadViaProxy(
         'X-Public-Key': publicKeyB64,
         'X-Signature': signature,
       },
+      // Both halves refuse caching (D2a). The worker sends `Cache-Control:
+      // no-store`; this is the other half. A replayed answer would replay its
+      // capability claim and its txId with it — a cached success is
+      // indistinguishable from a fresh one, and this is the response the whole
+      // fingerprint protocol exists to make trustworthy.
+      cache: 'no-store',
       body: bodyText,
     });
 
     if (response.ok) {
-      const data = await response.json();
+      let raw: unknown;
+      try {
+        raw = await response.json();
+      } catch {
+        return { kind: 'unavailable', error: 'upload answered 2xx with a non-JSON body' };
+      }
+      const data = parseUploadOk(raw);
+      if (data === null) {
+        // A 2xx the protocol does not recognise is a transport/protocol fault,
+        // and RETRYABLE: nothing about the record is known from it. Storing any
+        // part of it — a txId, a hint — would be recording a guess.
+        return { kind: 'unavailable', error: 'upload answered 2xx with a body that fails the protocol schema' };
+      }
+      // D2a — the ATOMIC half of the worker-floor guarantee.
+      //
+      // A one-off /health probe cannot protect against a rollback that happens
+      // AFTER it: the client would have asked the safe worker and then stored a
+      // txId handed out by the old one. So the proof travels in the answer, and
+      // a build that depends on it refuses to record anything without it.
+      //
+      // Gated on BACKUP_IMPORT_ENABLED deliberately, not applied always: until
+      // a released client has import on, nothing depends on semantic
+      // idempotency, and refusing here would remove the safe worker-rollback
+      // window D2a keeps open until the import flip.
+      //
+      // The outcome is `unavailable`, i.e. RETRYABLE. It is not the record's
+      // fault and not terminal — the worker is simply below the floor, and the
+      // right response is to keep the row and wait, exactly as for a 503.
+      if (BACKUP_IMPORT_ENABLED && data.semanticIdempotency !== 1) {
+        return {
+          kind: 'unattested',
+          error: 'worker does not attest semanticIdempotency — refusing to record an unproven txId',
+          // Kept on purpose: refusing the txId must not also discard the proof
+          // that money was spent. Without it the triple-failure path re-posts.
+          recovery: data.recovery,
+        };
+      }
       // committed:false means the TX posted but the server's idempotency record
       // isn't confirmed yet → caller keeps needsRecheck.
       return {
         kind: 'accepted',
         txId: data.txId,
-        committed: data.committed !== false,
+        committed: data.committed,
         recovery: data.recovery,
       };
     }
@@ -495,31 +634,27 @@ export async function uploadViaProxy(
     const text = await response.text();
     if (response.status === 429) return { kind: 'rate_limited', error: text };
     if (response.status === 403) return { kind: 'not_registered', error: text };
-    if (response.status === 409) return { kind: 'in_progress', error: text };
+    if (response.status === 409) {
+      // The machine code is read BEFORE the generic meaning. A conflict read as
+      // «already in progress» would be retried forever against an answer that
+      // can never change.
+      if (readCode(text) === 'id_payload_conflict') return { kind: 'publication_conflict', error: text };
+      return { kind: 'in_progress', error: text };
+    }
     if (response.status === 503) {
       // The kill switches answer 503 with a machine-readable JSON code; a
       // plain-text 503 stays the generic retryable 'unavailable'.
-      try {
-        const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null) {
-          const code = (parsed as { code?: unknown }).code;
-          if (code === 'uploads_disabled') return { kind: 'uploads_disabled', error: text };
-          if (code === 'v3_uploads_disabled') return { kind: 'v3_disabled', error: text };
-          if (code === 'v4_uploads_disabled') return { kind: 'v4_disabled', error: text };
-        }
-      } catch { /* not JSON → generic 503 */ }
-      return { kind: 'unavailable', error: text }; // retryable
+      switch (readCode(text)) {
+        case 'uploads_disabled': return { kind: 'uploads_disabled', error: text };
+        case 'v3_uploads_disabled': return { kind: 'v3_disabled', error: text };
+        case 'v4_uploads_disabled': return { kind: 'v4_disabled', error: text };
+        default: return { kind: 'unavailable', error: text }; // retryable
+      }
     }
-    if (response.status === 400) {
-      // Both worker branches of «Invalid recovery token» answer 400 with a
-      // machine code; any other 400 stays the generic (retryable-by-user) error.
-      try {
-        const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null
-            && (parsed as { code?: unknown }).code === 'recovery_invalid') {
-          return { kind: 'recovery_invalid', error: text };
-        }
-      } catch { /* not JSON → generic 400 */ }
+    if (response.status === 400 && readCode(text) === 'recovery_invalid') {
+      // Both worker branches of «Invalid recovery token» answer 400 with this
+      // code; any other 400 stays the generic (retryable-by-user) error.
+      return { kind: 'recovery_invalid', error: text };
     }
     return { kind: 'error', error: `HTTP ${response.status}: ${text}` };
   } catch (e) {

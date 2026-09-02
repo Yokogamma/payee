@@ -62,7 +62,8 @@ export function computeSyncCounters(
 /**
  * What a quarantined record actually is, in one sentence, in ONE place.
  *
- * `SyncRecord.terminalError` is `'unsupported_version' | 'malformed_record'`:
+ * `SyncRecord.terminalError` is `'unsupported_version' | 'malformed_record'`
+ * (the two this generic sentence describes; the two other reasons have their own):
  * either a record a newer build wrote, or a row that is simply broken. Naming
  * only the first — as both the status line and the settings panel did, in two
  * separately-worded copies — tells the owner of a corrupted row to «update the
@@ -83,6 +84,18 @@ export const QUARANTINE_EXPLANATION =
  * actually landed on-chain, while «повторить» is a guaranteed no-op and the
  * quarantine deliberately survives it.
  */
+/**
+ * 'publication_conflict' is the third reason with its OWN sentence. The
+ * generic text («эта версия приложения не может обработать») is simply false
+ * for it: the record is readable and this build handles it fine — the SERVER
+ * refused to publish because the id already names different bytes on chain.
+ * The honest advice is neither «update the app» nor «restore by seed»: the
+ * local text is safe, and publishing it needs a new id.
+ */
+export const PUBLICATION_CONFLICT_EXPLANATION =
+  'под этим идентификатором в блокчейне уже другая версия; текст цел, ' +
+  'а опубликовать его можно только как новую запись';
+
 export const RECOVERY_INVALIDATED_EXPLANATION =
   'сервер отклонил подтверждение публикации; повтор не поможет — ' +
   'восстановление по seed-фразе вернёт запись, если транзакция прошла';

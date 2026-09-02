@@ -79,16 +79,16 @@ describe('uploadViaProxy committed flag', () => {
   it('passes through committed:false (server did not confirm the DO commit)', async () => {
     vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
     vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ txId: 'tx1', committed: false }), { status: 200 }),
+      new Response(JSON.stringify({ txId: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs', committed: false }), { status: 200 }),
     ));
     const { uploadViaProxy } = await import('./arweave');
-    expect(await uploadViaProxy('{}', 'pk', 'sig')).toEqual({ kind: 'accepted', txId: 'tx1', committed: false });
+    expect(await uploadViaProxy('{}', 'pk', 'sig')).toEqual({ kind: 'accepted', txId: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs', committed: false });
   });
 
   it('defaults committed:true when the field is absent', async () => {
     vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
     vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify({ txId: 'tx2' }), { status: 200 }),
+      new Response(JSON.stringify({ txId: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjt' }), { status: 200 }),
     ));
     const { uploadViaProxy } = await import('./arweave');
     const r = await uploadViaProxy('{}', 'pk', 'sig');

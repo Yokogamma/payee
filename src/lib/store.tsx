@@ -257,6 +257,10 @@ export interface ArweaveState {
    *  обработать»), here the record is intact and a seed restore can bring it
    *  back if the transaction landed on-chain. */
   recoveryInvalidatedCount: number;
+  /** Subset of quarantinedCount with reason 'publication_conflict' — its own
+   *  explainer too: the record is readable and this build handles it; the
+   *  SERVER refused because the id already names other bytes on chain. */
+  publicationConflictCount: number;
   /** STORAGE-BACKED reset risk, SPLIT BY KIND: every stored record minus the
    *  confirmed ones. The reset dialog must use THIS, not the visible `notes` —
    *  an invisible quarantined/undecryptable record (or the whole safebox, which
@@ -273,6 +277,7 @@ export interface ArweaveState {
     errorCount: number;
     quarantinedCount: number;
     recoveryInvalidatedCount: number;
+    publicationConflictCount: number;
   };
   lastSync: number | null;
   lastError: string | null;
@@ -290,6 +295,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
   confirmedCount: 0,
   quarantinedCount: 0,
   recoveryInvalidatedCount: 0,
+  publicationConflictCount: 0,
   resetRisk: { notes: 0, safebox: 0 },
   safebox: {
     unsyncedCount: 0,
@@ -298,6 +304,7 @@ const INITIAL_ARWEAVE: ArweaveState = {
     errorCount: 0,
     quarantinedCount: 0,
     recoveryInvalidatedCount: 0,
+    publicationConflictCount: 0,
   },
   lastSync: null,
   lastError: null,
@@ -2116,7 +2123,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     //    dangerous: an orphan `confirmed` row cancels out a real unsynced note
     //    in `resetRisk` and makes the reset dialog claim everything is safely
     //    on chain right before wiping it.
-    const zero = () => ({ accepted: 0, confirmed: 0, errors: 0, quarantined: 0, recoveryInvalidated: 0 });
+    const zero = () => ({ accepted: 0, confirmed: 0, errors: 0, quarantined: 0, recoveryInvalidated: 0, publicationConflict: 0 });
     const tallyFor = (ids: string[]) => {
       const t = zero();
       for (const id of ids) {
@@ -2132,6 +2139,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           // (the record is intact; seed restore can bring it back) — the
           // generic «версия не может обработать» text would be a lie for it.
           if (r.terminalError === 'recovery_invalidated') t.recoveryInvalidated++;
+          else if (r.terminalError === 'publication_conflict') t.publicationConflict++;
         }
         else if (r.status === 'accepted') t.accepted++;
         else if (r.status === 'error') t.errors++;
@@ -2160,6 +2168,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       errorCount: tally.note.errors,
       quarantinedCount: tally.note.quarantined,
       recoveryInvalidatedCount: tally.note.recoveryInvalidated,
+      publicationConflictCount: tally.note.publicationConflict,
       // Storage-backed: EVERY stored record that is not confirmed is at risk on
       // a reset — including versions invisible in the UI (historical,
       // quarantined, undecryptable, or locked away in the safebox).
@@ -2174,6 +2183,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         errorCount: tally.safebox.errors,
         quarantinedCount: tally.safebox.quarantined,
         recoveryInvalidatedCount: tally.safebox.recoveryInvalidated,
+        publicationConflictCount: tally.safebox.publicationConflict,
       },
     }));
   }
