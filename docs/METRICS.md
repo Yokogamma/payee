@@ -47,6 +47,7 @@ number of rows and the host values are:
   classified `dead` outright.
 | `post_accepted` | event, host | — |
 | `redrop_new_tx` | event, host | — |
+| `semantic_idempotency` | event, outcome (`deduped` / `conflict` / `redrop_conflict` / `legacy_backfilled` / `legacy_not_ours` / `legacy_unproven` / `legacy_dead_redrop` / `recovery_unproven` / `recovery_conflict`), appVersion | — |
 
 `invalid_response` is an HTTP success whose body failed the runtime schema
 (non-base64url anchor, `12abc` instead of a price, oversized body) — a
@@ -62,6 +63,7 @@ that is exactly the signal D9 introduces verification for.
 | the same successful POST when the new txId follows a PROVEN dead — the `doRedrop` branches AND the recovery-hint branch (valid token + dead verdict + age guard) | additionally `redrop_new_tx` (the event's definition is «a new paid txId after a confirmed dead», not «went through /redrop»; clarified in the PR #105 review — missing the recovery path would hide the riskiest triple-failure scenario from the security metric) |
 | terminal `return` from `handleUpload` — ONLY from paid-path branches | `upload_outcome`: `accepted` = a final 200 AFTER a POST actually performed by THIS request; `arweave_error` = non-2xx from the gateway; `arweave_throw` = the catch branch. Early returns (validation 4xx, kill switches 503, rate limit 429, idempotent hits, reconciliation without a new POST) emit NOTHING — the metric answers "how do paid publications end" |
 | `getTxStatusWorker` returned a verdict | `gateway_call` kind=`status` + `status_verdict` |
+| every DECISION of the fingerprint protocol (D2) — the paths `upload_outcome` is silent about | `semantic_idempotency`: `deduped` = an existing txId handed back after a fingerprint match (idempotent hit, resolved posted state, resolved redrop, reconciled recovery); `conflict` = 409 from `/check-and-reserve`; `redrop_conflict` = 409 because the superseding transaction carries other bytes; `legacy_backfilled` / `legacy_not_ours` / `legacy_unproven` / `legacy_dead_redrop` = how a never-fingerprinted record was resolved; `recovery_unproven` / `recovery_conflict` = the recovery-token branch refused to bind. This is the SOAK instrument: docs/ROLLBACK.md «D2 … release runbook» defines the exit criteria over it |
 
 ## Numeric conventions
 
@@ -118,6 +120,7 @@ Request: `{ "report": "<name>", "hours"?: 1..168 }` (default 24; body cap
 | `gateway_health` | `{ rows: [{kind, host, class, calls, p95_ms}] }` |
 | `upload_outcomes` | `{ rows: [{outcome, app_version, n}] }` |
 | `status_verdicts` | `{ rows: [{verdict, host, n}] }` |
+| `semantic_idempotency` | `{ rows: [{outcome, app_version, n}] }` |
 
 Responses: 503 no `METRICS_ADMIN_SECRET` → 401 bad bearer → 503 upstream not
 configured (`CF_ACCOUNT_ID`/`CF_ANALYTICS_TOKEN`/valid `METRICS_DATASET`) →

@@ -62,9 +62,24 @@ interface CheckAndReserveRequest { noteId: string; limit: number; fp?: string }
 interface MarkPostedRequest { noteId: string; txId: string; token: string }
 interface CommitRequest { noteId: string; txId: string; token: string }
 interface ReleaseRequest { noteId: string; token: string }
-/** `fp` of the payload about to be RE-posted. Absent → the record's own `fp` is
- *  carried forward, so a redrop never silently drops it. */
-interface RedropRequest { noteId: string; txId: string; limit: number; fp?: string }
+/**
+ * `fp` of the payload about to be RE-posted. Absent → the record's own `fp` is
+ * carried forward, so a redrop never silently drops it.
+ *
+ * `snapshot` is REQUIRED on the legacy path (a record whose bytes were never
+ * fingerprinted): the redrop then compare-and-swaps against the whole record
+ * identity AND requires `fp` to still be absent, exactly like `/backfill-fp`.
+ * Without it two requests holding the same legacy snapshot could both
+ * «resolve» it — the second landing a fingerprint on top of the first's, or
+ * being handed the first's new txId for a different payload.
+ */
+interface RedropRequest {
+  noteId: string;
+  txId: string;
+  limit: number;
+  fp?: string;
+  snapshot?: LegacySnapshot;
+}
 interface BackfillFpRequest {
   noteId: string;
   snapshot: LegacySnapshot;
@@ -332,13 +347,42 @@ export class RateLimiter implements DurableObject {
   /** A posted/committed TX was found dropped → convert back to a fresh
    *  reservation for re-post, respecting quota + attempts. */
   private async handleRedrop(request: Request): Promise<Response> {
-    const { noteId, txId, limit, fp: requestedFp } = await request.json<RedropRequest>();
+    const { noteId, txId, limit, fp: requestedFp, snapshot } = await request.json<RedropRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
 
     if (!record) return Response.json({ ok: false, gone: true });
+
+    // Legacy path: the caller acted on a snapshot, so the record must still BE
+    // that snapshot — and still be unfingerprinted. Anything else means a
+    // concurrent request got here first (a backfill, or another redrop) and
+    // the caller must go back through /check-and-reserve, where the comparison
+    // happens against whatever is now recorded.
+    if (snapshot !== undefined && (
+      record.fp !== undefined
+      || record.status !== snapshot.status
+      || record.txId !== snapshot.txId
+      || record.token !== snapshot.token
+      || record.gen !== snapshot.gen
+    )) {
+      return Response.json({ ok: false, stale: true });
+    }
+
     if (record.status === 'reserved') return Response.json({ ok: false, inProgress: true });
     if (record.txId !== txId) {
-      // Superseded by another request under a new txId.
+      // Superseded by another request under a new txId. Whose bytes? The
+      // stored fp answers — and it MUST be consulted: handing back the new
+      // txId on the strength of «someone committed something under this id»
+      // is the exact binding D2 forbids, payload A under transaction B.
+      if (record.fp === undefined) {
+        // Never fingerprinted: only /check-and-reserve can resolve it, via the
+        // backfill protocol.
+        return Response.json({ ok: false, legacy: true });
+      }
+      if (requestedFp !== undefined && record.fp !== requestedFp) {
+        return Response.json({
+          ok: false, conflict: true, txId: record.txId, state: record.status,
+        });
+      }
       return Response.json({
         ok: false,
         committed: record.status === 'committed',

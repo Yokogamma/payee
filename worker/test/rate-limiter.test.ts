@@ -350,6 +350,109 @@ describe('semantic idempotency — the same id under DIFFERENT bytes', () => {
   });
 });
 
+describe('/redrop under D2 — the superseding txId must carry the SAME fp', () => {
+  const FP_B = fp('fp-payload-B');
+  const redrop = async (
+    stub: DurableObjectStub, noteId: string, txId: string, fpValue: string | undefined,
+    snapshot?: { status: string; txId: string; token: string; gen: number },
+  ) => {
+    const r = await stub.fetch('http://do/redrop', {
+      method: 'POST',
+      body: JSON.stringify({ noteId, txId, limit: 20, ...(fpValue === undefined ? {} : { fp: fpValue }), ...(snapshot ? { snapshot } : {}) }),
+    });
+    return r.json() as Promise<{
+      ok: boolean; token?: string; committed?: boolean; txId?: string;
+      conflict?: boolean; stale?: boolean; legacy?: boolean; inProgress?: boolean;
+    }>;
+  };
+
+  it('superseded by the SAME payload → resolved with the new txId', async () => {
+    const s = stubFor('pk-Rd1');
+    const first = await reserve(s, 'rd1');
+    await commit(s, 'rd1', 'tx-old', first.token!);
+    const re = await redrop(s, 'rd1', 'tx-old', FP_A);
+    await commit(s, 'rd1', 'tx-new', re.token!);
+
+    const late = await redrop(s, 'rd1', 'tx-old', FP_A);
+    expect(late.ok).toBe(false);
+    expect(late.committed).toBe(true);
+    expect(late.txId).toBe('tx-new');
+    expect(late.conflict).toBeUndefined();
+  });
+
+  it('superseded by a DIFFERENT payload → typed conflict, never the new txId as success', async () => {
+    // The reviewed race: A (fpA) and B (fpB) both decide the old tx is dead;
+    // B re-posts first. A must not be handed B's transaction — that is payload A
+    // under transaction B, the binding D2 exists to forbid.
+    const s = stubFor('pk-Rd2');
+    const first = await reserve(s, 'rd2');
+    await commit(s, 'rd2', 'tx-old', first.token!);
+    const re = await redrop(s, 'rd2', 'tx-old', FP_B); // B wins the redrop
+    await commit(s, 'rd2', 'tx-B', re.token!);
+
+    const a = await redrop(s, 'rd2', 'tx-old', FP_A);
+    expect(a.ok).toBe(false);
+    expect(a.conflict).toBe(true);
+    expect(a.txId).toBe('tx-B');
+    expect(a.committed).toBeUndefined();
+  });
+
+  it('superseded by an UNFINGERPRINTED record → legacy, not a verdict', async () => {
+    const s = stubFor('pk-Rd3');
+    await runInDurableObject(s, async (_i, state) => {
+      await state.storage.put('note:rd3', { status: 'committed', token: 't', gen: 0, txId: 'tx-other' });
+    });
+    const r = await redrop(s, 'rd3', 'tx-old', FP_A);
+    expect(r.ok).toBe(false);
+    expect(r.legacy).toBe(true);
+    expect(r.committed).toBeUndefined();
+  });
+
+  it('a legacy redrop CASes on its snapshot: a concurrent backfill makes it stale', async () => {
+    // A verified the transaction dead; meanwhile B proved the publication and
+    // backfilled its fp. A's redrop must not overwrite that proof.
+    const s = stubFor('pk-Rd4');
+    await runInDurableObject(s, async (_i, state) => {
+      await state.storage.put('note:rd4', { status: 'committed', token: 't', gen: 0, txId: 'tx-legacy' });
+    });
+    const snap = { status: 'committed', txId: 'tx-legacy', token: 't', gen: 0 };
+    await backfill(s, 'rd4', snap, FP_B); // B got there first
+
+    const a = await redrop(s, 'rd4', 'tx-legacy', FP_A, snap);
+    expect(a.ok).toBe(false);
+    expect(a.stale).toBe(true);
+    expect((await reserve(s, 'rd4', 20, FP_A)).status).toBe('id_payload_conflict');
+    expect((await reserve(s, 'rd4', 20, FP_B)).status).toBe('exists');
+  });
+
+  it('a legacy redrop CASes on its snapshot: a concurrent redrop makes it stale', async () => {
+    const s = stubFor('pk-Rd5');
+    await runInDurableObject(s, async (_i, state) => {
+      await state.storage.put('note:rd5', { status: 'committed', token: 't', gen: 0, txId: 'tx-legacy' });
+    });
+    const snap = { status: 'committed', txId: 'tx-legacy', token: 't', gen: 0 };
+    expect((await redrop(s, 'rd5', 'tx-legacy', FP_B, snap)).ok).toBe(true);
+
+    const a = await redrop(s, 'rd5', 'tx-legacy', FP_A, snap);
+    expect(a.ok).toBe(false);
+    expect(a.stale).toBe(true);
+    expect(a.token).toBeUndefined(); // no second reservation was minted
+  });
+
+  it('a legacy redrop with a MATCHING snapshot proceeds and fingerprints the reservation', async () => {
+    const s = stubFor('pk-Rd6');
+    await runInDurableObject(s, async (_i, state) => {
+      await state.storage.put('note:rd6', { status: 'committed', token: 't', gen: 0, txId: 'tx-legacy' });
+    });
+    const r = await redrop(s, 'rd6', 'tx-legacy', FP_A, { status: 'committed', txId: 'tx-legacy', token: 't', gen: 0 });
+    expect(r.ok).toBe(true);
+    const stored = await runInDurableObject(s, async (_i, state) =>
+      state.storage.get<{ status: string; fp?: string }>('note:rd6'));
+    expect(stored?.status).toBe('reserved');
+    expect(stored?.fp).toBe(FP_A);
+  });
+});
+
 describe('/backfill-fp — snapshot CAS', () => {
   const seedLegacy = async (stub: DurableObjectStub, noteId: string) => {
     await runInDurableObject(stub, async (_i, state) => {

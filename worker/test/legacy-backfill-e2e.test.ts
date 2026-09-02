@@ -27,6 +27,12 @@ const baseEnv = env as unknown as Record<string, unknown>;
 
 const { mockRoute } = setupOutboundMock();
 
+// RSA-4096 keygen for the harness wallets runs ONCE per process and is paid by
+// whichever test asks first — under CPU contention (a parallel client suite)
+// that first test blew the default 5 s timeout. Pay it here, explicitly, with
+// a budget that says what it is.
+beforeAll(async () => { await testWallet(); await newWallet(); }, 60_000);
+
 const NOTE_ID = '33333333-4444-4555-8666-777777777777';
 const C = 'AAAAAAAAAAAAAAAAAAAAAA==';
 const IV = 'AAAAAAAAAAAAAAAA';
@@ -97,19 +103,32 @@ function serveTx(tx: { txId: string; header: Record<string, unknown>; bytes: Uin
   mockRoute('GET', new RegExp(`^${G1}/raw/${tx.txId}$`), 200, '', 1, { makeBody: () => tx.bytes });
 }
 
+/** Analytics Engine capture, so each legacy outcome can be asserted as the
+ *  soak metric it becomes. */
+type Point = { blobs?: string[]; doubles?: number[]; indexes?: string[] };
+function capture() {
+  const points: Point[] = [];
+  const dataset = { writeDataPoint: (p: Point) => { points.push(p); } };
+  const outcomes = () => points
+    .filter(p => p.blobs?.[0] === 'semantic_idempotency')
+    .map(p => p.blobs?.[1]);
+  return { dataset, outcomes };
+}
+
 /**
  * env with a single-origin payload pool and BOTH wallets trusted:
  *  - the harness wallet, because it signed the publication D9 must accept;
  *  - the worker's own signing wallet, because /upload refuses while that one is
  *    outside the set (it would otherwise 503 before reaching this path).
  */
-async function envFor(): Promise<Record<string, unknown>> {
+async function envFor(cap?: ReturnType<typeof capture>): Promise<Record<string, unknown>> {
   const publisher = await testWallet();
   const signer = await addressOfJwk(String(baseEnv.ARWEAVE_JWK));
   return {
     ...baseEnv,
     TRUSTED_OWNERS: `${signer},${publisher.address}`,
     PAYLOAD_GATEWAYS: G1,
+    ...(cap ? { METRICS_ENABLED: 'true', METRICS: cap.dataset } : {}),
   };
 }
 
@@ -124,10 +143,13 @@ describe('a legacy record whose publication IS the payload being sent', () => {
     );
     await seedLegacyCommitted(noteId, tx.txId);
     serveTx(tx);
+    const cap = capture();
 
-    const r = await worker.fetch(await uploadRequest(noteId, 'lb-1'), await envFor() as never);
+    const r = await worker.fetch(await uploadRequest(noteId, 'lb-1'), await envFor(cap) as never);
 
     expect(r.status).toBe(200);
+    // One proof, then one dedupe on the re-check — in that order.
+    expect(cap.outcomes()).toEqual(['legacy_backfilled', 'deduped']);
     const body = await r.json() as { txId: string; committed: boolean; deduped?: boolean };
     expect(body.txId).toBe(tx.txId);
     expect(body.committed).toBe(true);
@@ -170,10 +192,12 @@ describe('a legacy record whose publication is something ELSE', () => {
     );
     await seedLegacyCommitted(noteId, tx.txId);
     serveTx(tx);
+    const cap = capture();
 
-    const r = await worker.fetch(await uploadRequest(noteId, 'lb-3'), await envFor() as never);
+    const r = await worker.fetch(await uploadRequest(noteId, 'lb-3'), await envFor(cap) as never);
 
     expect(r.status).toBe(409);
+    expect(cap.outcomes()).toEqual(['legacy_backfilled', 'conflict']);
     const body = await r.json() as { code: string; txId?: string };
     expect(body.code).toBe('id_payload_conflict');
     // The proof still landed — the fingerprint of what is ACTUALLY published.
@@ -196,10 +220,12 @@ describe('a legacy record whose publication is something ELSE', () => {
     // route here would leave it unconsumed. That is the assertion: the pool
     // does not spend a second request on a transaction it has already refused.
     mockRoute('GET', new RegExp(`^${G1}/tx/${tx.txId}$`), 200, JSON.stringify(tx.header));
+    const cap = capture();
 
-    const r = await worker.fetch(await uploadRequest(noteId, 'lb-4'), await envFor() as never);
+    const r = await worker.fetch(await uploadRequest(noteId, 'lb-4'), await envFor(cap) as never);
 
     expect(r.status).toBe(409);
+    expect(cap.outcomes()).toEqual(['legacy_not_ours']);
     // Nothing is bound: we cannot fingerprint a publication that is not ours.
     expect(await storedFp(noteId)).toBeUndefined();
   });
@@ -216,8 +242,10 @@ describe('an unprovable legacy record', () => {
     );
     await seedLegacyCommitted(noteId, tx.txId);
     // No routes: the pool is unreachable.
+    const cap = capture();
 
-    const r = await worker.fetch(await uploadRequest(noteId, 'lb-5'), await envFor() as never);
+    const r = await worker.fetch(await uploadRequest(noteId, 'lb-5'), await envFor(cap) as never);
+    expect(cap.outcomes()).toEqual(['legacy_unproven']);
 
     // Absence of evidence is a TRANSPORT failure, not a verdict. A conflict
     // here would quarantine a healthy record over a bad afternoon on the
@@ -369,8 +397,9 @@ describe('a legacy record whose transaction is PROVEN gone', () => {
     const postTx = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
 
     const signer = await newWallet();
+    const cap = capture();
     const r = await worker.fetch(await uploadRequest(noteId, 'lb-dead'), {
-      ...(await envFor()),
+      ...(await envFor(cap)),
       // A real signable wallet, declared trusted, so the re-post can complete.
       ARWEAVE_JWK: JSON.stringify(signer.jwk),
       TRUSTED_OWNERS: signer.address,
@@ -381,6 +410,7 @@ describe('a legacy record whose transaction is PROVEN gone', () => {
     expect(postTx.calls).toBe(1);       // exactly one paid POST
     expect(body.txId).not.toBe(deadTx); // under a NEW transaction
     expect(body.deduped).toBe(false);   // this one was paid for
+    expect(cap.outcomes()).toEqual(['legacy_dead_redrop']);
 
     // …and the record is no longer legacy: it carries this payload's fp.
     expect(await storedFp(noteId)).toBe(await computePublicationFp(VERSION, dataFor(noteId)));

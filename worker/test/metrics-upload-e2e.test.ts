@@ -303,6 +303,9 @@ describe('upload_outcome matrix — paid-path returns ONLY (L r19/r20)', () => {
     expect(r.status).toBe(200);
     expect(cap.byEvent('upload_outcome')).toHaveLength(0);
     expect(cap.byEvent('gateway_call')).toHaveLength(0); // and no paid legs either
+    // …but the fingerprint protocol reports what it decided: this is the soak
+    // instrument for exactly the path upload_outcome stays silent about.
+    expect(cap.byEvent('semantic_idempotency').map(p => p.blobs?.[1])).toEqual(['deduped']);
   });
 
   it('validation 400 emits nothing', async () => {

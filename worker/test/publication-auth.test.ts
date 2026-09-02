@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { beforeAll, describe, it, expect } from 'vitest';
 import { authenticatePublication } from '../src/publication-auth';
 // CROSS-HALF IMPORT (deliberate): the signing harness PR-3a built for the
 // client's D9 suite. Reusing it is the point — the worker must accept exactly
@@ -8,6 +8,12 @@ import { buildSignedTx, newWallet, notesTags, testWallet } from '../../src/test-
 import { computePublicationFp } from '../src/publication-fp';
 
 const OWNER_HASH = 'owner-hash-under-test';
+
+// RSA-4096 keygen for the harness wallets runs ONCE per process and is paid by
+// whichever test asks first — under CPU contention (a parallel client suite)
+// that first test blew the default 5 s timeout. Pay it here, explicitly, with
+// a budget that says what it is.
+beforeAll(async () => { await testWallet(); await newWallet(); }, 60_000);
 const NOTE_ID = '77777777-2222-8333-8444-555555555555';
 const G1 = 'https://g1.test';
 const G2 = 'https://g2.test';

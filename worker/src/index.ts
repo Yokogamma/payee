@@ -845,6 +845,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const hasTimestamp = declaredVersion === '1';
   const isSplitEnvelope = declaredVersion === '4';
 
+  // The soak's instrument (D2). One event per decision the fingerprint
+  // protocol makes, labelled by outcome — so «is the release behaving» is a
+  // query, not a feeling. Fires on paths `upload_outcome` deliberately stays
+  // silent about (idempotent hits, reconciliation without a POST), because
+  // those are precisely the paths this release changed.
+  const attest = (outcome: string) => emit('semantic_idempotency', [outcome, declaredVersion], []);
+
   const REQUIRED_TAGS = new Map<string, string>([
     ['App-Name', APP_NAME],
     ['App-Version', declaredVersion],
@@ -999,11 +1006,31 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   };
 
   // Convert a dropped server TX back to a fresh reservation for re-post.
-  const doRedrop = async (deadTxId: string):
-    Promise<{ kind: 'resolved'; txId: string } | { kind: 'defer' } | { kind: 'repost'; token: string }> => {
-    const resp = await doCall('/redrop', { noteId, txId: deadTxId, limit: quotaLimit, fp: requestedFp });
-    const r: { ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean; committed?: boolean; txId?: string } = await resp.json();
-    if (r.committed && r.txId) return { kind: 'resolved', txId: r.txId }; // reposted elsewhere
+  //
+  // `snapshot` is passed on the LEGACY path and makes the DO compare-and-swap
+  // (see RedropRequest). `resolved` is answered only when the DO confirms the
+  // superseding transaction carries THIS payload's fingerprint; a different
+  // one is a typed conflict, and a record that moved on or is still
+  // unfingerprinted is deferred — the client's retry re-enters through
+  // /check-and-reserve, where the comparison is made against the current
+  // record.
+  const doRedrop = async (deadTxId: string, snapshot?: LegacySnapshot):
+    Promise<
+      | { kind: 'resolved'; txId: string }
+      | { kind: 'conflict'; txId?: string }
+      | { kind: 'defer' }
+      | { kind: 'repost'; token: string }
+    > => {
+    const resp = await doCall('/redrop', {
+      noteId, txId: deadTxId, limit: quotaLimit, fp: requestedFp, ...(snapshot ? { snapshot } : {}),
+    });
+    const r: {
+      ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean;
+      committed?: boolean; txId?: string; conflict?: boolean; stale?: boolean; legacy?: boolean;
+    } = await resp.json();
+    if (r.conflict) return { kind: 'conflict', txId: r.txId };
+    if (r.stale || r.legacy) return { kind: 'defer' };
+    if (r.committed && r.txId) return { kind: 'resolved', txId: r.txId }; // reposted elsewhere, SAME fp
     if (r.rateLimited || r.inProgress || !r.ok || !r.token) return { kind: 'defer' };
     return { kind: 'repost', token: r.token };
   };
@@ -1057,9 +1084,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // record is comparable. So the status quorum is asked, and only a
       // unanimous `dead` past the age guard opens the re-post.
       const live = await getTxStatusWorker(snapshot.txId, emit, env);
-      if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) return { kind: 'dead' };
+      if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) {
+        attest('legacy_dead_redrop');
+        return { kind: 'dead' };
+      }
       // Alive-but-unfetchable, unavailable, or too recent: retryable, and
       // nothing is written.
+      attest('legacy_unproven');
       return { kind: 'respond', response: error('Publication could not be authenticated', 503) };
     }
     if (auth.kind === 'not-ours') {
@@ -1067,6 +1098,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // this canonicalization cannot read. Not transient, so a 503 would loop
       // forever — and the historical txId must never be returned as a success.
       // Nothing is written: no observedFp, no binding.
+      attest('legacy_not_ours');
       return { kind: 'respond', response: idPayloadConflict(snapshot.txId) };
     }
 
@@ -1074,13 +1106,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // the verification is expensive and its result is a fact about the
     // publication, not a verdict about this request.
     await doCall('/backfill-fp', { noteId, snapshot, observedFp: auth.observedFp });
+    attest('legacy_backfilled');
     return { kind: 'retry' };
   };
 
   let checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
   let checkResult: CheckResult = await checkResp.json();
 
-  let legacyRedrop: string | null = null;
+  let legacyRedrop: LegacySnapshot | null = null;
   if (checkResult.status === 'legacy' && checkResult.snapshot) {
     const age = checkResult.snapshot.status === 'committed'
       ? (checkResult.committedAt ?? 0)
@@ -1088,7 +1121,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     const outcome = await resolveLegacy(checkResult.snapshot, age);
     if (outcome.kind === 'respond') return outcome.response;
     if (outcome.kind === 'dead') {
-      legacyRedrop = checkResult.snapshot.txId;
+      legacyRedrop = checkResult.snapshot;
     } else {
       // Exactly ONE retry. The record is no longer legacy (this backfill filled
       // it, or a concurrent one did), so a second `legacy` would mean the record
@@ -1103,6 +1136,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (checkResult.status === 'id_payload_conflict') {
     // The same noteId under DIFFERENT bytes. Typed, never a silent replay of
     // the historical txId.
+    attest('conflict');
     return idPayloadConflict(checkResult.txId);
   }
 
@@ -1119,10 +1153,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // is not comparable: quota and attempts apply exactly as elsewhere, and the
     // new reservation carries THIS payload's fingerprint, so the record stops
     // being legacy whatever happens next.
-    const rd = await doRedrop(legacyRedrop);
+    const rd = await doRedrop(legacyRedrop.txId, legacyRedrop);
     if (rd.kind === 'resolved') {
+      attest('deduped');
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
+    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -1133,12 +1169,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // payload (the fp comparison above). `deduped` is additive — an older
       // client ignores it, which is safe precisely because the proof was done
       // by the server, not asserted by the client.
+      attest('deduped');
       return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
     }
 
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!, emit, env);
     if (live === 'alive') {
+      attest('deduped');
       return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
     }
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
@@ -1148,9 +1186,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     const rd = await doRedrop(checkResult.txId!);
     if (rd.kind === 'resolved') {
       // Superseded: another request committed this payload while we were
-      // deciding. This response paid for nothing, so it is a dedupe.
+      // deciding — the DO confirmed the SAME fingerprint. This response paid
+      // for nothing, so it is a dedupe.
+      attest('deduped');
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
+    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -1167,6 +1208,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           // `deduped` only NOW: the posted state has been resolved — liveness
           // checked and the DO finalized — which is what the plan requires
           // before this answer may be given.
+          attest('deduped');
           return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
         }
       } catch { /* fall through to retryable 503 */ }
@@ -1178,9 +1220,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     const rd = await doRedrop(checkResult.txId!);
     if (rd.kind === 'resolved') {
       // Superseded: another request committed this payload while we were
-      // deciding. This response paid for nothing, so it is a dedupe.
+      // deciding — the DO confirmed the SAME fingerprint. This response paid
+      // for nothing, so it is a dedupe.
+      attest('deduped');
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
+    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -1221,12 +1266,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           expectedNoteId: noteId,
         });
         if (auth.kind === 'unproven') {
+          attest('recovery_unproven');
           await safeRelease(reserveToken);
           return error('Publication could not be authenticated', 503);
         }
         if (auth.kind !== 'authenticated' || auth.observedFp !== requestedFp) {
           // Proven to be different bytes (or not ours at all). The reservation
           // is released and NOTHING is bound to the old transaction.
+          attest('recovery_conflict');
           await safeRelease(reserveToken);
           return idPayloadConflict(recoveryHint.txId);
         }
@@ -1236,6 +1283,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           if (commitResp.ok && commit.ok) {
             // The recovery branch reconciles an EXISTING transaction, so this
             // too returns an id it did not create.
+            attest('deduped');
             return uploadAccepted({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true });
           }
         } catch { /* fall through */ }
@@ -1555,7 +1603,8 @@ async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: 
 
 /**
  * Server-side liveness check for a committed TX (recheck path). Maps the gateway
- * contract to a coarse verdict: 200/202 → alive, 404/400 → dead, else unknown.
+ * contract to a coarse verdict: 200/202 → alive, 404 → dead, everything else
+ * (400 included — see probeStatusOrigin) → unavailable.
  * PR-2 wraps the SAME fetch in a stopwatch and emits gateway_call(status) +
  * status_verdict; the verdict logic itself is unchanged (quorum is PR-3a).
  */
