@@ -431,8 +431,8 @@ is done in the direction that deploys nothing dangerous:
 4. dispatch it for a commit that exists only on an unmerged branch — the run
    must stop at the same gate, with the «not reachable from the trusted head»
    message;
-5. dispatch it for an untagged intermediate commit of a merged PR — refused
-   too: only the head of `main` and tagged commits are deployable, because every
+5. dispatch it for an intermediate commit of a merged PR — refused too: only
+   the head of `main` and allowlisted SHAs are deployable, because every
    mid-review state is also an ancestor of `main` and none of them was ever
    judged as deployable;
 6. record all five run ids here.
