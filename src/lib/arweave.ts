@@ -537,11 +537,16 @@ export type UploadsCapability = 'enabled' | 'disabled' | 'unknown';
  *  independent: an old worker that knows v3 but not v4 reports
  *  `{v3:'enabled', v4:'unknown'}` and the v4 pause stays up (fail closed). */
 export interface WorkerCapabilities {
+  /** The GLOBAL switch on its own. Needed to lift the global pause marker
+   *  when `uploads` is back on while BOTH version switches stay off — v1/v2
+   *  are allowed again in that state, and deriving «global is fine» from
+   *  «some version is enabled» could never say so. */
+  uploads: UploadsCapability;
   v3: UploadsCapability;
   v4: UploadsCapability;
 }
 
-const UNKNOWN_CAPABILITIES: WorkerCapabilities = { v3: 'unknown', v4: 'unknown' };
+const UNKNOWN_CAPABILITIES: WorkerCapabilities = { uploads: 'unknown', v3: 'unknown', v4: 'unknown' };
 
 /**
  * Strictly-validated /health probe used to lift a persisted upload pause.
@@ -635,7 +640,10 @@ function readCapabilities(data: unknown, nonce: string, expectedHash: string): W
     if (typeof d.uploads !== 'boolean' || typeof flag !== 'boolean') return 'unknown';
     return d.uploads && flag ? 'enabled' : 'disabled';
   };
-  return { v3: readOne('3', d.v3Uploads), v4: readOne('4', d.v4Uploads) };
+  // The global flag is read on the same fresh, validated answer, and with
+  // the same strictness: a missing or non-boolean value is unknown.
+  const uploads: UploadsCapability = typeof d.uploads !== 'boolean' ? 'unknown' : (d.uploads ? 'enabled' : 'disabled');
+  return { uploads, v3: readOne('3', d.v3Uploads), v4: readOne('4', d.v4Uploads) };
 }
 
 // ─── Download (Restore from Arweave) ─────────────────────────────────
