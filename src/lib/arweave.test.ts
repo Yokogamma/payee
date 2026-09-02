@@ -1074,3 +1074,55 @@ describe('a malformed header must cost ONE gateway, never the sweep', () => {
     expect(res[0].text).toBe('смешанные источники');
   });
 });
+
+describe('the index walk is bounded (P2 review)', () => {
+  // One more party that can misbehave. Each bound ends the sweep as
+  // INCOMPLETE — a state the UI already explains — never as a hang.
+  const NOTE = { name: 'Note-Id', value: 'nid' };
+  const TAGS = [{ name: 'App-Name', value: 'EternalNotes' }, { name: 'App-Version', value: '2' }, NOTE];
+  const page = (cursor: string, hasNextPage: boolean) => new Response(JSON.stringify({ data: { transactions: {
+    edges: [{ cursor, node: { id: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs', tags: TAGS } }],
+    pageInfo: { hasNextPage },
+  } } }), { status: 200 });
+
+  async function sweep(fetchImpl: (url: string) => Promise<Response>) {
+    vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
+    vi.stubGlobal('fetch', vi.fn(fetchImpl));
+    const { deriveKey, generateMnemonic } = await import('./crypto');
+    const key = await deriveKey(generateMnemonic());
+    const { fetchAllNotes } = await import('./arweave');
+    return fetchAllNotes('oh', ring(key));
+  }
+
+  it('a cursor that repeats ends the walk as incomplete, not forever', async () => {
+    let graphqlCalls = 0;
+    const r = await sweep(async (url) => {
+      if (url.includes('/graphql')) { graphqlCalls++; return page('same', true); }
+      throw new Error('no payload'); // the one candidate is unavailable
+    });
+    expect(r.incomplete).toBe(true);
+    expect(graphqlCalls).toBe(2); // the page, and the page that repeated it
+  });
+
+  it('an index that never stops claiming hasNextPage hits the page budget', async () => {
+    let n = 0;
+    const r = await sweep(async (url) => {
+      if (url.includes('/graphql')) return page(`c${n++}`, true);
+      throw new Error('no payload');
+    });
+    expect(r.incomplete).toBe(true);
+    expect(n).toBeLessThanOrEqual(201);
+  });
+
+  it('an oversized page is a fetch failure — index unavailable on the FIRST page', async () => {
+    const huge = JSON.stringify({ data: { transactions: { edges: [], pageInfo: { hasNextPage: false }, pad: 'x'.repeat(600 * 1024) } } });
+    await expect(sweep(async () => new Response(huge, { status: 200 })))
+      .rejects.toBeInstanceOf((await import('./arweave')).ArweaveIndexUnavailableError);
+  });
+
+  it('a page that fails the schema is a fetch failure too', async () => {
+    const bad = JSON.stringify({ data: { transactions: { edges: [{ cursor: 1, node: {} }], pageInfo: { hasNextPage: 'yes' } } } });
+    await expect(sweep(async () => new Response(bad, { status: 200 })))
+      .rejects.toBeInstanceOf((await import('./arweave')).ArweaveIndexUnavailableError);
+  });
+});
