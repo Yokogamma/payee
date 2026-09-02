@@ -55,13 +55,15 @@
  * live worker, is a PR-branch tip and is NOT on that chain. A gate that refuses
  * its own floor is broken.
  *
- * So the rule follows the practice the runbook already prescribes («allowed
- * rollback targets = tags in this list»; «append the release tag on each
- * deploy»): the candidate must be reachable from the trusted head AND be
- * either that head itself or a TAGGED commit. Deploying the newest thing and
- * rolling back to a release both keep working; a mid-review state does not.
- * The escape hatch, if some untagged commit really must ship, is to tag it —
- * which the runbook demanded anyway.
+ * So the rule narrows ancestry with a second question, and the answer to it
+ * lives on the protected branch (PR-3a): the candidate must be reachable from
+ * the trusted head AND be either that head itself or a SHA listed in
+ * `scripts/release-allowlist.mjs`. Deploying the newest thing and rolling back
+ * to a release both keep working; a mid-review state does not. The escape
+ * hatch, if some older commit really must ship, is to add its SHA to that file
+ * in a reviewed pull request. It is NOT to tag the commit: a tag is not branch
+ * protection, so «any tagged ancestor» would let anyone able to push a tag
+ * choose what deploys.
  *
  * ── Why this file cannot be the whole answer ─────────────────────────
  *
