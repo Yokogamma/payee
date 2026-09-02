@@ -104,6 +104,11 @@ export const IconRefresh = () => (
 /** Disclosure. Rotated by the caller when expanded. */
 export const IconChevron = () => <Line><path d="m6 9 6 6 6-6" /></Line>;
 
+/** Back to the list. Drawn rather than rotated from the disclosure chevron:
+ *  a `transform` on an icon inside a text button shifts its optical baseline,
+ *  and the two are used at different sizes. */
+export const IconChevronLeft = () => <Line><path d="m14 6-6 6 6 6" /></Line>;
+
 /** Dismiss. Replaces the ✕ character, which is not one glyph across platforms
  *  and was the last piece of text pretending to be an icon in this line. */
 export const IconClose = () => (

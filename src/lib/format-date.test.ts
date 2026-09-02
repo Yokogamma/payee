@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatNoteDate } from './format-date';
+import { formatNoteDate, formatNoteDateFull, formatVersionStamp } from './format-date';
 
 /** 2026-08-17 14:30:00 local — «now» for every case below. Passed explicitly
  *  rather than faked globally: the function takes `now` as a parameter for
@@ -78,5 +78,79 @@ describe('formatNoteDate — часы, идущие не туда', () => {
 
   it('и не превращается в «через 3 часа» — заметка не запланирована', () => {
     expect(formatNoteDate(NOW + 3 * HOUR, NOW)).not.toMatch(/через/);
+  });
+});
+
+/**
+ * The absolute variant, used for the accessible name of the feed's open
+ * control: «Открыть заметку от …». A control must not be named by a moving
+ * target, and «Открыть заметку от только что» is not a sentence.
+ */
+describe('formatNoteDateFull — всегда дата, никогда «сколько прошло»', () => {
+  it('этот год — без года', () => {
+    expect(formatNoteDateFull(new Date(2026, 7, 19, 12, 0).getTime(), NOW)).toBe('19 августа');
+  });
+
+  it('прошлый год — с годом', () => {
+    expect(formatNoteDateFull(new Date(2025, 7, 19, 12, 0).getTime(), NOW)).toBe('19 августа 2025');
+  });
+
+  it('только что созданная заметка всё равно названа датой', () => {
+    // Именно здесь относительный форматтер сказал бы «только что».
+    expect(formatNoteDate(NOW, NOW)).toBe('только что');
+    expect(formatNoteDateFull(NOW, NOW)).toBe('17 августа');
+  });
+
+  it('будущая метка печатается датой, а не клампится', () => {
+    // У полного форматтера относительной ветки нет вовсе, поэтому и клампа
+    // «только что» здесь быть не может.
+    expect(formatNoteDateFull(NOW + 3 * HOUR, NOW)).toBe('17 августа');
+    expect(formatNoteDateFull(new Date(2027, 0, 5, 12, 0).getTime(), NOW)).toBe('5 января 2027');
+  });
+
+  it('ни при каком входе не содержит относительных слов', () => {
+    for (const ts of [NOW, NOW - MINUTE, NOW - HOUR, NOW - DAY, NOW + DAY, NOW - 400 * DAY]) {
+      expect(formatNoteDateFull(ts, NOW)).not.toMatch(/назад|только что|через/);
+    }
+  });
+});
+
+describe('formatVersionStamp — момент, а не «сколько прошло»', () => {
+  // Все даты строятся в ЛОКАЛЬНОМ времени, и Intl форматирует в нём же —
+  // поэтому литеральные ожидания устойчивы к часовому поясу машины.
+
+  it('дата этого года печатается без года, со временем', () => {
+    expect(formatVersionStamp(new Date(2026, 7, 13, 14, 22).getTime(), NOW)).toBe('13 августа, 14:22');
+  });
+
+  it('дата прошлого года печатается с годом', () => {
+    expect(formatVersionStamp(new Date(2025, 7, 13, 14, 22).getTime(), NOW)).toBe('13 августа 2025, 14:22');
+  });
+
+  it('часы и минуты двузначные — ведущий ноль на месте', () => {
+    expect(formatVersionStamp(new Date(2026, 7, 13, 9, 5).getTime(), NOW)).toBe('13 августа, 09:05');
+  });
+
+  it('полночь — это 00:00, а не 24:00', () => {
+    // Ради этого случая формат объявлен через `hourCycle: 'h23'`, а не
+    // `hour12: false`: последний в части сборок ICU даёт цикл h24 и печатает
+    // несуществующее «24:00». В любой другой час разницы не видно.
+    expect(formatVersionStamp(new Date(2026, 7, 13, 0, 0).getTime(), NOW)).toBe('13 августа, 00:00');
+    expect(formatVersionStamp(new Date(2026, 7, 13, 12, 0).getTime(), NOW)).toBe('13 августа, 12:00');
+  });
+
+  it('относительной ветки нет вовсе — даже у только что созданной версии', () => {
+    const stamp = formatVersionStamp(NOW, NOW);
+    expect(stamp).toBe('17 августа, 14:30');
+    expect(stamp).not.toContain('назад');
+    expect(stamp).not.toContain('только что');
+  });
+
+  it('метка из будущего печатает свою дату, а не клампится', () => {
+    // У относительного форматтера будущее клампится в «только что» — здесь
+    // клампить нечем и незачем: это архивная запись, а не ориентир.
+    const future = formatVersionStamp(NOW + 3 * HOUR, NOW);
+    expect(future).toBe('17 августа, 17:30');
+    expect(future).not.toContain('только что');
   });
 });

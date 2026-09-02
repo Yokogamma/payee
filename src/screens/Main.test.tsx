@@ -99,6 +99,7 @@ function baseStore() {
     retryRestore: vi.fn(),
     clearRestoreStatus: vi.fn(),
     updateCheck: { status: 'idle' as const },
+    lastSweepOutcome: null as 'ok' | 'partial' | 'error' | null,
     checkForUpdates: vi.fn(),
     syncStatuses: { n1: { status: 'confirmed' as const, txId: 'TX123' } },
     dismissError: vi.fn(),
@@ -913,5 +914,53 @@ describe('Main — фокус следует за разделом', () => {
   it('но НЕ крадёт фокус при первом рендере', () => {
     render(<Main theme="system" onThemeChange={vi.fn()} />);
     expect(document.activeElement).toBe(document.body);
+  });
+});
+
+/**
+ * The rollback half of the reading view.
+ *
+ * `flags.ts` states it as a contract, not as a style: with the writer off
+ * `editNote` THROWS, and «edit/history controls are hidden» — while «readers
+ * are never gated». So the note still opens and still reads; only the two
+ * write-adjacent controls are absent.
+ */
+describe('Main — чтение при выключенном писателе', () => {
+  const openFirstNote = () => {
+    fireEvent.click(screen.getByRole('button', { name: /^Открыть заметку от/ }));
+  };
+
+  it('заметка открывается и читается', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(document.querySelector('.note-reader-body')).toBeTruthy();
+    expect(document.querySelector('.note-reading')?.textContent).toContain('привет мир');
+    expect(document.querySelector('.notes-feed')).toBeNull();
+  });
+
+  it('но панель не предлагает ни правку, ни историю', () => {
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    openFirstNote();
+    expect(screen.queryByRole('button', { name: 'Изменить' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'История' })).toBeNull();
+    // Copying is writer-independent and stays — the panel is not empty.
+    expect(screen.getByRole('button', { name: 'Копировать' })).toBeTruthy();
+  });
+
+  it('адрес версии сворачивается в заметку: страницы версии тут нет', () => {
+    // Единственная заметка в этой фикстуре одноверсионная, так что /v/1 — это
+    // её же текущая версия, и возвращать там нечего ни при каком флаге.
+    window.history.replaceState(null, '', '#/notes/n1/v/1');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(window.location.hash).toBe('#/notes/n1');
+    expect(document.querySelector('.note-reader-body')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Вернуть' })).toBeNull();
+  });
+
+  it('мусор в номере версии не открывает ничего странного', () => {
+    window.history.replaceState(null, '', '#/notes/n1/v/0');
+    render(<Main theme="system" onThemeChange={vi.fn()} />);
+    expect(window.location.hash).toBe('#/notes/n1');
+    expect(document.querySelector('.note-reading')?.textContent).toContain('привет мир');
   });
 });

@@ -423,6 +423,10 @@ export type UpdateCheckState =
     }
   | { status: 'error'; at: number };
 
+/** `ok` — the sweep reached everything it asked for; `partial` — it ran but
+ *  some pages or payloads were unreachable; `error` — it failed outright. */
+export type SweepOutcome = 'ok' | 'partial' | 'error';
+
 /**
  * Why a PIN offered during RESTORE is not the PIN of this device:
  *  'already-set' — another tab configured one first (first-writer-wins: its
@@ -489,6 +493,19 @@ interface NotesStore {
   restoredUpdatedCount: number | null;
   /** Outcome of the manual «Проверить обновления» run (see UpdateCheckState). */
   updateCheck: UpdateCheckState;
+  /** How the LAST sweep of either mode ended — the only honest answer to «can
+   *  this list of versions be trusted to be complete?».
+   *
+   *  It exists because the banner state cannot answer that. `restoreError` is
+   *  dismissible (`clearRestoreStatus`), a successful check never clears a
+   *  stale one, a successful restore never clears a stale `updateCheck.partial`,
+   *  and `updateCheck` only ever describes the manual check. Anything reading
+   *  those four to decide «is the snapshot whole» reads four half-answers.
+   *
+   *  NOT a gate: nothing is blocked on it. It is what a screen prints when it
+   *  wants to admit that what it shows may be missing something. `null` = no
+   *  sweep has finished in this vault session. */
+  lastSweepOutcome: SweepOutcome | null;
   vaultError: string | null;
   hasPin: boolean;
   /** Outcome of a PIN requested from the RESTORE flow, when it did NOT end up
@@ -827,6 +844,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [restoredCount, setRestoredCount] = useState<number | null>(null);
   const [restoredUpdatedCount, setRestoredUpdatedCount] = useState<number | null>(null);
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({ status: 'idle' });
+  const [lastSweepOutcome, setLastSweepOutcome] = useState<SweepOutcome | null>(null);
   // v3 uploads paused by the worker kill switch. Authoritative state lives in
   // the shared IndexedDB marker (readV3PauseMeta) — this mirrors it for the UI.
   const [v3Paused, setV3Paused] = useState(false);
@@ -1932,6 +1950,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // would otherwise leave 'checking' pinned forever (its own state writes are
     // gated on the epoch it no longer owns).
     setUpdateCheck({ status: 'idle' });
+    // The outcome belongs to the session that measured it. `clearRestoreStatus`
+    // deliberately does NOT touch it (a dismissed banner is not a whole
+    // snapshot), but a lock ends the session that knew — the next unlock starts
+    // with «no sweep has finished yet», and the next sweep answers again.
+    setLastSweepOutcome(null);
     // Ремонтный набор принадлежит закрываемой сессии; следующая разблокировка
     // пересоберёт его заново из фактов СВОЕЙ расшифровки (§6.4).
     undecryptableIdsRef.current = new Set();
@@ -2827,6 +2850,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         await refreshSafeboxPresence(myEpoch);
       }
       if (vaultEpochRef.current !== myEpoch) return;
+      // THE OUTCOME IS PUBLISHED WITH THE TERMINAL STATUS, in this same
+      // synchronous block — NOT after the `sweep-full-at` write further down.
+      // An await between the two would leave the fresh status standing beside
+      // the PREVIOUS sweep's caveat for as long as that write takes.
+      // The generation is re-checked next to the epoch: a wipe during this
+      // sweep must not publish an outcome into the database that replaced it.
+      if (getDbGeneration() === myDbGen) setLastSweepOutcome(incomplete ? 'partial' : 'ok');
       if (mode === 'restore') {
         setRestoredCount(newRoots.size);
         setRestoredUpdatedCount(updatedRoots.size);
@@ -2870,6 +2900,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // caller's signal aborted, and every state write below is epoch-gated.
       console.error(mode === 'restore' ? 'restoreFromArweave failed:' : 'checkForUpdates failed:', err);
       if (vaultEpochRef.current !== myEpoch) return;
+      if (getDbGeneration() === myDbGen) setLastSweepOutcome('error');
       if (mode === 'restore') setRestoreError('Не удалось восстановить заметки из Arweave.');
       else setUpdateCheck({ status: 'error', at: Date.now() });
     } finally {
@@ -4523,6 +4554,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     restoredCount,
     restoredUpdatedCount,
     updateCheck,
+    lastSweepOutcome,
     vaultError,
     hasPin,
     pinSetupNotice,
@@ -4592,7 +4624,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     safeboxUnlocked, safeboxLockGeneration, safeboxPinConfigured, safeboxEntryCount, safeboxEntries,
     safeboxChains, filteredSafeboxChains, safeboxSearchQuery, restoredSafeboxCount,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
-    restoredCount, restoredUpdatedCount, updateCheck, vaultError, hasPin, pinSetupNotice,
+    restoredCount, restoredUpdatedCount, updateCheck, lastSweepOutcome, vaultError, hasPin, pinSetupNotice,
     autoLockTimeout, bootError,
     storageBlocked, storageOutdated,
     createNewWallet, confirmMnemonic, restoreFromMnemonic, dismissPinSetupNotice, addNote,

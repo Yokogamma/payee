@@ -35,9 +35,8 @@ const HEAD = 'd'.repeat(40);
 /** A git that answers from a fixed ancestry map.
  *
  *  Defaults satisfy everything a test is NOT about: every named commit exists,
- *  everything is reachable from HEAD, everything carries a tag, and the pinned
- *  minimum is below the configured floor. A test that wants one of those to
- *  fail says so. */
+ *  everything is reachable from HEAD, and the pinned minimum is below the
+ *  configured floor. A test that wants one of those to fail says so. */
 const fakeGit = ({ present = [A, B, C, HEAD, MINIMUM_FLOOR], ancestors = {} } = {}) => ({
   hasCommit: sha => present.includes(sha),
   isAncestor: (ancestor, descendant) => {
@@ -194,9 +193,9 @@ describe('which commits are deployable at all', () => {
     expect(verdict.reason).toMatch(/neither the trusted head nor an allowlisted release/);
   });
 
-  it('the head itself needs no tag', () => {
+  it('the head itself needs no allowlist entry', () => {
     const verdict = decide({
-      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] } }),
+      floor: A, candidate: HEAD, git: fakeGit({ ancestors: { [A]: [HEAD] } }), isAllowed: () => false,
     });
     expect(verdict.ok).toBe(true);
   });
@@ -275,10 +274,9 @@ describe('against a real repository, built for the purpose', () => {
     first = commit('first');
     second = commit('second');
     third = commit('third');
-    // `second` is a release; `first` is only the minimum. `third` is the head
-    // and needs no tag of its own.
-    run('tag', 'release-2', second);
-    run('tag', 'release-1', first);
+    // `second` is a release; `first` is only the minimum. Neither carries a
+    // tag: nothing reads tags any more, and the one test that is about them
+    // makes its own.
     // A branch that was never merged — the shape the trust boundary exists for.
     run('checkout', '-q', '-b', 'unmerged', first);
     offBranch = commit('off the default branch');
