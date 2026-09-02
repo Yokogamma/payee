@@ -469,6 +469,25 @@ export async function registerWithProxy(
  * Upload encrypted note data via Cloudflare Worker proxy.
  * Server handles Arweave TX creation and payment.
  */
+/**
+ * The machine-readable `code` of a worker refusal, or undefined.
+ *
+ * The worker's typed refusals (kill switches, recovery, publication conflict)
+ * all carry `{code}` in a JSON body; a plain-text body means the generic
+ * meaning of the status applies. One reader for all of them, so a new code is
+ * one comparison and not a fourth copy of the try/parse/narrow dance.
+ */
+function readCode(text: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const code = (parsed as { code?: unknown }).code;
+    return typeof code === 'string' ? code : undefined;
+  } catch {
+    return undefined; // not JSON
+  }
+}
+
 export async function uploadViaProxy(
   bodyText: string,
   publicKeyB64: string,
@@ -534,39 +553,23 @@ export async function uploadViaProxy(
       // The machine code is read BEFORE the generic meaning. A conflict read as
       // «already in progress» would be retried forever against an answer that
       // can never change.
-      try {
-        const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null
-            && (parsed as { code?: unknown }).code === 'id_payload_conflict') {
-          return { kind: 'publication_conflict', error: text };
-        }
-      } catch { /* not JSON → the generic in-progress 409 */ }
+      if (readCode(text) === 'id_payload_conflict') return { kind: 'publication_conflict', error: text };
       return { kind: 'in_progress', error: text };
     }
     if (response.status === 503) {
       // The kill switches answer 503 with a machine-readable JSON code; a
       // plain-text 503 stays the generic retryable 'unavailable'.
-      try {
-        const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null) {
-          const code = (parsed as { code?: unknown }).code;
-          if (code === 'uploads_disabled') return { kind: 'uploads_disabled', error: text };
-          if (code === 'v3_uploads_disabled') return { kind: 'v3_disabled', error: text };
-          if (code === 'v4_uploads_disabled') return { kind: 'v4_disabled', error: text };
-        }
-      } catch { /* not JSON → generic 503 */ }
-      return { kind: 'unavailable', error: text }; // retryable
+      switch (readCode(text)) {
+        case 'uploads_disabled': return { kind: 'uploads_disabled', error: text };
+        case 'v3_uploads_disabled': return { kind: 'v3_disabled', error: text };
+        case 'v4_uploads_disabled': return { kind: 'v4_disabled', error: text };
+        default: return { kind: 'unavailable', error: text }; // retryable
+      }
     }
-    if (response.status === 400) {
-      // Both worker branches of «Invalid recovery token» answer 400 with a
-      // machine code; any other 400 stays the generic (retryable-by-user) error.
-      try {
-        const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null
-            && (parsed as { code?: unknown }).code === 'recovery_invalid') {
-          return { kind: 'recovery_invalid', error: text };
-        }
-      } catch { /* not JSON → generic 400 */ }
+    if (response.status === 400 && readCode(text) === 'recovery_invalid') {
+      // Both worker branches of «Invalid recovery token» answer 400 with this
+      // code; any other 400 stays the generic (retryable-by-user) error.
+      return { kind: 'recovery_invalid', error: text };
     }
     return { kind: 'error', error: `HTTP ${response.status}: ${text}` };
   } catch (e) {
