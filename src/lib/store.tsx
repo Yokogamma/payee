@@ -1872,13 +1872,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // with the lock/reload, but the fail-closed pause itself must never look
       // like silently-stuck sync. Malformed marker = paused (fail closed).
       try {
-        const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
+        const [pause3, pause4, pauseGlobal] = await Promise.all([
+          readV3PauseMeta(), readV4PauseMeta(), readGlobalPauseMeta(),
+        ]);
         if (vaultEpochRef.current === myEpoch) {
-          setV3Paused(pause3 !== null);
-          setV4Paused(pause4 !== null);
+          // The global marker pauses every version, so it raises BOTH banners:
+          // reading only the version markers here left a global pause
+          // invisible after a reload — a silently stuck queue, which is the
+          // one state the persisted markers exist to prevent.
+          const global = pauseGlobal !== null;
+          setV3Paused(global || pause3 !== null);
+          setV4Paused(global || pause4 !== null);
         }
       } catch (err) {
-        console.error('readV3PauseMeta at unlock failed:', err);
+        console.error('pause markers at unlock failed:', err);
       }
 
       // Safebox presence (§3 hydration): the PIN-config record + the encrypted
@@ -2416,6 +2423,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // a contradicting dead control. NEVER markUnregistered.
         if (result.kind === 'v3_disabled') setV3Paused(true);
         else setV4Paused(true);
+      } else if (result.kind === 'uploads_disabled') {
+        // The GLOBAL switch answered: the marker is persisted (upload-flow),
+        // and BOTH banners go up NOW — not whenever the queue next happens to
+        // run. A pause with no banner is a silently stuck queue.
+        setV3Paused(true);
+        setV4Paused(true);
       } else {
         // L13: a clock-skew rejection looks like a permanent mystery to the
         // user — surface the actionable «проверьте время» toast.
@@ -2525,29 +2538,38 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (liftable) {
         const capability = await getWorkerCapabilities();
         let resumed = false;
+        let v3Lifted = false;
+        let v4Lifted = false;
         if (pause3 !== null && pause3 !== 'malformed' && capability.v3 === 'enabled'
             && await clearV3UploadsPaused(pause3.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
-          setV3Paused(false);
+          v3Lifted = true;
           resumed = true;
         }
         if (pause4 !== null && pause4 !== 'malformed' && capability.v4 === 'enabled'
             && await clearV4UploadsPaused(pause4.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
-          setV4Paused(false);
+          v4Lifted = true;
           resumed = true;
         }
-        // 'enabled' on ANY version already proves the GLOBAL flag is true — the
-        // capability table requires `uploads === true` before it says enabled —
-        // so no separate probe is needed to lift the global marker.
+        // The GLOBAL marker lifts on the GLOBAL verdict. It used to require
+        // «some version enabled», which is unreachable when `uploads` is back
+        // on while both version switches stay off — exactly the state in which
+        // v1/v2 are allowed again and the marker would have stood forever.
+        let globalLifted = false;
         if (pauseGlobal !== null && pauseGlobal !== 'malformed'
-            && (capability.v3 === 'enabled' || capability.v4 === 'enabled')
+            && capability.uploads === 'enabled'
             && await clearGlobalUploadsPaused(pauseGlobal.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
-          setV3Paused(false);
-          setV4Paused(false);
+          globalLifted = true;
           resumed = true;
         }
+        // Banners follow the MARKERS that remain, never the lift that just
+        // happened: lifting the global marker while a version marker stands
+        // must not clear that version's banner.
+        const globalStands = pauseGlobal !== null && !globalLifted;
+        setV3Paused(globalStands || (pause3 !== null && !v3Lifted));
+        setV4Paused(globalStands || (pause4 !== null && !v4Lifted));
         if (resumed) {
           await syncPendingRecords(); // re-enqueue the backlog
           kickQueue();
@@ -3108,6 +3130,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  go through the /health-validated probe instead. */
   const resumeV3Uploads = useCallback(async () => {
     const myEpoch = vaultEpochRef.current;
+    // Manual resume is the UNCONDITIONAL path: the person clicked. Clearing
+    // only the version marker while the global one stood would let the very
+    // next queue pass re-raise the pause — a button that visibly does nothing
+    // and a stop with no end. If the worker still refuses, the pause comes
+    // back through the ordinary fail-closed path, which is the right order.
+    await clearGlobalUploadsPaused('any');
     await clearV3UploadsPaused('any');
     if (vaultEpochRef.current !== myEpoch) return;
     setV3Paused(false);
@@ -3120,6 +3148,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   /** Manual resume of the SAFEBOX queue — same unconditional contract. */
   const resumeV4Uploads = useCallback(async () => {
     const myEpoch = vaultEpochRef.current;
+    await clearGlobalUploadsPaused('any'); // same reasoning as resumeV3Uploads
     await clearV4UploadsPaused('any');
     if (vaultEpochRef.current !== myEpoch) return;
     setV4Paused(false);

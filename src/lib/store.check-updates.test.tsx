@@ -23,7 +23,7 @@ vi.mock('./arweave', async importOriginal => {
     uploadViaProxy: vi.fn(async () => ({ kind: 'error' as const, error: 'offline' })),
     fetchAllNotes: vi.fn(async () => ({ notes: [], safeboxEntries: [], incomplete: false })),
     getTxStatus: vi.fn(async () => ({ kind: 'unavailable' as const })),
-    getWorkerCapabilities: vi.fn(async () => ({ v3: 'unknown' as const, v4: 'unknown' as const })),
+    getWorkerCapabilities: vi.fn(async () => ({ uploads: 'unknown' as const, v3: 'unknown' as const, v4: 'unknown' as const })),
   };
 });
 

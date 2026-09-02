@@ -74,7 +74,7 @@ vi.mock('./arweave', async importOriginal => {
     uploadViaProxy: vi.fn(async () => ({ kind: 'error' as const, error: 'offline' })),
     fetchAllNotes: vi.fn(async () => ({ notes: [], safeboxEntries: [], incomplete: false })),
     getTxStatus: vi.fn(async () => ({ kind: 'unavailable' as const })),
-    getWorkerCapabilities: vi.fn(async () => ({ v3: 'unknown' as const, v4: 'unknown' as const })),
+    getWorkerCapabilities: vi.fn(async () => ({ uploads: 'unknown' as const, v3: 'unknown' as const, v4: 'unknown' as const })),
   };
 });
 
@@ -218,7 +218,7 @@ beforeEach(async () => {
   vi.mocked(isArweaveOnline).mockResolvedValue(false);
   vi.mocked(uploadViaProxy).mockReset();
   vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'error', error: 'offline' });
-  vi.mocked(getWorkerCapabilities).mockResolvedValue({ v3: 'unknown', v4: 'unknown' });
+  vi.mocked(getWorkerCapabilities).mockResolvedValue({ uploads: 'unknown', v3: 'unknown', v4: 'unknown' });
   cryptoHooks.beforeEncryptEntry = null;
   cryptoHooks.beforeCreatePinBlob = null;
   cryptoHooks.beforeVerifyPin = null;
@@ -642,7 +642,7 @@ describe('safebox sync pipeline', () => {
 
   it('the pause is NOT lifted while /health reports versions∋4 but v4Uploads:false', async () => {
     await setMeta(V4_PAUSE_META_KEY, { pausedAt: 1000 });
-    vi.mocked(getWorkerCapabilities).mockResolvedValue({ v3: 'enabled', v4: 'disabled' });
+    vi.mocked(getWorkerCapabilities).mockResolvedValue({ uploads: 'enabled', v3: 'enabled', v4: 'disabled' });
     await enableSync();
     renderStore();
     await openMain();

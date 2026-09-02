@@ -20,7 +20,7 @@ vi.mock('./arweave', async importOriginal => {
     uploadViaProxy: vi.fn(async () => ({ kind: 'error' as const, error: 'offline' })),
     fetchAllNotes: vi.fn(async () => ({ notes: [], safeboxEntries: [], incomplete: false })),
     getTxStatus: vi.fn(async () => ({ kind: 'unavailable' as const })),
-    getWorkerCapabilities: vi.fn(async () => ({ v3: 'unknown' as const, v4: 'unknown' as const })),
+    getWorkerCapabilities: vi.fn(async () => ({ uploads: 'unknown' as const, v3: 'unknown' as const, v4: 'unknown' as const })),
   };
 });
 
@@ -64,7 +64,7 @@ import {
   initStorage, resetAll, setMeta, saveNote, getAllNotes as getStoredNotes,
   getAllSyncRecords, readV3PauseMeta, getSyncRecord, setSyncRecord,
 } from './storage';
-import { isArweaveOnline, uploadViaProxy, fetchAllNotes } from './arweave';
+import { isArweaveOnline, uploadViaProxy, fetchAllNotes, getWorkerCapabilities } from './arweave';
 import { deriveKey, decryptNote, encryptEnvelopeV3, type EncryptedNote } from './crypto';
 import type { RestoredNote, UploadResult } from './arweave';
 
@@ -656,5 +656,84 @@ describe('W3: search filters on what the card shows, not on the source', () => {
     await act(async () => { store.setSearchQuery('Заголовок и текст'); });
     expect(store.filteredNotes).toHaveLength(1);
     expect(store.filteredChains).toHaveLength(1);
+  });
+});
+
+describe('global pause lifecycle (P1 review)', () => {
+  const GLOBAL_DISABLED = { kind: 'uploads_disabled' as const, error: '{"code":"uploads_disabled"}' };
+
+  async function pauseGlobally() {
+    vi.mocked(isArweaveOnline).mockResolvedValue(true);
+    await setMeta('ar-enabled', true);
+    renderStore();
+    await openMain();
+    vi.mocked(uploadViaProxy).mockResolvedValue(GLOBAL_DISABLED);
+    await act(async () => { await store.addNote('нота'); });
+    await act(async () => { await store.retrySync(); });
+    const { readGlobalPauseMeta } = await import('./storage');
+    await waitFor(async () => expect(await readGlobalPauseMeta()).not.toBeNull());
+    await waitFor(() => expect(store.v3Paused).toBe(true));
+  }
+
+  it('a reload surfaces the GLOBAL marker — not only the version ones', async () => {
+    await pauseGlobally();
+    cleanup();
+    sessionStorage.setItem('eternal-notes-session', MN);
+    renderStore();
+    await waitFor(() => expect(store.isReady).toBe(true));
+    await waitFor(() => expect(store.screen).toBe('main'));
+    // Before: the unlock read only v3/v4 markers, and a global pause came back
+    // from a reload as a silently stuck queue.
+    await waitFor(() => expect(store.v3Paused).toBe(true));
+    await waitFor(() => expect(store.v4Paused).toBe(true));
+  });
+
+  it('manual resume lifts the GLOBAL marker, or the next queue pass re-pauses at once', async () => {
+    await pauseGlobally();
+    vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'accepted', txId: 'TX-OK', committed: true });
+    await act(async () => { await store.resumeV3Uploads(); });
+    const { readGlobalPauseMeta } = await import('./storage');
+    expect(await readGlobalPauseMeta()).toBeNull();
+    await waitFor(() => expect(store.v3Paused).toBe(false));
+    await waitFor(async () => {
+      const records = await getAllSyncRecords();
+      expect(records.some(r => r.status === 'accepted')).toBe(true); // it actually uploaded
+    });
+  });
+
+  it('the health probe lifts the GLOBAL marker on the GLOBAL verdict, with both versions still off', async () => {
+    await pauseGlobally();
+    // uploads back on, v3 and v4 still off: v1/v2 are allowed again. Under the
+    // old rule («some version enabled») this marker could never lift.
+    vi.mocked(getWorkerCapabilities).mockResolvedValue({ uploads: 'enabled', v3: 'disabled', v4: 'disabled' });
+    vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'accepted', txId: 'TX-OK', committed: true });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await new Promise(r => setTimeout(r, 50));
+    });
+    const { readGlobalPauseMeta } = await import('./storage');
+    await waitFor(async () => expect(await readGlobalPauseMeta()).toBeNull());
+    await waitFor(() => expect(store.v3Paused).toBe(false));
+  });
+
+  it('lifting the GLOBAL marker does not clear a version banner whose own marker stands', async () => {
+    await pauseGlobally();
+    // A v3 marker of its own, on top of the global one.
+    vi.mocked(uploadViaProxy).mockResolvedValue({ kind: 'v3_disabled', error: '{"code":"v3_uploads_disabled"}' });
+    const { clearGlobalUploadsPaused, readV3PauseMeta } = await import('./storage');
+    await clearGlobalUploadsPaused('any');
+    await act(async () => { await store.retrySync(); });
+    await waitFor(async () => expect(await readV3PauseMeta()).not.toBeNull());
+    // Now a global pause again, then a probe that lifts ONLY the global one.
+    vi.mocked(uploadViaProxy).mockResolvedValue(GLOBAL_DISABLED);
+    await act(async () => { await store.addNote('ещё'); await store.retrySync(); });
+    vi.mocked(getWorkerCapabilities).mockResolvedValue({ uploads: 'enabled', v3: 'disabled', v4: 'enabled' });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await new Promise(r => setTimeout(r, 50));
+    });
+    // v3 stays paused — its own marker is still there.
+    await waitFor(() => expect(store.v3Paused).toBe(true));
+    expect(await readV3PauseMeta()).not.toBeNull();
   });
 });

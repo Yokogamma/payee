@@ -752,28 +752,41 @@ describe('getWorkerCapabilities — the full verdict table (PR-3a)', () => {
     }));
   }
   const caps = async () => (await import('./arweave')).getWorkerCapabilities();
-  const UNKNOWN = { v3: 'unknown', v4: 'unknown' };
+  const UNKNOWN = { uploads: 'unknown', v3: 'unknown', v4: 'unknown' };
 
   it('enabled when EVERY condition holds', async () => {
     proxyEnv(); healthy();
-    expect(await caps()).toEqual({ v3: 'enabled', v4: 'enabled' });
+    expect(await caps()).toEqual({ uploads: 'enabled', v3: 'enabled', v4: 'enabled' });
   });
 
   // THE hole this closes: the global switch was ignored, so an emergency build
   // that refuses every upload would have had its pause lifted.
+  it('the GLOBAL verdict is reported on its own — enabled with both versions off', async () => {
+    // The state the global pause could never leave: uploads back on, v3 and v4
+    // still off. v1/v2 are allowed here, and only a verdict about `uploads`
+    // itself can say so.
+    proxyEnv(); healthy({ uploads: true, v3Uploads: false, v4Uploads: false });
+    expect(await caps()).toEqual({ uploads: 'enabled', v3: 'disabled', v4: 'disabled' });
+  });
+
+  it('a non-boolean uploads flag is unknown for the global verdict too', async () => {
+    proxyEnv(); healthy({ uploads: 'true' });
+    expect(await caps()).toEqual(UNKNOWN);
+  });
+
   it('uploads:false disables BOTH versions even with per-version flags true', async () => {
     proxyEnv(); healthy({ uploads: false });
-    expect(await caps()).toEqual({ v3: 'disabled', v4: 'disabled' });
+    expect(await caps()).toEqual({ uploads: 'disabled', v3: 'disabled', v4: 'disabled' });
   });
 
   it('per-version gates stay independent under uploads:true', async () => {
     proxyEnv(); healthy({ v4Uploads: false });
-    expect(await caps()).toEqual({ v3: 'enabled', v4: 'disabled' });
+    expect(await caps()).toEqual({ uploads: 'enabled', v3: 'enabled', v4: 'disabled' });
   });
 
   it('a MISSING flag is unknown, never a decision', async () => {
     proxyEnv(); healthy({ v4Uploads: undefined });
-    expect(await caps()).toEqual({ v3: 'enabled', v4: 'unknown' });
+    expect(await caps()).toEqual({ uploads: 'enabled', v3: 'enabled', v4: 'unknown' });
     vi.resetModules(); proxyEnv(); healthy({ uploads: undefined });
     expect(await caps()).toEqual(UNKNOWN);
   });
@@ -799,7 +812,7 @@ describe('getWorkerCapabilities — the full verdict table (PR-3a)', () => {
 
   it('a version absent from the versions list is unknown despite a true flag', async () => {
     proxyEnv(); healthy({ versions: ['1', '2'] });
-    expect(await caps()).toEqual(UNKNOWN);
+    expect(await caps()).toEqual({ ...UNKNOWN, uploads: 'enabled' });
   });
 
   it('ok:false is unknown', async () => {
