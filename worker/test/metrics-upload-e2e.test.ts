@@ -2,6 +2,8 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { addressOfJwk } from '../test-stubs/wallet-address';
+import { computePublicationFp } from '../src/publication-fp';
 import { setupOutboundMock, b64, sha256, statusUrlRe } from './helpers/outbound-mock';
 
 // PR-2 e2e: metric emission through the REAL /upload route (direct dispatch —
@@ -35,6 +37,7 @@ beforeAll(async () => {
     true, ['sign', 'verify'],
   );
   realJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
+  realWalletOwners = await addressOfJwk(realJwk);
 });
 
 async function makeIdentity() {
@@ -47,6 +50,17 @@ async function makeIdentity() {
 }
 
 /** Well-formed v2 upload; opts let a test corrupt tags or attach recovery. */
+/**
+ * The fp of exactly what `uploadRequest` publishes for this noteId.
+ *
+ * Injected records must carry it, or they are LEGACY: the worker would then try
+ * to authenticate a fabricated txId against the gateway pool instead of
+ * exercising the path under test. The legacy path has its own suite.
+ */
+async function fpFor(noteId: string): Promise<string> {
+  return computePublicationFp('2', JSON.stringify({ id: noteId, c: C, iv: IV }));
+}
+
 async function uploadRequest(
   id: { priv: Uint8Array; pkB64: string; ownerHash: string },
   noteId: string,
@@ -91,8 +105,19 @@ function capture() {
   return { points, dataset, byEvent };
 }
 
+// `realWalletOwners` is the address realJwk derives to: /upload refuses while
+// the signing wallet is outside TRUSTED_OWNERS (D2/D9), and these tests sign
+// with a wallet they generate themselves. `extra` still wins, so the JWK-matrix
+// cases below can substitute a broken key without also being told it is
+// trusted — a key that cannot derive an address cannot sign, and keeps its own
+// 502/`arweave_throw` outcome.
+let realWalletOwners = '';
+
 const metricsEnv = (dataset: AnalyticsEngineDataset, extra: Record<string, unknown> = {}): WorkerEnv =>
-  ({ ...baseEnv, ARWEAVE_JWK: realJwk, METRICS_ENABLED: 'true', METRICS: dataset, ...extra }) as WorkerEnv;
+  ({
+    ...baseEnv, ARWEAVE_JWK: realJwk, TRUSTED_OWNERS: realWalletOwners,
+    METRICS_ENABLED: 'true', METRICS: dataset, ...extra,
+  }) as WorkerEnv;
 
 function mockPaidLegs(priceBody = '3049039377', opts: { postDelayMs?: number } = {}) {
   const anchor = mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, ANCHOR);
@@ -278,6 +303,9 @@ describe('upload_outcome matrix — paid-path returns ONLY (L r19/r20)', () => {
     expect(r.status).toBe(200);
     expect(cap.byEvent('upload_outcome')).toHaveLength(0);
     expect(cap.byEvent('gateway_call')).toHaveLength(0); // and no paid legs either
+    // …but the fingerprint protocol reports what it decided: this is the soak
+    // instrument for exactly the path upload_outcome stays silent about.
+    expect(cap.byEvent('semantic_idempotency').map(p => p.blobs?.[1])).toEqual(['deduped']);
   });
 
   it('validation 400 emits nothing', async () => {
@@ -323,6 +351,7 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
       await state.storage.put(`note:${noteId}`, {
         status: 'posted', token: 'srv-token', gen: 0,
         txId: deadTxId, postedAt: Date.now() - 31 * 60_000,
+        fp: await fpFor(noteId), // POST-D2 record — see fpFor
       });
     });
 
@@ -399,6 +428,7 @@ describe('status leg: per-host metrics + the _quorum row (PR-3a)', () => {
     await runInDurableObject(stub, async (_i, state) => {
       await state.storage.put(`note:${noteId}`, {
         status: 'committed', txId: `TX-${noteId.slice(0, 8)}`, committedAt: Date.now() - 60_000, gen: 0,
+        fp: await fpFor(noteId), // POST-D2 record — see fpFor
       });
     });
     return `TX-${noteId.slice(0, 8)}`;

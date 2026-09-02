@@ -61,6 +61,24 @@ V3_UPLOADS_ENABLED = "true"
 # Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
 V4_UPLOADS_ENABLED = "true"
+# ── Trusted Arweave owners (D2/D9) ──
+# EVERY wallet address this project has ever posted under, comma separated.
+# The worker authenticates a publication before binding its txId to a payload
+# fingerprint, and `address in TRUSTED_OWNERS` is one of the D9 steps.
+#
+# NOT the current ARWEAVE_JWK: after a rotation that address cannot confirm the
+# project's OWN older transactions, and every one of them would stop
+# authenticating. This is a HISTORICAL list and entries are never removed.
+#
+# Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
+# deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
+# of it, and refuses a set that disagrees with the client's
+# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+#
+# Rotation order, and it is not symmetric: add the new address HERE and to the
+# client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker
+# refuses /upload while its own wallet is outside this set.
+TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # ── Status gateways (PR-3a) ──
 # Bare https origins, comma separated. MUST equal the client's
 # VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
@@ -71,6 +89,21 @@ V4_UPLOADS_ENABLED = "true"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# ── Payload gateways (D2/D9) ──
+# Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
+# tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
+# first, the slower community mirrors after).
+#
+# Used ONLY to authenticate an existing publication before binding its txId to a
+# payload fingerprint: the worker fetches /tx/<id> and /raw/<id> and runs D9 over
+# them. Lying is not a threat model here — the protocol is cryptographic, so a
+# wrong answer costs a retry against the next origin, never a wrong verdict.
+#
+# permagate.io is deliberately ABSENT while it is a STATUS origin: its cold /raw
+# timed out past 25 s in the acceptance probes, and only the HTTP code matters
+# for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
+# the deploy gate compares them.
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
 # ── Metrics (PR-2) ── Telemetry is fail-closed, the request path fail-open:
 # writes happen STRICTLY when METRICS_ENABLED = "true" AND the METRICS binding
 # exists; ANY other value (missing, garbage, no binding) disables writes
@@ -168,6 +201,25 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
+# ── Trusted Arweave owners (D2/D9) ──
+# EVERY wallet address this project has ever posted under, comma separated.
+# The worker authenticates a publication before binding its txId to a payload
+# fingerprint, and `address in TRUSTED_OWNERS` is one of the D9 steps.
+#
+# NOT the current ARWEAVE_JWK: after a rotation that address cannot confirm the
+# project's OWN older transactions, and every one of them would stop
+# authenticating. This is a HISTORICAL list and entries are never removed.
+#
+# Declared explicitly for staging too: a named environment inherits NOTHING.
+# Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
+# deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
+# of it, and refuses a set that disagrees with the client's
+# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+#
+# Rotation order, and it is not symmetric: add the new address HERE and to the
+# client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker
+# refuses /upload while its own wallet is outside this set.
+TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # ── Status gateways (PR-3a) ──
 # Bare https origins, comma separated. MUST equal the client's
 # VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
@@ -178,6 +230,21 @@ V4_UPLOADS_ENABLED = "true"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# ── Payload gateways (D2/D9) ──
+# Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
+# tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
+# first, the slower community mirrors after).
+#
+# Used ONLY to authenticate an existing publication before binding its txId to a
+# payload fingerprint: the worker fetches /tx/<id> and /raw/<id> and runs D9 over
+# them. Lying is not a threat model here — the protocol is cryptographic, so a
+# wrong answer costs a retry against the next origin, never a wrong verdict.
+#
+# permagate.io is deliberately ABSENT while it is a STATUS origin: its cold /raw
+# timed out past 25 s in the acceptance probes, and only the HTTP code matters
+# for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
+# the deploy gate compares them.
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
 # Metrics (PR-2) — same contract as production vars above; staging writes go
 # to its OWN dataset (explicit different name, M6 r14).
 METRICS_ENABLED = "true"

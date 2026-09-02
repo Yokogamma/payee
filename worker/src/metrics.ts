@@ -42,7 +42,7 @@ export function makeEmit(env: MetricsEnv): Emit {
 
 // ─── /admin/metrics SQL contract ────────────────────────────────────
 
-export const METRICS_REPORTS = ['gateway_health', 'upload_outcomes', 'status_verdicts'] as const;
+export const METRICS_REPORTS = ['gateway_health', 'upload_outcomes', 'status_verdicts', 'semantic_idempotency'] as const;
 export type MetricsReport = (typeof METRICS_REPORTS)[number];
 
 /** Dataset names are substituted into SQL — only after THIS validation. */
@@ -64,5 +64,8 @@ export function buildMetricsReportSql(report: MetricsReport, dataset: string, ho
       return `SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM ${dataset} WHERE index1='upload_outcome' AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON`;
     case 'status_verdicts':
       return `SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n FROM ${dataset} WHERE index1='status_verdict' AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY verdict, host LIMIT 100 FORMAT JSON`;
+    case 'semantic_idempotency':
+      // The D2 soak report: how the fingerprint protocol decided, per outcome.
+      return `SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM ${dataset} WHERE index1='semantic_idempotency' AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON`;
   }
 }

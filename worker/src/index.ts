@@ -15,6 +15,11 @@ import { readAllowCache } from './allowlist';
 // client-parity.test.ts already imports src/lib/crypto.ts.
 import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
 import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
+import { parseTrustedOwners } from '../../src/lib/trusted-owners';
+import { authenticatePublication } from './publication-auth';
+import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
+import { computePublicationFp } from './publication-fp';
+import type { LegacySnapshot } from './rate-limiter';
 import {
   ARWEAVE_HOST,
   assertStructurallyCompleteJwk,
@@ -54,6 +59,16 @@ interface Env {
    *  Empty/unset falls back to a lone arweave.net, where `dead` is unreachable
    *  by construction. */
   STATUS_GATEWAYS?: string;
+  /** Bare https origins for D9 publication authentication, comma separated,
+   *  and the ORDER IS NORMATIVE — the pool is tried in sequence. Separate from
+   *  STATUS_GATEWAYS because the two answer different questions: status needs
+   *  only an HTTP code (so a slow-but-correct origin is fine), while this pool
+   *  serves `/tx/<id>` and `/raw/<id>` on the path that decides whether a txId
+   *  may be bound to a payload. MUST equal the client's VITE_PAYLOAD_GATEWAYS;
+   *  the deploy gate compares them in order. Empty/unset falls back to a lone
+   *  arweave.net, which still verifies — D9 is cryptographic, so a single
+   *  origin costs redundancy, never correctness. */
+  PAYLOAD_GATEWAYS?: string;
   /** Full 40-char commit SHA this build was deployed from, injected by the
    *  trusted deploy workflow from its verified `candidate` input — NEVER from
    *  `github.sha`, which is the SHA of the workflow's own trusted head. */
@@ -62,6 +77,22 @@ interface Env {
    *  Self-reported SHA cannot distinguish a re-deploy of the same commit; this
    *  can. Optional so tests and older configs keep working. */
   CF_VERSION_METADATA?: { id?: string; tag?: string; timestamp?: string };
+  /** EVERY Arweave wallet address this project has ever posted under, comma
+   *  separated (D2/D9). The worker authenticates a publication before binding
+   *  its `txId` to a payload fingerprint, and `address ∈ TRUSTED_OWNERS` is one
+   *  of the D9 steps.
+   *
+   *  Deliberately NOT derived from `ARWEAVE_JWK`: that is the CURRENT wallet,
+   *  and after a rotation it cannot confirm the project's OWN older
+   *  transactions — every one of them would stop authenticating and healthy
+   *  records would start answering conflicts. This is a HISTORICAL list, and
+   *  entries are never removed.
+   *
+   *  Optional in the TYPE, mandatory in FACT: missing, empty or malformed
+   *  answers 503 on /upload rather than skipping the check. What it must
+   *  contain is pinned in scripts/owner-pins.mjs and gated on deploy by
+   *  scripts/check-trusted-owners.mjs. */
+  TRUSTED_OWNERS?: string;
   MAX_BODY_BYTES: string;
   RATE_LIMIT_PER_HOUR: string;
   ARWEAVE_JWK: string;
@@ -192,7 +223,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const origins = statusOrigins(env);
     return healthJson({
       ok: true,
-      versions: ['1', '2', '3', '4'],
+      versions: [...SUPPORTED_VERSIONS],
       uploads: uploadsEnabled(env),
       v3Uploads: v3UploadsEnabled(env),
       v4Uploads: v4UploadsEnabled(env),
@@ -200,6 +231,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       // implements them. Deliberately NOT a var: if it came from configuration,
       // a build carrying the old single-gateway logic could be relabelled as
       // the safe one and have its uploads switched back on.
+      // The MACHINE-READABLE capability a client with import depends on (D2a):
+      // this build compares a publication fingerprint before handing back a
+      // historical txId. Deliberately a constant, never a var — if it came from
+      // configuration, a build carrying the old logic could be relabelled as the
+      // safe one. The client refuses to store a txId from a response without it.
+      semanticIdempotency: 1,
       statusQuorumPolicy: QUORUM_POLICY_ID,
       statusGatewaysCount: origins.length,
       statusGatewaysHash: await statusGatewaysHash(origins),
@@ -252,17 +289,84 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
 // Isolate-level cache: the address is constant per deployment, so derive it once
 // instead of parsing the full JWK on every request.
-let walletAddressPromise: Promise<string> | null = null;
+//
+// KEYED ON THE JWK, not merely «computed once». The address used to feed a
+// diagnostic endpoint, where a stale value was only confusing; it now decides
+// whether /upload is allowed to sign at all (D2/D9), and a cache that ignores
+// which key it derived from would answer for the PREVIOUS wallet — passing the
+// trust check for a key that was never checked.
+let walletAddressCache: { jwk: string; address: Promise<string> } | null = null;
 
 function getWalletAddress(env: Env): Promise<string> {
-  if (!walletAddressPromise) {
-    walletAddressPromise = (async () => {
-      const wallet = JSON.parse(env.ARWEAVE_JWK);
-      const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
-      return arweave.wallets.jwkToAddress(wallet);
-    })();
+  const jwk = env.ARWEAVE_JWK;
+  if (walletAddressCache?.jwk !== jwk) {
+    walletAddressCache = {
+      jwk,
+      address: (async () => {
+        const wallet = JSON.parse(jwk);
+        const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
+        return arweave.wallets.jwkToAddress(wallet);
+      })(),
+    };
   }
-  return walletAddressPromise;
+  return walletAddressCache.address;
+}
+
+/**
+ * The historical trusted-owner set, or `null` when it is unusable.
+ *
+ * Fail-closed by construction: missing, empty and malformed all collapse to
+ * `null`, and every caller turns `null` into a 503. Treating an absent list as
+ * «no constraint» would silently weaken D9 to «some well-formed transaction
+ * exists», which an attacker satisfies by posting their own.
+ *
+ * NOT cached at isolate level: the value is a plain string on `env`, so
+ * re-parsing it costs a split of a short list, and a cache would be one more
+ * thing to invalidate on a config change.
+ */
+export function resolveTrustedOwners(env: Env): string[] | null {
+  const raw = env.TRUSTED_OWNERS;
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  try {
+    const owners = parseTrustedOwners(raw);
+    return owners.length > 0 ? owners : null;
+  } catch {
+    // A malformed entry is a CONFIGURATION defect, and dropping it silently
+    // would leave a set that looks fine and is quietly narrower.
+    return null;
+  }
+}
+
+/**
+ * Refuse uploads while the server's own wallet is outside the trusted set.
+ *
+ * The asymmetry is the point of the rotation runbook: a publication this
+ * worker makes RIGHT NOW is signed by `ARWEAVE_JWK`, so if that address is not
+ * trusted, the worker is about to create transactions that neither half will
+ * ever be able to authenticate. Posting them is worse than refusing — the
+ * money is spent and the record is unverifiable forever.
+ *
+ * Hence the order in the runbook: add the new address to both sets, deploy,
+ * and only THEN switch the key.
+ */
+export async function walletTrust(
+  env: Env,
+  owners: string[],
+): Promise<'trusted' | 'untrusted' | 'undeterminable'> {
+  let address: string;
+  try {
+    address = await getWalletAddress(env);
+  } catch {
+    walletAddressCache = null; // never cache a failure
+    // A JWK whose address cannot be derived is a JWK that cannot SIGN either,
+    // so it creates no untrusted transaction and this guard has nothing to
+    // protect against. Deliberately NOT refused here: the malformed-JWK paths
+    // have their own typed outcome further down (502 / `arweave_throw`, §R4),
+    // and answering «misconfigured» here would relabel them from one true
+    // statement into a less precise one.
+    return 'undeterminable';
+  }
+  return owners.includes(address) ? 'trusted' : 'untrusted';
 }
 
 async function handleWalletAddress(request: Request, env: Env): Promise<Response> {
@@ -275,7 +379,7 @@ async function handleWalletAddress(request: Request, env: Env): Promise<Response
   try {
     return json({ address: await getWalletAddress(env) });
   } catch {
-    walletAddressPromise = null; // never cache a failure
+    walletAddressCache = null; // never cache a failure
     return error('Wallet not configured', 503);
   }
 }
@@ -624,6 +728,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (typeof env.RECOVERY_HMAC_SECRET !== 'string' || env.RECOVERY_HMAC_SECRET.length < 16) {
     return error('Server misconfigured', 503);
   }
+  // TRUSTED_OWNERS is MANDATORY for uploads (D2/D9): it is what a publication
+  // is authenticated against before the worker binds an existing txId to a
+  // payload fingerprint. An absent list is not «no constraint» — it is a
+  // missing root of trust, so it fails closed here rather than being skipped
+  // at the point of use.
+  const trustedOwners = resolveTrustedOwners(env);
+  if (trustedOwners === null) return error('Server misconfigured', 503);
+  // …and the wallet about to SIGN must itself be trusted, or this request
+  // would create a transaction nobody can ever authenticate. Only a DERIVABLE
+  // address that is absent from the set refuses here — see walletTrust.
+  if ((await walletTrust(env, trustedOwners)) === 'untrusted') {
+    return error('Server misconfigured', 503);
+  }
 
   // Metrics emitter (PR-2). Telemetry is fail-closed / request path fail-open:
   // a noop unless METRICS_ENABLED === 'true' AND the binding exists.
@@ -722,15 +839,21 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const declaredVersion = Array.isArray(tags)
     ? tags.find(t => t && t.name === 'App-Version')?.value
     : undefined;
-  if (declaredVersion !== '1' && declaredVersion !== '2' &&
-      declaredVersion !== '3' && declaredVersion !== '4') {
+  if (!isSupportedVersion(declaredVersion)) {
     return error('Unsupported App-Version', 400);
   }
   const hasTimestamp = declaredVersion === '1';
   const isSplitEnvelope = declaredVersion === '4';
 
+  // The soak's instrument (D2). One event per decision the fingerprint
+  // protocol makes, labelled by outcome — so «is the release behaving» is a
+  // query, not a feeling. Fires on paths `upload_outcome` deliberately stays
+  // silent about (idempotent hits, reconciliation without a POST), because
+  // those are precisely the paths this release changed.
+  const attest = (outcome: string) => emit('semantic_idempotency', [outcome, declaredVersion], []);
+
   const REQUIRED_TAGS = new Map<string, string>([
-    ['App-Name', 'EternalNotes'],
+    ['App-Name', APP_NAME],
     ['App-Version', declaredVersion],
     ['Content-Type', 'application/json'],
   ]);
@@ -883,17 +1006,140 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   };
 
   // Convert a dropped server TX back to a fresh reservation for re-post.
-  const doRedrop = async (deadTxId: string):
-    Promise<{ kind: 'resolved'; txId: string } | { kind: 'defer' } | { kind: 'repost'; token: string }> => {
-    const resp = await doCall('/redrop', { noteId, txId: deadTxId, limit: quotaLimit });
-    const r: { ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean; committed?: boolean; txId?: string } = await resp.json();
-    if (r.committed && r.txId) return { kind: 'resolved', txId: r.txId }; // reposted elsewhere
+  //
+  // `snapshot` is passed on the LEGACY path and makes the DO compare-and-swap
+  // (see RedropRequest). `resolved` is answered only when the DO confirms the
+  // superseding transaction carries THIS payload's fingerprint; a different
+  // one is a typed conflict, and a record that moved on or is still
+  // unfingerprinted is deferred — the client's retry re-enters through
+  // /check-and-reserve, where the comparison is made against the current
+  // record.
+  const doRedrop = async (deadTxId: string, snapshot?: LegacySnapshot):
+    Promise<
+      | { kind: 'resolved'; txId: string }
+      | { kind: 'conflict'; txId?: string }
+      | { kind: 'defer' }
+      | { kind: 'repost'; token: string }
+    > => {
+    const resp = await doCall('/redrop', {
+      noteId, txId: deadTxId, limit: quotaLimit, fp: requestedFp, ...(snapshot ? { snapshot } : {}),
+    });
+    const r: {
+      ok: boolean; token?: string; rateLimited?: boolean; inProgress?: boolean;
+      committed?: boolean; txId?: string; conflict?: boolean; stale?: boolean; legacy?: boolean;
+    } = await resp.json();
+    if (r.conflict) return { kind: 'conflict', txId: r.txId };
+    if (r.stale || r.legacy) return { kind: 'defer' };
+    if (r.committed && r.txId) return { kind: 'resolved', txId: r.txId }; // reposted elsewhere, SAME fp
     if (r.rateLimited || r.inProgress || !r.ok || !r.token) return { kind: 'defer' };
     return { kind: 'repost', token: r.token };
   };
 
-  const checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit });
-  const checkResult: { status: string; txId?: string; committedAt?: number; postedAt?: number; token?: string } = await checkResp.json();
+  // The fingerprint of the payload THIS request carries. Computed from the
+  // outer `data` and the declared version — the immutable half of a
+  // publication — so two attempts at publishing the same record agree while a
+  // different record under a reused id does not.
+  let requestedFp: string;
+  try {
+    requestedFp = await computePublicationFp(declaredVersion, data);
+  } catch {
+    // Unreachable after the validation above; fail closed rather than reserve
+    // without a fingerprint, which would write a legacy-shaped record.
+    return error('Payload could not be fingerprinted', 400);
+  }
+
+  type CheckResult = {
+    status: string;
+    txId?: string;
+    committedAt?: number;
+    postedAt?: number;
+    token?: string;
+    state?: string;
+    snapshot?: LegacySnapshot;
+  };
+
+  /**
+   * Resolve a LEGACY record: authenticate the publication (D9) and record what
+   * it actually is, so the comparison can happen on the next pass.
+   *
+   * Returns a Response to send, or null meaning «resolved, ask the DO again».
+   */
+  const resolveLegacy = async (
+    snapshot: LegacySnapshot,
+    age: number,
+  ): Promise<{ kind: 'respond'; response: Response } | { kind: 'retry' } | { kind: 'dead' }> => {
+    const auth = await authenticatePublication(snapshot.txId, {
+      origins: payloadOrigins(env),
+      trustedOwners,
+      ownerHash,
+      expectedNoteId: noteId,
+    });
+
+    if (auth.kind === 'unproven') {
+      // Two very different reasons look identical from the payload pool: «the
+      // gateways are having a bad afternoon» and «this transaction is gone».
+      // Collapsing both into 503 would be safe for the first and PERMANENT for
+      // the second — a legacy record over a dropped transaction could never be
+      // re-posted again, because the redrop path is only reachable once the
+      // record is comparable. So the status quorum is asked, and only a
+      // unanimous `dead` past the age guard opens the re-post.
+      const live = await getTxStatusWorker(snapshot.txId, emit, env);
+      if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) return { kind: 'dead' };
+      // Alive-but-unfetchable, unavailable, or too recent: retryable, and
+      // nothing is written.
+      attest('legacy_unproven');
+      return { kind: 'respond', response: error('Publication could not be authenticated', 503) };
+    }
+    if (auth.kind === 'not-ours') {
+      // PROVEN to be something else: another wallet, another vault, or a body
+      // this canonicalization cannot read. Not transient, so a 503 would loop
+      // forever — and the historical txId must never be returned as a success.
+      // Nothing is written: no observedFp, no binding.
+      attest('legacy_not_ours');
+      return { kind: 'respond', response: idPayloadConflict(snapshot.txId) };
+    }
+
+    // Proven. The fingerprint is recorded WHATEVER the comparison then says —
+    // the verification is expensive and its result is a fact about the
+    // publication, not a verdict about this request.
+    const backfill: { ok: boolean; stale?: boolean } =
+      await (await doCall('/backfill-fp', { noteId, snapshot, observedFp: auth.observedFp })).json();
+    // The metric names what HAPPENED, not what was attempted: a stale CAS means
+    // a concurrent request proved and wrote this record first, and counting it
+    // as a backfill would inflate the very number the soak reads.
+    attest(backfill.ok ? 'legacy_backfilled' : 'legacy_backfill_stale');
+    return { kind: 'retry' };
+  };
+
+  let checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
+  let checkResult: CheckResult = await checkResp.json();
+
+  let legacyRedrop: LegacySnapshot | null = null;
+  if (checkResult.status === 'legacy' && checkResult.snapshot) {
+    const age = checkResult.snapshot.status === 'committed'
+      ? (checkResult.committedAt ?? 0)
+      : (checkResult.postedAt ?? 0);
+    const outcome = await resolveLegacy(checkResult.snapshot, age);
+    if (outcome.kind === 'respond') return outcome.response;
+    if (outcome.kind === 'dead') {
+      legacyRedrop = checkResult.snapshot;
+    } else {
+      // Exactly ONE retry. The record is no longer legacy (this backfill filled
+      // it, or a concurrent one did), so a second `legacy` would mean the record
+      // is being rewritten under us — and looping on that is how a retry storm
+      // starts. Whatever the DO says now is the answer.
+      checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
+      checkResult = await checkResp.json();
+      if (checkResult.status === 'legacy') return error('Record is being reconciled, retry', 503);
+    }
+  }
+
+  if (checkResult.status === 'id_payload_conflict') {
+    // The same noteId under DIFFERENT bytes. Typed, never a silent replay of
+    // the historical txId.
+    attest('conflict');
+    return idPayloadConflict(checkResult.txId);
+  }
 
   let reserveToken: string;
   // True whenever the upcoming POST creates a NEW paid txId after a PROVEN
@@ -902,19 +1148,55 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // additionally emits redrop_new_tx.
   let viaRedrop = false;
 
-  if (checkResult.status === 'exists') {
+  if (legacyRedrop !== null) {
+    // A legacy record over a PROVEN dead transaction, past the age guard. This
+    // is the ordinary redrop, reached the only way it can be for a record that
+    // is not comparable: quota and attempts apply exactly as elsewhere, and the
+    // new reservation carries THIS payload's fingerprint, so the record stops
+    // being legacy whatever happens next.
+    const rd = await doRedrop(legacyRedrop.txId, legacyRedrop);
+    if (rd.kind === 'resolved') {
+      attest('deduped');
+      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+    }
+    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
+    if (rd.kind === 'defer') { attest('legacy_dead_deferred'); return error('Recheck deferred', 503); }
+    // Only NOW is a redrop a fact: the CAS held and a reservation carrying this
+    // payload's fp exists. The dead verdict alone proved nothing about what
+    // followed it.
+    attest('legacy_dead_redrop');
+    reserveToken = rd.token;
+    viaRedrop = true;
+  } else if (checkResult.status === 'exists') {
     // Already committed. Without recheck this is the idempotent happy path.
-    if (!wantsRecheck) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
+    if (!wantsRecheck) {
+      // The idempotent happy path: an existing transaction, PROVEN to be this
+      // payload (the fp comparison above). `deduped` is additive — an older
+      // client ignores it, which is safe precisely because the proof was done
+      // by the server, not asserted by the client.
+      attest('deduped');
+      return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+    }
 
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!, emit, env);
-    if (live === 'alive') return json({ txId: checkResult.txId, status: 'accepted', committed: true });
+    if (live === 'alive') {
+      attest('deduped');
+      return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+    }
     if (live === 'unavailable') return error('Arweave status unavailable', 503);
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
       return error('Recheck deferred: committed too recently', 503); // race guard
     }
     const rd = await doRedrop(checkResult.txId!);
-    if (rd.kind === 'resolved') return json({ txId: rd.txId, status: 'accepted', committed: true });
+    if (rd.kind === 'resolved') {
+      // Superseded: another request committed this payload while we were
+      // deciding — the DO confirmed the SAME fingerprint. This response paid
+      // for nothing, so it is a dedupe.
+      attest('deduped');
+      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+    }
+    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -927,7 +1209,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       try {
         const commitResp = await doCall('/commit', { noteId, txId: checkResult.txId, token: checkResult.token });
         const commit: { ok: boolean } = await commitResp.json();
-        if (commitResp.ok && commit.ok) return json({ txId: checkResult.txId, status: 'accepted', committed: true });
+        if (commitResp.ok && commit.ok) {
+          // `deduped` only NOW: the posted state has been resolved — liveness
+          // checked and the DO finalized — which is what the plan requires
+          // before this answer may be given.
+          attest('deduped');
+          return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+        }
       } catch { /* fall through to retryable 503 */ }
       return error('Recheck deferred', 503); // raced / DO error — retry
     }
@@ -935,7 +1223,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       return error('Recheck deferred: posted too recently', 503);
     }
     const rd = await doRedrop(checkResult.txId!);
-    if (rd.kind === 'resolved') return json({ txId: rd.txId, status: 'accepted', committed: true });
+    if (rd.kind === 'resolved') {
+      // Superseded: another request committed this payload while we were
+      // deciding — the DO confirmed the SAME fingerprint. This response paid
+      // for nothing, so it is a dedupe.
+      attest('deduped');
+      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+    }
+    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -963,10 +1258,41 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       const live = await getTxStatusWorker(recoveryHint.txId, emit, env);
       if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
       if (live === 'alive') {
+        // The token proves noteId, txId and postedAt — it says NOTHING about
+        // the bytes. Committing here binds THIS request's fingerprint to that
+        // historical txId, so without authenticating the publication it would
+        // mint exactly the pair the floors forbid: payload B under transaction
+        // A, signed off by the server. So this branch runs the SAME proof as
+        // the legacy backfill, or it refuses.
+        const auth = await authenticatePublication(recoveryHint.txId, {
+          origins: payloadOrigins(env),
+          trustedOwners,
+          ownerHash,
+          expectedNoteId: noteId,
+        });
+        if (auth.kind === 'unproven') {
+          attest('recovery_unproven');
+          await safeRelease(reserveToken);
+          return error('Publication could not be authenticated', 503);
+        }
+        if (auth.kind !== 'authenticated' || auth.observedFp !== requestedFp) {
+          // Proven to be different bytes (or not ours at all). The reservation
+          // is released and NOTHING is bound to the old transaction.
+          attest('recovery_conflict');
+          await safeRelease(reserveToken);
+          return idPayloadConflict(recoveryHint.txId);
+        }
         try {
           const commitResp = await doCall('/commit', { noteId, txId: recoveryHint.txId, token: reserveToken });
           const commit: { ok: boolean } = await commitResp.json();
-          if (commitResp.ok && commit.ok) return json({ txId: recoveryHint.txId, status: 'accepted', committed: true });
+          if (commitResp.ok && commit.ok) {
+            // The recovery branch reconciles an EXISTING transaction, so this
+            // too returns an id it did not create. Counted under its OWN name:
+            // `recovery_*` must be a complete family — refusals AND successes —
+            // or the share of refusals in it is not a number anyone can read.
+            attest('recovery_reconciled');
+            return uploadAccepted({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true });
+          }
         } catch { /* fall through */ }
         await safeRelease(reserveToken);
         return error('Recheck deferred', 503);
@@ -1056,7 +1382,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // answers "how do paid publications end", not "how do requests end".
   if (committed) {
     emit('upload_outcome', ['accepted', declaredVersion], []);
-    return json({ txId, status: 'accepted', committed: true });
+    return uploadAccepted({ txId, status: 'accepted', committed: true, deduped: false });
   }
 
   // Not committed. If it's ANCHORED, the DO holds a `posted` record → the client
@@ -1066,7 +1392,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (anchored) {
     console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
     emit('upload_outcome', ['accepted', declaredVersion], []);
-    return json({ txId, status: 'accepted', committed: false });
+    return uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false });
   }
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
   // accepted is emitted only AFTER signRecovery resolves: should WebCrypto
@@ -1077,9 +1403,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (recoveryToken === null) {
     // Unreachable: the step-0 gate 503s uploads without RECOVERY_HMAC_SECRET.
     // Kept as defense in depth — never imply a hint exists when it doesn't.
-    return json({ txId, status: 'accepted', committed: false });
+    return uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false });
   }
-  return json({ txId, status: 'accepted', committed: false, recovery: { txId, postedAt, token: recoveryToken } });
+  return uploadAccepted({
+    txId, status: 'accepted', committed: false, deduped: false,
+    recovery: { txId, postedAt, token: recoveryToken },
+  });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1132,6 +1461,46 @@ async function statusGatewaysHash(origins: readonly string[]): Promise<string> {
   const bytes = new TextEncoder().encode(serializeStatusOrigins(origins));
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   return [...digest].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+}
+
+/**
+ * The typed refusal for «this noteId already names DIFFERENT bytes» (D2).
+ *
+ * 409 and a machine-readable `code`, never a 200 carrying the historical
+ * `txId`: that pair — payload B under transaction A — is precisely what the two
+ * irreversible floors exist to make impossible, and a client that cannot tell
+ * it from success would store it.
+ */
+function idPayloadConflict(txId: string | undefined): Response {
+  return new Response(JSON.stringify({ code: 'id_payload_conflict', ...(txId ? { txId } : {}) }), {
+    status: 409,
+    // Same reason as uploadAccepted: an intermediary replaying this verdict
+    // would replay a judgement about bytes it never saw.
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+}
+
+/**
+ * Every SUCCESSFUL /upload answer, carrying the capability marker (D2a).
+ *
+ * ── Why the marker rides on each response, not only on /health ────────
+ *
+ * A one-off `/health` probe is useless against a rollback that happens AFTER
+ * it: the client would have asked the safe worker and then stored a txId handed
+ * out by the old one. The guarantee has to be atomic with the answer it
+ * qualifies, so it travels in the answer.
+ *
+ * With it, an old worker cannot make a new client record an unproven binding —
+ * it physically cannot emit this field. For older clients the field is additive
+ * and inert, which is what makes deploying the worker before the client safe.
+ *
+ * `no-store` is part of the contract, not a nicety: an intermediary that
+ * replayed one of these responses would replay its capability claim too.
+ */
+function uploadAccepted(payload: Record<string, unknown>): Response {
+  return new Response(JSON.stringify({ ...payload, semanticIdempotency: 1 }), {
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
 }
 
 function json(data: unknown): Response {
@@ -1241,7 +1610,8 @@ async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: 
 
 /**
  * Server-side liveness check for a committed TX (recheck path). Maps the gateway
- * contract to a coarse verdict: 200/202 → alive, 404/400 → dead, else unknown.
+ * contract to a coarse verdict: 200/202 → alive, 404 → dead, everything else
+ * (400 included — see probeStatusOrigin) → unavailable.
  * PR-2 wraps the SAME fetch in a stopwatch and emits gateway_call(status) +
  * status_verdict; the verdict logic itself is unchanged (quorum is PR-3a).
  */
@@ -1277,6 +1647,13 @@ const QUORUM_METRIC_HOST = '_quorum';
  *  and deduplicated with the SAME parser the client compiles in. */
 function statusOrigins(env: Env): string[] {
   const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
+  return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
+}
+
+/** Configured payload origins for D9, in the pinned ORDER (unlike the status
+ *  pool, whose probes run in parallel and whose order carries no meaning). */
+function payloadOrigins(env: Env): string[] {
+  const parsed = parseOriginList(env.PAYLOAD_GATEWAYS ?? '');
   return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
 }
 

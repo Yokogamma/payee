@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { withTrustedWallet } from '../test-stubs/wallet-address';
 import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
 
 // Direct-dispatch suites (env-override) for the v3 upload kill switch and the
@@ -173,7 +174,7 @@ describe('v3 e2e idempotency (committed): exactly one paid POST', () => {
       true, ['sign', 'verify'],
     );
     const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
-    const envWithJwk = { ...baseEnv, ARWEAVE_JWK: jwk };
+    const envWithJwk = { ...baseEnv, ...(await withTrustedWallet(jwk)) };
 
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '0');
