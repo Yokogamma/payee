@@ -292,3 +292,55 @@ describe('«unproven» — a transport failure is never a verdict', () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe('the body reader refuses oversize BEFORE reading it all', () => {
+  it('an over-cap /raw with no Content-Length is refused, and the stream is cancelled', async () => {
+    // `arrayBuffer()`-then-check would read the whole body first; a hostile
+    // gateway could hand the isolate hundreds of megabytes before the check
+    // ever ran. This stub yields chunks forever and counts how many were
+    // pulled: a streaming reader stops within a few chunks of the cap.
+    const { tx, wallet } = await ourTx();
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) { pulled++; controller.enqueue(new Uint8Array(65_536)); },
+    });
+    const impl = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/raw/')) return new Response(endless, { status: 200 }); // no Content-Length
+      return new Response(JSON.stringify(tx.header), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const verdict = await authenticatePublication(tx.txId, {
+      origins: [G1], trustedOwners: [wallet.address], ownerHash: OWNER_HASH,
+      expectedNoteId: NOTE_ID, fetchImpl: impl,
+    });
+
+    expect(verdict.kind).toBe('unproven');
+    // 262 144-byte cap → crossed on the 5th 64 KiB chunk. Anything near that is
+    // streaming; a full read would never return at all.
+    expect(pulled).toBeLessThanOrEqual(8);
+  });
+
+  it('a Content-Length above the cap is refused without reading a byte', async () => {
+    const { tx, wallet } = await ourTx();
+    let pulled = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { pulled++; controller.enqueue(new Uint8Array(1)); },
+    });
+    const impl = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/raw/')) {
+        return new Response(body, { status: 200, headers: { 'Content-Length': String(10 * 1024 * 1024) } });
+      }
+      return new Response(JSON.stringify(tx.header), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await authenticatePublication(tx.txId, {
+      origins: [G1], trustedOwners: [wallet.address], ownerHash: OWNER_HASH,
+      expectedNoteId: NOTE_ID, fetchImpl: impl,
+    });
+    // At most the ONE pull the stream performs on construction to fill its
+    // queue — none from the reader, which never touched the body.
+    expect(pulled).toBeLessThanOrEqual(1);
+  });
+});

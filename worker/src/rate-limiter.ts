@@ -73,6 +73,16 @@ interface BackfillFpRequest {
   observedFp: string;
 }
 
+/** Attach `fp` only when there is one. A helper because the «carry it forward»
+ *  rule has to hold at EVERY transition, and a spread typed out by hand at each
+ *  of them is exactly how one of them silently drops it. */
+function withFp<T extends object>(record: T, fp: string | undefined): T & { fp?: string } {
+  return fp === undefined ? record : { ...record, fp };
+}
+
+/** The shape `computePublicationFp` produces: SHA-256 as 64 lowercase hex. */
+const FP_RE = /^[0-9a-f]{64}$/;
+
 export class RateLimiter implements DurableObject {
   private state: DurableObjectState;
 
@@ -199,10 +209,9 @@ export class RateLimiter implements DurableObject {
     await this.state.storage.put('attempts', w.attempts + 1);
     // The requested fp is recorded WITH the token: from here on this record is
     // no longer legacy, and every later state carries the same value forward.
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
+    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
-      ...(requestedFp === undefined ? {} : { fp: requestedFp }),
-    });
+    }, requestedFp));
     return Response.json({ status: 'ok', token });
   }
 
@@ -219,14 +228,11 @@ export class RateLimiter implements DurableObject {
     if (!record || record.status !== 'reserved' || record.token !== token) {
       return Response.json({ ok: false, stale: true });
     }
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
-      // `fp` is carried UNCHANGED: it describes the payload, and posting does
-      // not change the payload. Rebuilding the record field-by-field is how it
-      // would silently be dropped, so it is spread explicitly here and at every
-      // other transition.
+    // `fp` is carried UNCHANGED: it describes the payload, and posting does not
+    // change the payload.
+    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
       status: 'posted', token, gen: record.gen, txId, reservedAt: record.reservedAt, postedAt: Date.now(),
-      ...(record.fp === undefined ? {} : { fp: record.fp }),
-    });
+    }, record.fp));
     return Response.json({ ok: true });
   }
 
@@ -245,10 +251,9 @@ export class RateLimiter implements DurableObject {
       await this.state.storage.put('count', w.count + 1);
       committedGen = w.resetAt;
     }
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
+    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
       status: 'committed', token, gen: committedGen, txId, committedAt: now,
-      ...(record.fp === undefined ? {} : { fp: record.fp }), // carried, never re-derived
-    });
+    }, record.fp)); // carried, never re-derived
     return Response.json({ ok: true });
   }
 
@@ -300,6 +305,13 @@ export class RateLimiter implements DurableObject {
    */
   private async handleBackfillFp(request: Request): Promise<Response> {
     const { noteId, snapshot, observedFp } = await request.json<BackfillFpRequest>();
+    // Reachable only through the worker's own stub, and checked anyway: this
+    // value is written PERMANENTLY and compared byte-for-byte forever after.
+    // A malformed one would never match anything and would need an operator
+    // to clean up by hand.
+    if (typeof observedFp !== 'string' || !FP_RE.test(observedFp)) {
+      return Response.json({ ok: false, malformed: true });
+    }
     const current = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
 
     if (
@@ -362,11 +374,9 @@ export class RateLimiter implements DurableObject {
     // redrop can never silently downgrade a fingerprinted record to legacy —
     // which would cost a full verification cycle on the next request and, worse,
     // make the record briefly incomparable.
-    const carriedFp = requestedFp ?? record.fp;
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, {
+    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
-      ...(carriedFp === undefined ? {} : { fp: carriedFp }),
-    });
+    }, requestedFp ?? record.fp));
     return Response.json({ ok: true, token });
   }
 }

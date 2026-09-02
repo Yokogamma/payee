@@ -17,6 +17,7 @@ import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-
 import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
 import { parseTrustedOwners } from '../../src/lib/trusted-owners';
 import { authenticatePublication } from './publication-auth';
+import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
 import {
@@ -222,7 +223,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const origins = statusOrigins(env);
     return healthJson({
       ok: true,
-      versions: ['1', '2', '3', '4'],
+      versions: [...SUPPORTED_VERSIONS],
       uploads: uploadsEnabled(env),
       v3Uploads: v3UploadsEnabled(env),
       v4Uploads: v4UploadsEnabled(env),
@@ -838,15 +839,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const declaredVersion = Array.isArray(tags)
     ? tags.find(t => t && t.name === 'App-Version')?.value
     : undefined;
-  if (declaredVersion !== '1' && declaredVersion !== '2' &&
-      declaredVersion !== '3' && declaredVersion !== '4') {
+  if (!isSupportedVersion(declaredVersion)) {
     return error('Unsupported App-Version', 400);
   }
   const hasTimestamp = declaredVersion === '1';
   const isSplitEnvelope = declaredVersion === '4';
 
   const REQUIRED_TAGS = new Map<string, string>([
-    ['App-Name', 'EternalNotes'],
+    ['App-Name', APP_NAME],
     ['App-Version', declaredVersion],
     ['Content-Type', 'application/json'],
   ]);
@@ -1596,7 +1596,7 @@ function statusOrigins(env: Env): string[] {
 
 /** Configured payload origins for D9, in the pinned ORDER (unlike the status
  *  pool, whose probes run in parallel and whose order carries no meaning). */
-export function payloadOrigins(env: Env): string[] {
+function payloadOrigins(env: Env): string[] {
   const parsed = parseOriginList(env.PAYLOAD_GATEWAYS ?? '');
   return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
 }

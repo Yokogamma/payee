@@ -53,6 +53,7 @@ import {
   type TxHeader,
 } from '../../src/lib/tx-verify';
 import { computePublicationFp, decodePublicationData } from './publication-fp';
+import { APP_NAME, SUPPORTED_VERSIONS } from './protocol';
 
 /** One Arweave chunk. A publication larger than this is not something this
  *  project creates, and multi-chunk `data_root` is not implemented. */
@@ -65,11 +66,6 @@ const FETCH_TIMEOUT_MS = 10_000;
 /** Whole-operation ceiling across every origin, so a slow pool cannot hold a
  *  request open indefinitely. */
 const DEADLINE_MS = 25_000;
-
-/** The tag canon this project's writer emits — the same set the upload path
- *  validates. Kept here so «what our publications look like» is stated once. */
-export const APP_NAME = 'EternalNotes';
-export const SUPPORTED_VERSIONS: ReadonlySet<string> = new Set(['1', '2', '3', '4']);
 
 export type PublicationAuth =
   /** A completed D9 proof. `observedFp` may be written. */
@@ -119,14 +115,38 @@ export interface AuthDeps {
   onOrigin?: (origin: string, outcome: 'ok' | 'miss' | 'mismatch' | 'error') => void;
 }
 
-/** Read at most `cap` bytes, refusing anything larger rather than truncating:
- *  a truncated body would fail `data_size` anyway, with a worse message. */
+/**
+ * Read at most `cap` bytes, refusing anything larger rather than truncating.
+ *
+ * STREAMED, and cancelled the moment the cap is crossed — never
+ * `arrayBuffer()` followed by a length check. That order reads the WHOLE body
+ * first, so a hostile or broken gateway could hand this isolate hundreds of
+ * megabytes before the check ever ran. `Content-Length` is consulted as a
+ * cheap early refusal only; it is advisory, and a gateway may omit it or lie.
+ * Mirrors the client's reader in src/lib/arweave.ts.
+ */
 async function readCapped(response: Response, cap: number): Promise<Uint8Array | null> {
   const declared = response.headers.get('Content-Length');
   if (declared !== null && Number(declared) > cap) return null;
-  const buffer = await response.arrayBuffer();
-  if (buffer.byteLength > cap) return null;
-  return new Uint8Array(buffer);
+  if (!response.body) return null;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) { await reader.cancel(); return null; }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+  return out;
 }
 
 async function fetchFrom(
@@ -206,7 +226,7 @@ export async function authenticatePublication(
   // ── The signed tags decide attribution — the caller's record does not ──
   const tags = readVerifiedTags(header, {
     appName: APP_NAME,
-    supportedVersions: SUPPORTED_VERSIONS,
+    supportedVersions: new Set<string>(SUPPORTED_VERSIONS),
     ownerHash: deps.ownerHash,
   });
   if (isRejection(tags)) return { kind: 'not-ours', txId, reason: tags.reason };

@@ -16,7 +16,11 @@ function stubFor(name: string) {
 /** `fp` defaults to a fixed value so the ordinary lifecycle tests describe a
  *  POST-D2 record. Pass a different one to exercise the conflict branch, or
  *  `undefined` explicitly to write a legacy-shaped record. */
-const FP_A = 'fp-payload-A';
+/** A deterministic 64-hex fingerprint per label — the shape computePublicationFp
+ *  produces and /backfill-fp now insists on. Labels stay readable in failures. */
+const fp = (label: string) =>
+  Array.from(label, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('').padEnd(64, '0').slice(0, 64);
+const FP_A = fp('fp-payload-A');
 
 async function reserve(
   stub: DurableObjectStub,
@@ -314,7 +318,7 @@ describe('semantic idempotency — the same id under DIFFERENT bytes', () => {
     const res = await reserve(s, 'n-fp2');
     await commit(s, 'n-fp2', 'tx-2', res.token!);
 
-    const conflict = await reserve(s, 'n-fp2', 20, 'fp-payload-B');
+    const conflict = await reserve(s, 'n-fp2', 20, fp('fp-payload-B'));
     expect(conflict.status).toBe('id_payload_conflict');
     expect(conflict.txId).toBe('tx-2');
     expect(conflict.state).toBe('committed');
@@ -327,7 +331,7 @@ describe('semantic idempotency — the same id under DIFFERENT bytes', () => {
     const res = await reserve(s, 'n-fp3');
     await markPosted(s, 'n-fp3', 'tx-3', res.token!);
 
-    expect((await reserve(s, 'n-fp3', 20, 'fp-payload-B')).status).toBe('id_payload_conflict');
+    expect((await reserve(s, 'n-fp3', 20, fp('fp-payload-B'))).status).toBe('id_payload_conflict');
     // …and a matching fp keeps the existing protocol path rather than `exists`:
     // `posted` still owes a liveness check and a commit.
     expect((await reserve(s, 'n-fp3')).status).toBe('posted');
@@ -342,7 +346,7 @@ describe('semantic idempotency — the same id under DIFFERENT bytes', () => {
     const stored = await runInDurableObject(s, async (_i, state) =>
       state.storage.get<{ fp?: string }>('note:n-fp4'));
     expect(stored?.fp).toBe(FP_A);
-    expect((await reserve(s, 'n-fp4', 20, 'fp-payload-B')).status).toBe('id_payload_conflict');
+    expect((await reserve(s, 'n-fp4', 20, fp('fp-payload-B'))).status).toBe('id_payload_conflict');
   });
 });
 
@@ -359,8 +363,8 @@ describe('/backfill-fp — snapshot CAS', () => {
   it('writes the observed fp when the snapshot still matches', async () => {
     const s = stubFor('pk-Bf1');
     const snap = await seedLegacy(s, 'bf1');
-    expect(await backfill(s, 'bf1', snap, 'fp-observed')).toEqual({ ok: true, fp: 'fp-observed' });
-    expect((await reserve(s, 'bf1', 20, 'fp-observed')).status).toBe('exists');
+    expect(await backfill(s, 'bf1', snap, fp('fp-observed'))).toEqual({ ok: true, fp: fp('fp-observed') });
+    expect((await reserve(s, 'bf1', 20, fp('fp-observed'))).status).toBe('exists');
   });
 
   it('refuses when the record moved on — a stale snapshot writes nothing', async () => {
@@ -371,7 +375,7 @@ describe('/backfill-fp — snapshot CAS', () => {
         status: 'committed', token: 'DIFFERENT', gen: 0, txId: 'tx-legacy', reservedAt: 1,
       });
     });
-    const r = await backfill(s, 'bf2', snap, 'fp-observed');
+    const r = await backfill(s, 'bf2', snap, fp('fp-observed'));
     expect(r.ok).toBe(false);
     expect(r.stale).toBe(true);
   });
@@ -382,18 +386,31 @@ describe('/backfill-fp — snapshot CAS', () => {
     // first's result — a lost update the four-field CAS cannot see.
     const s = stubFor('pk-Bf3');
     const snap = await seedLegacy(s, 'bf3');
-    expect((await backfill(s, 'bf3', snap, 'fp-first')).ok).toBe(true);
+    expect((await backfill(s, 'bf3', snap, fp('fp-first'))).ok).toBe(true);
 
-    const second = await backfill(s, 'bf3', snap, 'fp-second');
+    const second = await backfill(s, 'bf3', snap, fp('fp-second'));
     expect(second.ok).toBe(false);
     expect(second.stale).toBe(true);
     // The loser is told what is already there, so it need not repeat the GET.
-    expect(second.fp).toBe('fp-first');
+    expect(second.fp).toBe(fp('fp-first'));
+  });
+
+  it('refuses a malformed fingerprint rather than storing it forever', async () => {
+    // The value is compared byte-for-byte on every later request; a bad one
+    // would never match anything and would need an operator to clean up.
+    const s = stubFor('pk-Bf5');
+    const snap = await seedLegacy(s, 'bf5');
+    for (const bad of ['', 'not-hex', 'ABCDEF'.repeat(11), 'a'.repeat(63), 'a'.repeat(65)]) {
+      const r = await backfill(s, 'bf5', snap, bad);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+    }
+    // …and the record is still legacy, i.e. still fixable.
+    expect((await reserve(s, 'bf5')).status).toBe('legacy');
   });
 
   it('refuses for a record that no longer exists', async () => {
     const s = stubFor('pk-Bf4');
-    const r = await backfill(s, 'gone', { status: 'committed', txId: 't', token: 'k', gen: 0 }, 'fp');
+    const r = await backfill(s, 'gone', { status: 'committed', txId: 't', token: 'k', gen: 0 }, fp('any'));
     expect(r.ok).toBe(false);
     expect(r.stale).toBe(true);
   });
