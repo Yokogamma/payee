@@ -15,6 +15,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
  */
 
 const PROXY = 'https://proxy.test';
+/** A canonical 43-char id: the parser at the 2xx boundary refuses anything else. */
+const TX = 'A'.repeat(43);
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -60,7 +62,7 @@ describe('the capability marker gates recording a txId', () => {
     // Not the record's fault and not terminal — the worker is simply below the
     // floor, so the row is kept and the queue waits, exactly as for a 503.
     const uploadViaProxy = await loadUpload(true);
-    stubFetch(ok({ txId: 'TX-1', committed: true }));
+    stubFetch(ok({ txId: TX, committed: true }));
 
     const result = await uploadViaProxy('{}', 'pk', 'sig');
 
@@ -72,8 +74,8 @@ describe('the capability marker gates recording a txId', () => {
     // The refusal is about the txId, not about the proof that money was spent.
     // Drop the hint and the triple-failure path posts again.
     const uploadViaProxy = await loadUpload(true);
-    const hint = { txId: 'TX-1', postedAt: 123, token: 'tok' };
-    stubFetch(ok({ txId: 'TX-1', committed: false, recovery: hint }));
+    const hint = { txId: TX, postedAt: 123, token: 'tok' };
+    stubFetch(ok({ txId: TX, committed: false, recovery: hint }));
 
     const result = await uploadViaProxy('{}', 'pk', 'sig');
 
@@ -83,17 +85,17 @@ describe('the capability marker gates recording a txId', () => {
 
   it('WITH import on: the marker present is an ordinary success', async () => {
     const uploadViaProxy = await loadUpload(true);
-    stubFetch(ok({ txId: 'TX-1', committed: true, semanticIdempotency: 1 }));
+    stubFetch(ok({ txId: TX, committed: true, semanticIdempotency: 1 }));
 
     const result = await uploadViaProxy('{}', 'pk', 'sig');
 
-    expect(result).toMatchObject({ kind: 'accepted', txId: 'TX-1', committed: true });
+    expect(result).toMatchObject({ kind: 'accepted', txId: TX, committed: true });
   });
 
   it('a WRONG marker value is not "close enough"', async () => {
     const uploadViaProxy = await loadUpload(true);
     for (const value of [0, 2, '1', true, null]) {
-      stubFetch(ok({ txId: 'TX-1', committed: true, semanticIdempotency: value }));
+      stubFetch(ok({ txId: TX, committed: true, semanticIdempotency: value }));
       expect((await uploadViaProxy('{}', 'pk', 'sig')).kind, String(value)).toBe('unattested');
     }
   });
@@ -103,9 +105,9 @@ describe('the capability marker gates recording a txId', () => {
     // would mean a defect found during the worker soak could only be cured by
     // an urgent forward fix.
     const uploadViaProxy = await loadUpload(false);
-    stubFetch(ok({ txId: 'TX-1', committed: true }));
+    stubFetch(ok({ txId: TX, committed: true }));
 
-    expect(await uploadViaProxy('{}', 'pk', 'sig')).toMatchObject({ kind: 'accepted', txId: 'TX-1' });
+    expect(await uploadViaProxy('{}', 'pk', 'sig')).toMatchObject({ kind: 'accepted', txId: TX });
   });
 });
 
@@ -149,7 +151,7 @@ describe('the request itself refuses caching', () => {
     // The worker sends `Cache-Control: no-store`; this is the other half. A
     // replayed answer would replay its capability claim and its txId with it.
     const uploadViaProxy = await loadUpload(true);
-    const calls = stubFetch(ok({ txId: 'TX-1', committed: true, semanticIdempotency: 1 }));
+    const calls = stubFetch(ok({ txId: TX, committed: true, semanticIdempotency: 1 }));
 
     await uploadViaProxy('{}', 'pk', 'sig');
 
@@ -181,5 +183,54 @@ describe('toPublicationConflict — what lands in the record', () => {
     const next = toPublicationConflict('n1', 'note', undefined, 'conflict body', 1000);
     expect(next.txId).toBeUndefined();
     expect(next.terminalError).toBe('publication_conflict');
+  });
+});
+
+describe('the 2xx body is validated at the runtime boundary', () => {
+  const HINT = { txId: TX, postedAt: 123, token: 'tok' };
+
+  it('a canonical body parses, with committed defaulting to true', async () => {
+    const { parseUploadOk } = await import('./arweave');
+    expect(parseUploadOk({ txId: TX })).toMatchObject({ txId: TX, committed: true });
+    expect(parseUploadOk({ txId: TX, committed: false, recovery: HINT }))
+      .toMatchObject({ txId: TX, committed: false, recovery: HINT });
+  });
+
+  it('refuses what used to be trusted on shape alone', async () => {
+    const { parseUploadOk } = await import('./arweave');
+    const bad: unknown[] = [
+      null, [], 'ok', 42,
+      {},                                           // no txId
+      { txId: 'short' },                            // non-canonical id
+      { txId: TX, committed: 'false' },             // a STRING would have read as true
+      { txId: TX, deduped: 1 },
+      { txId: TX, recovery: 'tok' },                // hint of the wrong shape
+      { txId: TX, recovery: { txId: TX } },         // incomplete hint
+      { txId: TX, recovery: { ...HINT, postedAt: -1 } },
+      { txId: TX, recovery: { ...HINT, token: '' } },
+      { txId: TX, recovery: { ...HINT, txId: 'B'.repeat(43) } }, // hint for ANOTHER transaction
+    ];
+    for (const body of bad) expect(parseUploadOk(body), JSON.stringify(body)).toBeNull();
+  });
+
+  it('a malformed 2xx is a RETRYABLE protocol failure, never accepted and never terminal', async () => {
+    // Once, a malformed recovery hint would be stored, sent back, refused with
+    // recovery_invalid, and a healthy record quarantined for good.
+    const uploadViaProxy = await loadUpload(true);
+    stubFetch(ok({ txId: TX, committed: false, recovery: { txId: TX }, semanticIdempotency: 1 }));
+    const result = await uploadViaProxy('{}', 'pk', 'sig');
+    expect(result.kind).toBe('unavailable');
+  });
+
+  it('a marker without a canonical txId is not a success', async () => {
+    const uploadViaProxy = await loadUpload(true);
+    stubFetch(ok({ txId: 'nope', semanticIdempotency: 1 }));
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('unavailable');
+  });
+
+  it('a non-JSON 2xx is retryable too', async () => {
+    const uploadViaProxy = await loadUpload(true);
+    stubFetch(new Response('<html>', { status: 200 }));
+    expect((await uploadViaProxy('{}', 'pk', 'sig')).kind).toBe('unavailable');
   });
 });

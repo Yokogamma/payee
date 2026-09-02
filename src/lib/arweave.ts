@@ -484,6 +484,63 @@ export async function registerWithProxy(
  * meaning of the status applies. One reader for all of them, so a new code is
  * one comparison and not a fourth copy of the try/parse/narrow dance.
  */
+/**
+ * A 2xx `/upload` body, validated at the RUNTIME boundary — or null.
+ *
+ * `response.json()` is `any`, and every field the caller then stores was
+ * trusted on shape alone. That is how a malformed body turns into a permanent
+ * fact: a `recovery` with the wrong shape is stored, sent back, refused with
+ * `recovery_invalid`, and a healthy record is quarantined for good; a
+ * `committed` of `"false"` reads as true; a marker without a canonical txId
+ * produces an `accepted` with nothing behind it.
+ *
+ * So: plain object; canonical 43-char base64url `txId`; strict boolean
+ * `committed`; `recovery` either absent or EXACTLY `{txId, postedAt, token}`
+ * with `recovery.txId === txId` (a hint for some other transaction is not
+ * this answer's hint); `deduped` optional strict boolean; `semanticIdempotency`
+ * passed through for the caller's gate. Anything else is a PROTOCOL failure —
+ * retryable, never a verdict about the record.
+ */
+export interface UploadOk {
+  txId: string;
+  committed: boolean;
+  recovery?: RecoveryHint;
+  deduped?: boolean;
+  semanticIdempotency?: unknown;
+}
+
+const TXID_CANON = /^[A-Za-z0-9_-]{43}$/;
+
+export function parseUploadOk(body: unknown): UploadOk | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (typeof b.txId !== 'string' || !TXID_CANON.test(b.txId)) return null;
+  if (b.committed !== undefined && typeof b.committed !== 'boolean') return null;
+  if (b.deduped !== undefined && typeof b.deduped !== 'boolean') return null;
+
+  let recovery: RecoveryHint | undefined;
+  if (b.recovery !== undefined) {
+    const r = b.recovery;
+    if (typeof r !== 'object' || r === null || Array.isArray(r)) return null;
+    const h = r as Record<string, unknown>;
+    if (typeof h.txId !== 'string' || !TXID_CANON.test(h.txId)) return null;
+    if (typeof h.postedAt !== 'number' || !Number.isFinite(h.postedAt) || h.postedAt <= 0) return null;
+    if (typeof h.token !== 'string' || h.token === '') return null;
+    if (h.txId !== b.txId) return null;
+    recovery = { txId: h.txId, postedAt: h.postedAt, token: h.token };
+  }
+
+  return {
+    txId: b.txId,
+    // Absent means committed (the pre-`committed` wire shape); only an explicit
+    // false means «posted, not yet finalized».
+    committed: b.committed !== false,
+    ...(recovery ? { recovery } : {}),
+    ...(b.deduped === undefined ? {} : { deduped: b.deduped }),
+    semanticIdempotency: b.semanticIdempotency,
+  };
+}
+
 function readCode(text: string): string | undefined {
   try {
     const parsed: unknown = JSON.parse(text);
@@ -520,7 +577,19 @@ export async function uploadViaProxy(
     });
 
     if (response.ok) {
-      const data = await response.json();
+      let raw: unknown;
+      try {
+        raw = await response.json();
+      } catch {
+        return { kind: 'unavailable', error: 'upload answered 2xx with a non-JSON body' };
+      }
+      const data = parseUploadOk(raw);
+      if (data === null) {
+        // A 2xx the protocol does not recognise is a transport/protocol fault,
+        // and RETRYABLE: nothing about the record is known from it. Storing any
+        // part of it — a txId, a hint — would be recording a guess.
+        return { kind: 'unavailable', error: 'upload answered 2xx with a body that fails the protocol schema' };
+      }
       // D2a — the ATOMIC half of the worker-floor guarantee.
       //
       // A one-off /health probe cannot protect against a rollback that happens
@@ -550,7 +619,7 @@ export async function uploadViaProxy(
       return {
         kind: 'accepted',
         txId: data.txId,
-        committed: data.committed !== false,
+        committed: data.committed,
         recovery: data.recovery,
       };
     }
