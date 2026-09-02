@@ -389,19 +389,34 @@ describe('the workflow cannot be talked out of the gate by the code it judges', 
     fileURLToPath(new URL('../.github/workflows/deploy-worker.yml', import.meta.url)),
     'utf8',
   );
-  const at = needle => workflow.indexOf(needle);
+  // TWO jobs, and the boundary between them is the token: the candidate's own
+  // code runs in `test-candidate` (no Environment, no secret); `deploy-worker`
+  // starts on a fresh runner and never executes it. Every ordering assertion
+  // below is therefore made WITHIN a job — a file-wide index would be answered
+  // by the wrong job's step.
+  const jobText = name => {
+    const start = workflow.indexOf(`\n  ${name}:\n`);
+    expect(start, `no job ${name}`).toBeGreaterThan(-1);
+    const rest = workflow.slice(start + 1);
+    const next = rest.slice(1).search(/\n  [a-z][a-z-]*:\n/);
+    return next === -1 ? rest : rest.slice(0, next + 1);
+  };
+  const testJob = jobText('test-candidate');
+  const deployJob = jobText('deploy-worker');
+  const at = (text, needle) => text.indexOf(needle);
 
   /** One step's own YAML — comments elsewhere in the file cannot answer for
    *  it. The `fetch-depth` check used to match the sentence ABOUT the setting
    *  two lines above the setting, and would have stayed green if the setting
    *  itself were deleted. */
-  const step = marker => {
-    const start = workflow.indexOf(marker);
+  const stepIn = (text, marker) => {
+    const start = text.indexOf(marker);
     expect(start, `no step matching ${marker}`).toBeGreaterThan(-1);
-    const from = workflow.lastIndexOf('\n      - ', start) + 1;
-    const next = workflow.indexOf('\n      - ', start);
-    return workflow.slice(from, next === -1 ? workflow.length : next);
+    const from = text.lastIndexOf('\n      - ', start) + 1;
+    const next = text.indexOf('\n      - ', start);
+    return text.slice(from, next === -1 ? text.length : next);
   };
+  const step = marker => stepIn(deployJob, marker);
 
   it('takes the candidate as an input, and the floor from a protected variable', () => {
     expect(workflow).toMatch(/inputs:\s*\n\s*candidate:/);
@@ -412,41 +427,81 @@ describe('the workflow cannot be talked out of the gate by the code it judges', 
   });
 
   it('materializes the candidate from the already-trusted history, not the network', () => {
-    // A second `actions/checkout` would fetch the candidate by ref — which is
-    // how an off-branch commit got in. A worktree can only produce a commit
-    // this clone already has, and the gate ran before it.
-    expect(workflow.match(/uses: actions\/checkout/g) ?? []).toHaveLength(1);
-    expect(step('git worktree add')).toContain('--detach candidate');
+    // A second `actions/checkout` IN A JOB would fetch the candidate by ref —
+    // which is how an off-branch commit got in. A worktree can only produce a
+    // commit that job's clone already has, and the gate ran before it. Each
+    // job checks out the TRUSTED ref exactly once and materializes from it.
+    for (const [name, job] of [['test-candidate', testJob], ['deploy-worker', deployJob]]) {
+      expect(job.match(/uses: actions\/checkout/g) ?? [], name).toHaveLength(1);
+      expect(stepIn(job, 'git worktree add'), name).toContain('--detach candidate');
+    }
+  });
+
+  it('the candidate\'s code runs ONLY in the job that holds no token', () => {
+    // The whole point of the split. Code that has executed on a runner can
+    // outlive a `checkout --force` through the index, untracked node_modules,
+    // $GITHUB_ENV or $GITHUB_PATH — so the job that receives the Cloudflare
+    // token must be one where nothing of the candidate has ever run.
+    expect(testJob).not.toContain('environment:');
+    expect(testJob).not.toContain('secrets.');
+    expect(deployJob).toContain('environment: dev');
+    expect(deployJob).toContain('needs: test-candidate');
+    // Tests and typecheck: test job only.
+    expect(testJob).toContain('npm --prefix worker test');
+    expect(deployJob).not.toContain('npm --prefix worker test');
+    expect(deployJob).not.toContain('run typecheck');
+    // Every install in the deploy job is DATA for the bundler, never a program.
+    for (const line of deployJob.split('\n').filter(l => /npm (--prefix \S+ )?ci\b/.test(l))) {
+      expect(line, line).toContain('--ignore-scripts');
+    }
+    // And the deploy job never restores-and-hopes: the dance is gone because
+    // what it defended against no longer happens there.
+    expect(deployJob).not.toContain('checkout --force');
   });
 
   it('checks the ref by its FULL name — a tag can share a branch\'s name', () => {
-    expect(step('Refuse to deploy from anything but')).toContain('refs/heads/$DEFAULT');
-    expect(step('Refuse to deploy from anything but')).toContain('REF: ${{ github.ref }}');
+    for (const job of [testJob, deployJob]) expect(stepIn(job, 'Refuse to deploy from anything but')).toContain('refs/heads/$DEFAULT');
+    for (const job of [testJob, deployJob]) expect(stepIn(job, 'Refuse to deploy from anything but')).toContain('REF: ${{ github.ref }}');
   });
 
-  it('runs the gate BEFORE any file of the candidate exists', () => {
+  it('runs the gate BEFORE any file of the candidate exists — in the deploy job', () => {
     // The ordering is the whole mechanism. A gate that runs after the code is
-    // on disk is a gate the code could have replaced — and a `run:` step from
-    // the candidate would execute before it in that case.
-    const gate = at('node scripts/check-worker-floor.mjs');
-    const materialize = at('git worktree add');
+    // on disk is a gate the code could have replaced.
+    const gate = at(deployJob, 'node scripts/check-worker-floor.mjs');
+    const materialize = at(deployJob, 'git worktree add');
     expect(gate).toBeGreaterThan(-1);
     expect(materialize).toBeGreaterThan(-1);
     expect(gate).toBeLessThan(materialize);
   });
 
+  it('the test job refuses an unreachable candidate BEFORE materializing it', () => {
+    // No Environment means no WORKER_FLOOR_SHA, so the floor gate cannot run
+    // here — but the TRUST half can, with plain git, and must: even a
+    // tokenless runner should not execute a commit nobody reviewed.
+    const guard = at(testJob, 'merge-base --is-ancestor');
+    const materialize = at(testJob, 'git worktree add');
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(materialize);
+    // The VARIABLE, not the word: the job's comments may name it while
+    // explaining why it is absent. What must be absent is a binding.
+    expect(testJob).not.toMatch(/WORKER_FLOOR_SHA:\s*\$\{\{/);
+  });
+
   it('keeps the candidate in its own directory, never over the trusted checkout', () => {
-    expect(workflow).toContain('workingDirectory: candidate/worker');
+    expect(deployJob).toContain('workingDirectory: candidate/worker');
     for (const marker of ['npm ci --ignore-scripts', 'npm --prefix worker test']) {
-      expect(step(marker), marker).toContain('working-directory: candidate');
+      expect(stepIn(testJob, marker), marker).toContain('working-directory: candidate');
     }
+    expect(stepIn(deployJob, 'npm --prefix worker ci --ignore-scripts')).toContain('working-directory: candidate');
   });
 
   it('fetches the whole history and keeps no credential for the candidate to find', () => {
-    const checkout = step('uses: actions/checkout');
-    expect(checkout).toContain('fetch-depth: 0');
-    expect(checkout).toContain('persist-credentials: false');
-    expect(at('fetch-depth: 0')).toBeLessThan(at('node scripts/check-worker-floor.mjs'));
+    for (const [name, job] of [['test-candidate', testJob], ['deploy-worker', deployJob]]) {
+      const checkout = stepIn(job, 'uses: actions/checkout');
+      expect(checkout, name).toContain('fetch-depth: 0');
+      expect(checkout, name).toContain('persist-credentials: false');
+    }
+    expect(at(deployJob, 'fetch-depth: 0')).toBeLessThan(at(deployJob, 'node scripts/check-worker-floor.mjs'));
   });
 
   it('never uses a TAG as the gate\'s input', () => {

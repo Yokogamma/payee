@@ -21,16 +21,39 @@ name: Deploy Worker (proxy) — dev
 # deployed» from «the code deciding whether it may be».
 #
 # But a free-form SHA would ALSO separate the deployed code from branch
-# protection, which is worse than the arrangement it replaced: this job installs
-# and tests the candidate in a runner that holds the Cloudflare token. So the
-# gate requires the candidate to be REACHABLE FROM THE TRUSTED HEAD — every
-# commit the default branch ever contained, so rollbacks keep working, and
-# nothing else. There is no second checkout either: the candidate is
-# materialized with `git worktree` out of the history already fetched here,
-# so nothing is pulled from the network after the gate has spoken.
+# protection, which is worse than the arrangement it replaced. So the gate
+# requires the candidate to be REACHABLE FROM THE TRUSTED HEAD — every commit
+# the default branch ever contained, so rollbacks keep working, and nothing
+# else. There is no second checkout either: the candidate is materialized with
+# `git worktree` out of the history already fetched here, so nothing is pulled
+# from the network after the gate has spoken.
+#
+# ── TWO jobs, and the boundary between them is the token ──────────────
+#
+# The candidate's OWN code — its npm lifecycle scripts, its test suite — runs
+# in `test-candidate`, a job with NO Environment and therefore no secret. It
+# used to run in the same job that later received the Cloudflare token, with
+# a `git checkout --force` in between; that is not a boundary. Code that has
+# executed on a runner can outlive a checkout through the index, through
+# untracked `node_modules`, through `$GITHUB_ENV` and `$GITHUB_PATH` — and the
+# token would then be handed to whatever it left behind.
+#
+# `deploy-worker` therefore starts on a FRESH runner, materializes the SHA
+# again from its own fetched history, and never EXECUTES candidate code:
+# dependency installs run with `--ignore-scripts` (node_modules are data for
+# the bundler, not a program), and wrangler bundles sources without running
+# them. What it deploys is exactly the bytes the gates judged, on a machine
+# where nothing else has run.
+#
+# Residual, named rather than hidden: wrangler itself is resolved from the
+# candidate's `worker/node_modules`, i.e. from the candidate's reviewed
+# lockfile — the same trust level as this branch's own lockfile, but for a
+# rollback it is an OLDER review. Running the trusted checkout's wrangler over
+# the candidate's config is the next step if that ever matters.
 #
 # The branch policy of the Environment remains the boundary for WHO may
-# dispatch this at all; the guard below is a rail for the honest mistake.
+# dispatch this at all; the default-branch guard below is a rail for the
+# honest mistake.
 #
 # NOTE: a workflow_dispatch workflow must already exist on the default branch
 # before it can be run from the Actions UI, so land this file in main FIRST
@@ -83,7 +106,74 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── Job 1: run the candidate's code where there is nothing to steal ────
+  #
+  # No `environment:` — so no CLOUDFLARE_API_TOKEN, no WORKER_FLOOR_SHA, no
+  # protected variable of any kind. The only thing this job proves is that the
+  # candidate builds and passes its own suite; the deploy job below trusts
+  # that verdict (`needs:`) and nothing else that happened here.
+  test-candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse to deploy from anything but the default branch
+        run: |
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "This workflow deploys a candidate SHA and must be dispatched from the $DEFAULT branch (was: $REF)." >&2
+            exit 1
+          fi
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+      # The TRUST half of the floor gate, without the floor: this job has no
+      # Environment and so cannot read WORKER_FLOOR_SHA, and does not need to —
+      # it decides only whether the candidate is code the default branch ever
+      # contained, i.e. code that passed branch protection. Even a tokenless
+      # runner should not execute a commit nobody reviewed. The full gate,
+      # floor included, runs again in the deploy job.
+      - name: Refuse a candidate that is not reachable from the trusted head
+        run: |
+          case "$CANDIDATE" in
+            *[!0-9a-f]*|"") echo "candidate must be a full lowercase 40-hex SHA" >&2; exit 1 ;;
+          esac
+          [ "${#CANDIDATE}" -eq 40 ] || { echo "candidate must be a full 40-hex SHA" >&2; exit 1; }
+          if ! git merge-base --is-ancestor "$CANDIDATE" "$TRUSTED_HEAD"; then
+            echo "candidate $CANDIDATE is not reachable from the trusted head $TRUSTED_HEAD" >&2
+            exit 1
+          fi
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+          TRUSTED_HEAD: ${{ github.sha }}
+      - name: Materialize the candidate
+        run: git worktree add --detach candidate "$CANDIDATE"
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+      # The CANDIDATE's Node, not this branch's: `npm ci` enforces the
+      # candidate's `engines` under `engine-strict`, so a rollback to a commit
+      # that predates a Node bump would otherwise fail at install time.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: candidate/.nvmrc
+      # ROOT deps are needed by the worker TEST suite since #104:
+      # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
+      # which resolves @scure/bip39 from the root node_modules. --ignore-scripts
+      # on purpose: the parity test only needs IMPORT RESOLUTION of pure-JS
+      # packages, so no lifecycle script of a root transitive dependency runs.
+      - run: npm ci --ignore-scripts
+        working-directory: candidate
+      - run: npm --prefix worker ci
+        working-directory: candidate
+      - run: npm --prefix worker run typecheck
+        working-directory: candidate
+      - run: npm --prefix worker test
+        working-directory: candidate
+
+  # ── Job 2: gate, materialize AGAIN, deploy — and never run the candidate ─
   deploy-worker:
+    needs: test-candidate
     runs-on: ubuntu-latest
     # vars.*/secrets.* below resolve from this environment.
     environment: dev
@@ -98,18 +188,11 @@ jobs:
       # shallow clone, and the floor gate is ancestry.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Ancestry cannot be computed from a shallow clone — and both of the
-          # gate's questions are ancestry.
           fetch-depth: 0
           # Nothing after this step talks to the remote: the candidate comes
           # out of the history fetched here, via `git worktree`. A credential
           # left in the config would only be there for candidate code to find.
           persist-credentials: false
-      # A guard rail, not a boundary — see the header. It catches the honest
-      # mistake (dispatching from a feature branch out of habit); the real
-      # restriction is the Environment's deployment branch policy.
-      # The FULL ref, not `ref_name`: a tag and a branch can share a name, and
-      # `ref_name` cannot tell them apart.
       - name: Refuse to deploy from anything but the default branch
         run: |
           if [ "$REF" != "refs/heads/$DEFAULT" ]; then
@@ -139,101 +222,48 @@ jobs:
       - run: node scripts/check-deploy-config.mjs CLOUDFLARE_ACCOUNT_ID
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-      # (The gateway check needs the candidate's own config, so it runs after
-      # materialization — see below. The SCRIPT still comes from the trusted
-      # root; only the file it judges comes from the candidate.)
       # ── The candidate: only now, and only in its own directory ─────
-      # A worktree, not a second checkout: the commit is already here (the gate
-      # proved it is reachable from this run's head), so there is nothing to
-      # fetch and no credential to hand out. `--detach` because a worktree of a
-      # historical commit has no branch to be on.
+      # A FRESH materialization on a FRESH runner. The test job's copy is gone
+      # with the test job's machine; nothing it did can be here.
       - name: Materialize the candidate
         run: git worktree add --detach candidate "$CANDIDATE"
         env:
           CANDIDATE: ${{ inputs.candidate }}
-      # The CANDIDATE's Node, not this branch's. `npm ci` runs inside
-      # `candidate/` and enforces the candidate's `engines` under
-      # `engine-strict`, so a rollback to a commit that predates a Node bump
-      # would fail at install time with a message about versions — in exactly
-      # the situation where a rollback is what is needed, and where both other
-      # ways out are now banned. `.nvmrc` is data, and the gate has already
-      # proved this commit is one the default branch contains.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: candidate/.nvmrc
-      # ── Config gates over the CANDIDATE, still executed by TRUSTED code ──
+      # ── Config gates over the CANDIDATE, executed by TRUSTED code ──
       #
       # What ships is candidate/worker/wrangler.toml. Checking the trusted
       # root's copy instead would wave through a historical rollback carrying an
-      # unapproved pool and only fail after it was live.
+      # unapproved pool and only fail after it was live. Read by scripts from
+      # THIS checkout; nothing of the candidate has run, so nothing here can
+      # have been rewritten — the restore-and-re-verify dance the previous
+      # layout needed is no longer needed, because the thing it defended
+      # against no longer happens in this job.
       - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
       - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
       # ── Emergency preflight, BEFORE anything is activated ──
       #
-      # Read by the TRUSTED checkout out of the CANDIDATE's own wrangler.toml:
-      # an emergency release is defined by every upload switch being off, and
+      # An emergency release is defined by every upload switch being off, and
       # discovering otherwise from a post-deploy smoke would mean the unsafe
-      # build was already live. A grep is enough and keeps this dependency-free.
-      # A block-scoped parser, NOT a grep: [env.staging.vars] carries the same
-      # key names, so a file-wide match would let a production "true" pass
-      # because staging happened to say "false".
+      # build was already live. A block-scoped parser, NOT a grep:
+      # [env.staging.vars] carries the same key names, so a file-wide match
+      # would let a production "true" pass because staging happened to say
+      # "false".
       - name: Emergency profile requires every upload switch off
         if: ${{ inputs.profile == 'emergency' }}
         run: node scripts/check-emergency-flags.mjs candidate/worker/wrangler.toml
-      # ── Only NOW may candidate code run ──
+      # ── Dependencies as DATA, never as a program ──
       #
-      # Everything below installs and EXECUTES the candidate: npm lifecycle
-      # scripts and its own test suite. That code can rewrite files — the
-      # trusted scripts in this checkout included — so the gates above read
-      # the config BEFORE any of it runs, and the re-verification further down
-      # runs AFTER it, from a restored tree.
-      # ROOT deps are needed by the worker TEST suite since #104:
-      # test/client-parity.test.ts imports the client's src/lib/crypto.ts,
-      # which resolves @scure/bip39 from the root node_modules (in ci.yml the
-      # root `npm ci` runs first, which is why CI never saw the gap; the first
-      # worker deploy after #104 did — the test step failed on module
-      # resolution). --ignore-scripts on purpose: the parity test only needs
-      # IMPORT RESOLUTION of pure-JS packages, so no lifecycle script of any
-      # root transitive dependency ever runs in this CREDENTIALED job — the
-      # accepted npm-ci residual risk (docs/SECRETS.md) does not widen.
-      - run: npm ci --ignore-scripts
+      # `--ignore-scripts`: no lifecycle script of any candidate dependency
+      # runs on this runner. wrangler needs the packages present to BUNDLE
+      # the worker; it does not need them to have installed themselves. The
+      # candidate's suite already ran — in the tokenless job.
+      - run: npm --prefix worker ci --ignore-scripts
         working-directory: candidate
-      - run: npm --prefix worker ci
-        working-directory: candidate
-      - run: npm --prefix worker run typecheck
-        working-directory: candidate
-      - run: npm --prefix worker test
-        working-directory: candidate
-      # ── Undo anything the candidate's own code changed ──
-      #
-      # Its install and test steps ran with write access to this runner. Tracked
-      # files are restored to the SHA that was gated, so what wrangler uploads is
-      # the reviewed state and not whatever a test left behind. node_modules are
-      # untracked and survive, which is what the deploy needs.
-      - name: Restore the candidate tree to the gated SHA
-        run: git -C candidate checkout --force -- .
-      # And prove the TRUSTED half was not rewritten either: these scripts are
-      # what judged the candidate, so a run that edited them would have judged
-      # with its own code.
-      - name: Refuse if candidate code modified the trusted checkout
-        run: |
-          DIRTY=$(git status --porcelain -- . ':!candidate')
-          if [ -n "$DIRTY" ]; then
-            echo "candidate code modified the trusted checkout — refusing to deploy:" >&2
-            echo "$DIRTY" >&2
-            exit 1
-          fi
-      # Re-run the gates on the restored tree, so the verdict describes exactly
-      # the bytes about to ship.
-      - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
-      - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
-        env:
-          VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
-      - name: Re-verify the emergency switches after the restore
-        if: ${{ inputs.profile == 'emergency' }}
-        run: node scripts/check-emergency-flags.mjs candidate/worker/wrangler.toml
       # ── Deploy ──
       # RELEASE_SHA is injected from the VERIFIED candidate input, never from
       # github.sha — that one is the SHA of this workflow's own trusted head,
