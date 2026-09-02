@@ -348,13 +348,6 @@ export function gitIn(cwd) {
       if (status === 1) return false;
       throw new Error(`git merge-base --is-ancestor exited with ${String(status)}`);
     },
-    isTagged(sha) {
-      // Output, not exit code: `tag --points-at` succeeds with nothing to say
-      // when the commit carries no tag.
-      const { status, error, stdout } = spawnSync('git', ['tag', '--points-at', sha], { cwd, encoding: 'utf8' });
-      if (error || status !== 0) return false;
-      return String(stdout).trim() !== '';
-    },
   };
 }
 
