@@ -1911,6 +1911,60 @@ the backup stack stays unmerged until the cause is named. A fix to the worker
 restarts the window — which is why telemetry defects are fixed BEFORE the
 first deploy, never after.
 
+### Producing the volume — `worker/scripts/soak-d2.mjs`
+
+The pre-release baseline was taken on **2026-09-07**, on the live `ff0954d`,
+as `POST /admin/metrics {"report":"upload_outcomes","hours":168}` — and it
+came back **`{"rows":[]}`: not one paid publication on the dev contour in
+seven days.** Two consequences, both recorded here so nobody re-derives them:
+
+- the «no worse than the baseline by 5 p.p.» clause has no denominator and
+  does not apply to this soak; the absolute **≥ 95 %** stays;
+- the volume above will NOT arrive organically. It is produced on purpose,
+  under a budget, by `npm run soak:d2` in `worker/` (state file outside the
+  repo, `~/.eternal-notes-soak/`; `SMOKE_URL`, `SMOKE_PRIVATE_KEY` as for the
+  paid smokes). One publication is quoted at ≈ 0.0033 AR
+  (`arweave.net/price/200`, 2026-09-07); the whole soak stays under
+  `SOAK_MAX_PAID_TOTAL` (default 30 paid POSTs).
+
+Order, and the reason each step sits where it does:
+
+1. **`seed-legacy --count 5` BEFORE the dispatch**, against the old worker
+   (the script refuses a worker that already reports `semanticIdempotency`).
+   Legacy records — no fingerprint in the DO — can only be created by the old
+   worker; after the deploy none can ever appear, and `legacy_backfilled ≥ 3`
+   would be unreachable. Five are seeded for three required, because a
+   transaction the payload pool cannot yet serve is `legacy_unproven`, and
+   the window allows one.
+2. Dispatch, smoke, release row — as above.
+3. **`day --paid 3` once a day, every day of the window**, and
+   `SOAK_RELEASE_SHA=<candidate>` set: the script gates on the live
+   `releaseSha`, on the marker, and on ONE `workerVersionId` for the whole
+   ledger (a redeploy is a new window, and the script says so instead of
+   continuing). Each run publishes new notes, re-sends every earlier note with
+   its EXACT bytes (that is the only thing it ever re-sends — a conflict is a
+   STOP, never a retry), asks `recheck` on confirmed notes older than 24 h,
+   and re-sends a seeded legacy note only once `/tx/<id>/status` shows ≥ 2
+   confirmations. With `METRICS_ADMIN_SECRET` in the environment the same run
+   writes the day's snapshot (`snapshots/<date>.json`: both reports, 24 h and
+   168 h). Three paid notes a day clear the 20-outcome floor by day 7 with
+   margin; the dedupe pass grows with the ledger and clears 10 by day 2.
+4. `status` at any time: progress against the volume, from the ledger. The
+   metrics are the verdict; the ledger is the plan.
+
+**`recovery_reconciled ≥ 1` cannot be produced by ANY client, this script
+included.** The branch runs only when the DO holds no record for an id whose
+transaction is alive under our Owner-Hash — a state reached solely through a
+failed `mark-posted` AND `commit` after a successful POST. Note records are
+never pruned, so every id this identity has ever published is known to its
+DO; forging the HMAC with the operator's secret does not help, because the
+transaction that would prove the id must itself have gone through the DO.
+The path is covered by the worker's own tests (`recheck.test.ts` «recovery
+token (triple-failure reconciliation)», `legacy-backfill-e2e.test.ts` asserts
+the `recovery_reconciled` event); the criterion needs an OWNER DECISION before the exit
+verdict: waive it for this window with that reason, or accept a longer window
+in the hope of a genuine DO fault — the script will not manufacture one.
+
 ### The floor is NOT raised by this release
 
 Deliberately, and it is the one instruction here that is easy to get backwards.
