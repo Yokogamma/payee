@@ -1965,72 +1965,43 @@ the `recovery_reconciled` event); the criterion needs an OWNER DECISION before t
 verdict: waive it for this window with that reason, or accept a longer window
 in the hope of a genuine DO fault — the script will not manufacture one.
 
-### Emergency path AFTER the import flip — OWNER DECISION PENDING (two drafts)
+### Emergency path AFTER the import flip — OWNER DECISION 2026-09-07: roll-forward, the switch is the lever
 
-The review of #136/#138 asks for ONE of these to be chosen and written down
-BEFORE `BACKUP_IMPORT_ENABLED` flips. The reason is arithmetic, not taste:
-once `WORKER_FLOOR_SHA` = `d65e352…`, every deployable commit is a descendant
-of the D2 release and therefore answers `statusQuorumPolicy =
-all-configured-v1` and `semanticIdempotency: 1`. The `emergency` profile as
-defined today (`worker/scripts/smoke-target.mjs`: `legacy-single-v0`, NO
-`semanticIdempotency`, all switches off) can then be satisfied by NO
-descendant of the floor — the break-glass path documented above stops
-existing at the flip. Something has to replace it, and both candidates below
-are complete; pick one, delete the other.
+Why a decision was needed: once `WORKER_FLOOR_SHA` = `d65e352…`, every
+deployable commit is a descendant of the D2 release and answers
+`statusQuorumPolicy = all-configured-v1` and `semanticIdempotency: 1`. The
+`emergency` profile as defined today (`worker/scripts/smoke-target.mjs`:
+`legacy-single-v0`, NO `semanticIdempotency`, all switches off) can be
+satisfied by NO descendant of the floor — the break-glass build documented
+above stops existing at the flip. The alternative considered and rejected:
+redefining the profile and keeping a pre-cut «uploads-off» build above the
+floor. Rejected because that build goes stale the moment the live worker
+moves, and a stale emergency build is a rollback in disguise that would have
+to be re-cut after every release.
 
-**Draft A — «uploads-off»: a prepared emergency build above the floor.**
+**The decision — no emergency build after the flip; the switch is the lever:**
 
-1. Redefine the `emergency` profile as «the floor's capabilities, all three
-   upload switches off»: `statusQuorumPolicy = all-configured-v1`,
-   `semanticIdempotency: 1`, `requireUploadsOff: true`. The profile still
-   cannot open a client release, and the preflight (`check-emergency-flags`)
-   still refuses a build with any switch on. Reviewed change + tests.
-2. Prepare the emergency SHA in advance: a commit on `main`, descendant of
-   the floor, identical to the live worker except the three switches
-   `"false"` in `[vars]`. List it under «Emergency releases — uploads
-   permanently off» with the run that smoked it under `profile = emergency`
-   (a smoke, not a soak — the build is the live one minus uploads).
-3. Incident: dispatch that SHA with `profile = emergency` (minutes; the gate
-   admits it as a floor descendant on the emergency list). Uploads stop for
-   v1–v4 before the body is read; the client's global pause marker (#141)
-   halts every queue on the next `/health`. Fix forward on `main`, dispatch
-   the fix under `normal`, uploads resume on the next probe.
-4. Cost: one more reviewed PR per worker release that changes anything the
-   emergency build must mirror (the emergency SHA goes stale the moment the
-   live worker moves; a stale emergency build is a rollback in disguise and
-   must be re-cut). The floor rule stays absolute — nothing below it, ever.
-
-**Draft B — «approved roll-forward»: no emergency build, the switch is the
-lever.**
-
-1. Incident lever = `UPLOADS_ENABLED = "false"` set as a **dashboard
-   override** on the live version (the one operation this runbook already
-   allows as EMERGENCY-ONLY, `:155`, `:257`). Effect within a minute, no
-   deploy, no gate, nothing below the floor. The client's global pause halts
-   the queues.
-2. Fix forward on `main`; dispatch the fix under `normal`. The deploy
-   materializes `[vars]` from the repo, i.e. `UPLOADS_ENABLED = "true"` — the
-   override is undone BY the fix deploy, deliberately: there is no second
-   step to forget, and no build in which the switches are off «for a while».
-3. If the fix is not ready within the hour, the override is synced back to
-   the repo as a commit (`"false"` in `[vars]`) and deployed under `normal`
-   so the source of truth stops lying; that commit is a descendant of the
-   floor and passes the normal profile (uploads off is a value, not a
-   capability).
-4. Cost: the `emergency` profile and the «Emergency releases» list become
-   history for the post-flip world (kept for reading old rows, never used
-   again); the dashboard edit is a manual step that MUST be mirrored in
-   `/health` right after (the smoke does not run on an override). The
-   operator has to trust themselves to do step 3, which is why it is written
-   with a deadline.
-
-**What both drafts share, and what neither changes:** the floor is absolute
-either way; a red smoke is a detector; `wrangler rollback` stays banned
-because a version restores its own vars. The choice is between «a prepared
-build that must be kept fresh» (A) and «a manual switch that must be synced
-back» (B). Recommendation: **B** — it has no artefact to go stale, its only
-manual step is bounded by a deadline, and it is the lever this runbook has
-already told the operator to reach for first.
+1. **Incident lever = `UPLOADS_ENABLED = "false"` as a dashboard override**
+   on the live version — the one operation this runbook already allows as
+   EMERGENCY-ONLY (`:155`, `:257`). Effect within a minute; no deploy, no
+   gate, nothing below the floor. The worker answers
+   `503 {code:'uploads_disabled'}` to v1–v4 before reading the body, and the
+   client's global pause marker (#141) halts every queue on the next
+   `/health`. Verify with `/health` immediately: `uploads: false`.
+2. **Fix forward on `main`; dispatch the fix under `normal`.** The deploy
+   materializes `[vars]` from the repo, i.e. `UPLOADS_ENABLED = "true"` —
+   the override is undone BY the fix deploy, deliberately: there is no
+   second step to forget, and no build in which the switches are off «for a
+   while». Uploads resume on the client's next probe.
+3. **Deadline for the manual state: one hour.** If the fix is not ready
+   within the hour, commit `"false"` into `[vars]` on `main` and deploy it
+   under `normal`, so the source of truth stops lying. That commit is a
+   descendant of the floor and passes the normal profile — uploads off is a
+   VALUE, not a capability. The fix later flips it back the same way.
+4. **What this retires:** the `emergency` profile and the «Emergency releases
+   — uploads permanently off» list stay for reading old rows and are never
+   used again after the flip. `wrangler rollback` stays banned (a version
+   restores its own vars); a red smoke stays a detector.
 
 ### The floor is NOT raised by this release
 
