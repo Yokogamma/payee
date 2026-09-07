@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   LEGACY_RELEASE_SHA, DEFAULTS, VOLUME,
-  emptyState, checkReleaseGate, planRun, classifyUpload, readConfirmations,
+  emptyState, checkReleaseGate, planRun, classifyUpload, readConfirmations, readTxHeaderOk,
   estimateCost, summarize, parseArgs, randomUuidV8, v3Tags,
 } from './soak-d2.mjs';
 
@@ -145,6 +145,18 @@ describe('readConfirmations', () => {
     expect(readConfirmations(404, 'Not Found')).toBeNull();
     expect(readConfirmations(200, { number_of_confirmations: 'many' })).toBeNull();
     expect(readConfirmations(200, { number_of_confirmations: -1 })).toBeNull();
+  });
+});
+
+describe('readTxHeaderOk', () => {
+  // The verifier needs a format-2 header naming THIS id; a 202 «Pending» or a
+  // header for another id is not one.
+  it('accepts only a served format-2 header for the id', () => {
+    expect(readTxHeaderOk(200, { format: 2, id: TX }, TX)).toBe(true);
+    expect(readTxHeaderOk(202, 'Pending', TX)).toBe(false);
+    expect(readTxHeaderOk(200, { format: 1, id: TX }, TX)).toBe(false);
+    expect(readTxHeaderOk(200, { format: 2, id: TX2 }, TX)).toBe(false);
+    expect(readTxHeaderOk(404, 'Not Found', TX)).toBe(false);
   });
 });
 

@@ -72,6 +72,9 @@ export const DEFAULTS = Object.freeze({
   recheckMinAgeMs: 24 * 3_600_000,
   /** Confirmations a legacy transaction must show before it is re-sent. */
   confirmationsRequired: 2,
+  /** And it must be at least this old: header/raw availability lags the
+   *  status endpoint, and the verifier needs both. */
+  legacyMinAgeMs: 60 * 60_000,
   probeOrigin: 'https://arweave.net',
   /** Payload size the price estimate is quoted for (a soak note ≈ 150 B). */
   priceBytes: 200,
@@ -209,6 +212,18 @@ export function classifyUpload(status, body, expectedTxId) {
     return { kind: 'conflict', detail: `a NEW paid txId ${body.txId} for an id already published as ${expectedTxId}` };
   }
   return { kind: 'accepted-new', detail: `txId=${body.txId} committed=${body.committed}` };
+}
+
+/**
+ * Would D9 find this transaction on the payload pool? The verifier reads
+ * `/tx/<id>` (a format-2 header naming this id) and `/raw/<id>` (bytes).
+ * Confirmations alone are NOT the question: on 2026-09-07 the first legacy
+ * pass ran against a record whose `/tx/<id>/status` already showed ≥ 2
+ * confirmations while `/raw/<id>` still answered 404 on every gateway — and
+ * that spent the window's single `legacy_unproven` twelve minutes in.
+ */
+export function readTxHeaderOk(status, body, txId) {
+  return status === 200 && !!body && typeof body === 'object' && body.format === 2 && body.id === txId;
 }
 
 /** `/tx/<id>/status` → confirmed enough to be verifiable by D9? */
@@ -382,6 +397,27 @@ async function confirmations(probeOrigin, txId) {
   }
 }
 
+/**
+ * Mirror the verifier's reads before spending the unproven budget: header AND
+ * bytes from the probe origin, plus the confirmation floor. Returns a reason
+ * string when not ready, null when it is.
+ */
+async function notVerifiableReason(probeOrigin, txId, opts) {
+  const conf = await confirmations(probeOrigin, txId);
+  if (conf === null) return 'status not yet visible';
+  if (conf < opts.confirmationsRequired) return `${conf} confirmation(s), need ${opts.confirmationsRequired}`;
+  try {
+    const header = await getJson(new URL(`/tx/${txId}`, probeOrigin));
+    if (!readTxHeaderOk(header.status, header.body, txId)) return `/tx header not served (HTTP ${header.status})`;
+    const raw = await fetch(new URL(`/raw/${txId}`, probeOrigin), { signal: AbortSignal.timeout(10_000) });
+    const bytes = raw.status === 200 ? (await raw.arrayBuffer()).byteLength : 0;
+    if (bytes === 0) return `/raw bytes not served (HTTP ${raw.status})`;
+  } catch (e) {
+    return `probe failed: ${e?.message ?? e}`;
+  }
+  return null;
+}
+
 async function metricsReport(origin, secret, report, hours) {
   const resp = await fetch(new URL('/admin/metrics', origin), {
     method: 'POST',
@@ -478,9 +514,13 @@ async function dayRun({ origin, signer, state, opts, dryRun }) {
   // 3. Legacy pass — only a CONFIRMED transaction, or the unproven budget burns.
   for (const noteId of plan.legacyCandidates) {
     const note = byId.get(noteId);
-    const conf = await confirmations(opts.probeOrigin, note.txId);
-    if (conf === null || conf < opts.confirmationsRequired) {
-      log(`  WAIT legacy ${noteId}: ${conf === null ? 'not yet visible' : `${conf} confirmation(s)`} on ${opts.probeOrigin} (need ${opts.confirmationsRequired})`);
+    if (Date.now() - note.createdAt < opts.legacyMinAgeMs) {
+      log(`  WAIT legacy ${noteId}: younger than ${Math.round(opts.legacyMinAgeMs / 60_000)} min`);
+      continue;
+    }
+    const why = await notVerifiableReason(opts.probeOrigin, note.txId, opts);
+    if (why) {
+      log(`  WAIT legacy ${noteId}: ${why} on ${opts.probeOrigin}`);
       continue;
     }
     note.confirmedAt ??= Date.now();

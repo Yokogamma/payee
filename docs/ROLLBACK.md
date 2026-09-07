@@ -1994,4 +1994,34 @@ request.
 
 | tag | SHA | run id | worker version id | smoked |
 |---|---|---|---|---|
-| _(fill on deploy)_ | | | | |
+| _(none — tags are labels, the gate reads SHAs)_ | `d65e352da5b1314c08e56e4045cab2d6e655713b` | [34125361606](https://github.com/Yokogamma/payee/actions/runs/34125361606) | `a2ea9d8a-c03e-4cd9-a4eb-80f7d5e53400` | green, `normal` profile, `semanticIdempotency: 1` proven, 2026-09-07 13:05 UTC |
+
+The candidate is `d65e352` and not `5881da2` (the #136 merge): the first
+dispatch of `5881da2` ([run 34124396448](https://github.com/Yokogamma/payee/actions/runs/34124396448))
+failed on `check-gateways-vs-worker.mjs` BEFORE wrangler — the job split in
+#136 had left the `env:` block with `VITE_STATUS_GATEWAYS` on the neighbouring
+step, the gate judged an empty pool and refused a correct one. Nothing was
+activated; `ff0954d` stayed live. #154 moved the `env:` back and added
+invariant C to `check-workflow-invariants.mjs` so the tree fails CI, not the
+deploy, the next time. `d65e352` is the merge of #154 on top of `5881da2`;
+the worker bytes are those of #136.
+
+**Soak window opened 2026-09-07 13:05 UTC on version id `a2ea9d8a…`.**
+Pre-release baseline (7 days, taken the same day before the dispatch):
+`upload_outcomes` = `{"rows":[]}` — see «Producing the volume». Five legacy
+records were seeded on `ff0954d` at 12:5x UTC, before the dispatch, under the
+smoke identity; they are the only records the new worker will ever backfill.
+
+**`legacy_unproven` — 1 of 1 spent, 2026-09-07 13:07 UTC, investigated.**
+The first `day` run re-sent seeded legacy record `ba9c4891…` (tx
+`Sh3YfqGv…`, 12 minutes old) because `/tx/<id>/status` already showed ≥ 2
+confirmations; the worker answered 503 «Publication could not be
+authenticated». Cause: header/bytes availability lags the status endpoint —
+a paid transaction posted the same minute answered 404 on `/raw/<id>`, and
+by 13:20 UTC all four payload gateways served header AND bytes for the
+legacy one (10 confirmations). Not a defect of the release: D9 refused to
+bind bytes it could not read, which is the fail-closed answer. The driver
+now probes `/tx/<id>` and `/raw/<id>` on the payload gateway and requires
+60 minutes of age before a legacy re-send. The budget for this window is
+exhausted: a second `legacy_unproven`, or any in the final 48 hours, fails
+the soak.
