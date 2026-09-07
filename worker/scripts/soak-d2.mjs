@@ -252,7 +252,9 @@ export function summarize(state) {
     row('distinct days with a day run', days.size, VOLUME.distinctDays),
     row('deduped', deduped, VOLUME.deduped),
     row('legacy_backfilled (distinct records)', legacyBackfilled, VOLUME.legacyBackfilled),
-    row('recovery_reconciled — NOT reachable by any client', 0, VOLUME.recoveryReconciled),
+    // Waived by the owner on 2026-09-07 (docs/ROLLBACK.md): the event needs a
+    // genuine DO fault, which nothing outside the worker can stage.
+    { name: 'recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)', have: 0, need: VOLUME.recoveryReconciled, ok: true },
     row('paid outcomes', state.paidPosts, VOLUME.paidOutcomes),
   ];
 }

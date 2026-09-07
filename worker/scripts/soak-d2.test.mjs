@@ -170,7 +170,7 @@ describe('estimateCost', () => {
 });
 
 describe('summarize', () => {
-  it('reports against the runbook volume and never claims recovery_reconciled', () => {
+  it('reports against the runbook volume; recovery_reconciled is waived, never claimed', () => {
     const state = {
       ...emptyState(),
       paidPosts: 21,
@@ -186,7 +186,7 @@ describe('summarize', () => {
     expect(rows['deduped']).toMatchObject({ have: 14, ok: true });
     expect(rows['distinct days with a day run']).toMatchObject({ have: 2, ok: false });
     expect(rows['legacy_backfilled (distinct records)']).toMatchObject({ have: 2, ok: false });
-    expect(rows['recovery_reconciled — NOT reachable by any client']).toMatchObject({ have: 0, ok: false });
+    expect(rows['recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)']).toMatchObject({ have: 0, ok: true });
   });
 });
 

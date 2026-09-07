@@ -2025,3 +2025,21 @@ now probes `/tx/<id>` and `/raw/<id>` on the payload gateway and requires
 60 minutes of age before a legacy re-send. The budget for this window is
 exhausted: a second `legacy_unproven`, or any in the final 48 hours, fails
 the soak.
+
+**OWNER DECISION 2026-09-07 — `recovery_reconciled ≥ 1` is WAIVED for this
+window.** The event fires only when the DO holds no record for an id whose
+transaction is alive under our Owner-Hash, i.e. after a successful POST whose
+`mark-posted` AND `commit` both failed — a genuine DO fault, which no client
+and no driver can stage (records are never pruned; a forged HMAC does not
+help because the proving transaction must itself have passed through the
+DO). Waiting for it would mean the backup never ships. The branch stays
+covered by `recheck.test.ts` («recovery token (triple-failure
+reconciliation)») and `legacy-backfill-e2e.test.ts` (asserts the event).
+The other volume floors and every exit criterion stand unchanged; if a real
+`recovery_*` event does appear in the window it is read under the table
+above like any other.
+
+**Daily runs are scheduled** (desktop scheduled task `soak-d2-daily-run`,
+12:00 local, until 2026-09-14): `day --paid 3` plus the snapshot, with the
+owner reading each report. A missed day shows up as a gap in
+`snapshots/` — that is the calendar the runbook warns about.
