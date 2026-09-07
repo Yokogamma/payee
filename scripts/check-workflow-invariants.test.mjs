@@ -228,3 +228,54 @@ jobs:
     expect(r.ok).toBe(false);
   });
 });
+
+describe('инвариант C: гейт-скрипт получает свою переменную', () => {
+  const gate = (runLine, env = '') => `
+name: t
+on: workflow_dispatch
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ${runLine}${env}
+      - uses: cloudflare/wrangler-action@${SHA}
+        with:
+          apiToken: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+`;
+  const withEnv = (v) => `
+        env:
+          ${v}: \${{ vars.${v} }}`;
+
+  // Ровно то, что уронило dispatch 5881da2: env: уехал на соседний шаг.
+  it('check-gateways-vs-worker без VITE_STATUS_GATEWAYS — нарушение', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-gateways-vs-worker.mjs --config=x') },
+      { name: 'b.yml', content: CANONICAL },
+    ]);
+    expect(violations.join(' ')).toMatch(/check-gateways-vs-worker\.mjs without VITE_STATUS_GATEWAYS/);
+  });
+
+  it('та же команда с env: на шаге — проходит', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-gateways-vs-worker.mjs --config=x', withEnv('VITE_STATUS_GATEWAYS')) },
+      { name: 'b.yml', content: CANONICAL },
+    ]);
+    expect(violations).toEqual([]);
+  });
+
+  it('--repo-only не читает Environment — env: не требуется', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-trusted-owners.mjs --repo-only --config=x') },
+      { name: 'b.yml', content: CANONICAL },
+    ]);
+    expect(violations).toEqual([]);
+  });
+
+  it('check-trusted-owners без --repo-only и без VITE_TRUSTED_OWNERS — нарушение', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-trusted-owners.mjs --config=x') },
+      { name: 'b.yml', content: CANONICAL },
+    ]);
+    expect(violations.join(' ')).toMatch(/check-trusted-owners\.mjs without VITE_TRUSTED_OWNERS/);
+  });
+});

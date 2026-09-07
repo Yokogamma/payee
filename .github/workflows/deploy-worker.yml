@@ -242,9 +242,9 @@ jobs:
       # layout needed is no longer needed, because the thing it defended
       # against no longer happens in this job.
       - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
-      - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
       # ── Emergency preflight, BEFORE anything is activated ──
       #
       # An emergency release is defined by every upload switch being off, and
