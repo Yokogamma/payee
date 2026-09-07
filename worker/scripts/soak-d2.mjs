@@ -10,6 +10,9 @@
  *
  * Modes (one per invocation; state lives OUTSIDE the repo, see SOAK_STATE):
  *
+ *   register [--invite C]   register the smoke identity on the target (free):
+ *                           with ADMIN_SECRET a single-use invite is seeded
+ *                           first, otherwise --invite carries a seeded code.
  *   seed-legacy --count N   BEFORE the deploy, against the OLD worker
  *                           (`ff0954d`, no `semanticIdempotency`): publishes N
  *                           notes whose DO records carry no fingerprint. These
@@ -42,6 +45,7 @@
  *   SOAK_MAX_PAID_TOTAL   hard cap on paid POSTs over the whole soak (default 30)
  *   SOAK_PROBE_ORIGIN     gateway used to confirm a transaction (arweave.net)
  *   METRICS_ADMIN_SECRET  optional; enables `snapshot`
+ *   ADMIN_SECRET          optional; lets `register` seed its own invite
  *
  * Every paid POST costs real AR: `--paid` bounds one run, SOAK_MAX_PAID_TOTAL
  * bounds the soak, and the price of one publication is printed before money
@@ -180,6 +184,7 @@ export function classifyUpload(status, body, expectedTxId) {
     return { kind: 'in-progress', detail: 'reservation in flight' };
   }
   if (status === 429) return { kind: 'rate-limited', detail: 'hourly quota' };
+  if (status === 403) return { kind: 'not-registered', detail: typeof body === 'string' ? body.slice(0, 120) : JSON.stringify(body).slice(0, 120) };
   if (status === 503) return { kind: 'unavailable', detail: typeof body === 'string' ? body.slice(0, 120) : JSON.stringify(body).slice(0, 120) };
   if (status !== 200) return { kind: 'unexpected', detail: `HTTP ${status} ${JSON.stringify(body).slice(0, 160)}` };
   if (!body || typeof body !== 'object') return { kind: 'unexpected', detail: '200 without a JSON object' };
@@ -243,6 +248,7 @@ export function parseArgs(argv) {
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--paid' || a === '--count') { opts[a.slice(2)] = Number(rest[++i]); continue; }
+    if (a === '--invite') { opts.invite = String(rest[++i] ?? ''); continue; }
     if (a === '--dry-run') { opts.dryRun = true; continue; }
     throw new Error(`unknown argument: ${a}`);
   }
@@ -282,28 +288,65 @@ async function makeSigner(privB64) {
   const pub = await ed.getPublicKeyAsync(priv);
   const pkB64 = b64(pub);
   const ownerHash = b64(await sha256(pub));
+  async function signedPost(origin, path, payload) {
+    const body = JSON.stringify(payload);
+    const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), priv));
+    const resp = await fetch(new URL(path, origin), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Public-Key': pkB64, 'X-Signature': sig },
+      body,
+    });
+    const text = await resp.text();
+    let parsed = text;
+    try { parsed = JSON.parse(text); } catch { /* keep text */ }
+    return { status: resp.status, body: parsed };
+  }
   return {
     ownerHash,
-    async upload(origin, note, extra = {}) {
-      const body = JSON.stringify({
+    pkB64,
+    upload(origin, note, extra = {}) {
+      return signedPost(origin, '/upload', {
         data: JSON.stringify({ id: note.noteId, c: note.c, iv: note.iv }),
         tags: v3Tags(ownerHash, note.noteId),
         ownerHash,
         timestamp: Date.now(),
         ...extra,
       });
-      const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), priv));
-      const resp = await fetch(new URL('/upload', origin), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Public-Key': pkB64, 'X-Signature': sig },
-        body,
-      });
-      const text = await resp.text();
-      let parsed = text;
-      try { parsed = JSON.parse(text); } catch { /* keep text */ }
-      return { status: resp.status, body: parsed };
+    },
+    /** `/register` exactly as the client does it: signed body naming the key. */
+    register(origin, inviteCode) {
+      return signedPost(origin, '/register', { inviteCode, publicKey: pkB64, timestamp: Date.now() });
     },
   };
+}
+
+/**
+ * Register the smoke identity on the target worker. With ADMIN_SECRET in the
+ * environment a single-use invite is seeded first (a random code — its only
+ * purpose is to be consumed by the very next request); otherwise `--invite`
+ * must carry a code the operator already seeded. Nothing here is paid.
+ */
+async function registerKey({ origin, signer, inviteCode, adminSecret }) {
+  let code = inviteCode;
+  if (!code) {
+    if (!adminSecret) { console.error('✗ register needs --invite <code> or ADMIN_SECRET'); return 2; }
+    code = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex');
+    const resp = await fetch(new URL('/admin/seed-invite', origin), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminSecret}` },
+      body: JSON.stringify({ codes: [code] }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!resp.ok) { console.error(`✗ seed-invite: HTTP ${resp.status} ${(await resp.text()).slice(0, 160)}`); return 1; }
+    log('  invite seeded');
+  }
+  const { status, body } = await signer.register(origin, code);
+  if (status === 200 && body && body.ok === true) {
+    log(`  PASS registered publicKey=${signer.pkB64} ownerHash=${signer.ownerHash}`);
+    return 0;
+  }
+  console.error(`✗ register: HTTP ${status} ${JSON.stringify(body).slice(0, 160)}`);
+  return 1;
 }
 
 async function loadState(path) {
@@ -375,7 +418,7 @@ async function seedLegacy({ origin, signer, state, count, dryRun, opts }) {
     } else {
       failures++;
       log(`  FAIL legacy ${note.noteId}: ${verdict.kind} — ${verdict.detail}`);
-      if (verdict.kind === 'rate-limited') break;
+      if (verdict.kind === 'rate-limited' || verdict.kind === 'not-registered') break;
     }
   }
   state.runs.push({ at: Date.now(), mode: 'seed-legacy', paid: count - failures, failures });
@@ -408,7 +451,7 @@ async function dayRun({ origin, signer, state, opts, dryRun }) {
       run.problems.push(`paid ${note.noteId}: ${verdict.kind} — ${verdict.detail}`);
       log(`  FAIL paid ${note.noteId}: ${verdict.kind} — ${verdict.detail}`);
       if (verdict.kind === 'conflict') { stop('id_payload_conflict on a FRESH id — investigate before any further run'); return finish(state, run); }
-      if (verdict.kind === 'rate-limited') break;
+      if (verdict.kind === 'rate-limited' || verdict.kind === 'not-registered') break;
     }
   }
 
@@ -518,8 +561,8 @@ export async function main(argv) {
   const state = await loadState(statePath);
 
   if (mode === 'status') { printStatus(state); return 0; }
-  if (!['seed-legacy', 'day', 'snapshot'].includes(mode)) {
-    console.error('usage: soak-d2.mjs <seed-legacy --count N | day [--paid N] | snapshot | status> [--dry-run]');
+  if (!['register', 'seed-legacy', 'day', 'snapshot'].includes(mode)) {
+    console.error('usage: soak-d2.mjs <register [--invite CODE] | seed-legacy --count N | day [--paid N] | snapshot | status> [--dry-run]');
     return 2;
   }
 
@@ -530,6 +573,13 @@ export async function main(argv) {
   if (state.origin && state.origin !== origin) { console.error(`✗ state file belongs to ${state.origin}, target is ${origin}`); return 2; }
 
   const health = (await getJson(new URL('/health', origin))).body;
+  if (mode === 'register') {
+    const privB64 = process.env.SMOKE_PRIVATE_KEY;
+    if (!privB64) { console.error('✗ SMOKE_PRIVATE_KEY is required'); return 2; }
+    const signer = await makeSigner(privB64);
+    log(`register: ${signer.pkB64} on ${origin}`);
+    return registerKey({ origin, signer, inviteCode: cli.invite, adminSecret: process.env.ADMIN_SECRET });
+  }
   const gate = checkReleaseGate(health, mode, state, process.env.SOAK_RELEASE_SHA);
   if (!gate.ok) { console.error('✗ release gate:'); for (const p of gate.problems) console.error(`  - ${p}`); return 2; }
 

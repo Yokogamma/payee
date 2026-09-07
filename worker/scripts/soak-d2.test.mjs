@@ -120,6 +120,12 @@ describe('classifyUpload', () => {
     expect(classifyUpload(200, 'not json').kind).toBe('unexpected');
   });
 
+  // An unregistered key is refused before any reservation: no money moved,
+  // and every further attempt in the run would say the same thing.
+  it('names an unregistered identity', () => {
+    expect(classifyUpload(403, 'Not registered')).toMatchObject({ kind: 'not-registered' });
+  });
+
   it('names the retryable answers without inventing a verdict', () => {
     expect(classifyUpload(409, 'Upload already in progress').kind).toBe('in-progress');
     expect(classifyUpload(429, 'Rate limit exceeded').kind).toBe('rate-limited');
@@ -176,6 +182,7 @@ describe('parseArgs', () => {
   it('reads the mode and the numeric flags', () => {
     expect(parseArgs(['day', '--paid', '2', '--dry-run'])).toEqual({ mode: 'day', opts: { paid: 2, dryRun: true } });
     expect(parseArgs(['seed-legacy', '--count', '5'])).toEqual({ mode: 'seed-legacy', opts: { count: 5 } });
+    expect(parseArgs(['register', '--invite', 'abc'])).toEqual({ mode: 'register', opts: { invite: 'abc' } });
   });
   it('refuses junk', () => {
     expect(() => parseArgs(['day', '--paid', 'x'])).toThrow(/non-negative integer/);
