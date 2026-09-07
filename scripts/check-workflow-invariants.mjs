@@ -23,6 +23,15 @@
  *   third-party value lands directly on the command line. Such values go
  *   through `env:` and are dereferenced as "$VAR".
  *
+ * Invariant C — a gate script that reads an Environment variable is never
+ *   run without it. `check-gateways-vs-worker.mjs` reads VITE_STATUS_GATEWAYS
+ *   and `check-trusted-owners.mjs` reads VITE_TRUSTED_OWNERS unless invoked
+ *   with `--repo-only`; a `run:` step invoking either must carry that name
+ *   in its own `env:` (or the job's). The 2026-09-07 dispatch of `5881da2`
+ *   failed exactly here: the job split in #136 left the `env:` block on the
+ *   NEIGHBOURING step, the gate saw an empty variable and refused a correct
+ *   pool — a red deploy for a config that was right.
+ *
  * HONEST LIMIT (do not oversell this check): it catches syntax variation,
  * not deliberate obfuscation — e.g. an identifier assembled via format().
  * That class is caught in review, not statically. It also lives in the
@@ -39,6 +48,12 @@ import { load } from 'js-yaml';
 const TOKEN_IDENTIFIER = 'CLOUDFLARE_API_TOKEN';
 const WRANGLER_ACTION_SHA_RE = /^cloudflare\/wrangler-action@[0-9a-f]{40}$/;
 const EXPRESSION_RE = /\$\{\{[\s\S]*?\}\}/;
+
+/** Invariant C: gate script → the variable it reads (skipped under --repo-only). */
+const GATE_ENV = Object.freeze({
+  'check-gateways-vs-worker.mjs': 'VITE_STATUS_GATEWAYS',
+  'check-trusted-owners.mjs': 'VITE_TRUSTED_OWNERS',
+});
 
 /** Recursively visit every scalar with its path. */
 function walkScalars(node, path, visit) {
@@ -92,6 +107,23 @@ export function checkWorkflowInvariants(files) {
         );
       }
     });
+
+    // Invariant C: every gate invocation carries the variable it reads.
+    for (const [jobName, job] of Object.entries(doc.jobs ?? {})) {
+      (job?.steps ?? []).forEach((step, i) => {
+        const runText = typeof step?.run === 'string' ? step.run : '';
+        for (const [script, variable] of Object.entries(GATE_ENV)) {
+          if (!runText.includes(script) || runText.includes('--repo-only')) continue;
+          const carried = (step.env && variable in step.env) || (job.env && variable in job.env);
+          if (!carried) {
+            violations.push(
+              `${name}: jobs.${jobName}.steps.${i} runs ${script} without ${variable} in env: — ` +
+                'the gate would judge an empty pool and refuse a correct deploy',
+            );
+          }
+        }
+      });
+    }
 
     // Invariant A shape check for carriers found in THIS file.
     for (const carrier of carriers.filter((c) => c.file === name)) {
@@ -148,5 +180,5 @@ if (process.argv[1]?.endsWith('check-workflow-invariants.mjs')) {
     for (const v of violations) console.error(`  - ${v}`);
     process.exit(1);
   }
-  console.log('✓ workflow invariants: 2 token carriers at with.apiToken, no ${{ }} in run:');
+  console.log('✓ workflow invariants: 2 token carriers at with.apiToken, no ${{ }} in run:, gates carry their env');
 }
