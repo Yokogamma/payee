@@ -36,6 +36,34 @@ export interface OutboundRoute {
   gotSignal?: boolean;
   /** Authorization header of the LAST matching request, if any. */
   lastAuthorization?: string;
+  /** Redirect mode of the LAST matching request — `undefined` when the caller
+   *  left it at the default. Lets a suite assert the mode a call site passes,
+   *  not merely that it passed something the runtime tolerates. */
+  lastRedirect?: RequestRedirect;
+}
+
+/**
+ * workerd accepts ONLY `follow` and `manual`; `'error'` is refused with a
+ * TypeError while init is parsed — before any I/O, on every call, forever.
+ *
+ * A mock that quietly accepts anything is how that shipped: the suites were
+ * green while production could not read a single gateway. So the mock refuses
+ * exactly what the runtime refuses, with the runtime's own message.
+ *
+ * `init` WINS over the Request's own field, as the Fetch standard requires —
+ * and a bare `new Request(url)` already carries `redirect: 'follow'`, so the
+ * opposite order would mask precisely the call this exists to catch.
+ */
+export function assertSupportedRedirect(input: RequestInfo | URL, init?: RequestInit): RequestRedirect | undefined {
+  const redirect = init?.redirect ?? (input instanceof Request ? input.redirect : undefined);
+  if (redirect !== undefined && redirect !== 'follow' && redirect !== 'manual') {
+    throw new TypeError(
+      'Invalid redirect value, must be one of "follow" or "manual" ' +
+      '("error" won\'t be implemented since it does not make sense at the edge; ' +
+      'use "manual" and check the response status code)',
+    );
+  }
+  return redirect;
 }
 
 /** Status origins configured for the test isolates (vitest*.config.mts). */
@@ -63,11 +91,15 @@ export function setupOutboundMock() {
 
   beforeAll(() => {
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      // BEFORE routing: an init the runtime would refuse must fail here too,
+      // whether or not this suite happens to mock the URL.
+      const redirect = assertSupportedRedirect(input, init);
       const url = input instanceof Request ? input.url : String(input);
       const method = ((input instanceof Request ? input.method : init?.method) ?? 'GET').toUpperCase();
       const route = outboundRoutes.find(r => r.method === method && r.url.test(url) && r.calls < r.times);
       if (!route) throw new Error(`unmocked or exhausted outbound fetch: ${method} ${url}`);
       route.calls++;
+      route.lastRedirect = redirect;
       route.lastUrl = url;
       if (!(input instanceof Request)) route.gotSignal = init?.signal != null;
       if (typeof init?.body === 'string') route.lastBody = init.body;

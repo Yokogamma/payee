@@ -16,7 +16,7 @@ import { readAllowCache } from './allowlist';
 import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
 import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
 import { parseTrustedOwners } from '../../src/lib/trusted-owners';
-import { authenticatePublication } from './publication-auth';
+import { authenticatePublication, type ReadStage } from './publication-auth';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -1073,6 +1073,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       trustedOwners,
       ownerHash,
       expectedNoteId: noteId,
+      onOrigin: payloadOriginReporter(emit),
     });
 
     if (auth.kind === 'unproven') {
@@ -1269,6 +1270,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           trustedOwners,
           ownerHash,
           expectedNoteId: noteId,
+          onOrigin: payloadOriginReporter(emit),
         });
         if (auth.kind === 'unproven') {
           attest('recovery_unproven');
@@ -1658,6 +1660,25 @@ function payloadOrigins(env: Env): string[] {
 }
 
 /**
+ * Telemetry for the D9 reads — the half that had none.
+ *
+ * `authenticatePublication` accepted an `onOrigin` hook from the day it landed
+ * and NOBODY passed one, so a `legacy_unproven` said only «the proof did not
+ * complete»: an outage, a dropped transaction and a worker that could not
+ * issue a request at all were the same row. That is what made the redirect
+ * defect take a whole soak window to find.
+ *
+ * The stage rides in `kind` rather than a fifth blob because the report reads
+ * `blob2 AS kind, blob3 AS host, blob4 AS class` (metrics.ts) — a blob past
+ * the fourth would be written and never seen.
+ */
+function payloadOriginReporter(emit: Emit) {
+  return (origin: string, stage: ReadStage, outcome: string, elapsedMs: number): void => {
+    emit('gateway_call', [`payload_${stage}`, new URL(origin).host, outcome], [elapsedMs]);
+  };
+}
+
+/**
  * One origin's answer. Emits the per-host metrics PR-2 introduced — the `host`
  * label stays a BARE hostname (`arweave.net`), not the canonical origin, so the
  * historical time series is not split in half by this change.
@@ -1677,7 +1698,14 @@ async function probeStatusOrigin(origin: string, txId: string, emit: Emit): Prom
       // give TWO configured origins carrying ONE host's opinion, and unanimity
       // over the pool is exactly what authorizes a paid redrop. The client was
       // fixed first; leaving the authoritative side unfixed fixed nothing.
-      redirect: 'error',
+      //
+      // `'manual'`, NOT `'error'`: workerd rejects the latter with a TypeError
+      // before any I/O, which turned every probe into a `network` throw and
+      // pinned the quorum at `unavailable` — no gateway could ever vote. A 3xx
+      // now arrives as a response and falls to the `status !== 200` branch
+      // below (classifyStatus already buckets 3xx as `network`), so the vote
+      // is still `other` and the pool still gains no second opinion.
+      redirect: 'manual',
       signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {
