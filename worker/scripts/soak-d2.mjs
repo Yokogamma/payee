@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Soak driver for the D2 worker release («semantic idempotency», backup plan
  * step 3, PR #136). The dev contour has NO organic paid traffic — the
@@ -27,6 +26,10 @@
  *                           CONFIRMED on a payload gateway — an unconfirmed one
  *                           would burn the `legacy_unproven ≤ 1` budget for a
  *                           reason that has nothing to do with the release.
+ *                           `--no-recheck` / `--no-legacy` switch off the two
+ *                           passes that can reach a PAID redrop — the only way
+ *                           to make a run against the soak wallet cost nothing,
+ *                           since `--paid 0` bounds new publications alone.
  *   snapshot                the daily 24-hour report of `semantic_idempotency`
  *                           and `upload_outcomes`, kept as a dated file (the
  *                           runbook: «a soak without the daily snapshots is a
@@ -43,9 +46,17 @@
  *   SOAK_RELEASE_SHA      full SHA the `day` mode must see in /health
  *   SOAK_STATE            state file (default ~/.eternal-notes-soak/state.json)
  *   SOAK_MAX_PAID_TOTAL   hard cap on paid POSTs over the whole soak (default 30)
+ *   SOAK_REDROP_RECHECK_TOTAL  window cap on recheck SENDS (default 12)
+ *   SOAK_REDROP_LEGACY_TOTAL   window cap on legacy SENDS (default 8, a reserve)
  *   SOAK_PROBE_ORIGIN     gateway used to confirm a transaction (arweave.net)
  *   METRICS_ADMIN_SECRET  optional; enables `snapshot`
  *   ADMIN_SECRET          optional; lets `register` seed its own invite
+ *
+ * ⚠️ НЕ ДОБАВЛЯТЬ СЮДА SHEBANG. Файл импортируется soak-d2.test.mjs, а vite-node
+ * оборачивает модуль в тело функции — `#!` внутри неё даёт V8 «Invalid or
+ * unexpected token», и тест перестаёт СОБИРАТЬСЯ (падает молча, до единого
+ * ассерта). Запуск всегда явный — `node scripts/soak-d2.mjs` в run.sh и в
+ * npm-скрипте soak:d2, — поэтому shebang и не нужен.
  *
  * Every paid POST costs real AR: `--paid` bounds one run, SOAK_MAX_PAID_TOTAL
  * bounds the soak, and the price of one publication is printed before money
@@ -53,7 +64,7 @@
  * criterion that must read zero, and a retry would only add a second one.
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import * as ed from '@noble/ed25519';
@@ -70,6 +81,29 @@ export const DEFAULTS = Object.freeze({
   /** A `recheck` asks the status quorum; a young transaction answers
    *  `pending` and the worker defers without a decision. */
   recheckMinAgeMs: 24 * 3_600_000,
+  /**
+   * ── The redrop budget ──
+   *
+   * `--paid N` bounds NEW publications and nothing else. Two other requests
+   * can also spend AR, and neither is counted by `paidPosts`:
+   *
+   *   - a `recheck` whose status quorum answers `dead` past the age guard goes
+   *     to `doRedrop` — a paid re-post (worker/src/index.ts);
+   *   - a legacy attempt whose D9 is unproven AND whose quorum is unanimously
+   *     `dead` takes the same path, with no `recheck` involved at all.
+   *
+   * Once the request is sent the decision is the SERVER's, so the only lever
+   * here is not sending it. Hence a budget on SENDS, deliberately conservative:
+   * it counts what COULD cost money, not what did.
+   *
+   * Per run 3 + 2 = 5; per window 12 + 8 = 20 (owner, 2026-09-08). The legacy
+   * half is a RESERVE: `recheck` cannot borrow from it, because `dedupePerRun`
+   * is 8 and a busy ledger would otherwise spend the whole budget on rechecks
+   * and starve the three backfills the soak criteria actually require.
+   */
+  recheckPerRun: 3,
+  redropRecheckTotal: 12,
+  redropLegacyTotal: 8,
   /** Confirmations a legacy transaction must show before it is re-sent. */
   confirmationsRequired: 2,
   /** And it must be at least this old: header/raw availability lags the
@@ -104,7 +138,27 @@ export function emptyState() {
     runs: [],
     paidPosts: 0,
     unprovenSeen: 0,
+    /** Requests sent that COULD have cost a redrop — see DEFAULTS. Counted
+     *  before the request leaves, so a crash cannot refund the budget. */
+    redropSends: { recheck: 0, legacy: 0 },
   };
+}
+
+/**
+ * Charge one redrop-capable send and make it DURABLE before the request goes.
+ * Throws when the ledger cannot be written: the caller must then not send, or
+ * the quota stops bounding anything the moment the process dies.
+ */
+export async function chargeBudget(state, kind, persist) {
+  state.redropSends = redropSends(state);
+  state.redropSends[kind] += 1;
+  if (persist) await persist();
+}
+
+/** The redrop counters, tolerating a ledger written before they existed. */
+export function redropSends(state) {
+  const sends = state.redropSends ?? {};
+  return { recheck: sends.recheck ?? 0, legacy: sends.legacy ?? 0 };
 }
 
 /**
@@ -155,15 +209,48 @@ export function planRun(state, opts, now) {
   const dedupe = [...comparable]
     .sort((a, b) => (a.dedupes ?? 0) - (b.dedupes ?? 0) || a.createdAt - b.createdAt)
     .slice(0, opts.dedupePerRun);
-  const recheck = dedupe
+  // ── Redrop budget: two quotas, and the legacy half is a RESERVE ──
+  const sent = redropSends(state);
+  const recheckLeft = Math.max(0, opts.redropRecheckTotal - sent.recheck);
+  const legacyLeft = Math.max(0, opts.redropLegacyTotal - sent.legacy);
+  const withheld = [];
+
+  const recheckReady = dedupe
     .filter(n => n.confirmedAt && now - n.createdAt >= opts.recheckMinAgeMs)
     .map(n => n.noteId);
+  let recheck;
+  if (opts.noRecheck) {
+    recheck = [];
+    if (recheckReady.length) withheld.push(`recheck: ${recheckReady.length} candidate(s) held back by --no-recheck`);
+  } else {
+    const room = Math.min(opts.recheckPerRun, recheckLeft);
+    recheck = recheckReady.slice(0, room);
+    if (recheckReady.length > recheck.length) {
+      withheld.push(
+        `recheck: ${recheckReady.length - recheck.length} of ${recheckReady.length} held back ` +
+        `(per-run ${opts.recheckPerRun}, window ${sent.recheck}/${opts.redropRecheckTotal})`,
+      );
+    }
+  }
 
-  const legacyCandidates = state.notes
+  const legacyReady = state.notes
     .filter(n => n.kind === 'legacy' && !n.backfilledAt)
     .sort((a, b) => a.createdAt - b.createdAt)
-    .slice(0, opts.legacyPerRun)
     .map(n => n.noteId);
+  let legacyCandidates;
+  if (opts.noLegacy) {
+    legacyCandidates = [];
+    if (legacyReady.length) withheld.push(`legacy: ${legacyReady.length} candidate(s) held back by --no-legacy`);
+  } else {
+    const room = Math.min(opts.legacyPerRun, legacyLeft);
+    legacyCandidates = legacyReady.slice(0, room);
+    if (legacyReady.length > legacyCandidates.length) {
+      withheld.push(
+        `legacy: ${legacyReady.length - legacyCandidates.length} of ${legacyReady.length} held back ` +
+        `(per-run ${opts.legacyPerRun}, window ${sent.legacy}/${opts.redropLegacyTotal})`,
+      );
+    }
+  }
 
   return {
     paid,
@@ -171,6 +258,9 @@ export function planRun(state, opts, now) {
     dedupe: dedupe.map(n => n.noteId),
     recheck,
     legacyCandidates,
+    /** Why a ready candidate is NOT in the lists above — logged, never silent:
+     *  a run that quietly checks nothing looks exactly like a green one. */
+    withheld,
   };
 }
 
@@ -267,6 +357,11 @@ export function parseArgs(argv) {
     if (a === '--paid' || a === '--count') { opts[a.slice(2)] = Number(rest[++i]); continue; }
     if (a === '--invite') { opts.invite = String(rest[++i] ?? ''); continue; }
     if (a === '--dry-run') { opts.dryRun = true; continue; }
+    // The two passes that can reach a paid redrop, switchable off explicitly.
+    // A verification run against the soak wallet has no other way to promise
+    // it spends nothing: `--paid 0` bounds new publications and NOTHING else.
+    if (a === '--no-recheck') { opts.noRecheck = true; continue; }
+    if (a === '--no-legacy') { opts.noLegacy = true; continue; }
     throw new Error(`unknown argument: ${a}`);
   }
   for (const k of ['paid', 'count']) {
@@ -366,7 +461,7 @@ async function registerKey({ origin, signer, inviteCode, adminSecret }) {
   return 1;
 }
 
-async function loadState(path) {
+export async function loadState(path) {
   try {
     const parsed = JSON.parse(await readFile(path, 'utf8'));
     if (parsed?.version !== 1) throw new Error(`unsupported state version in ${path}`);
@@ -377,9 +472,60 @@ async function loadState(path) {
   }
 }
 
-async function saveState(path, state) {
+/**
+ * ATOMIC, because this file is now written mid-run.
+ *
+ * The budget is charged before every request that could cost money, and each
+ * charge rewrites the ledger. Writing in place means a process killed during
+ * the write leaves a TRUNCATED JSON — and this file is the only record of the
+ * five legacy fixtures, which cannot be recreated at all once D2 is live
+ * (`seed-legacy` demands the pre-D2 worker). So: write a sibling temp file,
+ * then rename over the original. A rename on the same filesystem either
+ * happened or did not; an interrupted write leaves the temp file behind and
+ * the ledger untouched.
+ */
+export async function saveState(path, state) {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2) + '\n');
+  const tmp = `${path}.tmp-${process.pid}`;
+  await writeFile(tmp, JSON.stringify(state, null, 2) + '\n');
+  await rename(tmp, path);
+}
+
+/**
+ * An exclusive lock on the ledger, held for the WHOLE run.
+ *
+ * Saving before the send stops a crash from refunding the budget; it does
+ * nothing about two processes. Both would read the same counters, plan the
+ * same sends independently and write over each other — and the quotas that
+ * exist to bound real AR would bound nothing. The daily scheduled task plus one
+ * impatient manual run is not a hypothetical arrangement.
+ *
+ * `wx` fails if the file exists, which is the whole mechanism. A stale lock is
+ * NOT broken automatically — that would restore the race it prevents — but the
+ * refusal names the file, the pid and the age so the operator can decide.
+ */
+export async function acquireLedgerLock(statePath, now = Date.now()) {
+  const lockPath = `${statePath}.lock`;
+  await mkdir(dirname(statePath), { recursive: true });
+  try {
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, at: now }) + '\n', { flag: 'wx' });
+  } catch (e) {
+    if (e?.code !== 'EEXIST') throw e;
+    let held = '(unreadable)';
+    try {
+      const raw = JSON.parse(await readFile(lockPath, 'utf8'));
+      held = `pid ${raw.pid}, ${Math.round((now - raw.at) / 60_000)} min ago`;
+    } catch { /* keep the placeholder */ }
+    return {
+      ok: false,
+      reason: `another run holds the ledger (${held}). If no run is alive, delete ${lockPath}`,
+      release: async () => {},
+    };
+  }
+  return {
+    ok: true,
+    release: async () => { try { await rm(lockPath); } catch { /* already gone */ } },
+  };
 }
 
 async function getJson(url) {
@@ -463,13 +609,40 @@ async function seedLegacy({ origin, signer, state, count, dryRun, opts }) {
   return failures;
 }
 
-async function dayRun({ origin, signer, state, opts, dryRun }) {
+/**
+ * Exported for the budget-execution tests: `signer` and `persist` are both
+ * injected, so a suite can prove that a failed ledger write stops a send
+ * without a wallet, and without any network beyond the price quote.
+ */
+export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
   const now = Date.now();
   const plan = planRun(state, opts, now);
   const price = await getJson(`${opts.probeOrigin}/price/${opts.priceBytes}`);
   const cost = estimateCost(String(price.body), plan.paid);
+  const sent = redropSends(state);
   log(`day: paid=${plan.paid} (≈ ${cost.totalAr} AR; ${plan.paidLeftAfter} left under SOAK_MAX_PAID_TOTAL=${opts.maxPaidTotal}), dedupe=${plan.dedupe.length}, recheck=${plan.recheck.length}, legacy candidates=${plan.legacyCandidates.length}`);
+  log(`  redrop budget: recheck ${sent.recheck}/${opts.redropRecheckTotal}, legacy ${sent.legacy}/${opts.redropLegacyTotal} (sends that COULD cost a re-post)`);
+  for (const why of plan.withheld) log(`  SKIP ${why}`);
   if (dryRun) { log('  dry run — nothing sent'); return 0; }
+
+  /**
+   * Charge the budget BEFORE the request leaves, and write the ledger with it.
+   * The run's single save at the end is not enough: a process killed between
+   * the send and that save would come back believing the budget untouched,
+   * and the same money could be spent twice.
+   */
+  const charge = async (kind) => {
+    try {
+      await chargeBudget(state, kind, persist);
+      return true;
+    } catch (e) {
+      // The ledger could not be made durable, so the budget would not bound
+      // anything: a send charged only in memory is a send nobody can count
+      // after a crash. Refuse to send rather than spend unrecorded money.
+      stop(`ledger write failed before a ${kind} send (${e?.message ?? e}) — nothing was sent`);
+      return false;
+    }
+  };
 
   const run = { at: now, mode: 'day', paid: 0, deduped: 0, rechecked: 0, legacyBackfilled: 0, problems: [] };
   const byId = new Map(state.notes.map(n => [n.noteId, n]));
@@ -497,6 +670,9 @@ async function dayRun({ origin, signer, state, opts, dryRun }) {
   for (const noteId of plan.dedupe) {
     const note = byId.get(noteId);
     const wantsRecheck = plan.recheck.includes(noteId);
+    // A plain dedupe answers from the DO and cannot reach the redrop path; a
+    // recheck asks the quorum and can. Only the latter is charged.
+    if (wantsRecheck && !(await charge('recheck'))) return finish(state, run);
     const { status, body } = await signer.upload(origin, note, wantsRecheck ? { recheck: true } : {});
     const verdict = classifyUpload(status, body, note.txId);
     if (verdict.kind === 'deduped') {
@@ -526,6 +702,9 @@ async function dayRun({ origin, signer, state, opts, dryRun }) {
       continue;
     }
     note.confirmedAt ??= Date.now();
+    // Charged even though no `recheck` flag is involved: an unproven D9 whose
+    // quorum reads `dead` reaches the paid re-post by its own path.
+    if (!(await charge('legacy'))) return finish(state, run);
     const { status, body } = await signer.upload(origin, note);
     const verdict = classifyUpload(status, body, note.txId);
     if (verdict.kind === 'deduped') {
@@ -586,6 +765,8 @@ async function snapshot({ origin, secret, stateDir }) {
 function printStatus(state) {
   log(`state: origin=${state.origin ?? '-'} release=${state.release?.sha?.slice(0, 7) ?? '-'} versionId=${state.release?.workerVersionId ?? '-'}`);
   log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length}); paid POSTs total: ${state.paidPosts}`);
+  const sent = redropSends(state);
+  log(`redrop-capable sends: recheck ${sent.recheck}/${DEFAULTS.redropRecheckTotal}, legacy ${sent.legacy}/${DEFAULTS.redropLegacyTotal}`);
   for (const row of summarize(state)) log(`  ${row.ok ? 'OK  ' : '    '} ${row.name}: ${row.have}/${row.need}`);
   const stops = state.runs.flatMap(r => (r.problems ?? []).filter(p => p.startsWith('STOP')));
   if (stops.length) { log('STOP markers in the ledger — the soak is NOT green:'); for (const s of stops) log(`  ${s}`); }
@@ -598,11 +779,29 @@ export async function main(argv) {
     paidPerRun: cli.paid ?? DEFAULTS.paidPerRun,
     maxPaidTotal: Number(process.env.SOAK_MAX_PAID_TOTAL ?? DEFAULTS.maxPaidTotal),
     probeOrigin: process.env.SOAK_PROBE_ORIGIN ?? DEFAULTS.probeOrigin,
+    redropRecheckTotal: Number(process.env.SOAK_REDROP_RECHECK_TOTAL ?? DEFAULTS.redropRecheckTotal),
+    redropLegacyTotal: Number(process.env.SOAK_REDROP_LEGACY_TOTAL ?? DEFAULTS.redropLegacyTotal),
+    noRecheck: cli.noRecheck === true,
+    noLegacy: cli.noLegacy === true,
   };
   const statePath = process.env.SOAK_STATE ?? join(homedir(), '.eternal-notes-soak', 'state.json');
-  const state = await loadState(statePath);
 
-  if (mode === 'status') { printStatus(state); return 0; }
+  // `status` only reads, and refusing it because a run is in flight would be
+  // hostile for no gain. Everything else takes the lock BEFORE reading the
+  // ledger: planning from a snapshot another process is already spending is
+  // exactly how two runs both believe the budget is theirs.
+  if (mode === 'status') { printStatus(await loadState(statePath)); return 0; }
+
+  const lock = await acquireLedgerLock(statePath);
+  if (!lock.ok) { console.error(`✗ ${lock.reason}`); return 2; }
+  try {
+    return await run();
+  } finally {
+    await lock.release();
+  }
+
+  async function run() {
+  const state = await loadState(statePath);
   if (!['register', 'seed-legacy', 'day', 'snapshot'].includes(mode)) {
     console.error('usage: soak-d2.mjs <register [--invite CODE] | seed-legacy --count N | day [--paid N] | snapshot | status> [--dry-run]');
     return 2;
@@ -645,7 +844,12 @@ export async function main(argv) {
     failures = await seedLegacy({ origin, signer, state, count, dryRun: cli.dryRun, opts });
   } else {
     state.release ??= { sha: health.releaseSha, workerVersionId: health.workerVersionId, firstSeenAt: Date.now() };
-    failures = await dayRun({ origin, signer, state, opts, dryRun: cli.dryRun });
+    failures = await dayRun({
+      origin, signer, state, opts, dryRun: cli.dryRun,
+      // Lets the run write the ledger BEFORE a request that could cost money,
+      // instead of trusting the single save at the end to survive a crash.
+      persist: cli.dryRun ? null : () => saveState(statePath, state),
+    });
     if (!cli.dryRun && process.env.METRICS_ADMIN_SECRET) {
       await snapshot({ origin, secret: process.env.METRICS_ADMIN_SECRET, stateDir: dirname(statePath) });
     }
@@ -653,6 +857,7 @@ export async function main(argv) {
   if (!cli.dryRun) await saveState(statePath, state);
   printStatus(state);
   return failures ? 1 : 0;
+  }
 }
 
 if (process.argv[1]?.endsWith('soak-d2.mjs')) {

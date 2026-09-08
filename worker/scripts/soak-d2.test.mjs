@@ -1,8 +1,13 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readdir, rm } from 'node:fs/promises';
 import {
   LEGACY_RELEASE_SHA, DEFAULTS, VOLUME,
   emptyState, checkReleaseGate, planRun, classifyUpload, readConfirmations, readTxHeaderOk,
   estimateCost, summarize, parseArgs, randomUuidV8, v3Tags,
+  redropSends, chargeBudget, acquireLedgerLock, saveState, loadState, dayRun,
 } from './soak-d2.mjs';
 
 const NEW_SHA = '5881da2ab1ce7ff6bc51d7ebb9794fddae254896';
@@ -91,6 +96,66 @@ describe('planRun', () => {
     const l2 = note({ noteId: 'l2', kind: 'legacy', createdAt: 1 });
     const l3 = note({ noteId: 'l3', kind: 'legacy', createdAt: 3, backfilledAt: 9 });
     expect(planRun({ ...emptyState(), notes: [l1, l2, l3] }, opts, 0).legacyCandidates).toEqual(['l2']);
+  });
+
+  // ── The redrop budget ──
+  //
+  // `--paid N` bounds new publications and NOTHING else. A recheck whose
+  // quorum reads `dead` goes to a PAID re-post, and so does a legacy attempt
+  // whose D9 is unproven — neither is counted by `paidPosts`. The lever is
+  // not sending the request, so the budget counts SENDS.
+  describe('redrop budget', () => {
+    const ready = (n) => Array.from({ length: n }, (_, i) =>
+      note({ noteId: `r${i}`, createdAt: 0, confirmedAt: 1, dedupes: i }));
+    const legacies = (n) => Array.from({ length: n }, (_, i) =>
+      note({ noteId: `l${i}`, kind: 'legacy', createdAt: i }));
+    const wide = { ...DEFAULTS, dedupePerRun: 8, recheckPerRun: 3, legacyPerRun: 2 };
+    const now = 100 * 3_600_000;
+
+    it('caps rechecks per run — dedupePerRun is 8, and 8 would eat the window', () => {
+      const plan = planRun({ ...emptyState(), notes: ready(8) }, wide, now);
+      expect(plan.recheck).toHaveLength(3);
+      expect(plan.dedupe).toHaveLength(8);          // the cheap pass is untouched
+      expect(plan.withheld.join(' ')).toMatch(/recheck: 5 of 8 held back/);
+    });
+
+    it('stops rechecking once the WINDOW quota is spent', () => {
+      const state = { ...emptyState(), notes: ready(8), redropSends: { recheck: 12, legacy: 0 } };
+      expect(planRun(state, wide, now).recheck).toEqual([]);
+    });
+
+    it('the legacy reserve is NOT borrowable: a spent recheck quota leaves it whole', () => {
+      const state = {
+        ...emptyState(),
+        notes: [...ready(8), ...legacies(3)],
+        redropSends: { recheck: 12, legacy: 0 },
+      };
+      const plan = planRun(state, wide, now);
+      expect(plan.recheck).toEqual([]);
+      expect(plan.legacyCandidates).toEqual(['l0', 'l1']);   // the three backfills stay reachable
+    });
+
+    it('stops legacy attempts once the reserve is spent', () => {
+      const state = { ...emptyState(), notes: legacies(3), redropSends: { recheck: 0, legacy: 8 } };
+      const plan = planRun(state, wide, now);
+      expect(plan.legacyCandidates).toEqual([]);
+      expect(plan.withheld.join(' ')).toMatch(/legacy: 3 of 3 held back/);
+    });
+
+    it('--no-recheck and --no-legacy hold both passes back, loudly', () => {
+      const state = { ...emptyState(), notes: [...ready(8), ...legacies(3)] };
+      const plan = planRun(state, { ...wide, noRecheck: true, noLegacy: true }, now);
+      expect(plan.recheck).toEqual([]);
+      expect(plan.legacyCandidates).toEqual([]);
+      expect(plan.dedupe).toHaveLength(8);          // plain dedupe cannot redrop
+      expect(plan.withheld).toHaveLength(2);
+    });
+
+    it('a ledger written before the counters existed reads as zero, not NaN', () => {
+      const legacyLedger = { ...emptyState(), notes: legacies(1) };
+      delete legacyLedger.redropSends;
+      expect(planRun(legacyLedger, wide, now).legacyCandidates).toEqual(['l0']);
+    });
   });
 });
 
@@ -196,6 +261,13 @@ describe('parseArgs', () => {
     expect(parseArgs(['seed-legacy', '--count', '5'])).toEqual({ mode: 'seed-legacy', opts: { count: 5 } });
     expect(parseArgs(['register', '--invite', 'abc'])).toEqual({ mode: 'register', opts: { invite: 'abc' } });
   });
+  // `--paid 0` is NOT a promise of a free run: the dedupe pass still carries
+  // rechecks, and the legacy pass sends too. These two are the actual lever.
+  it('reads the switches that hold back the redrop-capable passes', () => {
+    expect(parseArgs(['day', '--paid', '0', '--no-recheck', '--no-legacy'])).toEqual({
+      mode: 'day', opts: { paid: 0, noRecheck: true, noLegacy: true },
+    });
+  });
   it('refuses junk', () => {
     expect(() => parseArgs(['day', '--paid', 'x'])).toThrow(/non-negative integer/);
     expect(() => parseArgs(['day', '--wat'])).toThrow(/unknown argument/);
@@ -207,5 +279,99 @@ describe('upload framing', () => {
     const id = randomUuidV8();
     expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(v3Tags('owner', id).map(t => t.name)).toEqual(['App-Name', 'App-Version', 'Content-Type', 'Owner-Hash', 'Note-Id']);
+  });
+});
+
+/**
+ * The budget as it EXECUTES, not merely as it plans.
+ *
+ * Planning tests prove the quotas are computed; these prove the money cannot
+ * escape them: a ledger that will not persist must stop the send, a charge
+ * must survive the process, and two runs must not both believe the budget is
+ * theirs.
+ */
+describe('budget execution', () => {
+  const tmpDir = () => join(tmpdir(), `soak-d2-${randomUUID()}`);
+
+  const fakeSigner = () => {
+    const sent = [];
+    return {
+      sent,
+      upload: async (_origin, note, opts = {}) => {
+        sent.push({ noteId: note.noteId, recheck: opts.recheck === true });
+        return { status: 200, body: { txId: TX, status: 'accepted', committed: true, deduped: true, semanticIdempotency: 1 } };
+      },
+    };
+  };
+
+  // dayRun quotes the price before doing anything; nothing else touches the net
+  // once the legacy pass is switched off.
+  const stubPrice = () => vi.stubGlobal('fetch', async () => new Response('3371193814', { status: 200 }));
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  const readyNote = () => note({
+    noteId: 'ready', txId: TX, createdAt: 0, confirmedAt: 1, dedupes: 0,
+  });
+  const runOpts = { ...DEFAULTS, paidPerRun: 0, noLegacy: true };
+
+  it('a ledger that will not persist STOPS the send', async () => {
+    stubPrice();
+    const state = { ...emptyState(), notes: [readyNote()] };
+    const signer = fakeSigner();
+
+    const failures = await dayRun({
+      origin: 'https://worker.test', signer, state, opts: runOpts,
+      persist: async () => { throw new Error('disk full'); },
+    });
+
+    // Nothing was sent — not the recheck, not anything after it.
+    expect(signer.sent).toEqual([]);
+    expect(failures).toBeGreaterThan(0);
+    expect(state.runs.at(-1).problems.join(' ')).toMatch(/STOP: ledger write failed before a recheck send/);
+  });
+
+  it('the charge is durable: a second process reads the spent limit', async () => {
+    const dir = tmpDir();
+    const path = join(dir, 'state.json');
+    const state = { ...emptyState(), notes: [readyNote()] };
+
+    await chargeBudget(state, 'recheck', () => saveState(path, state));
+
+    // A FRESH read — what the next process actually sees.
+    const reloaded = await loadState(path);
+    expect(redropSends(reloaded)).toEqual({ recheck: 1, legacy: 0 });
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('the ledger is replaced atomically, never truncated in place', async () => {
+    const dir = tmpDir();
+    const path = join(dir, 'state.json');
+    await saveState(path, { ...emptyState(), paidPosts: 7 });
+    await saveState(path, { ...emptyState(), paidPosts: 8 });
+
+    expect((await loadState(path)).paidPosts).toBe(8);
+    // No temp file survives a completed write — a leftover would mean the
+    // rename never happened and the next reader could pick up a half-file.
+    expect((await readdir(dir)).filter(f => f.includes('.tmp'))).toEqual([]);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('a second concurrent run is refused the ledger and sends nothing', async () => {
+    const dir = tmpDir();
+    const path = join(dir, 'state.json');
+
+    const first = await acquireLedgerLock(path);
+    expect(first.ok).toBe(true);
+
+    const second = await acquireLedgerLock(path, Date.now() + 5 * 60_000);
+    expect(second.ok).toBe(false);
+    expect(second.reason).toMatch(/another run holds the ledger \(pid \d+, 5 min ago\)/);
+
+    // …and the lock is not a one-way door: releasing lets the next run in.
+    await first.release();
+    const third = await acquireLedgerLock(path);
+    expect(third.ok).toBe(true);
+    await third.release();
+    await rm(dir, { recursive: true, force: true });
   });
 });
