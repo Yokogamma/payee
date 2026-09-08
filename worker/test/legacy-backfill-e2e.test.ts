@@ -112,7 +112,14 @@ function capture() {
   const outcomes = () => points
     .filter(p => p.blobs?.[0] === 'semantic_idempotency')
     .map(p => p.blobs?.[1]);
-  return { dataset, outcomes };
+  /** `gateway_call` rows as the report reads them: kind, host, class, duration.
+   *  The stage of a D9 read lives in KIND (`payload_header` / `payload_raw`) —
+   *  the report groups by kind/host/class and a fifth blob would be invisible,
+   *  so asserting the row here is the only way to know the label is real. */
+  const gatewayCalls = () => points
+    .filter(p => p.blobs?.[0] === 'gateway_call')
+    .map(p => ({ kind: p.blobs?.[1], host: p.blobs?.[2], class: p.blobs?.[3], ms: p.doubles?.[0] }));
+  return { dataset, outcomes, gatewayCalls };
 }
 
 /**
@@ -470,5 +477,65 @@ describe('the capability marker rides on every successful answer (D2a)', () => {
       { ...(await envFor()), SEMANTIC_IDEMPOTENCY: '0' } as never,
     );
     expect((await r.json() as { semanticIdempotency?: number }).semanticIdempotency).toBe(1);
+  });
+});
+
+/**
+ * A REDIRECTING pool, end to end.
+ *
+ * This is the case the release shipped broken: the readers asked for
+ * `redirect: 'error'`, workerd refuses that value with a TypeError before any
+ * I/O, and so every gateway read failed instantly — on every host, forever.
+ * D9 could not complete and the status quorum could not collect a single vote,
+ * which is how a healthy record answered `legacy_unproven` for a whole soak
+ * window. The unit tests could not see it: the stubs ignored `init`.
+ *
+ * So this drives the real worker over a pool that actually redirects, and pins
+ * the three things that matter: the mode each request carries, the verdict, and
+ * that no money moves. A 302 must never authorize a paid re-post — the redrop
+ * is reachable only on a UNANIMOUS `dead`, and a redirect is not a vote.
+ */
+describe('a pool that answers 3xx', () => {
+  it('refuses to prove, refuses to redrop, and says why', async () => {
+    const noteId = '33333333-4444-4555-8666-77777777cccc';
+    const txId = 'REDIRECTREDIRECTREDIRECTREDIRECTREDIRECTRED'; // 43 base64url
+    await seedLegacyCommitted(noteId, txId);
+
+    // The payload pool redirects instead of serving the header.
+    const header = mockRoute('GET', new RegExp(`^${G1}/tx/${txId}$`), 302, '');
+    // The status pool is SPLIT: one redirect, one 404. Not unanimous, so the
+    // quorum is `unavailable` — the verdict that must not open the paid path.
+    const statusA = mockRoute('GET', /^https:\/\/arweave\.net\/tx\/[^/]+\/status$/, 302, '');
+    const statusB = mockRoute('GET', /^https:\/\/g2\.test\/tx\/[^/]+\/status$/, 404, 'not found');
+
+    const cap = capture();
+    const r = await worker.fetch(await uploadRequest(noteId, 'lb-302'), await envFor(cap) as never);
+
+    // Retryable, never a verdict: nothing is written and the record stays legacy.
+    expect(r.status).toBe(503);
+    expect(await r.text()).toMatch(/could not be authenticated/);
+    expect(cap.outcomes()).toEqual(['legacy_unproven']);
+    expect(await storedFp(noteId)).toBeUndefined();
+
+    // NO paid leg was attempted — not the anchor, not the price, not the POST.
+    const kinds = cap.gatewayCalls().map(c => c.kind);
+    expect(kinds).not.toContain('post');
+    expect(kinds).not.toContain('anchor');
+    expect(kinds).not.toContain('price');
+
+    // Every read asked for `manual`. `follow` would let one host answer for two
+    // configured origins; `error` does not reach the network at all.
+    expect(header.lastRedirect).toBe('manual');
+    expect(statusA.lastRedirect).toBe('manual');
+    expect(statusB.lastRedirect).toBe('manual');
+
+    // And the row a human reads at 3 a.m. names the STAGE and the reason.
+    expect(cap.gatewayCalls()).toContainEqual(
+      { kind: 'payload_header', host: 'arweave.net', class: 'network', ms: expect.any(Number) },
+    );
+    // The bytes were never asked for: the header pass already failed.
+    expect(kinds).not.toContain('payload_raw');
+    expect(cap.gatewayCalls().filter(c => c.kind === 'status').map(c => c.class).sort())
+      .toEqual(['404', 'network']);
   });
 });
