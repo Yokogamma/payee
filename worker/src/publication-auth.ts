@@ -125,7 +125,7 @@ export interface AuthDeps {
   onOrigin?: (
     origin: string,
     stage: ReadStage,
-    outcome: GatewayClass | 'oversize' | 'ok' | 'mismatch',
+    outcome: ReadOutcome,
     elapsedMs: number,
   ) => void;
 }
@@ -168,18 +168,28 @@ async function readCapped(response: Response, cap: number): Promise<Uint8Array |
 }
 
 /**
- * One origin's answer, WITH the reason it is not usable.
+ * WHY one origin's answer is not usable — a fact that used to be thrown away.
  *
- * The reason used to be thrown away: every failure — a thrown fetch, a 404, a
- * 500, a body over the cap — collapsed into `null` and was reported as `miss`.
- * That is why a total outage (the runtime refusing the redirect mode on every
- * call) looked exactly like «the gateways are having a bad afternoon», and the
- * defect survived a full soak window undiagnosed.
+ * Every failure (a thrown fetch, a 404, a 500, a body over the cap) collapsed
+ * into `null` and was reported as `miss`. That is why a total outage — the
+ * runtime refusing the redirect mode on every call — looked exactly like «the
+ * gateways are having a bad afternoon», and the defect survived a whole soak
+ * window undiagnosed.
+ *
+ * Transport facts only. Two labels beyond the shared vocabulary, because
+ * `readCapped` answers `null` for two DIFFERENT things and a diagnosis that
+ * conflates them sends the reader hunting for a size problem that is not there:
+ * `oversize` is a body (or a declared Content-Length) past the cap, `empty` is
+ * a 200 carrying no body at all.
  */
+type ReadClass = GatewayClass | 'oversize' | 'empty';
+
+/** …plus the verdicts the verification adds once bytes are in hand. */
+export type ReadOutcome = ReadClass | 'ok' | 'mismatch';
+
 interface OriginRead {
   bytes: Uint8Array | null;
-  /** Metrics label. `oversize` is ours: a 200 whose body crossed the cap. */
-  outcome: GatewayClass | 'oversize';
+  outcome: ReadClass;
   elapsedMs: number;
 }
 
@@ -216,6 +226,9 @@ async function fetchFrom(
       // status, not by an exception the runtime never let us take.
       return { bytes: null, outcome: classifyStatus(response.status), elapsedMs: since() };
     }
+    // Asked BEFORE readCapped, which would fold this into the same null as a
+    // body past the cap — see ReadClass.
+    if (response.body === null) return { bytes: null, outcome: 'empty', elapsedMs: since() };
     const bytes = await readCapped(response, cap);
     return bytes === null
       ? { bytes: null, outcome: 'oversize', elapsedMs: since() }
@@ -258,7 +271,7 @@ export async function authenticatePublication(
   const report = (
     origin: string,
     stage: ReadStage,
-    outcome: GatewayClass | 'oversize' | 'ok' | 'mismatch',
+    outcome: ReadOutcome,
     elapsedMs: number,
   ): void => {
     try { deps.onOrigin?.(origin, stage, outcome, elapsedMs); } catch { /* telemetry is never a verdict */ }

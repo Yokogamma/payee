@@ -516,6 +516,44 @@ describe('per-origin telemetry', () => {
     }
   });
 
+  it('tells an EMPTY answer from an oversized one', async () => {
+    // `readCapped` returns null for both, and the first version of this
+    // reporting called both `oversize` — sending whoever reads the row hunting
+    // for a size problem that does not exist.
+    const { tx, wallet } = await ourTx();
+    const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      assertSupportedRedirect(input, init);
+      // A 200 with NO body at all: `response.body` is null, nothing was capped.
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+    const { rows, onOrigin } = record();
+
+    const verdict = await authenticatePublication(tx.txId, {
+      origins: [G1], trustedOwners: [wallet.address], ownerHash: OWNER_HASH,
+      expectedNoteId: NOTE_ID, fetchImpl: impl, onOrigin,
+    });
+
+    expect(verdict.kind).toBe('unproven');
+    expect(rows).toEqual([{ origin: G1, stage: 'header', outcome: 'empty', ms: expect.any(Number) }]);
+  });
+
+  it('names an oversized body as such', async () => {
+    const { tx, wallet } = await ourTx();
+    const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      assertSupportedRedirect(input, init);
+      // Declared past the cap — refused before a byte is read.
+      return new Response('x', { status: 200, headers: { 'Content-Length': String(10 * 1024 * 1024) } });
+    }) as unknown as typeof fetch;
+    const { rows, onOrigin } = record();
+
+    await authenticatePublication(tx.txId, {
+      origins: [G1], trustedOwners: [wallet.address], ownerHash: OWNER_HASH,
+      expectedNoteId: NOTE_ID, fetchImpl: impl, onOrigin,
+    });
+
+    expect(rows).toEqual([{ origin: G1, stage: 'header', outcome: 'oversize', ms: expect.any(Number) }]);
+  });
+
   it('a THROWING hook does not turn a completed proof into a failure', async () => {
     // The hook comes from the caller. A metric that can break the request is
     // worse than no metric — and this module cannot assume the adapter is sane.
