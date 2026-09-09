@@ -28,9 +28,10 @@ in `worker/src/metrics.ts`.
 While the index was the bare event name, every kind of `gateway_call` shared one
 sampling bucket: measured on 2026-09-09, 36 of 84 rows survived and the
 survivors were all `anchor`/`price`, so `post` and both `payload_*` kinds
-vanished from the report while the weighted total stayed correct. A rare outcome
-sharing a bucket with a frequent one is the row that gets dropped — fatal for a
-criterion that must read strictly zero.
+vanished from the report while the weighted total stayed correct. So a rare
+outcome sharing a bucket with a frequent one CAN disappear from the sample
+entirely. WHICH rows the sampler drops was not measured and does not need to be:
+for a criterion that must read zero, the possibility is already enough.
 
 Rows written before the split carry the bare event name, so every report reads
 **both** schemas: `(index1 = 'x' OR index1 LIKE 'x:%')`. A row has exactly one

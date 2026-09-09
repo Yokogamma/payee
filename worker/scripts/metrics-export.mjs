@@ -19,7 +19,14 @@
  *
  * THE GOVERNING RULE: an incomplete export must FAIL, never be archived. A
  * short file is worse than a missing one — it gets read later as «nothing
- * happened». Every uncertainty below therefore ends in an exception.
+ * happened». Every check below therefore ends in an exception rather than in a
+ * default value.
+ *
+ * That is a RULE, not a guarantee: it covers the failures and incompleteness
+ * signals this script knows how to recognise. The contract of the observability
+ * API is implemented from documentation and has never been exercised against a
+ * live answer, so a shape nobody anticipated can still pass. Treat «it did not
+ * throw» as «no KNOWN defect», never as «the export is provably complete».
  *
  * Usage:
  *   node scripts/metrics-export.mjs metrics --hours 168 --out DIR

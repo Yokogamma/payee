@@ -61,7 +61,8 @@ const INDEX_DISCRIMINATOR_RE = /^[a-z0-9_.:-]{1,48}$/;
  *
  * That is fatal for the exit criteria in docs/ROLLBACK.md, which require
  * `conflict` and friends to read STRICTLY ZERO: a rare outcome sharing a bucket
- * with a frequent one is exactly the row that gets dropped. Giving each
+ * with a frequent one CAN disappear from the sample entirely — which of them
+ * the sampler drops was not measured, and does not need to be. Giving each
  * discriminator its own bucket does not PROVE a zero — nothing sampled can —
  * but it stops the frequent outcomes from crowding out the rare ones.
  *
