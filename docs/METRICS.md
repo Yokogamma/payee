@@ -31,7 +31,11 @@ things — do not merge them:
 
 - **The narrow window** 2026-09-08 12:00–13:00 UTC, one soak run. `gateway_call`
   kept FIVE rows: three `anchor` and two `price`. Not one surviving row for
-  `post` or for either `payload_*` kind, although all three had fired.
+  `post` or for either `payload_*` kind, although the branches that emit all
+  three were REACHED — `post_accepted` (3 rows, weight 1) and the two
+  `legacy_backfilled` rows prove the call sites ran. Reached is not delivered:
+  whether those data points were written and then dropped by the sampler, or
+  failed silently inside the `catch {}` in `makeEmit`, is NOT established.
   `SUM(_sample_interval)` over those five estimated 13 events, and 13 is exactly
   what the run should have produced (3×(anchor+price+post) plus 2×(header+raw)) —
   the estimate agreed with the expectation. In the same window

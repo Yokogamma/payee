@@ -254,8 +254,10 @@ describe('makeEmit — fail-closed telemetry, fail-open requests', () => {
  * Analytics Engine samples PER INDEX. Measured on 2026-09-09 over the narrow
  * window 2026-09-08 12:00–13:00 UTC: `gateway_call` kept FIVE rows — three
  * `anchor` and two `price` — and not one surviving row for `post` or for either
- * `payload_*` kind, although all three had fired. SUM(_sample_interval) over
- * those five estimated 13 events, which matched the 13 expected from the runs.
+ * `payload_*` kind, although the branches emitting all three were REACHED
+ * (`post_accepted` and `legacy_backfilled` prove the call sites ran, not that
+ * the writes landed). SUM(_sample_interval) over those five estimated 13
+ * events, which matched the 13 expected from the runs.
  *
  * So a rare outcome sharing a bucket with a frequent one CAN vanish from the
  * report — fatal for a criterion that must read strictly zero.
