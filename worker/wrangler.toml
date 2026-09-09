@@ -125,6 +125,35 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 binding = "METRICS"
 dataset = "eternal_notes_metrics"
 
+# ── Workers Logs (observability) ──
+# Checked in the Cloudflare API on 2026-09-09 and found ABSENT, with `logpush`
+# false and ZERO log events in the account for the whole soak. So the
+# `console.error` diagnostics next to the critical outcomes were writing to
+# nothing at all.
+#
+# This gives the criteria a SECOND, INDEPENDENT channel — not a guaranteed one.
+# Analytics Engine samples PER INDEX, so an absent row cannot be told from an
+# event that never happened, and two exit criteria in docs/ROLLBACK.md must
+# read STRICTLY ZERO. One estimating channel cannot establish a zero; two
+# channels that must both lose the same event make it far less likely.
+#
+# `head_sampling_rate = 1` asks for FULL COLLECTION. It is NOT a promise of
+# lossless storage, and this config alone proves nothing about delivery —
+# delivery is verified after the deploy (docs/METRICS.md, «Проверка доставки»).
+#
+# RETENTION IS THE TRAP: Workers Logs keeps at most SEVEN DAYS. A 168-hour soak
+# is exactly seven days, so the beginning of the window can age out on the very
+# day the window is being judged. Daily archival is therefore mandatory, not
+# optional — `soak-d2.mjs snapshot` writes the dated evidence files.
+#
+# NOTE: enabling this changes the deployed script, so it takes a deploy — and a
+# deploy RESETS the 168-hour soak window (soak-d2.mjs asserts one
+# workerVersionId for the whole window). Land it together with the other
+# telemetry fixes, never on its own mid-window.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # The Worker's own ACTIVE version id, reported by /health. A self-declared
 # release SHA cannot tell a re-deploy of the same commit from the original;
 # this can, and the deploy smoke compares it with the version id wrangler
@@ -257,6 +286,13 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 [[env.staging.analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "eternal_notes_metrics_staging"
+
+# Declared explicitly for staging too: a named environment inherits NOTHING,
+# so omitting this would leave staging without logs and make its smoke
+# structurally different from production's.
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
 
 # Declared explicitly for staging too: a named environment inherits NOTHING,
 # so omitting this would leave staging without the binding and make its smoke

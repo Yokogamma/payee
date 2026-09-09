@@ -132,7 +132,9 @@ describe('upstream contract: bearer, SQL text, {rows} shape, no proxying', () =>
     const r = await worker.fetch(req({ report: 'status_verdicts', hours: 48 }), configuredEnv());
     expect(r.status).toBe(200);
     expect(route.lastBody).toContain("INTERVAL '48' HOUR");
-    expect(route.lastBody).toContain("index1='status_verdict'");
+    // Reads BOTH schemas: bare-event rows written before the index split and
+    // event:discriminator rows written after it.
+    expect(route.lastBody).toContain("(index1 = 'status_verdict' OR index1 LIKE 'status_verdict:%')");
   });
 
   it('accepts every whitelisted report', async () => {
@@ -178,19 +180,19 @@ describe('upstream contract: bearer, SQL text, {rows} shape, no proxying', () =>
 describe('SQL templates are pinned (r17)', () => {
   it('gateway_health', () => {
     expect(buildMetricsReportSql('gateway_health', 'eternal_notes_metrics', 24)).toMatchInlineSnapshot(
-      `"SELECT blob2 AS kind, blob3 AS host, blob4 AS class, SUM(_sample_interval) AS calls, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_ms FROM eternal_notes_metrics WHERE index1='gateway_call' AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY kind, host, class LIMIT 200 FORMAT JSON"`,
+      `"SELECT blob2 AS kind, blob3 AS host, blob4 AS class, SUM(_sample_interval) AS calls, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_ms FROM eternal_notes_metrics WHERE (index1 = 'gateway_call' OR index1 LIKE 'gateway_call:%') AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY kind, host, class LIMIT 200 FORMAT JSON"`,
     );
   });
 
   it('upload_outcomes', () => {
     expect(buildMetricsReportSql('upload_outcomes', 'eternal_notes_metrics', 24)).toMatchInlineSnapshot(
-      `"SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE index1='upload_outcome' AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON"`,
+      `"SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE (index1 = 'upload_outcome' OR index1 LIKE 'upload_outcome:%') AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON"`,
     );
   });
 
   it('status_verdicts', () => {
     expect(buildMetricsReportSql('status_verdicts', 'eternal_notes_metrics', 24)).toMatchInlineSnapshot(
-      `"SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE index1='status_verdict' AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY verdict, host LIMIT 100 FORMAT JSON"`,
+      `"SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE (index1 = 'status_verdict' OR index1 LIKE 'status_verdict:%') AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY verdict, host LIMIT 100 FORMAT JSON"`,
     );
   });
 

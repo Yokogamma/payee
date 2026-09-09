@@ -163,8 +163,14 @@ describe('successful upload: exactly 3 legs, full event set, privacy', () => {
     expect(cap.byEvent('redrop_new_tx')).toHaveLength(0);
     expect(cap.byEvent('upload_outcome').map(p => [p.blobs?.[1], p.blobs?.[2]]))
       .toEqual([['accepted', '2']]);
-    // indexes = [event] on every point (independent sampling per type).
-    for (const p of cap.points) expect(p.indexes).toEqual([p.blobs?.[0]]);
+    // indexes = [event:discriminator] on every point: one sampling bucket per
+    // outcome, so a rare one is not crowded out of the sample by a frequent one
+    // (see metricIndexKey — this is what makes a strictly-zero criterion
+    // readable at all).
+    for (const p of cap.points) {
+      const [event, discriminator] = (p.blobs ?? []) as string[];
+      expect(p.indexes).toEqual([discriminator ? `${event}:${discriminator}` : event]);
+    }
 
     // Privacy: no noteId, no txId, no public key anywhere in the datapoints.
     const serialized = JSON.stringify(cap.points);

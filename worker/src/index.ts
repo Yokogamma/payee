@@ -850,7 +850,16 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // query, not a feeling. Fires on paths `upload_outcome` deliberately stays
   // silent about (idempotent hits, reconciliation without a POST), because
   // those are precisely the paths this release changed.
-  const attest = (outcome: string) => emit('semantic_idempotency', [outcome, declaredVersion], []);
+  // Analytics Engine SAMPLES, so `attest` alone can never establish that a
+  // critical outcome NEVER happened — the row may simply not have survived.
+  // Every outcome docs/ROLLBACK.md requires to read STRICTLY ZERO therefore
+  // also writes one structured log line, on a channel that does not share
+  // Analytics Engine's sampling. Routed through THIS one closure on purpose:
+  // a per-call-site logger is a logger somebody forgets at the next branch.
+  const attest = (outcome: string, txId?: string) => {
+    emit('semantic_idempotency', [outcome, declaredVersion], []);
+    if (CRITICAL_OUTCOMES.has(outcome)) logCritical(outcome, noteId, declaredVersion, txId);
+  };
 
   const REQUIRED_TAGS = new Map<string, string>([
     ['App-Name', APP_NAME],
@@ -1096,7 +1105,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // this canonicalization cannot read. Not transient, so a 503 would loop
       // forever — and the historical txId must never be returned as a success.
       // Nothing is written: no observedFp, no binding.
-      attest('legacy_not_ours');
+      attest('legacy_not_ours', snapshot.txId);
       return { kind: 'respond', response: idPayloadConflict(snapshot.txId) };
     }
 
@@ -1138,7 +1147,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (checkResult.status === 'id_payload_conflict') {
     // The same noteId under DIFFERENT bytes. Typed, never a silent replay of
     // the historical txId.
-    attest('conflict');
+    attest('conflict', checkResult.txId);
     return idPayloadConflict(checkResult.txId);
   }
 
@@ -1160,7 +1169,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       attest('deduped');
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
-    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
+    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') { attest('legacy_dead_deferred'); return error('Recheck deferred', 503); }
     // Only NOW is a redrop a fact: the CAS held and a reservation carrying this
     // payload's fp exists. The dead verdict alone proved nothing about what
@@ -1197,7 +1206,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       attest('deduped');
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
-    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
+    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -1231,7 +1240,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       attest('deduped');
       return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
     }
-    if (rd.kind === 'conflict') { attest('redrop_conflict'); return idPayloadConflict(rd.txId); }
+    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return idPayloadConflict(rd.txId); }
     if (rd.kind === 'defer') return error('Recheck deferred', 503);
     reserveToken = rd.token;
     viaRedrop = true;
@@ -1280,7 +1289,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         if (auth.kind !== 'authenticated' || auth.observedFp !== requestedFp) {
           // Proven to be different bytes (or not ours at all). The reservation
           // is released and NOTHING is bound to the old transaction.
-          attest('recovery_conflict');
+          attest('recovery_conflict', recoveryHint.txId);
           await safeRelease(reserveToken);
           return idPayloadConflict(recoveryHint.txId);
         }
@@ -1346,6 +1355,9 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   } catch (e) {
     await safeRelease(reserveToken);
     console.error('ARWEAVE_POST_FAILED', noteId, e);
+    // The fifth strictly-zero criterion. Same reasoning as the conflict
+    // outcomes: the metric alone cannot establish that this never happened.
+    logCritical('arweave_throw', noteId, declaredVersion);
     emit('upload_outcome', ['arweave_throw', declaredVersion], []);
     return error('Arweave upload failed', 502);
   }
@@ -1657,6 +1669,37 @@ function statusOrigins(env: Env): string[] {
 function payloadOrigins(env: Env): string[] {
   const parsed = parseOriginList(env.PAYLOAD_GATEWAYS ?? '');
   return parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
+}
+
+/**
+ * The outcomes docs/ROLLBACK.md requires to read STRICTLY ZERO over a soak
+ * window. Each is a protocol defect, a mismatched pointer or an attack — the
+ * kind of thing that must never be lost to a sampling decision.
+ */
+const CRITICAL_OUTCOMES = new Set(['conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict']);
+
+/**
+ * One structured line per critical outcome, on Workers Logs.
+ *
+ * WHY a second channel: Analytics Engine samples per index, so an absent row
+ * cannot be told apart from an event that never happened — and «strictly zero»
+ * is exactly a claim about absence. This channel is not a guarantee either
+ * (`head_sampling_rate = 1` asks for full collection, it does not promise
+ * lossless storage, and retention is seven days), so the two are used
+ * together and the daily snapshot archives both before they age out.
+ *
+ * PRIVACY: enum-like labels, the noteId, and — for a conflict — the txId that
+ * the investigation is actually about. Never note bytes, never a key, never a
+ * token or recovery hint. The txId is a public chain identifier; it rides here
+ * and NOT in Analytics Engine, whose stricter boundary (docs/METRICS.md) is
+ * unchanged by this.
+ */
+function logCritical(outcome: string, noteId: string, appVersion: string, txId?: string): void {
+  try {
+    console.error(JSON.stringify({ critical: outcome, noteId, appVersion, ...(txId ? { txId } : {}) }));
+  } catch {
+    /* diagnostics must never break the request */
+  }
 }
 
 /**

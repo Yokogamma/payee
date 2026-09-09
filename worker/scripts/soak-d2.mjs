@@ -1000,12 +1000,19 @@ async function snapshot({ origin, secret, stateDir }) {
   await mkdir(dir, { recursive: true });
   const at = new Date();
   const out = { at: at.toISOString(), origin, reports: {} };
-  for (const report of ['semantic_idempotency', 'upload_outcomes']) {
+  // ALL four reports, not two. Workers Logs keeps at most SEVEN DAYS and a
+  // soak window is exactly seven, so the beginning of the window can age out
+  // on the day the window is judged. These dated files are the only copy that
+  // outlives retention — a soak without them is a calendar, not a measurement.
+  for (const report of ['semantic_idempotency', 'upload_outcomes', 'gateway_health', 'status_verdicts']) {
     for (const hours of [24, 168]) {
       const { status, body } = await metricsReport(origin, secret, report, hours);
       out.reports[`${report}_${hours}h`] = { status, body };
       const rows = status === 200 && body && Array.isArray(body.rows) ? body.rows : null;
-      log(`  ${report} ${hours}h: ${rows ? (rows.length ? rows.map(r => `${r.outcome}=${r.n}`).join(' ') : 'no rows') : `HTTP ${status}`}`);
+      // Reports have different column names (outcome/kind/verdict), so the
+      // line is built from whatever the row actually carries.
+      const render = (r) => Object.entries(r).map(([k, v]) => `${k}=${v}`).join(',');
+      log(`  ${report} ${hours}h: ${rows ? (rows.length ? rows.map(render).join(' ') : 'no rows') : `HTTP ${status}`}`);
     }
   }
   const file = join(dir, `${at.toISOString().slice(0, 10)}.json`);
