@@ -194,8 +194,24 @@ binding = "CF_VERSION_METADATA"
 #   5. Register the smoke test key via an invite seeded through
 #      /admin/seed-invite + /register (InviteManager is the source of truth —
 #      never hand-write pk: entries into KV).
+#   6. wrangler secret put METRICS_ADMIN_SECRET --env staging  (staging-only)
+#   7. wrangler secret put CF_ANALYTICS_TOKEN --env staging     (Account →
+#      Account Analytics → Read)
+#      6 and 7 were added on 2026-09-10: the delivery check of docs/METRICS.md
+#      («Проверка доставки», step 1) reads staging's own /admin/metrics to see
+#      the control `conflict` in Analytics Engine. Without them that endpoint
+#      answers 503 and the check cannot be performed at all — the earlier list
+#      predates PR-2 and did not need them.
+#
+# NONE of this exists yet. Checked against the account on 2026-09-10: it holds
+# exactly ONE worker (`eternal-notes-proxy`) and ONE KV namespace
+# (`ALLOWLIST`) — so staging is unprovisioned, not merely unconfigured, and the
+# placeholder below is only the first thing that would fail.
+#
 # Config gate before any real staging deploy:
 #   npm run deploy:staging:check   (wrangler deploy --env staging --dry-run)
+#   — passes on the placeholder: it proves the config BUILDS, not that staging
+#     is ready.
 #
 # NOTE on origins: the workers.dev URL below is the API ENDPOINT, not a client
 # origin. CLI smoke sends no Origin header (CORS is not exercised); a browser
