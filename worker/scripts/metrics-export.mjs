@@ -102,7 +102,13 @@ export function rawRowsSqlAbsolute(dataset, fromIso, toIso) {
   return `SELECT timestamp, index1, blob1, blob2, blob3, blob4, double1, _sample_interval FROM ${dataset} WHERE timestamp >= toDateTime('${fromIso}') AND timestamp < toDateTime('${toIso}') ORDER BY timestamp ASC LIMIT ${RAW_ROW_LIMIT} FORMAT JSON`;
 }
 
-/** ClickHouse `toDateTime` wants `YYYY-MM-DD HH:MM:SS`, not an ISO `T`/`Z`. */
+/**
+ * ClickHouse `toDateTime` wants `YYYY-MM-DD HH:MM:SS`, not an ISO `T`/`Z`.
+ *
+ * TRUNCATES to a whole second, which is why `resolveInterval` guarantees whole
+ * seconds: feeding it a sub-second bound would quietly read a different
+ * interval than the archive's own name and metadata report.
+ */
 export function sqlTime(ms) {
   return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
 }
@@ -501,10 +507,14 @@ export const MAX_SPAN_MS = 168 * 3600_000;
  * interval, so a relative run never collides and the overwrite refusal is
  * never exercised). `--from/--to` give the reproducible form.
  */
+export const SECOND_MS = 1000;
+
 export function resolveInterval(opts, nowMs) {
   const hasAbsolute = opts.from !== null || opts.to !== null;
   if (!hasAbsolute) {
-    const toMs = nowMs;
+    // Floored to a whole second BEFORE anything derives from it. `--hours` is a
+    // whole number of seconds, so the lower bound stays exact too.
+    const toMs = Math.floor(nowMs / SECOND_MS) * SECOND_MS;
     return { fromMs: toMs - opts.hours * 3600_000, toMs };
   }
   if (opts.from === null || opts.to === null) throw new Error('--from and --to must be given together');
@@ -513,6 +523,17 @@ export function resolveInterval(opts, nowMs) {
   const toMs = Date.parse(opts.to);
   if (!Number.isFinite(fromMs)) throw new Error(`--from is not a timestamp: ${opts.from}`);
   if (!Number.isFinite(toMs)) throw new Error(`--to is not a timestamp: ${opts.to}`);
+  // NOT rounded silently. `sqlTime` truncates to a whole second, so a bound of
+  // 12:00:00.900 would make Analytics Engine read from 12:00:00 while the
+  // metadata and the archive NAME still claimed 12:00:00.900 — an archive of a
+  // different interval than the one it says it holds. What the operator typed
+  // is either exact or refused.
+  if (fromMs % SECOND_MS !== 0 || toMs % SECOND_MS !== 0) {
+    throw new Error(
+      '--from/--to must land on whole seconds: the Analytics Engine bound has second resolution, '
+      + 'so a sub-second bound would archive a different interval than its name and metadata claim',
+    );
+  }
   if (toMs <= fromMs) throw new Error('--to must be after --from');
   if (toMs - fromMs > MAX_SPAN_MS) throw new Error('the interval must not exceed 168 hours');
   return { fromMs, toMs };

@@ -8,7 +8,7 @@ import {
   REPORTS, reportSql, reportSqlAbsolute, rawRowsSqlAbsolute, indexFilter, sqlTime,
   sliceRange, assertSliceComplete, assertNotSampled, assertAllFromWorker, pickScriptKey,
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
-  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS,
+  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
 } from './metrics-export.mjs';
 
@@ -438,5 +438,61 @@ describe('resolveInterval', () => {
     const opts = rel({ from: '2026-09-09T00:00:00Z', to: '2026-09-10T00:00:00Z' });
     const { fromMs, toMs } = resolveInterval(opts, NOW);
     expect(archiveName('logs', 'w', fromMs, toMs)).toBe(archiveName('logs', 'w', fromMs, toMs));
+  });
+});
+/**
+ * The bound the archive CLAIMS must be the bound the query READ.
+ *
+ * `sqlTime` truncates to a whole second, so a `--from` of 12:00:00.900 made
+ * Analytics Engine read from 12:00:00 while the metadata and the file name
+ * still said 12:00:00.900 — an archive of a different interval than the one it
+ * says it holds. Precision is therefore settled in ONE place, before anything
+ * derives from it.
+ */
+describe('interval precision is consistent across SQL, metadata and the file name', () => {
+  const rel = (over = {}) => ({ hours: 24, hoursGiven: false, from: null, to: null, ...over });
+  /** What the SQL bound actually means, read back as a timestamp. */
+  const readBack = (ms) => Date.parse(`${sqlTime(ms)}Z`);
+
+  it('a relative run is floored to whole seconds despite a sub-second now', () => {
+    const now = Date.UTC(2026, 8, 10, 12, 0, 1) + 137; // …:01.137
+    const { fromMs, toMs } = resolveInterval(rel({ hours: 1 }), now);
+
+    expect(toMs % SECOND_MS).toBe(0);
+    expect(fromMs % SECOND_MS).toBe(0);
+    expect(toMs).toBe(Date.UTC(2026, 8, 10, 12, 0, 1));
+    // The SQL bound means exactly what the metadata says.
+    expect(readBack(fromMs)).toBe(fromMs);
+    expect(readBack(toMs)).toBe(toMs);
+    // …and so does the archive name, which strips the milliseconds.
+    expect(archiveName('logs', 'w', fromMs, toMs)).toContain('2026-09-10T120001Z');
+    expect(archiveName('logs', 'w', fromMs, toMs)).not.toMatch(/.d{3}Z/); // no lost milliseconds to hide
+  });
+
+  it('REFUSES sub-second absolute bounds instead of silently truncating them', () => {
+    // The exact reproduction: 12:00:00.900 .. 12:00:01.100 would have been read
+    // as 12:00:00 .. 12:00:01.
+    expect(() => resolveInterval(rel({ from: '2026-09-10T12:00:00.900Z', to: '2026-09-10T12:00:01.100Z' }), 0))
+      .toThrow(/whole seconds.*second resolution.*different interval/s);
+    expect(() => resolveInterval(rel({ from: '2026-09-10T12:00:00.000Z', to: '2026-09-10T12:00:01.500Z' }), 0))
+      .toThrow(/whole seconds/);
+    expect(() => resolveInterval(rel({ from: '2026-09-10T12:00:00.001Z', to: '2026-09-10T13:00:00Z' }), 0))
+      .toThrow(/whole seconds/);
+  });
+
+  it('accepts whole-second absolute bounds and keeps them exact everywhere', () => {
+    const { fromMs, toMs } = resolveInterval(rel({ from: '2026-09-09T00:00:00Z', to: '2026-09-10T00:00:00Z' }), 0);
+    expect(readBack(fromMs)).toBe(fromMs);
+    expect(readBack(toMs)).toBe(toMs);
+    expect(sqlTime(fromMs)).toBe('2026-09-09 00:00:00');
+    // The same bounds reach the SQL of every report and of the raw rows.
+    const sql = reportSqlAbsolute('upload_outcomes', 'd', sqlTime(fromMs), sqlTime(toMs));
+    expect(sql).toContain("toDateTime('2026-09-09 00:00:00')");
+    expect(sql).toContain("toDateTime('2026-09-10 00:00:00')");
+  });
+
+  it('the whole-second rule is checked BEFORE ordering, so the message names the real problem', () => {
+    expect(() => resolveInterval(rel({ from: '2026-09-10T00:00:00.500Z', to: '2026-09-09T00:00:00.500Z' }), 0))
+      .toThrow(/whole seconds/);
   });
 });
