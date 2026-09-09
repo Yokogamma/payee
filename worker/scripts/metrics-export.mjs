@@ -187,12 +187,15 @@ export function assertNotSampled(statistics, slice) {
  * other check here (array present, abr_level 1, right worker) and was written
  * out with exit 0.
  *
- * The allowlist is deliberately narrow, and an ABSENT status is a refusal too:
- * completion that cannot be verified is not completion. A first live run
- * against an unlisted spelling fails loudly, which is the intended direction of
- * the error.
+ * The documented enum is exactly `STARTED | COMPLETED`, so the match is EXACT:
+ * no case coercion, no plausible-looking synonyms. An earlier version guessed a
+ * wider allowlist, which risks accepting a status that does not actually mean
+ * completion — and there was nothing to guess about, the contract says so.
+ *
+ * An ABSENT status is a refusal too: completion that cannot be verified is not
+ * completion.
  */
-export const COMPLETE_RUN_STATUSES = new Set(['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED']);
+export const COMPLETED_RUN_STATUS = 'COMPLETED';
 
 export function assertRunComplete(run, slice) {
   const where = `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()}`;
@@ -200,14 +203,13 @@ export function assertRunComplete(run, slice) {
   if (status === undefined || status === null || status === '') {
     throw new Error(`${where}: the answer carries no run.status, so completion cannot be verified. Do NOT archive this run.`);
   }
-  const upper = String(status).toUpperCase();
-  if (!COMPLETE_RUN_STATUSES.has(upper)) {
+  if (status !== COMPLETED_RUN_STATUS) {
     throw new Error(
-      `${where}: run.status=${status} — the query had not finished, so the events are partial. `
-      + 'Do NOT archive this run.',
+      `${where}: run.status=${status} — the query had not finished (the documented statuses are `
+      + `STARTED | ${COMPLETED_RUN_STATUS}), so the events are partial. Do NOT archive this run.`,
     );
   }
-  return upper;
+  return status;
 }
 
 /**

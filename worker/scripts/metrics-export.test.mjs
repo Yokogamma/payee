@@ -8,7 +8,7 @@ import {
   REPORTS, reportSql, reportSqlAbsolute, rawRowsSqlAbsolute, indexFilter, sqlTime,
   sliceRange, assertSliceComplete, assertNotSampled, assertAllFromWorker, pickScriptKey,
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
-  assertRunComplete, assertNoTruncatedEvents, COMPLETE_RUN_STATUSES,
+  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
 } from './metrics-export.mjs';
 
@@ -236,7 +236,7 @@ describe('paging follows the documented cursor', () => {
   const page = (n, first) => Array.from({ length: n }, (_, i) => ev(`id-${first + i}`));
   const ok = (events, over = {}) => ({
     success: true,
-    result: { run: { status: 'COMPLETE' }, statistics: { abr_level: 1 }, events: { events }, ...over },
+    result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, events: { events }, ...over },
   });
 
   it('sends the last $metadata.id as a TOP-LEVEL offset until a short page ends it', async () => {
@@ -259,7 +259,7 @@ describe('paging follows the documented cursor', () => {
     expect(sent[1].parameters.limit).toBe(LOG_PAGE_LIMIT);
     expect(sent[1].limit).toBe(LOG_QUERY_LIMIT);
     expect(sent[1].parameters.filters).toEqual([{ key: KEY, operation: 'eq', value: 'w', type: 'string' }]);
-    expect(runStatus).toBe('COMPLETE');
+    expect(runStatus).toBe('COMPLETED');
     expect(abrLevel).toBe(1);
   });
 
@@ -318,9 +318,13 @@ describe('a query that has not finished is refused', () => {
     expect(() => assertRunComplete({ status: '' }, slice)).toThrow(/no run\.status/);
   });
 
-  it('accepts the terminal spellings, case-insensitively', () => {
-    for (const s of COMPLETE_RUN_STATUSES) {
-      expect(assertRunComplete({ status: s.toLowerCase() }, slice)).toBe(s);
+  // The documented enum is exactly STARTED | COMPLETED. Matching loosely would
+  // risk accepting a status that does not mean completion.
+  it('accepts ONLY the exact documented status', () => {
+    expect(COMPLETED_RUN_STATUS).toBe('COMPLETED');
+    expect(assertRunComplete({ status: 'COMPLETED' }, slice)).toBe('COMPLETED');
+    for (const wrong of ['completed', 'Completed', 'COMPLETE', 'SUCCESS', 'SUCCEEDED', 'DONE']) {
+      expect(() => assertRunComplete({ status: wrong }, slice)).toThrow(/had not finished/);
     }
   });
 
@@ -352,7 +356,7 @@ describe('truncated events are refused', () => {
     const post = async () => ({
       success: true,
       result: {
-        run: { status: 'COMPLETE' }, statistics: { abr_level: 1 },
+        run: { status: 'COMPLETED' }, statistics: { abr_level: 1 },
         events: { events: [{ $metadata: { id: 'a', service: 'w' }, $workers: { truncated: true } }] },
       },
     });
