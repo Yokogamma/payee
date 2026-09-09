@@ -19,8 +19,22 @@ different per environment: `eternal_notes_metrics` (production block) and
 
 ## Event schema (stable blob/double order — Cloudflare requires it)
 
-The event name is BOTH the index (`indexes: [event]` — low cardinality,
-independent sampling per event type) and `blob1`.
+`blob1` is the event name. The INDEX is `event:discriminator`, where the
+discriminator is the first caller blob (the kind/outcome/verdict) when it is a
+short enum-like label, and the bare event name otherwise — see `metricIndexKey`
+in `worker/src/metrics.ts`.
+
+**Why the discriminator is in the index.** Analytics Engine samples PER INDEX.
+While the index was the bare event name, every kind of `gateway_call` shared one
+sampling bucket: measured on 2026-09-09, 36 of 84 rows survived and the
+survivors were all `anchor`/`price`, so `post` and both `payload_*` kinds
+vanished from the report while the weighted total stayed correct. A rare outcome
+sharing a bucket with a frequent one is the row that gets dropped — fatal for a
+criterion that must read strictly zero.
+
+Rows written before the split carry the bare event name, so every report reads
+**both** schemas: `(index1 = 'x' OR index1 LIKE 'x:%')`. A row has exactly one
+`index1`, so the union is a partition and cannot double count.
 
 | Event | blobs (in order) | doubles |
 |---|---|---|
@@ -191,43 +205,123 @@ four — either would justify an ADR for server-side probes.
 
 Замер 2026-09-09 показал, что одного канала недостаточно: Analytics Engine
 сэмплирует **по индексу**, и отсутствие строки неотличимо от отсутствия
-события. Для критериев «строго ноль» этого мало по построению. Поэтому у
-каждого обязательного критерия минимум два независимых источника.
+события. Для критериев «строго ноль» этого мало по построению.
 
-| Критерий (docs/ROLLBACK.md «Exit») | Источники | Проверка покрытия |
+**Чем ledger является и чем НЕ является.** Он фиксирует действия драйвера и
+годится, чтобы **обнаружить расхождение** с телеметрией. Взаимозаменяемым
+счётчиком он не является, и вот почему:
+
+- `paidAttempts` считает **отправки**, а `upload_outcome` эмитится только на
+  платном пути. Запрос, отклонённый раньше (429, 403, 409, выключатель), даёт
+  попытку без исхода — знаменатели РАЗНЫЕ, доля успеха по ним не совпадёт;
+- платный redrop списывается в `redropSends`, а не в `paidAttempts`. Его
+  `upload_outcome` не имеет парной попытки;
+- `unprovenSeen` растёт **только в legacy-пассе** и считает `legacy_unproven`.
+  Счётчиком `recovery_unproven` он не является;
+- пути восстановления драйвер вообще не проходит: `recovery_*` требует
+  настоящего сбоя DO, который никакой клиент поставить не может — тем же
+  основанием владелец 07.09 отменил `recovery_reconciled`.
+
+| Критерий (docs/ROLLBACK.md «Exit») | Источники | Что даёт покрытие |
 |---|---|---|
-| `conflict`, `redrop_conflict`, `legacy_not_ours`, `recovery_conflict` — **строго 0** | 1. `semantic_idempotency` в AE, теперь со **своим индексом на исход** (`semantic_idempotency:conflict`) 2. строка `{"critical":"…","noteId":…,"txId":…}` в Workers Logs | оба канала обязаны показать контрольное событие в staging-проверке доставки **до** старта окна; в самом окне — совпадение двух каналов |
-| `arweave_throw` — **строго 0** | 1. `upload_outcome:arweave_throw` в AE 2. `{"critical":"arweave_throw"}` в логах 3. ledger драйвера: **попытки** против успехов | ledger даёт независимый счёт попыток (с `cf38c4b`), поэтому провал виден как расхождение «попыток больше, чем успехов» даже если обе телеметрии потеряли строку |
-| `legacy_unproven`, `recovery_unproven` — ≤ 1 и 0 в последние 48 ч | `semantic_idempotency` + `state.unprovenSeen` в ledger | два счёта одного события; расхождение = потеря в одном из каналов |
-| доля успеха ≥ 95 % | `upload_outcome` (`accepted` ÷ все) + ledger (успехи ÷ попытки) | ledger знаменатель считает честно; AE-доля сверяется с ним |
+| `conflict`, `redrop_conflict`, `legacy_not_ours` — **строго 0** | 1. `semantic_idempotency` в AE, свой индекс на исход 2. строка `{"critical":…}` в Workers Logs | два независимых канала: чтобы ноль оказался ложным, событие должно потеряться в ОБОИХ. Драйвер дополнительно ставит `STOP` при конфликте — третий сигнал, независимый от телеметрии |
+| `recovery_conflict` — **строго 0** | только AE + логи | **по существу не проверяется**: путь недостижим для драйвера, и ноль здесь означает «не наблюдалось», а не «проверено». То же ограничение, что у отменённого `recovery_reconciled` |
+| `arweave_throw` — **строго 0** | 1. `upload_outcome` в AE 2. `{"critical":"arweave_throw"}` в логах 3. ledger: попытки против успехов | ledger ловит РАСХОЖДЕНИЕ (попыток больше, чем успехов) даже если обе телеметрии потеряли строку. Он их не заменяет: знаменатель другой |
+| `legacy_unproven` — ≤ 1 и 0 в последние 48 ч | AE + `unprovenSeen` в ledger | два счёта одного события; расхождение = потеря в одном из каналов |
+| `recovery_unproven` — ≤ 1 | только AE + логи | как `recovery_conflict`: ledger-аналога нет |
+| доля успеха ≥ 95 % | `upload_outcome` (`accepted` ÷ все) | ledger — только для сверки ПОРЯДКА величины, не для замены: знаменатели разные |
 | объём (30 решений, 3 дня, 10 дедупов, 3 бэкфилла, 20 платных) | ledger (`summarize`) + `semantic_idempotency` | ledger авторитетен по действиям драйвера, AE — по решениям воркера |
 
-**Ежедневная выгрузка обязательна.** Workers Logs хранит максимум **семь
-дней**, а окно соака — ровно семь. Начало окна может исчезнуть в тот самый
-день, когда окно оценивают. `soak-d2.mjs snapshot` пишет датированные файлы по
-всем четырём отчётам (24 ч и 168 ч) в `~/.eternal-notes-soak/snapshots/`; `day`
-вызывает его автоматически при наличии `METRICS_ADMIN_SECRET`. Логи, которые
-нужно сохранить дольше семи дней, выгружаются отдельно — у этого канала своя
-учётка (Workers Observability read), в `CF_ANALYTICS_TOKEN` этих прав нет.
+**Что из этого следует.** Полностью двухканальны только три конфликтных исхода
+и `arweave_throw`. `recovery_*` остаются одноканальными и недостижимыми для
+драйвера — это ограничение надо принимать явно при зачёте окна, а не считать
+закрытым.
 
-## Проверка доставки (после деплоя, до старта окна)
+## Ежедневное сохранение свидетельств
 
-`head_sampling_rate = 1` — это запрос на полный сбор, **не** гарантия хранения
-без потерь. Конфигурация сама по себе ничего не доказывает, поэтому доставка
-проверяется наблюдением.
+Оба канала **истекают**: Workers Logs хранит максимум семь дней, а окно соака —
+ровно семь, поэтому начало окна исчезает в тот самый день, когда окно
+оценивают. Что не записано на диск — потеряно.
 
-**Только на staging.** Контрольное событие — это настоящий `conflict`, и
-выпущенное в dev-контуре оно **сломает тот самый критерий, который должно
-подтвердить**: отчёт за 168 ч увидит единицу вместо нуля. У staging свой
-датасет (`eternal_notes_metrics_staging`) и свои логи, поэтому загрязнения нет.
+Три команды, все только на чтение, все нужны ежедневно:
+
+```
+node worker/scripts/soak-d2.mjs snapshot
+node worker/scripts/metrics-export.mjs metrics --hours 24
+node worker/scripts/metrics-export.mjs logs --hours 24
+```
+
+`soak-d2.mjs snapshot` архивирует **только Analytics Engine** — логи он не
+трогает. Их забирает `metrics-export.mjs`, и ему нужен **отдельный токен**
+(`Account → Workers Observability → Read`); в `CF_ANALYTICS_TOKEN` этих прав
+нет.
+
+Как `metrics-export.mjs logs` защищает выгрузку:
+
+- диапазон режется на срезы (`--slice-minutes`, по умолчанию 60), запрос идёт
+  по каждому срезу отдельно;
+- срез, вернувшийся ровно на потолке (1000 событий), **обрывает выгрузку
+  ошибкой**: он неотличим от усечённого, а молча короткий архив хуже
+  отсутствующего — его прочитают как «ничего не было». Лечение — меньший срез;
+- любой не-2xx от API даёт исключение, а не пустой результат;
+- **ноль событий на всём диапазоне — находка, а не успех**: ровно так выглядит
+  «логи не собирались». Скрипт говорит об этом отдельной строкой.
+
+`metrics-export.mjs metrics` сохраняет и **сырые строки** с `_sample_interval`:
+взвешенную оценку нельзя пересчитать после того, как окно истекло.
+
+## Проверка доставки
+
+`head_sampling_rate = 1` — запрос на полный сбор, **не** гарантия хранения без
+потерь. Конфигурация ничего не доказывает; доставка проверяется наблюдением, и
+проверок нужно ДВЕ.
+
+**1. Контрольное событие — только на staging.** Настоящий `conflict`,
+выпущенный в dev-контуре, сломает ровно тот критерий, который должен
+подтвердить: отчёт за 168 ч увидит единицу вместо нуля. У staging свой датасет
+(`eternal_notes_metrics_staging`) и свои логи.
 
 1. Задеплоить кандидата на staging.
-2. Отправить `/upload` с уже занятым `noteId` и другими байтами → 409
-   `id_payload_conflict`. Платного POST на этом пути нет, деньги не тратятся.
-3. Убедиться, что событие видно **в обоих** каналах:
-   - `POST /admin/metrics` `{report:'semantic_idempotency', hours:1}` → строка
-     `conflict`;
-   - запрос Workers Logs → строка `{"critical":"conflict",…}` с тем же
-     `noteId`.
-4. Оба канала показали — доставка подтверждена, можно катить на dev и начинать
-   окно. Показал один — расследовать до старта окна, а не после.
+2. Отправить `/upload` с занятым `noteId` и другими байтами → 409
+   `id_payload_conflict`. Платного POST на этом пути нет.
+3. Убедиться, что событие видно **в обоих** каналах: `semantic_idempotency`
+   показывает `conflict`, а `metrics-export.mjs logs` возвращает строку
+   `{"critical":"conflict"}` с тем же `noteId`.
+
+Это подтверждает ПРОВОДКУ. Про сбор в dev-контуре не говорит ничего.
+
+**2. Сбор в dev — событиями вне критериев.** После деплоя в dev, до старта
+окна:
+
+1. Сделать заведомо безопасный запрос: `/health` и один дедуп существующей
+   заметки. Платного пути не касается, ни один критерий не двигает.
+2. `metrics-export.mjs logs --hours 1` обязан вернуть **ненулевое** число
+   событий для этого воркера. Ноль здесь означает, что логи не собираются, и
+   это блокирует старт окна.
+3. `soak-d2.mjs snapshot` обязан показать строки за тот же час.
+
+Оба канала живы — окно можно открывать.
+
+**3. Контроль покрытия ВНУТРИ окна.** Ежедневно при разборе снапшота: число
+дедупов в ledger за сутки и `deduped` в `semantic_idempotency` должны сходиться
+по порядку величины, а суточная выгрузка логов — быть непустой. Расхождение или
+пустой день означает, что канал деградировал в середине окна; расследовать
+надо до конца окна, а не после.
+
+## Откат ниже разводки индексов
+
+Читатель `/admin/metrics` — часть воркера. Откат ниже коммита с разводкой
+вернёт старый шаблон `index1 = 'event'`, и строки новой схемы
+(`event:discriminator`) **перестанут показываться в отчётах**, оставаясь в
+датасете. Потеря тихая: отчёт ответит меньшим числом, а не ошибкой.
+
+Порядок отката:
+
+1. Поднять `WORKER_FLOOR_SHA` — откат ниже этого коммита допускается только
+   осознанно, как и любой откат читателя.
+2. Если откат всё же выполнен, **отчёты `/admin/metrics` считать неполными** и
+   читать метрики через `worker/scripts/metrics-export.mjs metrics`: он не
+   зависит от развёрнутой версии и читает обе схемы.
+3. `worker/scripts/metrics-export.test.mjs` сравнивает SQL скрипта с
+   `buildMetricsReportSql` символ в символ. Если один изменили без другого,
+   тест падает — чинить нужно пару, а не тест.

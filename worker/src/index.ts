@@ -1685,8 +1685,11 @@ const CRITICAL_OUTCOMES = new Set(['conflict', 'redrop_conflict', 'legacy_not_ou
  * cannot be told apart from an event that never happened — and «strictly zero»
  * is exactly a claim about absence. This channel is not a guarantee either
  * (`head_sampling_rate = 1` asks for full collection, it does not promise
- * lossless storage, and retention is seven days), so the two are used
- * together and the daily snapshot archives both before they age out.
+ * lossless storage, and retention is SEVEN DAYS — the length of a whole soak
+ * window). The two channels are therefore read together, and neither survives
+ * on its own: the logs must be exported to disk daily with
+ * `scripts/metrics-export.mjs logs`, which needs its own Workers Observability
+ * token. `soak-d2.mjs snapshot` archives Analytics Engine ONLY.
  *
  * PRIVACY: enum-like labels, the noteId, and — for a conflict — the txId that
  * the investigation is actually about. Never note bytes, never a key, never a
