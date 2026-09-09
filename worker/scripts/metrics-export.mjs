@@ -9,18 +9,21 @@
  *
  * 1. RETENTION. Workers Logs keeps at most seven days and a soak window is
  *    exactly seven, so the beginning of the window can age out on the day the
- *    window is judged. Analytics Engine is not indefinite either. Whatever is
- *    not written to disk daily is simply gone.
+ *    window is judged. Whatever is not written to disk daily is gone.
  *
  * 2. ROLLBACK. `/admin/metrics` is served BY the worker, so its SQL is whatever
- *    the deployed version happens to contain. Roll the worker back below the
- *    index split and its reader stops seeing `event:discriminator` rows — the
- *    evidence would still exist and become unreadable through the endpoint.
- *    This script reads BOTH schemas regardless of what is deployed.
+ *    the deployed version contains. Roll the worker back below the index split
+ *    and its reader stops seeing `event:discriminator` rows — the evidence
+ *    would still exist and become unreadable through the endpoint. This script
+ *    reads BOTH schemas regardless of what is deployed.
+ *
+ * THE GOVERNING RULE: an incomplete export must FAIL, never be archived. A
+ * short file is worse than a missing one — it gets read later as «nothing
+ * happened». Every uncertainty below therefore ends in an exception.
  *
  * Usage:
  *   node scripts/metrics-export.mjs metrics --hours 168 --out DIR
- *   node scripts/metrics-export.mjs logs --hours 24 --out DIR
+ *   node scripts/metrics-export.mjs logs --hours 24 --worker eternal-notes-proxy
  *
  * Credentials — never on the command line (shell history, process listings):
  *   metrics: $CF_ANALYTICS_TOKEN, else the file $CF_ANALYTICS_TOKEN_FILE
@@ -31,61 +34,92 @@
  *   both:    $CF_ACCOUNT_ID (an identifier, not a secret)
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, stat, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export const DEFAULT_ACCOUNT_ID = '88cd072a3c0a9b861d52dcc126b9d57e';
 export const DEFAULT_DATASET = 'eternal_notes_metrics';
+export const DEFAULT_WORKER = 'eternal-notes-proxy';
 export const REPORTS = ['gateway_health', 'upload_outcomes', 'status_verdicts', 'semantic_idempotency'];
+
+// ── Analytics Engine SQL ──────────────────────────────────────────────
 
 /**
  * The union that reads BOTH index schemas — the same expression the worker's
  * templates use. A data point carries exactly ONE `index1`, so the two sides
  * are mutually exclusive per row and the union cannot double count.
- *
- * Kept identical to worker/src/metrics.ts by metrics-export.test.mjs, which
- * compares this module's SQL with `buildMetricsReportSql` character for
- * character. If that test fails, the two readers have drifted.
  */
 export function indexFilter(event) {
   return `(index1 = '${event}' OR index1 LIKE '${event}:%')`;
 }
 
-/** Byte-for-byte the worker's whitelisted templates. */
-export function reportSql(report, dataset, hours) {
-  switch (report) {
-    case 'gateway_health':
-      return `SELECT blob2 AS kind, blob3 AS host, blob4 AS class, SUM(_sample_interval) AS calls, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_ms FROM ${dataset} WHERE ${indexFilter('gateway_call')} AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY kind, host, class LIMIT 200 FORMAT JSON`;
-    case 'upload_outcomes':
-      return `SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM ${dataset} WHERE ${indexFilter('upload_outcome')} AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON`;
-    case 'status_verdicts':
-      return `SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n FROM ${dataset} WHERE ${indexFilter('status_verdict')} AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY verdict, host LIMIT 100 FORMAT JSON`;
-    case 'semantic_idempotency':
-      return `SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM ${dataset} WHERE ${indexFilter('semantic_idempotency')} AND timestamp > NOW() - INTERVAL '${hours}' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON`;
-    default:
-      throw new Error(`unknown report: ${report}`);
-  }
-}
-
-/** Raw rows, unaggregated — what a `SUM(_sample_interval)` estimate is built from. */
-export function rawRowsSql(dataset, hours) {
-  return `SELECT timestamp, index1, blob1, blob2, blob3, blob4, double1, _sample_interval FROM ${dataset} WHERE timestamp > NOW() - INTERVAL '${hours}' HOUR ORDER BY timestamp ASC LIMIT 10000 FORMAT JSON`;
-}
-
-// ── Log export ────────────────────────────────────────────────────────
-
-/** The per-request cap this script asks the observability API for. */
-export const LOG_PAGE_LIMIT = 1000;
+const PROJECTION = {
+  gateway_health: "SELECT blob2 AS kind, blob3 AS host, blob4 AS class, SUM(_sample_interval) AS calls, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_ms",
+  upload_outcomes: 'SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n',
+  status_verdicts: 'SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n',
+  semantic_idempotency: 'SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n',
+};
+const EVENT_OF = {
+  gateway_health: 'gateway_call',
+  upload_outcomes: 'upload_outcome',
+  status_verdicts: 'status_verdict',
+  semantic_idempotency: 'semantic_idempotency',
+};
+const TAIL = {
+  gateway_health: 'GROUP BY kind, host, class LIMIT 200 FORMAT JSON',
+  upload_outcomes: 'GROUP BY outcome, app_version LIMIT 50 FORMAT JSON',
+  status_verdicts: 'GROUP BY verdict, host LIMIT 100 FORMAT JSON',
+  semantic_idempotency: 'GROUP BY outcome, app_version LIMIT 50 FORMAT JSON',
+};
 
 /**
- * Split a range into slices, newest last.
- *
- * The observability query API is asked for a bounded number of events per
- * call. Rather than trust an undocumented cursor, the range is CUT into
- * slices and each slice is checked against the cap (see assertNotTruncated):
- * a slice that comes back full may have lost events, and the answer is a
- * narrower slice, never a silent partial export.
+ * The RELATIVE form — byte-identical to the worker's whitelisted templates.
+ * Kept only so metrics-export.test.mjs can prove the two readers have not
+ * drifted; the archive itself uses the absolute form below.
  */
+export function reportSql(report, dataset, hours) {
+  if (!PROJECTION[report]) throw new Error(`unknown report: ${report}`);
+  return `${PROJECTION[report]} FROM ${dataset} WHERE ${indexFilter(EVENT_OF[report])} AND timestamp > NOW() - INTERVAL '${hours}' HOUR ${TAIL[report]}`;
+}
+
+/**
+ * The ABSOLUTE form — what the archive uses.
+ *
+ * `NOW()` is evaluated per query, so a run that fires five statements covers
+ * five slightly different windows and the raw rows do not add up to the
+ * aggregates they are supposed to explain. One fixed interval for every
+ * statement of a run makes the export reproducible and self-consistent.
+ */
+export function reportSqlAbsolute(report, dataset, fromIso, toIso) {
+  if (!PROJECTION[report]) throw new Error(`unknown report: ${report}`);
+  return `${PROJECTION[report]} FROM ${dataset} WHERE ${indexFilter(EVENT_OF[report])} AND timestamp >= toDateTime('${fromIso}') AND timestamp < toDateTime('${toIso}') ${TAIL[report]}`;
+}
+
+/** Raw rows for one interval — an aggregate cannot be re-derived once the window ages out. */
+export const RAW_ROW_LIMIT = 10000;
+export function rawRowsSqlAbsolute(dataset, fromIso, toIso) {
+  return `SELECT timestamp, index1, blob1, blob2, blob3, blob4, double1, _sample_interval FROM ${dataset} WHERE timestamp >= toDateTime('${fromIso}') AND timestamp < toDateTime('${toIso}') ORDER BY timestamp ASC LIMIT ${RAW_ROW_LIMIT} FORMAT JSON`;
+}
+
+/** ClickHouse `toDateTime` wants `YYYY-MM-DD HH:MM:SS`, not an ISO `T`/`Z`. */
+export function sqlTime(ms) {
+  return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+// ── Completeness guards ───────────────────────────────────────────────
+
+/**
+ * The observability API's documented caps. `parameters.limit` is the PAGE size
+ * (max 100); the top-level `limit` bounds the whole query (max 2000). They are
+ * different knobs and passing one value to both — as the first version of this
+ * script did — makes any completeness check meaningless.
+ */
+export const LOG_PAGE_LIMIT = 100;
+export const LOG_QUERY_LIMIT = 2000;
+/** Pages per slice before the slice is declared too broad to export safely. */
+export const MAX_PAGES_PER_SLICE = Math.ceil(LOG_QUERY_LIMIT / LOG_PAGE_LIMIT);
+
+/** Split a range into slices, oldest first. */
 export function sliceRange(fromMs, toMs, sliceMs) {
   if (!(Number.isFinite(fromMs) && Number.isFinite(toMs)) || toMs <= fromMs) {
     throw new Error(`bad range: ${fromMs}..${toMs}`);
@@ -99,19 +133,100 @@ export function sliceRange(fromMs, toMs, sliceMs) {
 }
 
 /**
- * A slice that returned exactly the cap is INDISTINGUISHABLE from a slice that
- * was truncated, and a silently short export is worse than none: it would be
- * archived as evidence and read as «nothing happened».
+ * A slice that exhausts the query cap may have lost events, and a silently
+ * short export is archived as evidence and later read as «nothing happened».
  */
-export function assertNotTruncated(count, limit, slice) {
-  if (count >= limit) {
-    const from = new Date(slice.from).toISOString();
-    const to = new Date(slice.to).toISOString();
+export function assertSliceComplete(count, slice) {
+  if (count >= LOG_QUERY_LIMIT) {
     throw new Error(
-      `slice ${from}..${to} returned ${count} events at the ${limit} cap — it may be truncated. `
+      `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()} reached the `
+      + `${LOG_QUERY_LIMIT}-event query cap — it may be truncated. Re-run with a smaller `
+      + '--slice-minutes; do NOT archive this run.',
+    );
+  }
+}
+
+/**
+ * The envelope check. A 200 carrying `success: false` is a FAILURE, and the
+ * first version of this script turned it into an empty array and exit 0.
+ */
+export function unwrap(doc, what) {
+  if (!doc || typeof doc !== 'object') throw new Error(`${what}: answer is not an object`);
+  if (doc.success !== true) {
+    throw new Error(`${what}: API reported failure — ${JSON.stringify(doc.errors ?? doc).slice(0, 300)}`);
+  }
+  if (!('result' in doc)) throw new Error(`${what}: no result in a successful answer`);
+  return doc.result;
+}
+
+/**
+ * Adaptive Bit Rate: the observability store may answer from a SAMPLED tier,
+ * and `abr_level` says which. Anything above the exact tier means the counts
+ * are estimates — which is the very property this export exists to avoid, so
+ * it is refused rather than archived with a footnote nobody reads.
+ */
+export function assertNotSampled(statistics, slice) {
+  const level = statistics?.abr_level;
+  if (level !== undefined && level !== null && Number(level) > 1) {
+    throw new Error(
+      `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()} was answered at `
+      + `abr_level=${level} — the store SAMPLED it, so these counts are estimates. `
       + 'Re-run with a smaller --slice-minutes; do NOT archive this run.',
     );
   }
+  return level ?? null;
+}
+
+/**
+ * Every returned event must belong to the worker that was asked for.
+ *
+ * The first version passed `filters: []`, so one event from any other worker
+ * in the account made the delivery check pass. A filter alone is not enough
+ * either: if the filter KEY is wrong the API may quietly match everything, so
+ * membership is verified on the rows that come back.
+ */
+export function assertAllFromWorker(events, scriptKey, target) {
+  const readKey = (e) => scriptKey.split('.').reduce((v, k) => (v == null ? v : v[k]), e);
+  const strays = events
+    .map((e) => readKey(e))
+    .filter((v) => v !== target);
+  if (strays.length) {
+    const seen = [...new Set(strays.map((v) => String(v)))].slice(0, 5);
+    throw new Error(
+      `${strays.length} of ${events.length} events are not from ${target} (saw ${seen.join(', ')}) — `
+      + `the filter on ${scriptKey} did not hold. Do NOT archive this run.`,
+    );
+  }
+}
+
+/**
+ * Which field carries the script name is not something to guess: a wrong key
+ * silently matches nothing, and «no events» is exactly the answer that must
+ * never be produced by a bug. The key is resolved against the store's own key
+ * list and the run fails loudly when none of the candidates exists.
+ */
+export const SCRIPT_KEY_CANDIDATES = ['$metadata.service', '$workers.scriptName', '$metadata.scriptName', 'scriptName'];
+
+export function pickScriptKey(availableKeys) {
+  const names = new Set(availableKeys.map((k) => (typeof k === 'string' ? k : k?.key)).filter(Boolean));
+  const hit = SCRIPT_KEY_CANDIDATES.find((c) => names.has(c));
+  if (!hit) {
+    throw new Error(
+      `none of the known script-name keys (${SCRIPT_KEY_CANDIDATES.join(', ')}) exists in this store; `
+      + `available: ${[...names].slice(0, 20).join(', ')}. Refusing to export unfiltered.`,
+    );
+  }
+  return hit;
+}
+
+/**
+ * Archive name: mode, target and the EXACT interval. Two exports on one day —
+ * a daily one and an hourly delivery check — must not collide, and the first
+ * version's `YYYY-MM-DD-mode.json` let the second destroy the first.
+ */
+export function archiveName(mode, target, fromMs, toMs) {
+  const stamp = (ms) => new Date(ms).toISOString().replace(/[:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  return `${stamp(fromMs)}--${stamp(toMs)}-${mode}-${target}.json`;
 }
 
 // ── IO ────────────────────────────────────────────────────────────────
@@ -127,7 +242,7 @@ async function credential(envName, fileEnvName) {
   throw new Error(`missing credential: set $${envName} or point $${fileEnvName} at a file containing it`);
 }
 
-async function cfPost(url, token, body, asJson) {
+async function cfPost(url, token, body, asJson, what) {
   const res = await fetch(url, {
     method: 'POST',
     headers: asJson
@@ -137,65 +252,129 @@ async function cfPost(url, token, body, asJson) {
     signal: AbortSignal.timeout(30_000),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${new URL(url).pathname}: ${text.slice(0, 300)}`);
+  if (!res.ok) throw new Error(`${what}: HTTP ${res.status} — ${text.slice(0, 300)}`);
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`non-JSON answer from ${new URL(url).pathname}: ${text.slice(0, 200)}`);
+    throw new Error(`${what}: non-JSON answer — ${text.slice(0, 200)}`);
   }
 }
 
-async function exportMetrics({ accountId, dataset, hours, outDir }) {
+/**
+ * Atomic and NON-DESTRUCTIVE.
+ *
+ * Written to a sibling temp file and renamed, so a process killed mid-write
+ * never leaves a half-file under the real name — and an existing archive is
+ * never replaced: evidence that is already on disk is not this tool's to
+ * destroy. The temp file is removed on every failure path.
+ */
+export async function writeArchive(dir, name, payload) {
+  await mkdir(dir, { recursive: true });
+  const finalPath = join(dir, name);
+  const tmp = `${finalPath}.tmp-${process.pid}`;
+  await writeFile(tmp, JSON.stringify(payload, null, 2) + '\n', { flag: 'wx' });
+  try {
+    if (await stat(finalPath).then(() => true, () => false)) {
+      throw new Error(`archive already exists: ${finalPath} — refusing to overwrite evidence`);
+    }
+    await rename(tmp, finalPath);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    throw e;
+  }
+  return finalPath;
+}
+
+// ── Exports ───────────────────────────────────────────────────────────
+
+async function exportMetrics({ accountId, dataset, fromMs, toMs, fetchImpl }) {
   const token = await credential('CF_ANALYTICS_TOKEN', 'CF_ANALYTICS_TOKEN_FILE');
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`;
-  const out = { at: new Date().toISOString(), kind: 'metrics', dataset, hours, reports: {}, raw: null };
+  const from = sqlTime(fromMs);
+  const to = sqlTime(toMs);
+  const post = (sql, what) => cfPost(url, token, sql, false, what);
+
+  const reports = {};
   for (const report of REPORTS) {
-    const doc = await cfPost(url, token, reportSql(report, dataset, hours), false);
-    out.reports[report] = doc.data ?? doc;
-    console.log(`  ${report}: ${Array.isArray(doc.data) ? doc.data.length : '?'} row(s)`);
+    const doc = await post(reportSqlAbsolute(report, dataset, from, to), report);
+    if (!Array.isArray(doc?.data)) throw new Error(`${report}: no data array in the answer`);
+    reports[report] = doc.data;
+    console.log(`  ${report}: ${doc.data.length} row(s)`);
   }
-  // The raw rows too: an aggregate cannot be re-derived once the window ages
-  // out, and `_sample_interval` is only visible here.
-  const raw = await cfPost(url, token, rawRowsSql(dataset, hours), false);
-  out.raw = raw.data ?? raw;
-  console.log(`  raw rows: ${Array.isArray(out.raw) ? out.raw.length : '?'}`);
-  return out;
+
+  const rawDoc = await post(rawRowsSqlAbsolute(dataset, from, to), 'raw');
+  if (!Array.isArray(rawDoc?.data)) throw new Error('raw: no data array in the answer');
+  if (rawDoc.data.length >= RAW_ROW_LIMIT) {
+    throw new Error(
+      `raw rows hit the ${RAW_ROW_LIMIT} cap — the export may be truncated. Narrow --hours; `
+      + 'do NOT archive this run.',
+    );
+  }
+  console.log(`  raw rows: ${rawDoc.data.length}`);
+
+  return {
+    at: new Date().toISOString(), kind: 'metrics', dataset,
+    interval: { from, to, fromMs, toMs },
+    reports, raw: rawDoc.data,
+  };
 }
 
-async function exportLogs({ accountId, hours, sliceMs, outDir }) {
+async function exportLogs({ accountId, target, fromMs, toMs, sliceMs }) {
   const token = await credential('CF_LOGS_TOKEN', 'CF_LOGS_TOKEN_FILE');
-  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/observability/telemetry/query`;
-  const to = Date.now();
-  const from = to - hours * 3600_000;
-  const slices = sliceRange(from, to, sliceMs);
+  const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/observability/telemetry`;
+
+  const keysDoc = await cfPost(`${base}/keys`, token, {
+    timeframe: { from: fromMs, to: toMs }, datasets: ['cloudflare-workers'], limit: 200,
+  }, true, 'keys');
+  const scriptKey = pickScriptKey(unwrap(keysDoc, 'keys') ?? []);
+  console.log(`  script-name key: ${scriptKey}`);
+
+  const slices = sliceRange(fromMs, toMs, sliceMs);
   const events = [];
+  const sliceMeta = [];
   for (const slice of slices) {
-    const doc = await cfPost(url, token, {
-      queryId: `soak-export-${slice.from}`,
-      timeframe: { from: slice.from, to: slice.to },
-      parameters: { datasets: ['cloudflare-workers'], filters: [], limit: LOG_PAGE_LIMIT },
-      view: 'events',
-      limit: LOG_PAGE_LIMIT,
-      dry: false,
-    }, true);
-    const batch = doc?.result?.events?.events ?? [];
-    assertNotTruncated(batch.length, LOG_PAGE_LIMIT, slice);
-    events.push(...batch);
-    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s)`);
+    let offset = 0;
+    let inSlice = 0;
+    let abr = null;
+    for (let page = 0; page < MAX_PAGES_PER_SLICE; page++) {
+      const doc = await cfPost(`${base}/query`, token, {
+        queryId: `soak-export-${slice.from}-${offset}`,
+        timeframe: { from: slice.from, to: slice.to },
+        parameters: { datasets: ['cloudflare-workers'], limit: LOG_PAGE_LIMIT, offset,
+          filters: [{ key: scriptKey, operation: 'eq', value: target, type: 'string' }] },
+        view: 'events',
+        limit: LOG_QUERY_LIMIT,
+        dry: false,
+      }, true, `query ${new Date(slice.from).toISOString()}`);
+      const result = unwrap(doc, 'query');
+      const batch = result?.events?.events;
+      if (!Array.isArray(batch)) throw new Error('query: no events array in a successful answer');
+      abr = assertNotSampled(result?.statistics, slice);
+      assertAllFromWorker(batch, scriptKey, target);
+      events.push(...batch);
+      inSlice += batch.length;
+      offset += batch.length;
+      if (batch.length < LOG_PAGE_LIMIT) break;
+      if (page === MAX_PAGES_PER_SLICE - 1) assertSliceComplete(LOG_QUERY_LIMIT, slice);
+    }
+    assertSliceComplete(inSlice, slice);
+    sliceMeta.push({ from: new Date(slice.from).toISOString(), to: new Date(slice.to).toISOString(), events: inSlice, abrLevel: abr });
+    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${inSlice} event(s)`);
   }
+
   const critical = events.filter((e) => {
     const msg = e?.$metadata?.message ?? e?.message ?? '';
     return typeof msg === 'string' && msg.includes('"critical"');
   });
   console.log(`  total ${events.length} event(s), of which ${critical.length} critical`);
-  // An EMPTY export is a finding, not a success: it is what «logs were never
-  // collected» looks like, and it must not be mistaken for «nothing happened».
   if (events.length === 0) {
-    console.log('  ! ZERO events in the whole range — verify that observability is enabled and collecting');
+    console.log('  ! ZERO events for this worker in the whole range — that is what «logs were never');
+    console.log('  ! collected» looks like. Do not read it as «nothing happened».');
   }
   return {
-    at: new Date().toISOString(), kind: 'logs', hours,
-    sliceMinutes: sliceMs / 60_000, slices: slices.length,
+    at: new Date().toISOString(), kind: 'logs', target, scriptKey,
+    interval: { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), fromMs, toMs },
+    sliceMinutes: sliceMs / 60_000, slices: sliceMeta,
     counts: { events: events.length, critical: critical.length },
     critical, events,
   };
@@ -203,12 +382,13 @@ async function exportLogs({ accountId, hours, sliceMs, outDir }) {
 
 export function parseArgs(argv) {
   const [mode, ...rest] = argv;
-  const opts = { hours: 24, out: null, sliceMinutes: 60 };
+  const opts = { hours: 24, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--hours') { opts.hours = Number(rest[++i]); continue; }
     if (a === '--out') { opts.out = String(rest[++i] ?? ''); continue; }
     if (a === '--slice-minutes') { opts.sliceMinutes = Number(rest[++i]); continue; }
+    if (a === '--worker') { opts.worker = String(rest[++i] ?? ''); continue; }
     throw new Error(`unknown argument: ${a}`);
   }
   if (!Number.isInteger(opts.hours) || opts.hours < 1 || opts.hours > 168) {
@@ -217,28 +397,31 @@ export function parseArgs(argv) {
   if (!Number.isInteger(opts.sliceMinutes) || opts.sliceMinutes < 1) {
     throw new Error('--slice-minutes must be a positive integer');
   }
+  if (!/^[a-z0-9-]{1,64}$/.test(opts.worker)) throw new Error('--worker must be a script name');
   return { mode, opts };
 }
 
 export async function main(argv) {
   const { mode, opts } = parseArgs(argv);
   if (!['metrics', 'logs'].includes(mode)) {
-    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N] [--slice-minutes N] [--out DIR]');
+    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N] [--slice-minutes N] [--worker NAME] [--out DIR]');
     return 2;
   }
   const accountId = process.env.CF_ACCOUNT_ID ?? DEFAULT_ACCOUNT_ID;
   const dataset = process.env.METRICS_DATASET ?? DEFAULT_DATASET;
   const outDir = opts.out ?? join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.eternal-notes-soak', 'snapshots');
-  await mkdir(outDir, { recursive: true });
+  // ONE interval for the whole run, fixed before the first request.
+  const toMs = Date.now();
+  const fromMs = toMs - opts.hours * 3600_000;
 
-  console.log(`${mode}: last ${opts.hours}h → ${outDir}`);
+  console.log(`${mode}: ${new Date(fromMs).toISOString()} .. ${new Date(toMs).toISOString()} → ${outDir}`);
   const payload = mode === 'metrics'
-    ? await exportMetrics({ accountId, dataset, hours: opts.hours, outDir })
-    : await exportLogs({ accountId, hours: opts.hours, sliceMs: opts.sliceMinutes * 60_000, outDir });
+    ? await exportMetrics({ accountId, dataset, fromMs, toMs })
+    : await exportLogs({ accountId, target: opts.worker, fromMs, toMs, sliceMs: opts.sliceMinutes * 60_000 });
 
-  const file = join(outDir, `${new Date().toISOString().slice(0, 10)}-${mode}.json`);
-  await writeFile(file, JSON.stringify(payload, null, 2) + '\n');
-  console.log(`kept: ${file}`);
+  const target = mode === 'metrics' ? dataset : opts.worker;
+  const path = await writeArchive(outDir, archiveName(mode, target, fromMs, toMs), payload);
+  console.log(`kept: ${path}`);
   return 0;
 }
 

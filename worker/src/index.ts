@@ -1672,11 +1672,19 @@ function payloadOrigins(env: Env): string[] {
 }
 
 /**
- * The outcomes docs/ROLLBACK.md requires to read STRICTLY ZERO over a soak
- * window. Each is a protocol defect, a mismatched pointer or an attack — the
- * kind of thing that must never be lost to a sampling decision.
+ * Every outcome a soak window is JUDGED on (docs/ROLLBACK.md «Exit»): the four
+ * that must read strictly zero, and the two bounded by «≤ 1 each and 0 in the
+ * final 48 hours». All six are protocol defects, mismatched pointers, attacks
+ * or transport failures — the kind of thing that must never be lost to a
+ * sampling decision, so each gets the second channel.
+ *
+ * `legacy_unproven` additionally has a ledger counterpart (`unprovenSeen`);
+ * `recovery_unproven` has none, which is exactly why it needs this one.
  */
-const CRITICAL_OUTCOMES = new Set(['conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict']);
+const CRITICAL_OUTCOMES = new Set([
+  'conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict',
+  'legacy_unproven', 'recovery_unproven',
+]);
 
 /**
  * One structured line per critical outcome, on Workers Logs.
