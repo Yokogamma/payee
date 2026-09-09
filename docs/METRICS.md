@@ -26,12 +26,25 @@ in `worker/src/metrics.ts`.
 
 **Why the discriminator is in the index.** Analytics Engine samples PER INDEX.
 While the index was the bare event name, every kind of `gateway_call` shared one
-sampling bucket: measured on 2026-09-09, 36 of 84 rows survived and the
-survivors were all `anchor`/`price`, so `post` and both `payload_*` kinds
-vanished from the report while the weighted total stayed correct. So a rare
-outcome sharing a bucket with a frequent one CAN disappear from the sample
-entirely. WHICH rows the sampler drops was not measured and does not need to be:
-for a criterion that must read zero, the possibility is already enough.
+sampling bucket. Two measurements from 2026-09-09, and they say different
+things — do not merge them:
+
+- **The narrow window** 2026-09-08 12:00–13:00 UTC, one soak run. `gateway_call`
+  kept FIVE rows: three `anchor` and two `price`. Not one surviving row for
+  `post` or for either `payload_*` kind, although all three had fired.
+  `SUM(_sample_interval)` over those five estimated 13 events, and 13 is exactly
+  what the run should have produced (3×(anchor+price+post) plus 2×(header+raw)) —
+  the estimate agreed with the expectation. In the same window
+  `legacy_backfilled` was reported as 4 against a real 2.
+- **168 hours.** `gateway_call` had 36 rows for an estimated 84 events — and
+  there `post` (9 rows) and both `payload_*` kinds (1 row each) DID appear. The
+  wider the interval, the likelier a kind keeps at least one row; it is the
+  narrow read that loses whole categories, and narrow reads are what a soak
+  report is made of.
+
+So a rare outcome sharing a bucket with a frequent one CAN disappear from the
+sample entirely. WHICH rows the sampler drops was not measured and does not need
+to be: for a criterion that must read zero, the possibility is already enough.
 
 Rows written before the split carry the bare event name, so every report reads
 **both** schemas: `(index1 = 'x' OR index1 LIKE 'x:%')`. A row has exactly one

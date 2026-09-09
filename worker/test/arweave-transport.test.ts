@@ -251,12 +251,14 @@ describe('makeEmit — fail-closed telemetry, fail-open requests', () => {
 /**
  * The index split.
  *
- * Analytics Engine samples PER INDEX. Measured on 2026-09-09: with the bare
- * event name as the index, 36 of 84 `gateway_call` rows survived and the
- * survivors were ALL `anchor`/`price` — `post` and both `payload_*` kinds
- * disappeared from the report while the weighted total stayed right. A rare
- * outcome sharing a bucket with a frequent one is the row that gets dropped,
- * which is fatal for a criterion that must read strictly zero.
+ * Analytics Engine samples PER INDEX. Measured on 2026-09-09 over the narrow
+ * window 2026-09-08 12:00–13:00 UTC: `gateway_call` kept FIVE rows — three
+ * `anchor` and two `price` — and not one surviving row for `post` or for either
+ * `payload_*` kind, although all three had fired. SUM(_sample_interval) over
+ * those five estimated 13 events, which matched the 13 expected from the runs.
+ *
+ * So a rare outcome sharing a bucket with a frequent one CAN vanish from the
+ * report — fatal for a criterion that must read strictly zero.
  */
 describe('metricIndexKey — one sampling bucket per outcome', () => {
   it('puts the discriminator in the index and leaves blob1 the bare event', () => {

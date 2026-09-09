@@ -53,11 +53,18 @@ const INDEX_DISCRIMINATOR_RE = /^[a-z0-9_.:-]{1,48}$/;
  *
  * Analytics Engine samples PER INDEX. With the bare event name as the index,
  * every kind of `gateway_call` shared ONE sampling bucket, and so did every
- * outcome of `semantic_idempotency`. Measured on 2026-09-09 over the D2 soak:
- * only 36 of 84 `gateway_call` rows survived, and the survivors happened to be
- * all `anchor`/`price` — `post` and both `payload_*` kinds vanished from the
- * report entirely while the weighted TOTAL stayed correct. The same mechanism
- * inflated `legacy_backfilled` to 4 against a real 2.
+ * outcome of `semantic_idempotency`.
+ *
+ * Measured on 2026-09-09 over the narrow window 2026-09-08 12:00–13:00 UTC:
+ * `gateway_call` kept FIVE rows — three `anchor`, two `price` — and no
+ * surviving row at all for `post` or for either `payload_*` kind, although all
+ * three had fired. SUM(_sample_interval) over those five estimated 13 events,
+ * matching the 13 expected from what the runs did. The same mechanism reported
+ * `legacy_backfilled` as 4 against a real 2.
+ *
+ * A WIDER measurement behaves differently and must not be conflated with it:
+ * over 168 hours `gateway_call` had 36 rows for an estimated 84 events, and
+ * there `post` (9 rows) and both `payload_*` kinds (1 row each) DID appear.
  *
  * That is fatal for the exit criteria in docs/ROLLBACK.md, which require
  * `conflict` and friends to read STRICTLY ZERO: a rare outcome sharing a bucket
