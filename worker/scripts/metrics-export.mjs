@@ -490,12 +490,42 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs }) {
   };
 }
 
+export const MAX_SPAN_MS = 168 * 3600_000;
+
+/**
+ * The interval of a run, fixed BEFORE the first request.
+ *
+ * `--hours` is relative to now, which makes two runs of the same command cover
+ * two different windows: convenient daily, useless for archiving a NAMED
+ * window and for re-running the identical export (the archive name carries the
+ * interval, so a relative run never collides and the overwrite refusal is
+ * never exercised). `--from/--to` give the reproducible form.
+ */
+export function resolveInterval(opts, nowMs) {
+  const hasAbsolute = opts.from !== null || opts.to !== null;
+  if (!hasAbsolute) {
+    const toMs = nowMs;
+    return { fromMs: toMs - opts.hours * 3600_000, toMs };
+  }
+  if (opts.from === null || opts.to === null) throw new Error('--from and --to must be given together');
+  if (opts.hoursGiven) throw new Error('--hours cannot be combined with --from/--to');
+  const fromMs = Date.parse(opts.from);
+  const toMs = Date.parse(opts.to);
+  if (!Number.isFinite(fromMs)) throw new Error(`--from is not a timestamp: ${opts.from}`);
+  if (!Number.isFinite(toMs)) throw new Error(`--to is not a timestamp: ${opts.to}`);
+  if (toMs <= fromMs) throw new Error('--to must be after --from');
+  if (toMs - fromMs > MAX_SPAN_MS) throw new Error('the interval must not exceed 168 hours');
+  return { fromMs, toMs };
+}
+
 export function parseArgs(argv) {
   const [mode, ...rest] = argv;
-  const opts = { hours: 24, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER };
+  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
-    if (a === '--hours') { opts.hours = Number(rest[++i]); continue; }
+    if (a === '--hours') { opts.hours = Number(rest[++i]); opts.hoursGiven = true; continue; }
+    if (a === '--from') { opts.from = String(rest[++i] ?? ''); continue; }
+    if (a === '--to') { opts.to = String(rest[++i] ?? ''); continue; }
     if (a === '--out') { opts.out = String(rest[++i] ?? ''); continue; }
     if (a === '--slice-minutes') { opts.sliceMinutes = Number(rest[++i]); continue; }
     if (a === '--worker') { opts.worker = String(rest[++i] ?? ''); continue; }
@@ -514,15 +544,14 @@ export function parseArgs(argv) {
 export async function main(argv) {
   const { mode, opts } = parseArgs(argv);
   if (!['metrics', 'logs'].includes(mode)) {
-    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N] [--slice-minutes N] [--worker NAME] [--out DIR]');
+    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--out DIR]');
     return 2;
   }
   const accountId = process.env.CF_ACCOUNT_ID ?? DEFAULT_ACCOUNT_ID;
   const dataset = process.env.METRICS_DATASET ?? DEFAULT_DATASET;
   const outDir = opts.out ?? join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.eternal-notes-soak', 'snapshots');
   // ONE interval for the whole run, fixed before the first request.
-  const toMs = Date.now();
-  const fromMs = toMs - opts.hours * 3600_000;
+  const { fromMs, toMs } = resolveInterval(opts, Date.now());
 
   console.log(`${mode}: ${new Date(fromMs).toISOString()} .. ${new Date(toMs).toISOString()} → ${outDir}`);
   const payload = mode === 'metrics'

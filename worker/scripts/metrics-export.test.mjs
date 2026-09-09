@@ -8,7 +8,7 @@ import {
   REPORTS, reportSql, reportSqlAbsolute, rawRowsSqlAbsolute, indexFilter, sqlTime,
   sliceRange, assertSliceComplete, assertNotSampled, assertAllFromWorker, pickScriptKey,
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
-  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS,
+  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
 } from './metrics-export.mjs';
 
@@ -206,10 +206,11 @@ describe('archives are unique, atomic and never overwritten', () => {
 describe('parseArgs', () => {
   it('reads the modes and flags', () => {
     expect(parseArgs(['metrics'])).toEqual({
-      mode: 'metrics', opts: { hours: 24, out: null, sliceMinutes: 60, worker: 'eternal-notes-proxy' },
+      mode: 'metrics',
+      opts: { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: 'eternal-notes-proxy' },
     });
     expect(parseArgs(['logs', '--hours', '168', '--slice-minutes', '15', '--out', 'D', '--worker', 'w-1']))
-      .toEqual({ mode: 'logs', opts: { hours: 168, out: 'D', sliceMinutes: 15, worker: 'w-1' } });
+      .toEqual({ mode: 'logs', opts: { hours: 168, hoursGiven: true, from: null, to: null, out: 'D', sliceMinutes: 15, worker: 'w-1' } });
   });
 
   it('refuses junk rather than exporting a wrong range', () => {
@@ -385,5 +386,57 @@ describe('concurrent publication', () => {
     expect(left.filter(f => f.includes('.tmp'))).toEqual([]);
     expect(left).toEqual(['race.json']);
     await rm(dir, { recursive: true, force: true });
+  });
+});
+/**
+ * A RELATIVE run covers a different window every time it starts, so two runs of
+ * the same command never collide — which also means the overwrite refusal is
+ * never reached from the CLI. Archiving a NAMED window, and re-running the
+ * identical export, need absolute bounds.
+ */
+describe('resolveInterval', () => {
+  const NOW = Date.UTC(2026, 8, 10, 12, 0, 0);
+  const rel = (over = {}) => ({ hours: 24, hoursGiven: false, from: null, to: null, ...over });
+
+  it('relative: ends at now and reaches back --hours', () => {
+    expect(resolveInterval(rel(), NOW)).toEqual({ fromMs: NOW - 24 * 3600_000, toMs: NOW });
+    expect(resolveInterval(rel({ hours: 1 }), NOW)).toEqual({ fromMs: NOW - 3600_000, toMs: NOW });
+  });
+
+  it('two relative runs of the SAME command cover different windows', () => {
+    const a = resolveInterval(rel(), NOW);
+    const b = resolveInterval(rel(), NOW + 1000);
+    expect(a).not.toEqual(b); // …hence never the same archive name
+  });
+
+  it('absolute: the SAME bounds every time, so a re-run hits the same archive', () => {
+    const opts = rel({ from: '2026-09-09T00:00:00Z', to: '2026-09-10T00:00:00Z' });
+    const first = resolveInterval(opts, NOW);
+    const second = resolveInterval(opts, NOW + 86_400_000);
+    expect(first).toEqual(second);
+    expect(first).toEqual({ fromMs: Date.UTC(2026, 8, 9), toMs: Date.UTC(2026, 8, 10) });
+  });
+
+  it('refuses a half-given, contradictory or impossible interval', () => {
+    expect(() => resolveInterval(rel({ from: '2026-09-09T00:00:00Z' }), NOW)).toThrow(/together/);
+    expect(() => resolveInterval(rel({ to: '2026-09-09T00:00:00Z' }), NOW)).toThrow(/together/);
+    expect(() => resolveInterval(rel({ hoursGiven: true, from: '2026-09-09T00:00:00Z', to: '2026-09-10T00:00:00Z' }), NOW))
+      .toThrow(/cannot be combined/);
+    expect(() => resolveInterval(rel({ from: 'yesterday', to: '2026-09-10T00:00:00Z' }), NOW)).toThrow(/not a timestamp/);
+    expect(() => resolveInterval(rel({ from: '2026-09-10T00:00:00Z', to: 'soon' }), NOW)).toThrow(/not a timestamp/);
+    expect(() => resolveInterval(rel({ from: '2026-09-10T00:00:00Z', to: '2026-09-10T00:00:00Z' }), NOW)).toThrow(/after --from/);
+    expect(() => resolveInterval(rel({ from: '2026-09-11T00:00:00Z', to: '2026-09-10T00:00:00Z' }), NOW)).toThrow(/after --from/);
+  });
+
+  it('refuses a span past the retention the evidence can come from', () => {
+    const from = new Date(NOW - MAX_SPAN_MS - 1000).toISOString();
+    expect(() => resolveInterval(rel({ from, to: new Date(NOW).toISOString() }), NOW))
+      .toThrow(/must not exceed 168 hours/);
+  });
+
+  it('the absolute form drives the archive name, so a re-run collides on purpose', () => {
+    const opts = rel({ from: '2026-09-09T00:00:00Z', to: '2026-09-10T00:00:00Z' });
+    const { fromMs, toMs } = resolveInterval(opts, NOW);
+    expect(archiveName('logs', 'w', fromMs, toMs)).toBe(archiveName('logs', 'w', fromMs, toMs));
   });
 });
