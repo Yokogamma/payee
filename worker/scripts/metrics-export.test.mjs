@@ -7,7 +7,8 @@ import { buildMetricsReportSql, METRICS_REPORTS } from '../src/metrics.ts';
 import {
   REPORTS, reportSql, reportSqlAbsolute, rawRowsSqlAbsolute, indexFilter, sqlTime,
   sliceRange, assertSliceComplete, assertNotSampled, assertAllFromWorker, pickScriptKey,
-  unwrap, archiveName, writeArchive, parseArgs,
+  unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
+  assertRunComplete, assertNoTruncatedEvents, COMPLETE_RUN_STATUSES,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
 } from './metrics-export.mjs';
 
@@ -218,5 +219,167 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['logs', '--slice-minutes', '0'])).toThrow(/positive integer/);
     expect(() => parseArgs(['logs', '--worker', 'Bad Name'])).toThrow(/script name/);
     expect(() => parseArgs(['logs', '--nope'])).toThrow(/unknown argument/);
+  });
+});
+/**
+ * Paging, end to end, without a network.
+ *
+ * The previous version incremented a NUMBER inside `parameters` and never
+ * asked for page two: the API pages `view: 'events'` by the id of the last
+ * event, at the TOP level. A one-page export of a multi-page slice is the
+ * silent short file this tool exists to prevent.
+ */
+describe('paging follows the documented cursor', () => {
+  const slice = { from: 0, to: 3600_000 };
+  const KEY = '$metadata.service';
+  const ev = (id) => ({ $metadata: { id, service: 'w' } });
+  const page = (n, first) => Array.from({ length: n }, (_, i) => ev(`id-${first + i}`));
+  const ok = (events, over = {}) => ({
+    success: true,
+    result: { run: { status: 'COMPLETE' }, statistics: { abr_level: 1 }, events: { events }, ...over },
+  });
+
+  it('sends the last $metadata.id as a TOP-LEVEL offset until a short page ends it', async () => {
+    const sent = [];
+    const post = async (body) => {
+      sent.push(body);
+      if (sent.length === 1) return ok(page(LOG_PAGE_LIMIT, 0));
+      if (sent.length === 2) return ok(page(LOG_PAGE_LIMIT, 100));
+      return ok(page(5, 200));
+    };
+
+    const { events, runStatus, abrLevel } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+
+    expect(events).toHaveLength(2 * LOG_PAGE_LIMIT + 5);
+    expect(sent).toHaveLength(3);
+    expect(sent[0].offset).toBeUndefined();            // the first page carries no cursor
+    expect(sent[1].offset).toBe('id-99');              // the LAST id of page one…
+    expect(sent[2].offset).toBe('id-199');             // …then of page two
+    expect(sent[1].parameters.offset).toBeUndefined(); // NOT a number inside parameters
+    expect(sent[1].parameters.limit).toBe(LOG_PAGE_LIMIT);
+    expect(sent[1].limit).toBe(LOG_QUERY_LIMIT);
+    expect(sent[1].parameters.filters).toEqual([{ key: KEY, operation: 'eq', value: 'w', type: 'string' }]);
+    expect(runStatus).toBe('COMPLETE');
+    expect(abrLevel).toBe(1);
+  });
+
+  it('a single short page needs no second request', async () => {
+    let calls = 0;
+    const post = async () => { calls += 1; return ok(page(3, 0)); };
+    const { events } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    expect(events).toHaveLength(3);
+    expect(calls).toBe(1);
+  });
+
+  it('an empty first page ends the slice without a cursor', async () => {
+    let calls = 0;
+    const post = async () => { calls += 1; return ok([]); };
+    const { events } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    expect(events).toEqual([]);
+    expect(calls).toBe(1);
+  });
+
+  it('refuses a cursor that does not advance — paging would loop or repeat', async () => {
+    const post = async () => ok(page(LOG_PAGE_LIMIT, 0)); // always the same last id
+    await expect(collectSlice({ post, slice, scriptKey: KEY, target: 'w' }))
+      .rejects.toThrow(/cursor did not advance.*NOT archive/si);
+  });
+
+  it('refuses a full page whose last event has no id', async () => {
+    const post = async () => ok([...page(LOG_PAGE_LIMIT - 1, 0), { $metadata: { service: 'w' } }]);
+    await expect(collectSlice({ post, slice, scriptKey: KEY, target: 'w' }))
+      .rejects.toThrow(/no \$metadata\.id.*cannot page safely/s);
+  });
+
+  it('nextCursor is null on a short page and refuses a repeat', () => {
+    expect(nextCursor([], null)).toBe(null);
+    expect(nextCursor([ev('a')], null)).toBe('a');
+    expect(() => nextCursor([ev('a')], 'a')).toThrow(/did not advance/);
+    expect(eventId(ev('z'))).toBe('z');
+  });
+});
+
+/**
+ * `success: true` says the REQUEST was accepted, not that the query finished.
+ * A run still STARTED answers with what it had so far — and that answer passed
+ * every other check here and was archived with exit 0.
+ */
+describe('a query that has not finished is refused', () => {
+  const slice = { from: 0, to: 3600_000 };
+
+  it('refuses run.status STARTED', () => {
+    expect(() => assertRunComplete({ status: 'STARTED' }, slice))
+      .toThrow(/run\.status=STARTED.*had not finished.*NOT archive/si);
+  });
+
+  it('refuses an ABSENT status — unverifiable completion is not completion', () => {
+    expect(() => assertRunComplete({}, slice)).toThrow(/no run\.status/);
+    expect(() => assertRunComplete(undefined, slice)).toThrow(/no run\.status/);
+    expect(() => assertRunComplete({ status: '' }, slice)).toThrow(/no run\.status/);
+  });
+
+  it('accepts the terminal spellings, case-insensitively', () => {
+    for (const s of COMPLETE_RUN_STATUSES) {
+      expect(assertRunComplete({ status: s.toLowerCase() }, slice)).toBe(s);
+    }
+  });
+
+  it('the whole slice fails on it, not just the page', async () => {
+    const post = async () => ({
+      success: true,
+      result: { run: { status: 'STARTED' }, statistics: { abr_level: 1 }, events: { events: [] } },
+    });
+    await expect(collectSlice({ post, slice, scriptKey: '$metadata.service', target: 'w' }))
+      .rejects.toThrow(/had not finished/);
+  });
+});
+
+/**
+ * A truncated event is not the event: the message may be cut exactly where the
+ * `{"critical":…}` payload sits, turning a recorded defect into an unreadable
+ * line.
+ */
+describe('truncated events are refused', () => {
+  const slice = { from: 0, to: 3600_000 };
+
+  it('refuses a batch carrying a truncated event', () => {
+    expect(() => assertNoTruncatedEvents([{}, { $workers: { truncated: true } }], slice))
+      .toThrow(/1 of 2 events are marked truncated.*NOT archive/si);
+    expect(() => assertNoTruncatedEvents([{ $workers: { truncated: false } }], slice)).not.toThrow();
+  });
+
+  it('the whole slice fails on it', async () => {
+    const post = async () => ({
+      success: true,
+      result: {
+        run: { status: 'COMPLETE' }, statistics: { abr_level: 1 },
+        events: { events: [{ $metadata: { id: 'a', service: 'w' }, $workers: { truncated: true } }] },
+      },
+    });
+    await expect(collectSlice({ post, slice, scriptKey: '$metadata.service', target: 'w' }))
+      .rejects.toThrow(/marked truncated/);
+  });
+});
+
+/**
+ * `stat` then `rename` leaves a window in which another process publishes
+ * between the two: both runs report success and one result is lost.
+ */
+describe('concurrent publication', () => {
+  it('two simultaneous publishes: exactly one wins, the other says why', async () => {
+    const dir = tmpDir();
+    const settled = await Promise.allSettled([
+      writeArchive(dir, 'race.json', { who: 1 }),
+      writeArchive(dir, 'race.json', { who: 2 }),
+    ]);
+
+    expect(settled.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    const loser = settled.find(r => r.status === 'rejected');
+    expect(String(loser.reason)).toMatch(/already exists.*refusing to overwrite evidence/s);
+    // One archive, and no temp debris from the loser.
+    const left = await readdir(dir);
+    expect(left.filter(f => f.includes('.tmp'))).toEqual([]);
+    expect(left).toEqual(['race.json']);
+    await rm(dir, { recursive: true, force: true });
   });
 });

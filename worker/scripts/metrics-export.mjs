@@ -34,7 +34,8 @@
  *   both:    $CF_ACCOUNT_ID (an identifier, not a secret)
  */
 
-import { readFile, writeFile, mkdir, rename, stat, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, link, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 export const DEFAULT_ACCOUNT_ID = '88cd072a3c0a9b861d52dcc126b9d57e';
@@ -178,6 +179,120 @@ export function assertNotSampled(statistics, slice) {
 }
 
 /**
+ * The query must have RUN TO COMPLETION.
+ *
+ * A `success: true` envelope only says the REQUEST was accepted. A run still
+ * `STARTED` answers with whatever it had gathered so far, and archiving that is
+ * exactly the silent short file this tool exists to prevent — it passed every
+ * other check here (array present, abr_level 1, right worker) and was written
+ * out with exit 0.
+ *
+ * The allowlist is deliberately narrow, and an ABSENT status is a refusal too:
+ * completion that cannot be verified is not completion. A first live run
+ * against an unlisted spelling fails loudly, which is the intended direction of
+ * the error.
+ */
+export const COMPLETE_RUN_STATUSES = new Set(['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED']);
+
+export function assertRunComplete(run, slice) {
+  const where = `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()}`;
+  const status = run?.status;
+  if (status === undefined || status === null || status === '') {
+    throw new Error(`${where}: the answer carries no run.status, so completion cannot be verified. Do NOT archive this run.`);
+  }
+  const upper = String(status).toUpperCase();
+  if (!COMPLETE_RUN_STATUSES.has(upper)) {
+    throw new Error(
+      `${where}: run.status=${status} — the query had not finished, so the events are partial. `
+      + 'Do NOT archive this run.',
+    );
+  }
+  return upper;
+}
+
+/**
+ * An event the store TRUNCATED is not the event: the message may be cut exactly
+ * where the `{"critical":…}` payload sits, which would turn a recorded defect
+ * into a line nobody can read.
+ */
+export function assertNoTruncatedEvents(events, slice) {
+  const cut = events.filter((e) => e?.$workers?.truncated === true);
+  if (cut.length) {
+    throw new Error(
+      `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()}: `
+      + `${cut.length} of ${events.length} events are marked truncated — their payload is incomplete. `
+      + 'Do NOT archive this run.',
+    );
+  }
+}
+
+/** The events cursor: `$metadata.id`, passed at the TOP level as `offset`. */
+export function eventId(e) {
+  return e?.$metadata?.id;
+}
+
+/**
+ * The next cursor, or null when the page was the last one.
+ *
+ * NOT a row count: the API pages `view: 'events'` by the id of the last event
+ * seen, at the top level. The previous version incremented a NUMBER inside
+ * `parameters`, which is a different knob — it never asked for page two.
+ */
+export function nextCursor(batch, previous) {
+  if (!batch.length) return null;
+  const last = eventId(batch[batch.length - 1]);
+  if (typeof last !== 'string' || !last) {
+    throw new Error('the last event of a full page carries no $metadata.id — cannot page safely. Do NOT archive this run.');
+  }
+  if (last === previous) {
+    throw new Error(`the cursor did not advance (${last}) — paging would loop or silently repeat. Do NOT archive this run.`);
+  }
+  return last;
+}
+
+/**
+ * One slice, paged to exhaustion. `post` is injected so the whole loop —
+ * cursor handling included — is exercised by the tests without a network.
+ */
+export async function collectSlice({ post, slice, scriptKey, target }) {
+  const events = [];
+  let cursor = null;
+  let abrLevel = null;
+  let runStatus = null;
+  for (let page = 0; page < MAX_PAGES_PER_SLICE; page++) {
+    const body = {
+      queryId: `soak-export-${slice.from}-${page}`,
+      timeframe: { from: slice.from, to: slice.to },
+      parameters: {
+        datasets: ['cloudflare-workers'],
+        limit: LOG_PAGE_LIMIT,
+        filters: [{ key: scriptKey, operation: 'eq', value: target, type: 'string' }],
+      },
+      view: 'events',
+      limit: LOG_QUERY_LIMIT,
+      dry: false,
+    };
+    if (cursor) body.offset = cursor;
+
+    const result = unwrap(await post(body, `page ${page + 1}`), 'query');
+    runStatus = assertRunComplete(result?.run, slice);
+    abrLevel = assertNotSampled(result?.statistics, slice);
+    const batch = result?.events?.events;
+    if (!Array.isArray(batch)) throw new Error('query: no events array in a successful answer');
+    assertNoTruncatedEvents(batch, slice);
+    assertAllFromWorker(batch, scriptKey, target);
+    events.push(...batch);
+    assertSliceComplete(events.length, slice);
+
+    if (batch.length < LOG_PAGE_LIMIT) return { events, abrLevel, runStatus };
+    cursor = nextCursor(batch, cursor);
+  }
+  // Every page came back full and the pages ran out: the slice is too broad.
+  assertSliceComplete(LOG_QUERY_LIMIT, slice);
+  return { events, abrLevel, runStatus };
+}
+
+/**
  * Every returned event must belong to the worker that was asked for.
  *
  * The first version passed `filters: []`, so one event from any other worker
@@ -271,16 +386,28 @@ async function cfPost(url, token, body, asJson, what) {
 export async function writeArchive(dir, name, payload) {
   await mkdir(dir, { recursive: true });
   const finalPath = join(dir, name);
-  const tmp = `${finalPath}.tmp-${process.pid}`;
-  await writeFile(tmp, JSON.stringify(payload, null, 2) + '\n', { flag: 'wx' });
+  // Unique per PROCESS, not just per pid: two runs on one machine must not
+  // collide on the temp file either.
+  const tmp = `${finalPath}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    if (await stat(finalPath).then(() => true, () => false)) {
-      throw new Error(`archive already exists: ${finalPath} — refusing to overwrite evidence`);
+    await writeFile(tmp, JSON.stringify(payload, null, 2) + '\n', { flag: 'wx' });
+    // `link` is an ATOMIC create-if-absent: it fails with EEXIST rather than
+    // replacing. A `stat` followed by `rename` — what this used to do — leaves
+    // a window in which another process publishes between the two, and both
+    // runs then report success while only one file survives.
+    try {
+      await link(tmp, finalPath);
+    } catch (e) {
+      if (e?.code === 'EEXIST') {
+        throw new Error(`archive already exists: ${finalPath} — refusing to overwrite evidence`);
+      }
+      throw e;
     }
-    await rename(tmp, finalPath);
-  } catch (e) {
+  } finally {
+    // Always: the content now lives at `finalPath` through the hard link, and
+    // a failure anywhere above must not leave debris. The write itself is
+    // INSIDE the try, so a failure during it is cleaned up too.
     await rm(tmp, { force: true });
-    throw e;
   }
   return finalPath;
 }
@@ -329,37 +456,18 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs }) {
   const scriptKey = pickScriptKey(unwrap(keysDoc, 'keys') ?? []);
   console.log(`  script-name key: ${scriptKey}`);
 
+  const post = (body, what) => cfPost(`${base}/query`, token, body, true, what);
   const slices = sliceRange(fromMs, toMs, sliceMs);
   const events = [];
   const sliceMeta = [];
   for (const slice of slices) {
-    let offset = 0;
-    let inSlice = 0;
-    let abr = null;
-    for (let page = 0; page < MAX_PAGES_PER_SLICE; page++) {
-      const doc = await cfPost(`${base}/query`, token, {
-        queryId: `soak-export-${slice.from}-${offset}`,
-        timeframe: { from: slice.from, to: slice.to },
-        parameters: { datasets: ['cloudflare-workers'], limit: LOG_PAGE_LIMIT, offset,
-          filters: [{ key: scriptKey, operation: 'eq', value: target, type: 'string' }] },
-        view: 'events',
-        limit: LOG_QUERY_LIMIT,
-        dry: false,
-      }, true, `query ${new Date(slice.from).toISOString()}`);
-      const result = unwrap(doc, 'query');
-      const batch = result?.events?.events;
-      if (!Array.isArray(batch)) throw new Error('query: no events array in a successful answer');
-      abr = assertNotSampled(result?.statistics, slice);
-      assertAllFromWorker(batch, scriptKey, target);
-      events.push(...batch);
-      inSlice += batch.length;
-      offset += batch.length;
-      if (batch.length < LOG_PAGE_LIMIT) break;
-      if (page === MAX_PAGES_PER_SLICE - 1) assertSliceComplete(LOG_QUERY_LIMIT, slice);
-    }
-    assertSliceComplete(inSlice, slice);
-    sliceMeta.push({ from: new Date(slice.from).toISOString(), to: new Date(slice.to).toISOString(), events: inSlice, abrLevel: abr });
-    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${inSlice} event(s)`);
+    const { events: batch, abrLevel, runStatus } = await collectSlice({ post, slice, scriptKey, target });
+    events.push(...batch);
+    sliceMeta.push({
+      from: new Date(slice.from).toISOString(), to: new Date(slice.to).toISOString(),
+      events: batch.length, abrLevel, runStatus,
+    });
+    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s)`);
   }
 
   const critical = events.filter((e) => {
