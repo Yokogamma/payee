@@ -284,7 +284,7 @@ describe('summarize', () => {
       ],
     };
     const rows = Object.fromEntries(summarize(state).map(r => [r.name, r]));
-    expect(rows['paid outcomes IN THE WINDOW (day runs only)']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
+    expect(rows['confirmed paid publications in the window (plan; criterion = upload_outcome in AE)']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
     expect(rows['deduped']).toMatchObject({ have: 14, ok: true });
     expect(rows['distinct days with a day run']).toMatchObject({ have: 2, ok: false });
     expect(rows['legacy_backfilled (distinct records)']).toMatchObject({ have: 2, ok: false });
@@ -726,7 +726,7 @@ describe('paid publications are attributed from durable records', () => {
 
   it('the volume row reports the WINDOW figure, not the lifetime one', () => {
     const s = ledger(5, 9);
-    const row = summarize(s).find(r => /paid outcomes/i.test(r.name));
+    const row = summarize(s).find(r => /confirmed paid publications/i.test(r.name));
     expect(row).toMatchObject({ have: 9, need: VOLUME.paidOutcomes, ok: false });
     expect(row.have).not.toBe(s.paidPosts);
   });
@@ -735,8 +735,8 @@ describe('paid publications are attributed from durable records', () => {
     const real = ledger(0, 20);
     const padded = ledger(5, 15);
     expect(padded.paidPosts).toBe(20);
-    expect(summarize(real).find(r => /paid outcomes/i.test(r.name)).ok).toBe(true);
-    expect(summarize(padded).find(r => /paid outcomes/i.test(r.name)).ok).toBe(false);
+    expect(summarize(real).find(r => /confirmed paid publications/i.test(r.name)).ok).toBe(true);
+    expect(summarize(padded).find(r => /confirmed paid publications/i.test(r.name)).ok).toBe(false);
   });
 
   it('the BUDGET counts the seeding — money spent is money spent', () => {
@@ -777,7 +777,7 @@ describe('paid publications are attributed from durable records', () => {
     // The publication belongs to the WINDOW, and is not misfiled as seeding.
     expect(paidOutcomesInWindow(reloaded)).toBe(1);
     expect(seededPaid(reloaded)).toBe(0);
-    expect(summarize(reloaded).find(r => /paid outcomes/i.test(r.name)).have).toBe(1);
+    expect(summarize(reloaded).find(r => /confirmed paid publications/i.test(r.name)).have).toBe(1);
     await rm(dir, { recursive: true, force: true });
   });
 });
