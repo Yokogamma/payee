@@ -187,8 +187,21 @@ binding = "CF_VERSION_METADATA"
 # OPERATOR PREREQUISITES (once, before first `npm run deploy:staging`):
 #   1. wrangler kv namespace create ALLOWLIST --env staging
 #      → paste the returned id below (placeholder deploys will fail until then).
-#   2. wrangler secret put ARWEAVE_JWK --env staging        (DEDICATED test JWK,
-#      minimal AR balance — never the production wallet)
+#   2. wrangler secret put ARWEAVE_JWK --env staging
+#      Use THE SAME wallet as the dev contour. That is not laziness, it is what
+#      the config on line ~267 already requires: `env.staging.TRUSTED_OWNERS`
+#      names exactly one address, the dev one, and `/upload` answers 503 while
+#      the signing wallet is outside that set (walletTrust) — so a DIFFERENT
+#      JWK would refuse every upload until its address were added here too.
+#      The older wording asked for a dedicated JWK «never the production
+#      wallet»; there IS no production wallet yet (production will be built
+#      from scratch on .app later), and the dev wallet is already a test wallet
+#      with a minimal balance, so a second one buys nothing and would have to
+#      be funded with real AR.
+#      The cost of sharing it, named rather than hidden: the same JWK then
+#      lives in two workers' secrets, and staging's paid posts draw on the same
+#      balance as the soak budget. Revisit BOTH this line and staging's
+#      TRUSTED_OWNERS when a real production contour exists.
 #   3. wrangler secret put ADMIN_SECRET --env staging       (staging-only value)
 #   4. wrangler secret put RECOVERY_HMAC_SECRET --env staging (staging-only)
 #   5. Register the smoke test key via an invite seeded through
