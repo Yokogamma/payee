@@ -9,7 +9,7 @@ import {
   estimateCost, summarize, parseArgs, randomUuidV8, v3Tags,
   redropSends, chargeBudget, acquireLedgerLock, saveState, loadState, dayRun,
   newAttempt, paidAttempts, attemptsSpent, attemptsSummary, chargeAttempt,
-  seedLegacy,
+  seedLegacy, paidOutcomesInWindow,
   needsAttemptsMigration, migrateAttempts, reconcilePendingAttempts,
 } from './soak-d2.mjs';
 
@@ -274,14 +274,16 @@ describe('summarize', () => {
       ...emptyState(),
       paidPosts: 21,
       notes: [note({ kind: 'legacy', backfilledAt: 1 }), note({ kind: 'legacy', backfilledAt: 1 }), note({ kind: 'legacy' })],
+      // `paid` per run is what the WINDOW counts; `paidPosts` above is the
+      // lifetime total and is deliberately NOT what the volume row reads.
       runs: [
-        { at: Date.UTC(2026, 8, 8), mode: 'day', deduped: 6 },
-        { at: Date.UTC(2026, 8, 9), mode: 'day', deduped: 7 },
-        { at: Date.UTC(2026, 8, 9, 23), mode: 'day', deduped: 1 },
+        { at: Date.UTC(2026, 8, 8), mode: 'day', deduped: 6, paid: 7 },
+        { at: Date.UTC(2026, 8, 9), mode: 'day', deduped: 7, paid: 7 },
+        { at: Date.UTC(2026, 8, 9, 23), mode: 'day', deduped: 1, paid: 7 },
       ],
     };
     const rows = Object.fromEntries(summarize(state).map(r => [r.name, r]));
-    expect(rows['paid outcomes']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
+    expect(rows['paid outcomes IN THE WINDOW (day runs only)']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
     expect(rows['deduped']).toMatchObject({ have: 14, ok: true });
     expect(rows['distinct days with a day run']).toMatchObject({ have: 2, ok: false });
     expect(rows['legacy_backfilled (distinct records)']).toMatchObject({ have: 2, ok: false });
@@ -669,5 +671,68 @@ describe('paid-attempt ledger', () => {
       expect(needsAttemptsMigration(emptyState())).toBe(false);
       expect(migrateAttempts(emptyState(), 1).migrated).toBe(false);
     });
+  });
+});
+/**
+ * Budget and window volume are DIFFERENT numbers.
+ *
+ * `seed-legacy` publishes from the PRE-D2 worker, before the window exists, so
+ * those publications emit no `upload_outcome` of the release. Counting them
+ * toward the 20 required by docs/ROLLBACK.md would clear the volume bar on
+ * evidence the criterion does not accept — 20 reported while the release
+ * itself had produced 15. The budget goes the other way: money spent is money
+ * spent, whichever worker spent it.
+ */
+describe('seeding counts against the budget, never toward the window volume', () => {
+  const seededState = (seedPaid, dayPaids) => ({
+    ...emptyState(),
+    paidPosts: seedPaid + dayPaids.reduce((a, b) => a + b, 0),
+    runs: [
+      { at: Date.UTC(2026, 8, 1), mode: 'seed-legacy', paid: seedPaid, failures: 0 },
+      ...dayPaids.map((p, i) => ({
+        at: Date.UTC(2026, 8, 2 + i), mode: 'day', paid: p, deduped: 0, rechecked: 0, legacyBackfilled: 0, problems: [],
+      })),
+    ],
+    paidAttempts: {
+      records: Array.from({ length: seedPaid + dayPaids.reduce((a, b) => a + b, 0) },
+        (_, i) => ({ id: `a${i}`, at: 0, noteId: `n${i}`, outcome: 'accepted-new' })),
+      priorEra: null,
+    },
+  });
+
+  it('counts ONLY day runs toward the window', () => {
+    const s = seededState(5, [3, 3, 3]);
+    expect(s.paidPosts).toBe(14);              // lifetime, seeding included
+    expect(paidOutcomesInWindow(s)).toBe(9);   // the window saw nine
+  });
+
+  it('the volume row reports the WINDOW figure, not the lifetime one', () => {
+    const s = seededState(5, [3, 3, 3]);
+    const row = summarize(s).find(r => /paid outcomes/i.test(r.name));
+    expect(row.have).toBe(9);
+    expect(row.have).not.toBe(s.paidPosts);
+    expect(row.need).toBe(VOLUME.paidOutcomes);
+    expect(row.ok).toBe(false); // 9 of 20 — seeding must not clear this bar
+  });
+
+  it('a window that reaches 20 by day runs alone passes; one padded by seeding does not', () => {
+    const real = seededState(0, [4, 4, 4, 4, 4]);          // 20 in the window
+    const padded = seededState(5, [3, 3, 3, 3, 3]);        // 20 lifetime, 15 in the window
+    expect(summarize(real).find(r => /paid outcomes/i.test(r.name)).ok).toBe(true);
+    expect(padded.paidPosts).toBe(20);
+    expect(summarize(padded).find(r => /paid outcomes/i.test(r.name)).ok).toBe(false);
+  });
+
+  it('the BUDGET still counts the seeding — money spent is money spent', () => {
+    const s = seededState(5, [3]);
+    expect(attemptsSpent(s)).toBe(8);
+    expect(planRun(s, { ...DEFAULTS, paidPerRun: 3, maxPaidTotal: 10 }, 0).paid).toBe(2);
+  });
+
+  // The seed run IS in `runs`; it simply is not a `day` run.
+  it('the seed run does not add a distinct day', () => {
+    const s = seededState(5, [3]);
+    expect(s.runs).toHaveLength(2);
+    expect(summarize(s).find(r => /distinct days/i.test(r.name)).have).toBe(1);
   });
 });

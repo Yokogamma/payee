@@ -455,6 +455,27 @@ export function estimateCost(priceWinstonForBytes, count) {
 }
 
 /** Progress against VOLUME from the ledger — a plan, not the verdict. */
+/**
+ * Paid outcomes that count toward the WINDOW — `day` runs only.
+ *
+ * NOT `state.paidPosts`. That counter is the lifetime total of the ledger and
+ * includes `seed-legacy`, whose publications are made by the PRE-D2 worker,
+ * before the window exists. docs/ROLLBACK.md («Volume») requires 20 paid
+ * outcomes as `upload_outcome` INSIDE the window, on one worker version — and
+ * the seeded five emit no `upload_outcome` of the release at all.
+ *
+ * Counting them would report 20 while the release itself had produced 15: the
+ * volume bar would clear on evidence the criterion does not accept.
+ *
+ * The budget is deliberately the other way round (`attemptsSpent` counts the
+ * seeding too): money spent is money spent, whichever worker spent it.
+ */
+export function paidOutcomesInWindow(state) {
+  return (state.runs ?? [])
+    .filter(r => r.mode === 'day')
+    .reduce((n, r) => n + (r.paid ?? 0), 0);
+}
+
 export function summarize(state) {
   const days = new Set(state.runs.filter(r => r.mode === 'day').map(r => new Date(r.at).toISOString().slice(0, 10)));
   const deduped = state.runs.reduce((n, r) => n + (r.deduped ?? 0), 0);
@@ -469,7 +490,7 @@ export function summarize(state) {
     // Waived by the owner on 2026-09-07 (docs/ROLLBACK.md): the event needs a
     // genuine DO fault, which nothing outside the worker can stage.
     { name: 'recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)', have: 0, need: VOLUME.recoveryReconciled, ok: true },
-    row('paid outcomes', state.paidPosts, VOLUME.paidOutcomes),
+    row('paid outcomes IN THE WINDOW (day runs only)', paidOutcomesInWindow(state), VOLUME.paidOutcomes),
   ];
 }
 
@@ -1022,7 +1043,12 @@ async function snapshot({ origin, secret, stateDir }) {
 
 function printStatus(state) {
   log(`state: origin=${state.origin ?? '-'} release=${state.release?.sha?.slice(0, 7) ?? '-'} versionId=${state.release?.workerVersionId ?? '-'}`);
-  log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length}); paid POSTs total: ${state.paidPosts}`);
+  log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length})`);
+  // Two DIFFERENT numbers, printed together so they cannot be mistaken for one
+  // another: the lifetime total includes `seed-legacy` (made by the pre-D2
+  // worker, outside any window), the window figure counts `day` runs only.
+  const seeded = state.paidPosts - paidOutcomesInWindow(state);
+  log(`paid POSTs: ${paidOutcomesInWindow(state)} in the window (day runs) + ${seeded} outside it (seeding) = ${state.paidPosts} lifetime`);
   const sent = redropSends(state);
   log(`redrop-capable sends: recheck ${sent.recheck}/${DEFAULTS.redropRecheckTotal}, legacy ${sent.legacy}/${DEFAULTS.redropLegacyTotal}`);
   // An unmigrated ledger must not read as "0 attempts" — that is exactly the
