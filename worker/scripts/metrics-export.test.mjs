@@ -10,7 +10,7 @@ import {
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
   assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
-  messageOf, probeLines, assertProbeSeen,
+  messageOf, probeLines, assertProbeSeen, parseStructured, criticalLines,
 } from './metrics-export.mjs';
 
 const tmpDir = () => join(tmpdir(), `mx-${randomUUID()}`);
@@ -546,5 +546,73 @@ describe('telemetry probe in the export', () => {
     expect(parseArgs(['logs', '--expect-probe', ID]).opts.expectProbe).toBe(ID);
     expect(() => parseArgs(['logs', '--expect-probe', 'nope'])).toThrow(/probeId the endpoint returned/);
     expect(() => parseArgs(['logs', '--expect-probe', ''])).toThrow(/probeId the endpoint returned/);
+  });
+});
+/**
+ * Classification by PARSED FIELDS, never by substring.
+ *
+ * A substring search accepted a line whose `probeId` was a different probe
+ * while the expected id merely appeared in another field — a green delivery
+ * check for an event that never arrived. The same weakness sat next to it in
+ * the `critical` count.
+ */
+describe('lines are classified by what they ARE, not by text they contain', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+  const OTHER = '99999999-2222-4333-8444-555555555555';
+  const line = (msg) => ({ $metadata: { message: msg } });
+
+  it('parses a structured line and refuses everything that is not one', () => {
+    expect(parseStructured('{"a":1}')).toEqual({ a: 1 });
+    expect(parseStructured('[1,2]')).toBe(null);       // an array is not a line
+    expect(parseStructured('{oops')).toBe(null);       // malformed
+    expect(parseStructured('ARWEAVE_POST_FAILED n-1')).toBe(null); // plain text
+    expect(parseStructured('')).toBe(null);
+    expect(parseStructured(null)).toBe(null);
+  });
+
+  // The exact reproduction: the expected id sits in `detail`, the real probe
+  // is a different one.
+  it('does NOT accept the expected id from another field', () => {
+    const decoy = line(`{"probe":"telemetry_probe","probeId":"${OTHER}","detail":"${ID}"}`);
+    expect(probeLines([decoy])).toHaveLength(1);       // it IS a probe line…
+    expect(() => assertProbeSeen([decoy], ID)).toThrow(/NOT in this export/); // …but not THIS one
+  });
+
+  it('matches on probeId exactly', () => {
+    const real = line(`{"probe":"telemetry_probe","probeId":"${ID}","at":1}`);
+    expect(assertProbeSeen([real], ID)).toBe(1);
+    expect(() => assertProbeSeen([real], OTHER)).toThrow(/NOT in this export/);
+  });
+
+  it('a line that merely mentions the probe type is not a probe', () => {
+    const mention = line(`{"critical":"conflict","noteId":"telemetry_probe","detail":"${ID}"}`);
+    expect(probeLines([mention])).toEqual([]);
+    expect(() => assertProbeSeen([mention], ID)).toThrow(/NOT in this export/);
+  });
+
+  it('critical lines are counted the same way — by the field', () => {
+    const real = line('{"critical":"conflict","noteId":"n-1"}');
+    const quoting = line('{"probe":"telemetry_probe","probeId":"x","detail":"the word critical"}');
+    const nonJson = line('ARWEAVE_POST_FAILED n-1 Error: boom');
+    expect(criticalLines([real, quoting, nonJson])).toHaveLength(1);
+    // …and a probe never lands in the number that must read zero.
+    expect(criticalLines(probeLines([real, quoting]))).toEqual([]);
+  });
+});
+
+/**
+ * A flag that is accepted and then ignored reports success for a check that
+ * never ran — the worst possible answer from a verification tool.
+ */
+describe('--expect-probe is refused where it could only be ignored', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+
+  it('refuses the flag in `metrics`, before any request goes out', () => {
+    expect(() => parseArgs(['metrics', '--expect-probe', ID]))
+      .toThrow(/applies only to `logs`.*no log lines/s);
+  });
+
+  it('accepts it in `logs`', () => {
+    expect(parseArgs(['logs', '--expect-probe', ID]).opts.expectProbe).toBe(ID);
   });
 });

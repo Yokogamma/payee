@@ -248,13 +248,36 @@ export function messageOf(event) {
 }
 
 /**
+ * A log line as a structured object, or null when it is not one.
+ *
+ * Classification is by PARSED FIELDS, never by substring. A line is matched on
+ * what it *is*, not on what text happens to appear somewhere inside it: a
+ * `detail` field quoting the expected id, or the word `critical` inside a
+ * message, would otherwise be counted as the thing itself.
+ */
+export function parseStructured(message) {
+  if (typeof message !== 'string' || message[0] !== '{') return null;
+  try {
+    const value = JSON.parse(message);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The control event of the delivery check (`POST /admin/telemetry-probe`).
  *
  * Counted SEPARATELY from `critical`: a probe is not a soak outcome and must
  * never be added to a number that has to read zero.
  */
 export function probeLines(events) {
-  return events.filter((e) => messageOf(e).includes('"probe":"telemetry_probe"'));
+  return events.filter((e) => parseStructured(messageOf(e))?.probe === 'telemetry_probe');
+}
+
+/** The critical-outcome lines — by the parsed field, for the same reason. */
+export function criticalLines(events) {
+  return events.filter((e) => typeof parseStructured(messageOf(e))?.critical === 'string');
 }
 
 /**
@@ -263,9 +286,17 @@ export function probeLines(events) {
  * A probe that was written but did not arrive is exactly the failure the whole
  * exercise is looking for, and «I did not spot it in the output» is not a
  * result. Absence therefore fails the run.
+ *
+ * The id is compared against the `probeId` FIELD. A substring search over the
+ * whole message accepted a line whose `probeId` was some other probe while the
+ * expected id merely appeared in another field — a green check for an event
+ * that never arrived.
  */
 export function assertProbeSeen(events, probeId) {
-  const seen = probeLines(events).filter((e) => messageOf(e).includes(probeId));
+  const seen = events.filter((e) => {
+    const line = parseStructured(messageOf(e));
+    return line?.probe === 'telemetry_probe' && line.probeId === probeId;
+  });
   if (!seen.length) {
     throw new Error(
       `the telemetry probe ${probeId} is NOT in this export. Either the structured line never `
@@ -520,7 +551,7 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs, expectProb
     console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s)`);
   }
 
-  const critical = events.filter((e) => messageOf(e).includes('"critical"'));
+  const critical = criticalLines(events);
   const probes = probeLines(events);
   console.log(`  total ${events.length} event(s): ${critical.length} critical, ${probes.length} probe`);
   if (expectProbe) console.log(`  probe ${expectProbe}: seen ${assertProbeSeen(events, expectProbe)} time(s)`);
@@ -604,6 +635,13 @@ export function parseArgs(argv) {
   if (!/^[a-z0-9-]{1,64}$/.test(opts.worker)) throw new Error('--worker must be a script name');
   if (opts.expectProbe !== null && !/^[0-9a-f-]{36}$/.test(opts.expectProbe)) {
     throw new Error('--expect-probe must be the probeId the endpoint returned');
+  }
+  // Refused HERE, before any request goes out. `metrics` reads Analytics
+  // Engine, which holds no log lines at all, so the flag could only be
+  // ignored — and an ignored delivery check that still writes an archive and
+  // exits 0 reports success for a check that never ran.
+  if (opts.expectProbe !== null && mode !== 'logs') {
+    throw new Error(`--expect-probe applies only to \`logs\`; in \`${mode}\` there are no log lines to find it in`);
   }
   return { mode, opts };
 }
