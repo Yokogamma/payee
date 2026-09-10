@@ -1947,10 +1947,67 @@ Order, and the reason each step sits where it does:
    and re-sends a seeded legacy note only once `/tx/<id>/status` shows ≥ 2
    confirmations. With `METRICS_ADMIN_SECRET` in the environment the same run
    writes the day's snapshot (`snapshots/<date>.json`: both reports, 24 h and
-   168 h). Three paid notes a day clear the 20-outcome floor by day 7 with
-   margin; the dedupe pass grows with the ledger and clears 10 by day 2.
+   168 h). Three paid notes a day clear the 20-outcome floor by day 7 with NO
+   margin at all once the seeding is counted — see «Бюджет перезапускаемого
+   окна» below before choosing `--paid`; the dedupe pass grows with the ledger
+   and clears 10 by day 2.
 4. `status` at any time: progress against the volume, from the ledger. The
    metrics are the verdict; the ledger is the plan.
+
+#### Бюджет перезапускаемого окна — зафиксирован 2026-09-10
+
+Прежняя формулировка «весь соак укладывается в `SOAK_MAX_PAID_TOTAL`» неполна
+в трёх местах, и каждое стоит денег.
+
+**1. Посев считается в тот же лимит, но НЕ в объём окна.** `SOAK_MAX_PAID_TOTAL`
+ограничивает ПОПЫТКИ (`attemptsSpent`), и посев их тратит наравне с остальными.
+Но его публикации делает до-D2 воркер, вне окна, и `upload_outcome` релиза они
+не дают — поэтому `summarize` считает объём отдельно, только по подтверждённым
+записям `mode: 'day'` (`paidOutcomesInWindow`). Засчитать посев в 20 исходов
+нельзя без явного изменения критерия владельцем.
+
+**2. Ошибки и неизвестные исходы тоже расходуют лимит.** Попытка списывается
+ДО отправки; провал и потерянный ответ занимают слот навсегда и объёма не
+приносят. Поэтому 25 — это ПОЛ, а не план:
+
+| | `--paid 3` | `--paid 4` |
+|---|---|---|
+| Посев | 5 | 5 |
+| Попытки в окне | 21 (7 прогонов) | 20 (5 прогонов) |
+| **Итого из 30** | 26 | 25 |
+| Запас на провалы и неизвестные | 4 | 5 |
+| Запас дней в окне 168 ч | **0** | 2 |
+
+При `--paid 3` семь прогонов ложатся ровно в семь дней: один пропущенный день —
+и объём не набран. Прежнее «с запасом» относилось к окну без посева.
+
+**3. Redrop-способные отправки — ОТДЕЛЬНАЯ трата, вне этого лимита.** `recheck`
+и `legacy`, чей статус-кворум скажет `dead`, уходят в `doRedrop` — платный
+re-post на стороне воркера. Он списывается в `redropSends`, а НЕ в
+`paidAttempts`, поэтому `SOAK_MAX_PAID_TOTAL` его не ограничивает вовсе.
+Потолки свои: `redropRecheckTotal` 12 + `redropLegacyTotal` 8 = **до 20
+отправок**, каждая из которых МОЖЕТ стоить публикацию.
+
+**Худший случай по AR, который надо покрыть балансом:** 30 попыток под лимитом
+плюс до 20 redrop-способных отправок = **до 50 публикаций**. При котировке
+≈ 0.0033 AR за публикацию (`arweave.net/price/200`, 2026-09-07) это ≈ 0.17 AR.
+Котировка меняется; проверить баланс перед посевом.
+
+#### Подтверждение посева — до открытия окна
+
+Посев считается удавшимся не по коду возврата, а по состоянию ledger:
+
+- `status` показывает 5 заметок `kind: 'legacy'`, **ни одной с `backfilledAt`**
+  (иначе это перенос старого прогресса, а не новые фикстуры);
+- у каждой есть `txId`, и он подтверждается на цепочке;
+- `paid POSTs` в статусе показывает `0 in the window (day) + 5 seeding`.
+
+Для приёмки нужны **минимум три РАЗНЫЕ фикстуры, реально прошедшие backfill
+ВНУТРИ нового окна**: `legacy_backfilled ≥ 3` считается по заметкам с
+`backfilledAt`, который проставляют прогоны `day` уже на кандидате. Пять
+сеются на три требуемых, потому что нерасшифровываемая пулом транзакция даёт
+`legacy_unproven`, а окно допускает одну.
+
 
 **`recovery_reconciled ≥ 1` cannot be produced by ANY client, this script
 included.** The branch runs only when the DO holds no record for an id whose
