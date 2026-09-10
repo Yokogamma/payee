@@ -241,6 +241,41 @@ export function assertNoTruncatedEvents(events, slice) {
   }
 }
 
+/** The log line an event carries, wherever the store puts it. */
+export function messageOf(event) {
+  const msg = event?.$metadata?.message ?? event?.message ?? '';
+  return typeof msg === 'string' ? msg : '';
+}
+
+/**
+ * The control event of the delivery check (`POST /admin/telemetry-probe`).
+ *
+ * Counted SEPARATELY from `critical`: a probe is not a soak outcome and must
+ * never be added to a number that has to read zero.
+ */
+export function probeLines(events) {
+  return events.filter((e) => messageOf(e).includes('"probe":"telemetry_probe"'));
+}
+
+/**
+ * The delivery check, as an ASSERTION rather than something to eyeball.
+ *
+ * A probe that was written but did not arrive is exactly the failure the whole
+ * exercise is looking for, and «I did not spot it in the output» is not a
+ * result. Absence therefore fails the run.
+ */
+export function assertProbeSeen(events, probeId) {
+  const seen = probeLines(events).filter((e) => messageOf(e).includes(probeId));
+  if (!seen.length) {
+    throw new Error(
+      `the telemetry probe ${probeId} is NOT in this export. Either the structured line never `
+      + 'reached Workers Logs, or it did not reach it within this interval — the delivery check '
+      + 'has FAILED and the soak window must not be opened on it.',
+    );
+  }
+  return seen.length;
+}
+
 /** The events cursor: `$metadata.id`, passed at the TOP level as `offset`. */
 export function eventId(e) {
   return e?.$metadata?.id;
@@ -461,7 +496,7 @@ async function exportMetrics({ accountId, dataset, fromMs, toMs, fetchImpl }) {
   };
 }
 
-async function exportLogs({ accountId, target, fromMs, toMs, sliceMs }) {
+async function exportLogs({ accountId, target, fromMs, toMs, sliceMs, expectProbe }) {
   const token = await credential('CF_LOGS_TOKEN', 'CF_LOGS_TOKEN_FILE');
   const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/observability/telemetry`;
 
@@ -485,11 +520,10 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs }) {
     console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s)`);
   }
 
-  const critical = events.filter((e) => {
-    const msg = e?.$metadata?.message ?? e?.message ?? '';
-    return typeof msg === 'string' && msg.includes('"critical"');
-  });
-  console.log(`  total ${events.length} event(s), of which ${critical.length} critical`);
+  const critical = events.filter((e) => messageOf(e).includes('"critical"'));
+  const probes = probeLines(events);
+  console.log(`  total ${events.length} event(s): ${critical.length} critical, ${probes.length} probe`);
+  if (expectProbe) console.log(`  probe ${expectProbe}: seen ${assertProbeSeen(events, expectProbe)} time(s)`);
   if (events.length === 0) {
     console.log('  ! ZERO events for this worker in the whole range — that is what «logs were never');
     console.log('  ! collected» looks like. Do not read it as «nothing happened».');
@@ -498,8 +532,9 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs }) {
     at: new Date().toISOString(), kind: 'logs', target, scriptKey,
     interval: { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), fromMs, toMs },
     sliceMinutes: sliceMs / 60_000, slices: sliceMeta,
-    counts: { events: events.length, critical: critical.length },
-    critical, events,
+    counts: { events: events.length, critical: critical.length, probes: probes.length },
+    expectProbe: expectProbe ?? null,
+    critical, probes, events,
   };
 }
 
@@ -548,7 +583,7 @@ export function resolveInterval(opts, nowMs) {
 
 export function parseArgs(argv) {
   const [mode, ...rest] = argv;
-  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER };
+  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER, expectProbe: null };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--hours') { opts.hours = Number(rest[++i]); opts.hoursGiven = true; continue; }
@@ -557,6 +592,7 @@ export function parseArgs(argv) {
     if (a === '--out') { opts.out = String(rest[++i] ?? ''); continue; }
     if (a === '--slice-minutes') { opts.sliceMinutes = Number(rest[++i]); continue; }
     if (a === '--worker') { opts.worker = String(rest[++i] ?? ''); continue; }
+    if (a === '--expect-probe') { opts.expectProbe = String(rest[++i] ?? ''); continue; }
     throw new Error(`unknown argument: ${a}`);
   }
   if (!Number.isInteger(opts.hours) || opts.hours < 1 || opts.hours > 168) {
@@ -566,13 +602,16 @@ export function parseArgs(argv) {
     throw new Error('--slice-minutes must be a positive integer');
   }
   if (!/^[a-z0-9-]{1,64}$/.test(opts.worker)) throw new Error('--worker must be a script name');
+  if (opts.expectProbe !== null && !/^[0-9a-f-]{36}$/.test(opts.expectProbe)) {
+    throw new Error('--expect-probe must be the probeId the endpoint returned');
+  }
   return { mode, opts };
 }
 
 export async function main(argv) {
   const { mode, opts } = parseArgs(argv);
   if (!['metrics', 'logs'].includes(mode)) {
-    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--out DIR]');
+    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--expect-probe UUID] [--out DIR]');
     return 2;
   }
   const accountId = process.env.CF_ACCOUNT_ID ?? DEFAULT_ACCOUNT_ID;
@@ -584,7 +623,7 @@ export async function main(argv) {
   console.log(`${mode}: ${new Date(fromMs).toISOString()} .. ${new Date(toMs).toISOString()} → ${outDir}`);
   const payload = mode === 'metrics'
     ? await exportMetrics({ accountId, dataset, fromMs, toMs })
-    : await exportLogs({ accountId, target: opts.worker, fromMs, toMs, sliceMs: opts.sliceMinutes * 60_000 });
+    : await exportLogs({ accountId, target: opts.worker, fromMs, toMs, sliceMs: opts.sliceMinutes * 60_000, expectProbe: opts.expectProbe });
 
   const target = mode === 'metrics' ? dataset : opts.worker;
   const path = await writeArchive(outDir, archiveName(mode, target, fromMs, toMs), payload);

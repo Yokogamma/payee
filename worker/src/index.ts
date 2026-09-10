@@ -181,11 +181,11 @@ export default {
       ? handleOptions(origin, allowedOrigins)
       : addCors(await handleRequest(request, env), origin, allowedOrigins);
 
-    // Cache-Control: no-store on EVERY /admin/metrics response — centrally,
-    // not in the handler (M r19): the router's Content-Type check answers 415
-    // BEFORE dispatch, and a wrong method falls through to 404, so the header
-    // must be attached here to cover 415/404/401/4xx/5xx alike.
-    if (new URL(request.url).pathname === '/admin/metrics') {
+    // Cache-Control: no-store on EVERY response of the telemetry admin paths —
+    // centrally, not in the handler (M r19): the router's Content-Type check
+    // answers 415 BEFORE dispatch, and a wrong method falls through to 404, so
+    // the header must be attached here to cover 415/404/401/4xx/5xx alike.
+    if (NO_STORE_PATHS.has(new URL(request.url).pathname)) {
       const headers = new Headers(response.headers);
       headers.set('Cache-Control', 'no-store');
       return new Response(response.body, {
@@ -280,6 +280,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === '/admin/metrics' && request.method === 'POST') {
     return handleAdminMetrics(request, env);
+  }
+  if (url.pathname === '/admin/telemetry-probe' && request.method === 'POST') {
+    return handleTelemetryProbe(request, env);
   }
 
   return new Response('Not found', { status: 404 });
@@ -1706,11 +1709,64 @@ const CRITICAL_OUTCOMES = new Set([
  * unchanged by this.
  */
 function logCritical(outcome: string, noteId: string, appVersion: string, txId?: string): void {
+  logStructured({ critical: outcome, noteId, appVersion, ...(txId ? { txId } : {}) });
+}
+
+/**
+ * The ONE place a structured diagnostic line is written.
+ *
+ * Shared on purpose: the telemetry probe must exercise the very same mechanism
+ * the critical outcomes use — same `console.error`, same `JSON.stringify`, same
+ * swallow — or a green probe would prove something other than what it claims.
+ */
+function logStructured(payload: Record<string, unknown>): void {
   try {
-    console.error(JSON.stringify({ critical: outcome, noteId, appVersion, ...(txId ? { txId } : {}) }));
+    console.error(JSON.stringify(payload));
   } catch {
     /* diagnostics must never break the request */
   }
+}
+
+/**
+ * `telemetry_probe` — a safe control event for verifying that a structured
+ * application line actually REACHES Workers Logs in the contour where the soak
+ * will run.
+ *
+ * Why it exists: `/health` writes no console line at all, so its invocation
+ * record proves the collector runs, not that an application-written JSON line
+ * survives. And the honest alternative — provoking a real `conflict` — would
+ * need a prior paid publication AND would put a non-zero into the very
+ * criterion it was meant to verify.
+ *
+ * Deliberately NOT a criterion: its own field name (`probe`, never `critical`),
+ * no Analytics Engine row, no upload path, nothing that can cost AR. The id is
+ * generated HERE and returned to the caller — never taken from the request, so
+ * nothing a caller sends can end up inside the log line.
+ */
+function logTelemetryProbe(probeId: string): void {
+  logStructured({ probe: 'telemetry_probe', probeId, at: Date.now() });
+}
+
+/**
+ * POST /admin/telemetry-probe — writes one probe line, answers with its id.
+ *
+ * Behind METRICS_ADMIN_SECRET rather than ADMIN_SECRET: this is a telemetry
+ * question, and the metrics reader is the least-privilege identity that already
+ * exists for telemetry (it holds no seed-invite or revoke rights).
+ */
+const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe']);
+
+async function handleTelemetryProbe(request: Request, env: Env): Promise<Response> {
+  if (!env.METRICS_ADMIN_SECRET) return error('Metrics endpoint not configured', 503);
+  if (!(await verifyBearerSecret(env.METRICS_ADMIN_SECRET, request.headers.get('Authorization')))) {
+    return error('Unauthorized', 401);
+  }
+  const probeId = crypto.randomUUID();
+  logTelemetryProbe(probeId);
+  return new Response(JSON.stringify({ probe: 'telemetry_probe', probeId }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
 }
 
 /**

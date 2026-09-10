@@ -188,20 +188,27 @@ binding = "CF_VERSION_METADATA"
 #   1. wrangler kv namespace create ALLOWLIST --env staging
 #      → paste the returned id below (placeholder deploys will fail until then).
 #   2. wrangler secret put ARWEAVE_JWK --env staging
-#      Use THE SAME wallet as the dev contour. That is not laziness, it is what
-#      the config on line ~267 already requires: `env.staging.TRUSTED_OWNERS`
-#      names exactly one address, the dev one, and `/upload` answers 503 while
-#      the signing wallet is outside that set (walletTrust) — so a DIFFERENT
-#      JWK would refuse every upload until its address were added here too.
-#      The older wording asked for a dedicated JWK «never the production
-#      wallet»; there IS no production wallet yet (production will be built
-#      from scratch on .app later), and the dev wallet is already a test wallet
-#      with a minimal balance, so a second one buys nothing and would have to
-#      be funded with real AR.
-#      The cost of sharing it, named rather than hidden: the same JWK then
-#      lives in two workers' secrets, and staging's paid posts draw on the same
-#      balance as the soak budget. Revisit BOTH this line and staging's
-#      TRUSTED_OWNERS when a real production contour exists.
+#      TWO legitimate choices; pick deliberately, the config permits only one
+#      of them out of the box.
+#
+#      (a) THE SAME wallet as dev — what this config is already written for.
+#          `env.staging.TRUSTED_OWNERS` names exactly one address, the dev one,
+#          and `/upload` answers 503 while the signing wallet is outside that
+#          set (walletTrust). Nothing else to do. The older wording asked for a
+#          dedicated JWK «never the production wallet», but there IS no
+#          production wallet yet (production comes later, from scratch, on
+#          .app), and the dev wallet is already a test wallet with a minimal
+#          balance.
+#      (b) A SEPARATE staging wallet — legitimate and sometimes right: it
+#          isolates the AR balance from the soak budget and keeps one key out
+#          of two workers' secrets. It is NOT ruled out by anything here; it
+#          simply costs an extra step — its address MUST be added to
+#          `env.staging.TRUSTED_OWNERS` below, or staging refuses every upload
+#          — plus real AR to fund it.
+#
+#      The trade-off, stated rather than hidden: (a) shares a key and a balance
+#      across contours; (b) buys isolation for funding and an edit. Revisit
+#      when a real production contour exists.
 #   3. wrangler secret put ADMIN_SECRET --env staging       (staging-only value)
 #   4. wrangler secret put RECOVERY_HMAC_SECRET --env staging (staging-only)
 #   5. Register the smoke test key via an invite seeded through
@@ -210,11 +217,12 @@ binding = "CF_VERSION_METADATA"
 #   6. wrangler secret put METRICS_ADMIN_SECRET --env staging  (staging-only)
 #   7. wrangler secret put CF_ANALYTICS_TOKEN --env staging     (Account →
 #      Account Analytics → Read)
-#      6 and 7 were added on 2026-09-10: the delivery check of docs/METRICS.md
-#      («Проверка доставки», step 1) reads staging's own /admin/metrics to see
-#      the control `conflict` in Analytics Engine. Without them that endpoint
-#      answers 503 and the check cannot be performed at all — the earlier list
-#      predates PR-2 and did not need them.
+#      6 and 7 are needed ONLY if telemetry is exercised on staging at all.
+#      The delivery check of docs/METRICS.md no longer requires staging: it runs
+#      in dev, through POST /admin/telemetry-probe, which needs no second wallet
+#      and provokes no control `conflict`. Keep these two for a staging that is
+#      set up for isolation — without them staging /admin/metrics and the probe
+#      both answer 503.
 #
 # NONE of this exists yet. Checked against the account on 2026-09-10: it holds
 # exactly ONE worker (`eternal-notes-proxy`) and ONE KV namespace

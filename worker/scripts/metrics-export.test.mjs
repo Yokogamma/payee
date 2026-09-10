@@ -10,6 +10,7 @@ import {
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
   assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
+  messageOf, probeLines, assertProbeSeen,
 } from './metrics-export.mjs';
 
 const tmpDir = () => join(tmpdir(), `mx-${randomUUID()}`);
@@ -207,10 +208,10 @@ describe('parseArgs', () => {
   it('reads the modes and flags', () => {
     expect(parseArgs(['metrics'])).toEqual({
       mode: 'metrics',
-      opts: { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: 'eternal-notes-proxy' },
+      opts: { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: 'eternal-notes-proxy', expectProbe: null },
     });
     expect(parseArgs(['logs', '--hours', '168', '--slice-minutes', '15', '--out', 'D', '--worker', 'w-1']))
-      .toEqual({ mode: 'logs', opts: { hours: 168, hoursGiven: true, from: null, to: null, out: 'D', sliceMinutes: 15, worker: 'w-1' } });
+      .toEqual({ mode: 'logs', opts: { hours: 168, hoursGiven: true, from: null, to: null, out: 'D', sliceMinutes: 15, worker: 'w-1', expectProbe: null } });
   });
 
   it('refuses junk rather than exporting a wrong range', () => {
@@ -494,5 +495,56 @@ describe('interval precision is consistent across SQL, metadata and the file nam
   it('the whole-second rule is checked BEFORE ordering, so the message names the real problem', () => {
     expect(() => resolveInterval(rel({ from: '2026-09-10T00:00:00.500Z', to: '2026-09-09T00:00:00.500Z' }), 0))
       .toThrow(/whole seconds/);
+  });
+});
+/**
+ * The delivery check, as an assertion.
+ *
+ * «I did not spot the probe in the output» is not a result: a probe that was
+ * written and did not arrive is precisely the failure the exercise is looking
+ * for, so its absence has to fail the run rather than be read past.
+ */
+describe('telemetry probe in the export', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+  const OTHER = '99999999-2222-4333-8444-555555555555';
+  const line = (msg) => ({ $metadata: { message: msg } });
+  const probe = (id) => line(`{"probe":"telemetry_probe","probeId":"${id}","at":1}`);
+  const critical = line('{"critical":"conflict","noteId":"n-1"}');
+
+  it('reads the message wherever the store puts it', () => {
+    expect(messageOf({ $metadata: { message: 'a' } })).toBe('a');
+    expect(messageOf({ message: 'b' })).toBe('b');
+    expect(messageOf({})).toBe('');
+    expect(messageOf({ $metadata: { message: 42 } })).toBe(''); // never a non-string
+  });
+
+  it('counts probes SEPARATELY from critical outcomes', () => {
+    const events = [probe(ID), critical, probe(OTHER)];
+    expect(probeLines(events)).toHaveLength(2);
+    // A probe must never be added to a number that has to read zero.
+    expect(events.filter(e => messageOf(e).includes('"critical"'))).toHaveLength(1);
+  });
+
+  it('confirms the expected probe and counts it', () => {
+    expect(assertProbeSeen([critical, probe(ID)], ID)).toBe(1);
+    expect(assertProbeSeen([probe(ID), probe(ID)], ID)).toBe(2);
+  });
+
+  it('FAILS when the expected probe is absent — that is the whole point', () => {
+    expect(() => assertProbeSeen([critical, probe(OTHER)], ID))
+      .toThrow(/probe .* is NOT in this export.*delivery check has FAILED.*must not be opened/s);
+    expect(() => assertProbeSeen([], ID)).toThrow(/NOT in this export/);
+  });
+
+  it('does not accept a probe line that merely looks similar', () => {
+    // Right id, but not a probe line: an ordinary log that happens to quote it.
+    expect(() => assertProbeSeen([line(`{"critical":"conflict","noteId":"${ID}"}`)], ID))
+      .toThrow(/NOT in this export/);
+  });
+
+  it('--expect-probe must be the id the endpoint returned', () => {
+    expect(parseArgs(['logs', '--expect-probe', ID]).opts.expectProbe).toBe(ID);
+    expect(() => parseArgs(['logs', '--expect-probe', 'nope'])).toThrow(/probeId the endpoint returned/);
+    expect(() => parseArgs(['logs', '--expect-probe', ''])).toThrow(/probeId the endpoint returned/);
   });
 });
