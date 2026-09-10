@@ -125,6 +125,35 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 binding = "METRICS"
 dataset = "eternal_notes_metrics"
 
+# ── Workers Logs (observability) ──
+# Checked in the Cloudflare API on 2026-09-09 and found ABSENT, with `logpush`
+# false and ZERO log events in the account for the whole soak. So the
+# `console.error` diagnostics next to the critical outcomes were writing to
+# nothing at all.
+#
+# This gives the criteria a SECOND, INDEPENDENT channel — not a guaranteed one.
+# Analytics Engine samples PER INDEX, so an absent row cannot be told from an
+# event that never happened, and two exit criteria in docs/ROLLBACK.md must
+# read STRICTLY ZERO. One estimating channel cannot establish a zero; two
+# channels that must both lose the same event make it far less likely.
+#
+# `head_sampling_rate = 1` asks for FULL COLLECTION. It is NOT a promise of
+# lossless storage, and this config alone proves nothing about delivery —
+# delivery is verified after the deploy (docs/METRICS.md, «Проверка доставки»).
+#
+# RETENTION IS THE TRAP: Workers Logs keeps at most SEVEN DAYS. A 168-hour soak
+# is exactly seven days, so the beginning of the window can age out on the very
+# day the window is being judged. Daily archival is therefore mandatory, not
+# optional — `soak-d2.mjs snapshot` writes the dated evidence files.
+#
+# NOTE: enabling this changes the deployed script, so it takes a deploy — and a
+# deploy RESETS the 168-hour soak window (soak-d2.mjs asserts one
+# workerVersionId for the whole window). Land it together with the other
+# telemetry fixes, never on its own mid-window.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # The Worker's own ACTIVE version id, reported by /health. A self-declared
 # release SHA cannot tell a re-deploy of the same commit from the original;
 # this can, and the deploy smoke compares it with the version id wrangler
@@ -158,15 +187,52 @@ binding = "CF_VERSION_METADATA"
 # OPERATOR PREREQUISITES (once, before first `npm run deploy:staging`):
 #   1. wrangler kv namespace create ALLOWLIST --env staging
 #      → paste the returned id below (placeholder deploys will fail until then).
-#   2. wrangler secret put ARWEAVE_JWK --env staging        (DEDICATED test JWK,
-#      minimal AR balance — never the production wallet)
+#   2. wrangler secret put ARWEAVE_JWK --env staging
+#      TWO legitimate choices; pick deliberately, the config permits only one
+#      of them out of the box.
+#
+#      (a) THE SAME wallet as dev — what this config is already written for.
+#          `env.staging.TRUSTED_OWNERS` names exactly one address, the dev one,
+#          and `/upload` answers 503 while the signing wallet is outside that
+#          set (walletTrust). Nothing else to do. The older wording asked for a
+#          dedicated JWK «never the production wallet», but there IS no
+#          production wallet yet (production comes later, from scratch, on
+#          .app), and the dev wallet is already a test wallet with a minimal
+#          balance.
+#      (b) A SEPARATE staging wallet — legitimate and sometimes right: it
+#          isolates the AR balance from the soak budget and keeps one key out
+#          of two workers' secrets. It is NOT ruled out by anything here; it
+#          simply costs an extra step — its address MUST be added to
+#          `env.staging.TRUSTED_OWNERS` below, or staging refuses every upload
+#          — plus real AR to fund it.
+#
+#      The trade-off, stated rather than hidden: (a) shares a key and a balance
+#      across contours; (b) buys isolation for funding and an edit. Revisit
+#      when a real production contour exists.
 #   3. wrangler secret put ADMIN_SECRET --env staging       (staging-only value)
 #   4. wrangler secret put RECOVERY_HMAC_SECRET --env staging (staging-only)
 #   5. Register the smoke test key via an invite seeded through
 #      /admin/seed-invite + /register (InviteManager is the source of truth —
 #      never hand-write pk: entries into KV).
+#   6. wrangler secret put METRICS_ADMIN_SECRET --env staging  (staging-only)
+#   7. wrangler secret put CF_ANALYTICS_TOKEN --env staging     (Account →
+#      Account Analytics → Read)
+#      6 and 7 are needed ONLY if telemetry is exercised on staging at all.
+#      The delivery check of docs/METRICS.md no longer requires staging: it runs
+#      in dev, through POST /admin/telemetry-probe, which needs no second wallet
+#      and provokes no control `conflict`. Keep these two for a staging that is
+#      set up for isolation — without them staging /admin/metrics and the probe
+#      both answer 503.
+#
+# NONE of this exists yet. Checked against the account on 2026-09-10: it holds
+# exactly ONE worker (`eternal-notes-proxy`) and ONE KV namespace
+# (`ALLOWLIST`) — so staging is unprovisioned, not merely unconfigured, and the
+# placeholder below is only the first thing that would fail.
+#
 # Config gate before any real staging deploy:
 #   npm run deploy:staging:check   (wrangler deploy --env staging --dry-run)
+#   — passes on the placeholder: it proves the config BUILDS, not that staging
+#     is ready.
 #
 # NOTE on origins: the workers.dev URL below is the API ENDPOINT, not a client
 # origin. CLI smoke sends no Origin header (CORS is not exercised); a browser
@@ -257,6 +323,13 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 [[env.staging.analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "eternal_notes_metrics_staging"
+
+# Declared explicitly for staging too: a named environment inherits NOTHING,
+# so omitting this would leave staging without logs and make its smoke
+# structurally different from production's.
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
 
 # Declared explicitly for staging too: a named environment inherits NOTHING,
 # so omitting this would leave staging without the binding and make its smoke

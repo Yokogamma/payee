@@ -141,6 +141,10 @@ export function emptyState() {
     /** Requests sent that COULD have cost a redrop — see DEFAULTS. Counted
      *  before the request leaves, so a crash cannot refund the budget. */
     redropSends: { recheck: 0, legacy: 0 },
+    /** Paid publications ATTEMPTED — what the budget actually charges.
+     *  Written BEFORE the request leaves; paidPosts above counts only the
+     *  successes and therefore cannot bound money. See the attempt ledger. */
+    paidAttempts: { records: [], priorEra: null },
   };
 }
 
@@ -159,6 +163,124 @@ export async function chargeBudget(state, kind, persist) {
 export function redropSends(state) {
   const sends = state.redropSends ?? {};
   return { recheck: sends.recheck ?? 0, legacy: sends.legacy ?? 0 };
+}
+
+// ── The paid-attempt ledger ───────────────────────────────────────────
+//
+// `paidPosts` counts SUCCESSES: it is incremented after the answer and only
+// for `accepted-new`. That makes it unfit to bound money — a publication that
+// failed, or one whose answer never arrived, spent the same AR and left the
+// counter untouched. The observability review of 2026-09-09 turned that from a
+// theoretical gap into the reason a soak window may not be certifiable: 18
+// attempts with one failure and 17 successes are indistinguishable from 17
+// clean attempts.
+//
+// So the budget is charged against ATTEMPTS, made durable BEFORE the request
+// leaves — the same contract `chargeBudget` already uses for redrop-capable
+// sends. An attempt whose outcome was never written stays `unknown` forever:
+// it keeps the limit it took and is NEVER re-driven. Re-sending it
+// automatically is exactly the double-paid publication D2 exists to prevent.
+
+/** An attempt record, created before the request leaves. */
+export function newAttempt(noteId, at, mode) {
+  return { id: crypto.randomUUID(), at, noteId, mode, outcome: 'pending' };
+}
+
+/**
+ * The attempt ledger, tolerating a state file written before it existed.
+ * `priorEra` is set ONLY by the explicit migration, never inferred here.
+ */
+export function paidAttempts(state) {
+  const a = state.paidAttempts;
+  return { records: Array.isArray(a?.records) ? a.records : [], priorEra: a?.priorEra ?? null };
+}
+
+/**
+ * What the budget charges. The prior era contributes its KNOWN SUCCESSES — a
+ * documented LOWER BOUND, not a reconstruction: how many attempts happened
+ * before anything recorded them is unknowable, and pretending otherwise would
+ * understate money already spent.
+ */
+export function attemptsSpent(state) {
+  const { records, priorEra } = paidAttempts(state);
+  return (priorEra?.knownSuccesses ?? 0) + records.length;
+}
+
+/** Counts for reporting. `pending` reads as `unknown` WITHOUT mutating. */
+export function attemptsSummary(state) {
+  const { records, priorEra } = paidAttempts(state);
+  const out = { total: attemptsSpent(state), accepted: 0, error: 0, unknown: 0, priorEra };
+  for (const r of records) {
+    if (r.outcome === 'accepted-new') out.accepted += 1;
+    else if (r.outcome === 'error') out.error += 1;
+    else out.unknown += 1; // 'unknown', and anything a crash left 'pending'
+  }
+  return out;
+}
+
+/**
+ * A ledger from before this counter existed must NOT be migrated silently:
+ * the historical attempt count is unknown and may not be invented from
+ * `paidPosts`. `day` refuses until the operator runs `migrate-attempts`.
+ */
+export function needsAttemptsMigration(state) {
+  // Detected by SCHEMA, never by results. A ledger whose publications all
+  // FAILED has `paidPosts === 0` and is still an old ledger — reading "no
+  // attempts" out of "no successes" is the very inference this counter exists
+  // to remove. `emptyState()` always carries the field, so a genuinely new
+  // ledger never matches.
+  return !Array.isArray(state.paidAttempts?.records);
+}
+
+/**
+ * The explicit transition. `paidPosts`, `notes` and every run record are left
+ * untouched — the history stays exactly as it was written.
+ */
+export function migrateAttempts(state, at) {
+  if (!needsAttemptsMigration(state)) {
+    state.paidAttempts ??= { records: [], priorEra: null };
+    state.paidAttempts.records ??= [];
+    return { migrated: false };
+  }
+  const knownSuccesses = state.paidPosts ?? 0;
+  state.paidAttempts = {
+    records: [],
+    priorEra: {
+      migratedAt: at,
+      knownSuccesses,
+      /** The point of the field: attempts before `migratedAt` were never
+       *  recorded, so the true figure is >= knownSuccesses and unknowable. */
+      attemptsUnknown: true,
+    },
+  };
+  return { migrated: true, knownSuccesses };
+}
+
+/**
+ * An attempt left `pending` means a process died between the send and the
+ * answer. It becomes `unknown`: the transaction MAY be on chain, and only a
+ * human may decide what to do about it. Idempotent — re-running it changes
+ * nothing, so an unpersisted reconciliation is safe to repeat.
+ */
+export function reconcilePendingAttempts(state, at) {
+  const stranded = paidAttempts(state).records.filter(r => r.outcome === 'pending');
+  for (const r of stranded) {
+    r.outcome = 'unknown';
+    r.detail = 'interrupted before the outcome was recorded';
+    r.reconciledAt = at;
+  }
+  return stranded;
+}
+
+/**
+ * Charge one paid attempt and make it DURABLE before the request goes.
+ * Throws when the ledger cannot be written: the caller must then NOT send.
+ */
+export async function chargeAttempt(state, attempt, persist) {
+  state.paidAttempts ??= { records: [], priorEra: null };
+  state.paidAttempts.records ??= [];
+  state.paidAttempts.records.push(attempt);
+  if (persist) await persist();
 }
 
 /**
@@ -202,7 +324,9 @@ export function checkReleaseGate(health, mode, state, expectedSha) {
  * the runner asks right before sending.
  */
 export function planRun(state, opts, now) {
-  const paidLeft = Math.max(0, opts.maxPaidTotal - state.paidPosts);
+  // Charged against ATTEMPTS, never successes: a publication that failed,
+  // or one whose answer never arrived, spent the same AR. See attemptsSpent.
+  const paidLeft = Math.max(0, opts.maxPaidTotal - attemptsSpent(state));
   const paid = Math.max(0, Math.min(opts.paidPerRun, paidLeft));
 
   const comparable = state.notes.filter(n => n.kind === 'paid' || n.backfilledAt);
@@ -331,6 +455,52 @@ export function estimateCost(priceWinstonForBytes, count) {
 }
 
 /** Progress against VOLUME from the ledger — a plan, not the verdict. */
+/**
+ * Confirmed paid publications of one driver mode, counted from the DURABLE
+ * attempt records.
+ *
+ * NOT from `state.runs`, and this is the whole point. A run object is appended
+ * to `runs` only by `finish()`, at the very END of the pass, while `settle()`
+ * has already persisted the successful attempt, the note and `paidPosts` the
+ * moment the answer arrived. A process killed between those two leaves a
+ * publication that is durably recorded but belongs to no run — invisible to a
+ * `runs`-based count, and, with a subtraction, misfiled as seeding.
+ *
+ * NOT `state.paidPosts` either: that is the lifetime total and includes
+ * `seed-legacy`, whose publications are made by the PRE-D2 worker before the
+ * window exists and emit no `upload_outcome` of the release at all.
+ * docs/ROLLBACK.md («Volume») requires 20 paid outcomes INSIDE the window on
+ * one worker version, so counting the seeded five would report 20 where the
+ * release produced 15.
+ *
+ * The budget is deliberately the other way round (`attemptsSpent` counts every
+ * record, seeding included): money spent is money spent, whichever worker
+ * spent it.
+ *
+ * A record written before attempts carried a `mode` matches NEITHER mode and
+ * is counted in neither figure — an unlabelled record cannot be attributed,
+ * and guessing would reintroduce exactly the misfiling this replaces.
+ */
+export function confirmedPaidByMode(state, mode) {
+  return paidAttempts(state).records
+    .filter(r => r.mode === mode && r.outcome === 'accepted-new')
+    .length;
+}
+
+export function paidOutcomesInWindow(state) {
+  return confirmedPaidByMode(state, 'day');
+}
+
+/**
+ * Seeding publications — counted from THEIR OWN records, never by subtracting
+ * the window figure from the lifetime one. Subtraction attributes anything the
+ * window failed to count to the seeding, which is exactly the wrong answer in
+ * the crash case above.
+ */
+export function seededPaid(state) {
+  return confirmedPaidByMode(state, 'seed-legacy');
+}
+
 export function summarize(state) {
   const days = new Set(state.runs.filter(r => r.mode === 'day').map(r => new Date(r.at).toISOString().slice(0, 10)));
   const deduped = state.runs.reduce((n, r) => n + (r.deduped ?? 0), 0);
@@ -345,7 +515,7 @@ export function summarize(state) {
     // Waived by the owner on 2026-09-07 (docs/ROLLBACK.md): the event needs a
     // genuine DO fault, which nothing outside the worker can stage.
     { name: 'recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)', have: 0, need: VOLUME.recoveryReconciled, ok: true },
-    row('paid outcomes', state.paidPosts, VOLUME.paidOutcomes),
+    row('paid outcomes IN THE WINDOW (day runs only)', paidOutcomesInWindow(state), VOLUME.paidOutcomes),
   ];
 }
 
@@ -583,29 +753,89 @@ function log(line) { console.log(line); }
 
 // ── Modes ─────────────────────────────────────────────────────────────
 
-async function seedLegacy({ origin, signer, state, count, dryRun, opts }) {
+/** Exported for the budget tests: its publications cost AR like any other. */
+export async function seedLegacy({ origin, signer, state, count, dryRun, opts, persist }) {
   const price = await getJson(`${opts.probeOrigin}/price/${opts.priceBytes}`);
   const cost = estimateCost(String(price.body), count);
   log(`seed-legacy: ${count} paid publication(s) on ${origin}`);
   log(`  price ≈ ${cost.perTxAr} AR each, ≈ ${cost.totalAr} AR total (arweave.net/price/${opts.priceBytes} = ${cost.perTxWinston} winston)`);
   if (dryRun) { log('  dry run — nothing sent'); return 0; }
+  // These publications cost the same AR as any other and must sit under the
+  // same limit. They used to be charged through `paidPosts`; since the budget
+  // moved to ATTEMPTS they have to be charged here or they escape it entirely.
+  if (needsAttemptsMigration(state)) {
+    log('  STOP ledger predates the paid-attempt counter — run `soak-d2.mjs migrate-attempts` first');
+    return 1;
+  }
+
+  // …and CHARGED is not the same as BOUNDED: `--count` alone would happily walk
+  // past SOAK_MAX_PAID_TOTAL, so the remainder is what actually caps the pass.
+  const spent = attemptsSpent(state);
+  const planned = Math.max(0, Math.min(count, opts.maxPaidTotal - spent));
+  if (planned < count) {
+    log(`  ${count - planned} of ${count} held back: ${spent}/${opts.maxPaidTotal} of the paid limit is already spent`);
+  }
+  if (planned === 0) { log('  STOP the paid limit is spent — nothing sent'); return 1; }
+
+  /** Outcome write, mirroring `dayRun`: an answer known but unrecorded is how
+   *  a legacy fixture loses the txId that cannot be recreated afterwards. */
+  const settle = async (attempt) => {
+    try {
+      if (persist) await persist();
+      return true;
+    } catch (e) {
+      log(`  STOP ledger write failed after a legacy seed send (${e?.message ?? e}) — the attempt stays UNKNOWN`);
+      return false;
+    }
+  };
 
   let failures = 0;
-  for (let i = 0; i < count; i++) {
+  // CONFIRMED successes only. Deriving this from `count - failures` counted
+  // publications that an early `break` never even attempted.
+  let seeded = 0;
+  for (let i = 0; i < planned; i++) {
     const note = { noteId: randomUuidV8(), c: b64(crypto.getRandomValues(new Uint8Array(64))), iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
-    const { status, body } = await signer.upload(origin, note);
+    const attempt = newAttempt(note.noteId, Date.now(), 'seed-legacy');
+    try {
+      await chargeAttempt(state, attempt, persist);
+    } catch (e) {
+      log(`  STOP ledger write failed before a legacy seed send (${e?.message ?? e}) — nothing was sent`);
+      failures++;
+      break;
+    }
+
+    let status, body;
+    try {
+      ({ status, body } = await signer.upload(origin, note));
+    } catch (e) {
+      attempt.outcome = 'unknown';
+      attempt.detail = String(e?.message ?? e);
+      failures++;
+      log(`  UNKNOWN legacy ${note.noteId}: ${attempt.detail} — may be published; never retried automatically`);
+      await settle(attempt);
+      break;
+    }
+
     const verdict = classifyUpload(status, body);
     if (verdict.kind === 'accepted-unattested') {
       state.notes.push({ ...note, kind: 'legacy', txId: body.txId, createdAt: Date.now(), dedupes: 0, rechecks: 0 });
       state.paidPosts += 1;
+      seeded += 1;
+      attempt.outcome = 'accepted-new'; attempt.txId = body.txId;
       log(`  PASS legacy ${note.noteId} → ${body.txId}`);
+      // The publication happened AND the ledger refused it: `seeded` counts the
+      // first, `failures` the second — both are true and neither is derived.
+      if (!(await settle(attempt))) { failures++; break; }
     } else {
       failures++;
+      attempt.outcome = 'error';
+      attempt.detail = `${verdict.kind} — ${verdict.detail}`;
       log(`  FAIL legacy ${note.noteId}: ${verdict.kind} — ${verdict.detail}`);
+      if (!(await settle(attempt))) break;
       if (verdict.kind === 'rate-limited' || verdict.kind === 'not-registered') break;
     }
   }
-  state.runs.push({ at: Date.now(), mode: 'seed-legacy', paid: count - failures, failures });
+  state.runs.push({ at: Date.now(), mode: 'seed-legacy', paid: seeded, failures, requested: count, planned });
   return failures;
 }
 
@@ -616,6 +846,21 @@ async function seedLegacy({ origin, signer, state, count, dryRun, opts }) {
  */
 export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
   const now = Date.now();
+  // A ledger written before the attempt counter existed may not be migrated
+  // behind the operator's back: the historical attempt count is unknowable and
+  // must not be reconstructed from `paidPosts`.
+  if (needsAttemptsMigration(state)) {
+    const why = 'ledger predates the paid-attempt counter — run `soak-d2.mjs migrate-attempts` first '
+      + '(attempts before it are UNKNOWN and are NOT reconstructed from paidPosts)';
+    log(`  STOP ${why}`);
+    return finish(state, { at: now, mode: 'day', paid: 0, deduped: 0, rechecked: 0, legacyBackfilled: 0, problems: [`STOP: ${why}`] });
+  }
+  // An attempt left `pending` means a previous run died between the send and
+  // the answer. It becomes `unknown`, keeps the limit it took, and is never
+  // re-driven. The end-of-run save persists this; repeating it is harmless.
+  for (const s of reconcilePendingAttempts(state, now)) {
+    log(`  UNKNOWN paid ${s.noteId} from an earlier run — interrupted before the outcome was recorded; NOT retried`);
+  }
   const plan = planRun(state, opts, now);
   const price = await getJson(`${opts.probeOrigin}/price/${opts.priceBytes}`);
   const cost = estimateCost(String(price.body), plan.paid);
@@ -648,20 +893,72 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
   const byId = new Map(state.notes.map(n => [n.noteId, n]));
   const stop = (why) => { run.problems.push(`STOP: ${why}`); log(`  STOP ${why}`); };
 
+  /**
+   * Write an attempt's OUTCOME. The attempt is already durable, so a failure
+   * here cannot unbound the budget — but a ledger that cannot record what it
+   * just did is not a ledger, and the record degrades to `unknown` on the next
+   * load anyway. Stop rather than keep spending blind.
+   */
+  const settle = async (attempt) => {
+    try {
+      if (persist) await persist();
+      return true;
+    } catch (e) {
+      stop(`ledger write failed after a paid send (${e?.message ?? e}) — the attempt stays UNKNOWN`);
+      return false;
+    }
+  };
+
   // 1. New paid publications.
   for (let i = 0; i < plan.paid; i++) {
     const note = { noteId: randomUuidV8(), c: b64(crypto.getRandomValues(new Uint8Array(64))), iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
-    const { status, body } = await signer.upload(origin, note);
+    // Durable BEFORE the request leaves: a ledger that will not take the
+    // attempt is a budget that bounds nothing, so refuse to send.
+    const attempt = newAttempt(note.noteId, Date.now(), 'day');
+    try {
+      await chargeAttempt(state, attempt, persist);
+    } catch (e) {
+      stop(`ledger write failed before a paid send (${e?.message ?? e}) — nothing was sent`);
+      return finish(state, run);
+    }
+
+    let status, body;
+    try {
+      ({ status, body } = await signer.upload(origin, note));
+    } catch (e) {
+      // The answer never arrived. The POST may or may not have happened, so
+      // the money may or may not be spent — and NOTHING may re-send this
+      // automatically. The attempt keeps the limit it took.
+      //
+      // This is a STOP, not a note: a scheduler that sees exit 0 here would
+      // record a healthy run over a publication nobody can account for.
+      attempt.outcome = 'unknown';
+      attempt.detail = String(e?.message ?? e);
+      stop(`paid ${note.noteId}: UNKNOWN outcome (${attempt.detail}) — the publication may exist; it is never retried automatically and needs a human`);
+      await settle(attempt);
+      // Stop the pass too: the next send would be planned from a ledger that
+      // does not know what the last one did.
+      return finish(state, run);
+    }
+
     const verdict = classifyUpload(status, body);
     if (verdict.kind === 'accepted-new') {
       const rec = { ...note, kind: 'paid', txId: body.txId, createdAt: Date.now(), dedupes: 0, rechecks: 0 };
       state.notes.push(rec); byId.set(rec.noteId, rec);
       state.paidPosts += 1; run.paid += 1;
+      attempt.outcome = 'accepted-new'; attempt.txId = body.txId;
       log(`  PASS paid ${note.noteId} → ${body.txId}`);
+      if (!(await settle(attempt))) return finish(state, run);
     } else {
+      attempt.outcome = 'error';
+      attempt.detail = `${verdict.kind} — ${verdict.detail}`;
       run.problems.push(`paid ${note.noteId}: ${verdict.kind} — ${verdict.detail}`);
       log(`  FAIL paid ${note.noteId}: ${verdict.kind} — ${verdict.detail}`);
-      if (verdict.kind === 'conflict') { stop('id_payload_conflict on a FRESH id — investigate before any further run'); return finish(state, run); }
+      // Recorded BEFORE settle, so a failing ledger cannot swallow the verdict
+      // that must read zero.
+      if (verdict.kind === 'conflict') stop('id_payload_conflict on a FRESH id — investigate before any further run');
+      const saved = await settle(attempt);
+      if (verdict.kind === 'conflict' || !saved) return finish(state, run);
       if (verdict.kind === 'rate-limited' || verdict.kind === 'not-registered') break;
     }
   }
@@ -749,12 +1046,19 @@ async function snapshot({ origin, secret, stateDir }) {
   await mkdir(dir, { recursive: true });
   const at = new Date();
   const out = { at: at.toISOString(), origin, reports: {} };
-  for (const report of ['semantic_idempotency', 'upload_outcomes']) {
+  // ALL four reports, not two. Workers Logs keeps at most SEVEN DAYS and a
+  // soak window is exactly seven, so the beginning of the window can age out
+  // on the day the window is judged. These dated files are the only copy that
+  // outlives retention — a soak without them is a calendar, not a measurement.
+  for (const report of ['semantic_idempotency', 'upload_outcomes', 'gateway_health', 'status_verdicts']) {
     for (const hours of [24, 168]) {
       const { status, body } = await metricsReport(origin, secret, report, hours);
       out.reports[`${report}_${hours}h`] = { status, body };
       const rows = status === 200 && body && Array.isArray(body.rows) ? body.rows : null;
-      log(`  ${report} ${hours}h: ${rows ? (rows.length ? rows.map(r => `${r.outcome}=${r.n}`).join(' ') : 'no rows') : `HTTP ${status}`}`);
+      // Reports have different column names (outcome/kind/verdict), so the
+      // line is built from whatever the row actually carries.
+      const render = (r) => Object.entries(r).map(([k, v]) => `${k}=${v}`).join(',');
+      log(`  ${report} ${hours}h: ${rows ? (rows.length ? rows.map(render).join(' ') : 'no rows') : `HTTP ${status}`}`);
     }
   }
   const file = join(dir, `${at.toISOString().slice(0, 10)}.json`);
@@ -764,9 +1068,31 @@ async function snapshot({ origin, secret, stateDir }) {
 
 function printStatus(state) {
   log(`state: origin=${state.origin ?? '-'} release=${state.release?.sha?.slice(0, 7) ?? '-'} versionId=${state.release?.workerVersionId ?? '-'}`);
-  log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length}); paid POSTs total: ${state.paidPosts}`);
+  log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length})`);
+  // Three numbers, each counted DIRECTLY from its own source. The window and
+  // seeding figures come from the durable attempt records; `paidPosts` is the
+  // lifetime counter. Deriving any of them by subtraction would blame the
+  // seeding for whatever the others failed to see.
+  const inWindow = paidOutcomesInWindow(state);
+  const seeded = seededPaid(state);
+  log(`paid POSTs: ${inWindow} in the window (day) + ${seeded} seeding = ${inWindow + seeded} attributed; ${state.paidPosts} lifetime`);
+  if (inWindow + seeded !== state.paidPosts) {
+    log(`  ! ${state.paidPosts - inWindow - seeded} paid POST(s) are unattributed — records without a mode, or a counter written without one`);
+  }
   const sent = redropSends(state);
   log(`redrop-capable sends: recheck ${sent.recheck}/${DEFAULTS.redropRecheckTotal}, legacy ${sent.legacy}/${DEFAULTS.redropLegacyTotal}`);
+  // An unmigrated ledger must not read as "0 attempts" — that is exactly the
+  // false reassurance this counter exists to remove.
+  if (needsAttemptsMigration(state)) {
+    log('paid attempts: NOT TRACKED — this ledger predates the counter; `day` refuses until `soak-d2.mjs migrate-attempts` is run');
+  } else {
+    const at = attemptsSummary(state);
+    log(`paid attempts: ${at.total}/${DEFAULTS.maxPaidTotal} (accepted ${at.accepted}, error ${at.error}, unknown ${at.unknown}) — the budget charges ATTEMPTS, not successes`);
+    if (at.priorEra?.attemptsUnknown) {
+      log(`  ! attempts before ${new Date(at.priorEra.migratedAt).toISOString()} were never recorded; the budget counts ${at.priorEra.knownSuccesses} known successes as a LOWER BOUND — the real figure may be higher`);
+    }
+    if (at.unknown) log(`  ! ${at.unknown} attempt(s) with an UNKNOWN outcome — each may be published; none is retried automatically`);
+  }
   for (const row of summarize(state)) log(`  ${row.ok ? 'OK  ' : '    '} ${row.name}: ${row.have}/${row.need}`);
   const stops = state.runs.flatMap(r => (r.problems ?? []).filter(p => p.startsWith('STOP')));
   if (stops.length) { log('STOP markers in the ledger — the soak is NOT green:'); for (const s of stops) log(`  ${s}`); }
@@ -802,8 +1128,20 @@ export async function main(argv) {
 
   async function run() {
   const state = await loadState(statePath);
+  if (mode === 'migrate-attempts') {
+    const res = migrateAttempts(state, Date.now());
+    if (res.migrated) {
+      log(`migrated: ${res.knownSuccesses} known successes recorded as the LOWER BOUND for the era before the counter existed`);
+      log('attempts before this point are UNKNOWN and were NOT reconstructed from paidPosts; the limit stays in force unchanged');
+    } else {
+      log('the attempt ledger is already in place — nothing to migrate');
+    }
+    await saveState(statePath, state);
+    printStatus(state);
+    return 0;
+  }
   if (!['register', 'seed-legacy', 'day', 'snapshot'].includes(mode)) {
-    console.error('usage: soak-d2.mjs <register [--invite CODE] | seed-legacy --count N | day [--paid N] | snapshot | status> [--dry-run]');
+    console.error('usage: soak-d2.mjs <register [--invite CODE] | seed-legacy --count N | day [--paid N] | snapshot | status | migrate-attempts> [--dry-run]');
     return 2;
   }
 
@@ -841,7 +1179,7 @@ export async function main(argv) {
   let failures;
   if (mode === 'seed-legacy') {
     const count = cli.count ?? 5;
-    failures = await seedLegacy({ origin, signer, state, count, dryRun: cli.dryRun, opts });
+    failures = await seedLegacy({ origin, signer, state, count, dryRun: cli.dryRun, opts, persist: cli.dryRun ? null : () => saveState(statePath, state) });
   } else {
     state.release ??= { sha: health.releaseSha, workerVersionId: health.workerVersionId, firstSeenAt: Date.now() };
     failures = await dayRun({

@@ -8,6 +8,9 @@ import {
   emptyState, checkReleaseGate, planRun, classifyUpload, readConfirmations, readTxHeaderOk,
   estimateCost, summarize, parseArgs, randomUuidV8, v3Tags,
   redropSends, chargeBudget, acquireLedgerLock, saveState, loadState, dayRun,
+  newAttempt, paidAttempts, attemptsSpent, attemptsSummary, chargeAttempt,
+  seedLegacy, paidOutcomesInWindow, seededPaid,
+  needsAttemptsMigration, migrateAttempts, reconcilePendingAttempts,
 } from './soak-d2.mjs';
 
 const NEW_SHA = '5881da2ab1ce7ff6bc51d7ebb9794fddae254896';
@@ -62,11 +65,42 @@ describe('checkReleaseGate', () => {
 describe('planRun', () => {
   const opts = { ...DEFAULTS, paidPerRun: 3, maxPaidTotal: 5, dedupePerRun: 2, legacyPerRun: 1 };
 
-  it('bounds paid publications per run AND per soak', () => {
-    expect(planRun({ ...emptyState(), paidPosts: 0 }, opts, 0).paid).toBe(3);
-    expect(planRun({ ...emptyState(), paidPosts: 4 }, opts, 0)).toMatchObject({ paid: 1, paidLeftAfter: 0 });
-    expect(planRun({ ...emptyState(), paidPosts: 5 }, opts, 0).paid).toBe(0);
-    expect(planRun({ ...emptyState(), paidPosts: 9 }, opts, 0).paid).toBe(0);
+  // The budget charges ATTEMPTS. `paidPosts` counts successes and is
+  // deliberately NOT the basis: 5 successes after 6 attempts means the sixth
+  // spent AR too, and a limit that cannot see it bounds nothing.
+  const attempted = (n) => ({
+    ...emptyState(),
+    paidAttempts: {
+      records: Array.from({ length: n }, (_, i) => ({ id: `a${i}`, at: 0, noteId: `n${i}`, outcome: 'accepted-new' })),
+      priorEra: null,
+    },
+  });
+
+  it('bounds paid publications per run AND per soak, counting attempts', () => {
+    expect(planRun(attempted(0), opts, 0).paid).toBe(3);
+    expect(planRun(attempted(4), opts, 0)).toMatchObject({ paid: 1, paidLeftAfter: 0 });
+    expect(planRun(attempted(5), opts, 0).paid).toBe(0);
+    expect(planRun(attempted(9), opts, 0).paid).toBe(0);
+  });
+
+  // The reason the counter exists at all: a failure and a lost answer cost the
+  // same AR as a success and must bound the plan identically.
+  it('a failed or unanswered attempt consumes the limit exactly like a success', () => {
+    const mixed = {
+      ...emptyState(),
+      paidPosts: 1,
+      paidAttempts: {
+        records: [
+          { id: 'a', at: 0, noteId: 'n1', outcome: 'accepted-new' },
+          { id: 'b', at: 0, noteId: 'n2', outcome: 'error' },
+          { id: 'c', at: 0, noteId: 'n3', outcome: 'unknown' },
+          { id: 'd', at: 0, noteId: 'n4', outcome: 'pending' },
+        ],
+        priorEra: null,
+      },
+    };
+    // `paidPosts` says 1. The budget must still see 4 spent.
+    expect(planRun(mixed, opts, 0)).toMatchObject({ paid: 1, paidLeftAfter: 0 });
   });
 
   it('dedupes the least-re-sent comparable notes first and never an unbackfilled legacy', () => {
@@ -239,15 +273,18 @@ describe('summarize', () => {
     const state = {
       ...emptyState(),
       paidPosts: 21,
+      paidAttempts: { records: Array.from({ length: 21 }, (_, i) => ({ id: `a${i}`, at: 0, noteId: `n${i}`, mode: 'day', outcome: 'accepted-new' })), priorEra: null },
       notes: [note({ kind: 'legacy', backfilledAt: 1 }), note({ kind: 'legacy', backfilledAt: 1 }), note({ kind: 'legacy' })],
+      // `paid` per run is what the WINDOW counts; `paidPosts` above is the
+      // lifetime total and is deliberately NOT what the volume row reads.
       runs: [
-        { at: Date.UTC(2026, 8, 8), mode: 'day', deduped: 6 },
-        { at: Date.UTC(2026, 8, 9), mode: 'day', deduped: 7 },
-        { at: Date.UTC(2026, 8, 9, 23), mode: 'day', deduped: 1 },
+        { at: Date.UTC(2026, 8, 8), mode: 'day', deduped: 6, paid: 7 },
+        { at: Date.UTC(2026, 8, 9), mode: 'day', deduped: 7, paid: 7 },
+        { at: Date.UTC(2026, 8, 9, 23), mode: 'day', deduped: 1, paid: 7 },
       ],
     };
     const rows = Object.fromEntries(summarize(state).map(r => [r.name, r]));
-    expect(rows['paid outcomes']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
+    expect(rows['paid outcomes IN THE WINDOW (day runs only)']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
     expect(rows['deduped']).toMatchObject({ have: 14, ok: true });
     expect(rows['distinct days with a day run']).toMatchObject({ have: 2, ok: false });
     expect(rows['legacy_backfilled (distinct records)']).toMatchObject({ have: 2, ok: false });
@@ -372,6 +409,375 @@ describe('budget execution', () => {
     const third = await acquireLedgerLock(path);
     expect(third.ok).toBe(true);
     await third.release();
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+/**
+ * The paid-attempt ledger.
+ *
+ * `paidPosts` counts SUCCESSES, so it can never bound money: 18 attempts with
+ * one failure and 17 successes are indistinguishable from 17 clean ones — the
+ * hole the 2026-09-09 observability review opened. These prove the attempt is
+ * durable before the send, that an unanswered send keeps its limit forever and
+ * is never re-driven, and that a ledger predating the counter is migrated
+ * EXPLICITLY instead of reconstructed from successes.
+ */
+describe('paid-attempt ledger', () => {
+  const tmpDir = () => join(tmpdir(), `soak-d2-${randomUUID()}`);
+  const stubPrice = () => vi.stubGlobal('fetch', async () => new Response('3371193814', { status: 200 }));
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const paidOpts = { ...DEFAULTS, paidPerRun: 1, noRecheck: true, noLegacy: true };
+  const unreachable = { upload: async () => { throw new Error('must not be reached'); } };
+
+  it('records the attempt BEFORE the send and settles the outcome after', async () => {
+    stubPrice();
+    const state = emptyState();
+    const inFlight = [];
+    const signer = {
+      upload: async () => {
+        inFlight.push(structuredClone(paidAttempts(state).records));
+        return { status: 200, body: { txId: TX, status: 'accepted', committed: true, semanticIdempotency: 1 } };
+      },
+    };
+
+    await dayRun({ origin: 'https://worker.test', signer, state, opts: paidOpts, persist: async () => {} });
+
+    expect(inFlight[0]).toHaveLength(1);
+    expect(inFlight[0][0].outcome).toBe('pending');
+    expect(attemptsSummary(state)).toMatchObject({ total: 1, accepted: 1, error: 0, unknown: 0 });
+    expect(paidAttempts(state).records[0].txId).toBe(TX);
+  });
+
+  it('a ledger that will not persist STOPS the paid send', async () => {
+    stubPrice();
+    const state = emptyState();
+
+    const failures = await dayRun({
+      origin: 'https://worker.test', signer: unreachable, state, opts: paidOpts,
+      persist: async () => { throw new Error('disk full'); },
+    });
+
+    expect(failures).toBeGreaterThan(0);
+    expect(state.runs.at(-1).problems.join(' ')).toMatch(/STOP: ledger write failed before a paid send/);
+    expect(attemptsSummary(state)).toMatchObject({ total: 1, unknown: 1 });
+  });
+
+  it('an unanswered send is a STOP: unknown outcome, NON-ZERO exit, limit kept', async () => {
+    stubPrice();
+    const state = emptyState();
+    const sent = [];
+    const signer = { upload: async (_o, note) => { sent.push(note.noteId); throw new Error('socket hang up'); } };
+
+    const failures = await dayRun({ origin: 'https://worker.test', signer, state, opts: { ...paidOpts, paidPerRun: 3 }, persist: async () => {} });
+
+    // The whole point: a scheduler must NOT read this as a healthy run.
+    expect(failures).toBeGreaterThan(0);
+    expect(sent).toHaveLength(1); // the pass stops instead of sending into an unknown wallet state
+    expect(state.paidPosts).toBe(0);
+    expect(attemptsSummary(state)).toMatchObject({ total: 1, accepted: 0, unknown: 1 });
+    expect(state.runs.at(-1).problems.join(' ')).toMatch(/STOP: paid .* UNKNOWN outcome .* needs a human/);
+  });
+
+  // Not "the next run sends nothing" — that proves little. The next run must be
+  // ABLE to publish and still leave the unknown attempt alone.
+  it('the unknown attempt is never re-sent: a later run publishes a NEW note instead', async () => {
+    stubPrice();
+    const state = emptyState();
+    const sent = [];
+    const dead = { upload: async (_o, note) => { sent.push(note.noteId); throw new Error('socket hang up'); } };
+    await dayRun({ origin: 'https://worker.test', signer: dead, state, opts: paidOpts, persist: async () => {} });
+
+    const stranded = paidAttempts(state).records[0];
+    expect(stranded.outcome).toBe('unknown');
+
+    const alive = {
+      upload: async (_o, note) => {
+        sent.push(note.noteId);
+        return { status: 200, body: { txId: TX2, status: 'accepted', committed: true, semanticIdempotency: 1 } };
+      },
+    };
+    await dayRun({ origin: 'https://worker.test', signer: alive, state, opts: paidOpts, persist: async () => {} });
+
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).not.toBe(stranded.noteId);            // a fresh id, not a retry of the unknown one
+    expect(paidAttempts(state).records).toHaveLength(2);  // and it took a second slot
+    expect(paidAttempts(state).records[0]).toMatchObject({ noteId: stranded.noteId, outcome: 'unknown' });
+    expect(attemptsSpent(state)).toBe(2);
+  });
+
+  it('a ledger that will not persist AFTER the send stops the run, and the attempt stays unknown on disk', async () => {
+    stubPrice();
+    const state = emptyState();
+    let writes = 0;
+    // The charge lands; the outcome write does not — exactly the window where
+    // the answer is known but unrecordable.
+    const persist = async () => { writes += 1; if (writes > 1) throw new Error('disk full'); };
+    const signer = { upload: async () => ({ status: 200, body: { txId: TX, status: 'accepted', committed: true, semanticIdempotency: 1 } }) };
+
+    const failures = await dayRun({ origin: 'https://worker.test', signer, state, opts: paidOpts, persist });
+
+    expect(failures).toBeGreaterThan(0);
+    expect(state.runs.at(-1).problems.join(' ')).toMatch(/STOP: ledger write failed after a paid send/);
+    expect(attemptsSpent(state)).toBe(1); // the slot is spent either way
+  });
+
+  // seed-legacy publications cost the same AR. They used to be bounded through
+  // `paidPosts`; moving the budget to attempts must not let them escape it.
+  it('seed-legacy publications are charged to the same limit', async () => {
+    stubPrice();
+    const state = emptyState();
+    const signer = { upload: async () => ({ status: 200, body: { txId: TX, status: 'accepted', committed: true } }) };
+
+    await seedLegacy({ origin: 'https://worker.test', signer, state, count: 5, opts: DEFAULTS, persist: async () => {} });
+
+    expect(state.paidPosts).toBe(5);
+    expect(attemptsSpent(state)).toBe(5); // NOT zero
+    // …and `day` sees the reduced remainder, exactly as it did before.
+    expect(planRun(state, { ...DEFAULTS, paidPerRun: 3, maxPaidTotal: 6 }, 0).paid).toBe(1);
+  });
+
+  it('seed-legacy refuses an unmigrated ledger rather than silently creating one', async () => {
+    stubPrice();
+    const state = emptyState();
+    delete state.paidAttempts;
+    const signer = { upload: async () => { throw new Error('must not be reached'); } };
+
+    const failures = await seedLegacy({ origin: 'https://worker.test', signer, state, count: 5, opts: DEFAULTS, persist: async () => {} });
+
+    expect(failures).toBeGreaterThan(0);
+    expect(state.paidAttempts).toBeUndefined();
+  });
+
+  // Charged is not the same as bounded: `--count` alone would walk past the
+  // window limit that every other paid send respects.
+  it('seed-legacy is BOUNDED by the remaining limit, not just by --count', async () => {
+    stubPrice();
+    const state = emptyState();
+    // The single slot of a one-slot budget, already taken by an unknown attempt.
+    await chargeAttempt(state, { ...newAttempt('earlier', 0), outcome: 'unknown' }, null);
+    const sent = [];
+    const signer = {
+      upload: async (_o, n) => { sent.push(n.noteId); return { status: 200, body: { txId: TX, status: 'accepted', committed: true } }; },
+    };
+
+    const failures = await seedLegacy({
+      origin: 'https://worker.test', signer, state, count: 1,
+      opts: { ...DEFAULTS, maxPaidTotal: 1 }, persist: async () => {},
+    });
+
+    expect(sent).toEqual([]);
+    expect(failures).toBeGreaterThan(0);
+    expect(attemptsSpent(state)).toBe(1); // the pass added nothing
+  });
+
+  it('seed-legacy writes the OUTCOME to disk, not merely the charge', async () => {
+    const dir = tmpDir();
+    const path = join(dir, 'state.json');
+    stubPrice();
+    const state = emptyState();
+    const signer = { upload: async () => ({ status: 200, body: { txId: TX, status: 'accepted', committed: true } }) };
+
+    await seedLegacy({
+      origin: 'https://worker.test', signer, state, count: 1,
+      opts: DEFAULTS, persist: () => saveState(path, state),
+    });
+
+    // What a process killed right here would find on its next start. A legacy
+    // fixture's txId cannot be recreated once D2 is live, so losing it is final.
+    const reloaded = await loadState(path);
+    expect(paidAttempts(reloaded).records[0]).toMatchObject({ outcome: 'accepted-new', txId: TX });
+    expect(reloaded.notes[0].txId).toBe(TX);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('an early stop does not invent successes in the seed run record', async () => {
+    stubPrice();
+    const state = emptyState();
+    const signer = { upload: async () => { throw new Error('socket hang up'); } };
+
+    await seedLegacy({ origin: 'https://worker.test', signer, state, count: 5, opts: DEFAULTS, persist: async () => {} });
+
+    const run = state.runs.at(-1);
+    expect(run.paid).toBe(0);        // `count - failures` would have claimed 4
+    expect(run.requested).toBe(5);
+    expect(state.paidPosts).toBe(0);
+    expect(attemptsSummary(state)).toMatchObject({ total: 1, accepted: 0, unknown: 1 });
+  });
+
+  it('an interruption between the send and the answer reconciles to unknown, keeping the limit', async () => {
+    const dir = tmpDir();
+    const path = join(dir, 'state.json');
+    const state = emptyState();
+
+    await chargeAttempt(state, newAttempt('n1', 0), () => saveState(path, state));
+
+    const reloaded = await loadState(path);
+    expect(paidAttempts(reloaded).records[0].outcome).toBe('pending');
+    expect(attemptsSpent(reloaded)).toBe(1);
+
+    const stranded = reconcilePendingAttempts(reloaded, 123);
+    expect(stranded).toHaveLength(1);
+    expect(paidAttempts(reloaded).records[0]).toMatchObject({ outcome: 'unknown', reconciledAt: 123 });
+    expect(attemptsSpent(reloaded)).toBe(1);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  describe('a ledger written before the counter existed', () => {
+    const legacyLedger = () => { const s = emptyState(); delete s.paidAttempts; s.paidPosts = 11; return s; };
+
+    it('day REFUSES until the operator migrates explicitly', async () => {
+      const state = legacyLedger();
+
+      const failures = await dayRun({
+        origin: 'https://worker.test', signer: unreachable, state, opts: paidOpts, persist: async () => {},
+      });
+
+      expect(failures).toBeGreaterThan(0);
+      expect(state.runs.at(-1).problems.join(' ')).toMatch(/STOP: ledger predates the paid-attempt counter/);
+    });
+
+    it('does NOT reconstruct attempts from successes, and keeps the limit in force', () => {
+      const state = legacyLedger();
+
+      expect(needsAttemptsMigration(state)).toBe(true);
+      expect(migrateAttempts(state, 999)).toMatchObject({ migrated: true, knownSuccesses: 11 });
+
+      expect(paidAttempts(state).records).toEqual([]);
+      expect(paidAttempts(state).priorEra).toMatchObject({ migratedAt: 999, knownSuccesses: 11, attemptsUnknown: true });
+      expect(state.paidPosts).toBe(11);
+      expect(attemptsSpent(state)).toBe(11);
+      expect(planRun(state, { ...DEFAULTS, paidPerRun: 3, maxPaidTotal: 12 }, 0).paid).toBe(1);
+    });
+
+    // The reviewer's case: results may not stand in for schema. A ledger whose
+    // publications ALL failed has paidPosts === 0 and is still an old ledger.
+    it('an old ledger with only FAILURES still needs migration', () => {
+      const s = emptyState();
+      delete s.paidAttempts;
+      s.paidPosts = 0;
+      s.runs = [{ at: 0, mode: 'day', paid: 0, problems: ['paid n1: unexpected — HTTP 502'] }];
+
+      expect(needsAttemptsMigration(s)).toBe(true);
+      expect(migrateAttempts(s, 5)).toMatchObject({ migrated: true, knownSuccesses: 0 });
+      expect(paidAttempts(s).priorEra).toMatchObject({ migratedAt: 5, knownSuccesses: 0, attemptsUnknown: true });
+    });
+
+    it('is idempotent, and a fresh ledger needs nothing', () => {
+      const migrated = legacyLedger();
+      migrateAttempts(migrated, 999);
+      expect(migrateAttempts(migrated, 1000)).toMatchObject({ migrated: false });
+      expect(paidAttempts(migrated).priorEra.migratedAt).toBe(999);
+
+      expect(needsAttemptsMigration(emptyState())).toBe(false);
+      expect(migrateAttempts(emptyState(), 1).migrated).toBe(false);
+    });
+  });
+});
+
+/**
+ * Budget and window volume are DIFFERENT numbers, and BOTH are counted from the
+ * durable attempt records — never from `runs`, never by subtraction.
+ *
+ * `runs` is the wrong source because `finish()` appends the run at the very END
+ * of a pass, while `settle()` has already persisted the successful attempt, the
+ * note and `paidPosts` the moment the answer arrived. A process killed between
+ * those two leaves a publication that IS durably recorded and belongs to no
+ * run. Counting from `runs` loses it; deriving the seeding by subtraction then
+ * blames the seeding for it.
+ */
+describe('paid publications are attributed from durable records', () => {
+  const rec = (n, mode, outcome = 'accepted-new') =>
+    Array.from({ length: n }, (_, i) => ({ id: `${mode}-${i}`, at: 0, noteId: `n-${mode}-${i}`, mode, outcome }));
+
+  const ledger = (seed, day, extraRuns = []) => ({
+    ...emptyState(),
+    paidPosts: seed + day,
+    runs: [
+      { at: Date.UTC(2026, 8, 1), mode: 'seed-legacy', paid: seed, failures: 0 },
+      ...extraRuns,
+    ],
+    paidAttempts: { records: [...rec(seed, 'seed-legacy'), ...rec(day, 'day')], priorEra: null },
+  });
+
+  it('counts ONLY day-mode confirmations toward the window', () => {
+    const s = ledger(5, 9);
+    expect(s.paidPosts).toBe(14);
+    expect(paidOutcomesInWindow(s)).toBe(9);
+    expect(seededPaid(s)).toBe(5);
+  });
+
+  it('counts the seeding from ITS OWN records, not by subtraction', () => {
+    // A record with no mode (written before attempts carried one) belongs to
+    // neither figure — and must NOT be swept into the seeding.
+    const s = ledger(2, 3);
+    s.paidAttempts.records.push({ id: 'x', at: 0, noteId: 'n-x', outcome: 'accepted-new' });
+    s.paidPosts = 6;
+    expect(seededPaid(s)).toBe(2);          // subtraction would have said 3
+    expect(paidOutcomesInWindow(s)).toBe(3);
+  });
+
+  it('only CONFIRMED publications count — errors and unknowns do not', () => {
+    const s = ledger(0, 2);
+    s.paidAttempts.records.push(...rec(1, 'day', 'error'), ...rec(1, 'day', 'unknown'), ...rec(1, 'day', 'pending'));
+    expect(paidOutcomesInWindow(s)).toBe(2);
+    expect(attemptsSpent(s)).toBe(5); // …but all five took budget
+  });
+
+  it('the volume row reports the WINDOW figure, not the lifetime one', () => {
+    const s = ledger(5, 9);
+    const row = summarize(s).find(r => /paid outcomes/i.test(r.name));
+    expect(row).toMatchObject({ have: 9, need: VOLUME.paidOutcomes, ok: false });
+    expect(row.have).not.toBe(s.paidPosts);
+  });
+
+  it('a window padded by seeding does NOT clear the bar', () => {
+    const real = ledger(0, 20);
+    const padded = ledger(5, 15);
+    expect(padded.paidPosts).toBe(20);
+    expect(summarize(real).find(r => /paid outcomes/i.test(r.name)).ok).toBe(true);
+    expect(summarize(padded).find(r => /paid outcomes/i.test(r.name)).ok).toBe(false);
+  });
+
+  it('the BUDGET counts the seeding — money spent is money spent', () => {
+    const s = ledger(5, 3);
+    expect(attemptsSpent(s)).toBe(8);
+    expect(planRun(s, { ...DEFAULTS, paidPerRun: 3, maxPaidTotal: 10 }, 0).paid).toBe(2);
+  });
+
+  it('the seed run is in `runs` but adds no distinct DAY', () => {
+    const s = ledger(5, 3, [{ at: Date.UTC(2026, 8, 2), mode: 'day', paid: 3, deduped: 0, problems: [] }]);
+    expect(s.runs).toHaveLength(2);
+    expect(summarize(s).find(r => /distinct days/i.test(r.name)).have).toBe(1);
+  });
+
+  /**
+   * The crash the `runs`-based count got wrong: killed after `settle()`
+   * persisted the success, before `finish()` appended the run.
+   */
+  it('a publication settled but never finished still counts in the window', async () => {
+    const dir = join(tmpdir(), `soak-d2-${randomUUID()}`);
+    const path = join(dir, 'state.json');
+    const state = emptyState();
+    const persist = () => saveState(path, state);
+
+    // Exactly what a paid send does, up to and including settle…
+    const attempt = newAttempt('n-1', 0, 'day');
+    await chargeAttempt(state, attempt, persist);
+    state.notes.push({ noteId: 'n-1', c: 'c', iv: 'iv', kind: 'paid', txId: TX, createdAt: 0, dedupes: 0, rechecks: 0 });
+    state.paidPosts += 1;
+    attempt.outcome = 'accepted-new';
+    attempt.txId = TX;
+    await persist();
+    // …and then the process dies. `finish()` never ran, so `runs` stays empty.
+
+    const reloaded = await loadState(path);
+    expect(reloaded.runs).toEqual([]);
+    expect(reloaded.paidPosts).toBe(1);
+    // The publication belongs to the WINDOW, and is not misfiled as seeding.
+    expect(paidOutcomesInWindow(reloaded)).toBe(1);
+    expect(seededPaid(reloaded)).toBe(0);
+    expect(summarize(reloaded).find(r => /paid outcomes/i.test(r.name)).have).toBe(1);
     await rm(dir, { recursive: true, force: true });
   });
 });

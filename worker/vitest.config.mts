@@ -38,6 +38,11 @@ export default defineConfig({
     }),
   ],
   test: {
+    // NOTE: scripts/**/*.test.mjs (the soak driver, the gateway smoke, the
+    // redirect guard) are deliberately NOT here — they are plain Node, and
+    // both worker configs run in the workers pool where node:fs is absent.
+    // The ROOT vitest.config.ts runs them (see its worker/scripts/** entry),
+    // so `cd worker && npm test` does not cover them and the root run does.
     include: ['test/**/*.test.ts', 'src/**/*.test.ts'],
     exclude: [
       '**/node_modules/**',

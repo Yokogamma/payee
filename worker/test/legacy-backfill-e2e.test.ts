@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
@@ -139,6 +139,10 @@ async function envFor(cap?: ReturnType<typeof capture>): Promise<Record<string, 
   };
 }
 
+// The conflict suite spies on console.error to read the critical-outcome log
+// lines; never leave that spy installed for the next file.
+afterEach(() => { vi.restoreAllMocks(); });
+
 describe('a legacy record whose publication IS the payload being sent', () => {
   it('backfills the fingerprint and answers the dedupe', async () => {
     const noteId = NOTE_ID;
@@ -200,11 +204,25 @@ describe('a legacy record whose publication is something ELSE', () => {
     await seedLegacyCommitted(noteId, tx.txId);
     serveTx(tx);
     const cap = capture();
+    // The strictly-zero criteria need a witness Analytics Engine sampling cannot
+    // swallow, so every critical outcome also writes one structured log line.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const r = await worker.fetch(await uploadRequest(noteId, 'lb-3'), await envFor(cap) as never);
 
     expect(r.status).toBe(409);
     expect(cap.outcomes()).toEqual(['legacy_backfilled', 'conflict']);
+
+    const critical = errorSpy.mock.calls
+      .map(c => c[0])
+      .filter((l): l is string => typeof l === 'string' && l.startsWith('{"critical"'))
+      .map(l => JSON.parse(l) as Record<string, unknown>);
+    expect(critical).toContainEqual(
+      expect.objectContaining({ critical: 'conflict', noteId, txId: tx.txId }),
+    );
+    // …and it carries the labels ONLY: no note bytes, no key material.
+    expect(JSON.stringify(critical)).not.toContain('BBBBBBBBBBBBBBBBBBBBBB==');
+    expect(JSON.stringify(critical)).not.toContain(identity.ownerHash);
     const body = await r.json() as { code: string; txId?: string };
     expect(body.code).toBe('id_payload_conflict');
     // The proof still landed — the fingerprint of what is ACTUALLY published.

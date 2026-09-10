@@ -132,7 +132,9 @@ describe('upstream contract: bearer, SQL text, {rows} shape, no proxying', () =>
     const r = await worker.fetch(req({ report: 'status_verdicts', hours: 48 }), configuredEnv());
     expect(r.status).toBe(200);
     expect(route.lastBody).toContain("INTERVAL '48' HOUR");
-    expect(route.lastBody).toContain("index1='status_verdict'");
+    // Reads BOTH schemas: bare-event rows written before the index split and
+    // event:discriminator rows written after it.
+    expect(route.lastBody).toContain("(index1 = 'status_verdict' OR index1 LIKE 'status_verdict:%')");
   });
 
   it('accepts every whitelisted report', async () => {
@@ -178,19 +180,19 @@ describe('upstream contract: bearer, SQL text, {rows} shape, no proxying', () =>
 describe('SQL templates are pinned (r17)', () => {
   it('gateway_health', () => {
     expect(buildMetricsReportSql('gateway_health', 'eternal_notes_metrics', 24)).toMatchInlineSnapshot(
-      `"SELECT blob2 AS kind, blob3 AS host, blob4 AS class, SUM(_sample_interval) AS calls, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_ms FROM eternal_notes_metrics WHERE index1='gateway_call' AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY kind, host, class LIMIT 200 FORMAT JSON"`,
+      `"SELECT blob2 AS kind, blob3 AS host, blob4 AS class, SUM(_sample_interval) AS calls, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95_ms FROM eternal_notes_metrics WHERE (index1 = 'gateway_call' OR index1 LIKE 'gateway_call:%') AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY kind, host, class LIMIT 200 FORMAT JSON"`,
     );
   });
 
   it('upload_outcomes', () => {
     expect(buildMetricsReportSql('upload_outcomes', 'eternal_notes_metrics', 24)).toMatchInlineSnapshot(
-      `"SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE index1='upload_outcome' AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON"`,
+      `"SELECT blob2 AS outcome, blob3 AS app_version, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE (index1 = 'upload_outcome' OR index1 LIKE 'upload_outcome:%') AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY outcome, app_version LIMIT 50 FORMAT JSON"`,
     );
   });
 
   it('status_verdicts', () => {
     expect(buildMetricsReportSql('status_verdicts', 'eternal_notes_metrics', 24)).toMatchInlineSnapshot(
-      `"SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE index1='status_verdict' AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY verdict, host LIMIT 100 FORMAT JSON"`,
+      `"SELECT blob2 AS verdict, blob3 AS host, SUM(_sample_interval) AS n FROM eternal_notes_metrics WHERE (index1 = 'status_verdict' OR index1 LIKE 'status_verdict:%') AND timestamp > NOW() - INTERVAL '24' HOUR GROUP BY verdict, host LIMIT 100 FORMAT JSON"`,
     );
   });
 
@@ -204,5 +206,129 @@ describe('SQL templates are pinned (r17)', () => {
     }
     expect(buildMetricsReportSql('gateway_health', 'eternal_notes_metrics', 24))
       .toContain('quantileExactWeighted(0.95)(double1, _sample_interval)');
+  });
+});
+/**
+ * POST /admin/telemetry-probe — the control event.
+ *
+ * It exists because neither cheaper option proves what the soak needs:
+ * `/health` writes no console line at all (its invocation record shows the
+ * collector runs, not that an application JSON line survives), and provoking a
+ * real `conflict` needs a prior PAID publication and would put a non-zero into
+ * the very criterion it was meant to verify.
+ *
+ * So the probe must be, at once: the SAME logging mechanism as the critical
+ * outcomes, invisible to every soak criterion, and incapable of spending AR.
+ */
+describe('POST /admin/telemetry-probe', () => {
+  const probeReq = (opts: { auth?: string | null; method?: string; contentType?: string } = {}) => {
+    const method = opts.method ?? 'POST';
+    return new Request('https://proxy.example.com/admin/telemetry-probe', {
+      method,
+      headers: {
+        ...(opts.contentType === undefined ? { 'Content-Type': 'application/json' }
+          : opts.contentType === '' ? {} : { 'Content-Type': opts.contentType }),
+        ...(opts.auth === null ? {} : { Authorization: opts.auth ?? AUTH }),
+      },
+      ...(method === 'GET' ? {} : { body: '{}' }),
+    });
+  };
+
+  /** Every structured line the worker wrote during one call. */
+  const captureLines = async (run: () => Promise<Response>) => {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { if (typeof args[0] === 'string') lines.push(args[0]); };
+    try {
+      return { response: await run(), lines };
+    } finally {
+      console.error = original;
+    }
+  };
+
+  it('writes ONE structured line carrying the id it returns', async () => {
+    const { response, lines } = await captureLines(() => worker.fetch(probeReq(), configuredEnv()));
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { probe: string; probeId: string };
+    expect(body.probe).toBe('telemetry_probe');
+    expect(body.probeId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const structured = lines.filter(l => l.startsWith('{')).map(l => JSON.parse(l) as Record<string, unknown>);
+    expect(structured).toHaveLength(1);
+    expect(structured[0]).toMatchObject({ probe: 'telemetry_probe', probeId: body.probeId });
+    expect(typeof structured[0].at).toBe('number');
+    // The id is the whole point: the operator greps the live export for it.
+    expect(lines[0]).toContain(body.probeId);
+  });
+
+  it('is NOT a criterion: never the `critical` key, and no soak outcome in it', async () => {
+    const { lines } = await captureLines(() => worker.fetch(probeReq(), configuredEnv()));
+    const line = lines.find(l => l.startsWith('{'))!;
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+
+    // `critical` is what the exporter counts and what the criteria are read
+    // from — a probe landing there would inflate a number that must read zero.
+    expect(parsed).not.toHaveProperty('critical');
+    expect(parsed).not.toHaveProperty('noteId');
+    for (const outcome of ['conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict', 'arweave_throw']) {
+      expect(line).not.toContain(outcome);
+    }
+  });
+
+  it('every call is distinguishable — two probes never share an id', async () => {
+    const a = await (await worker.fetch(probeReq(), configuredEnv())).json() as { probeId: string };
+    const b = await (await worker.fetch(probeReq(), configuredEnv())).json() as { probeId: string };
+    expect(a.probeId).not.toBe(b.probeId);
+  });
+
+  // Nothing a caller sends may reach the log line: a caller-chosen id would be
+  // an injection point into the very evidence the export is built from.
+  it('takes NOTHING from the request into the line', async () => {
+    const injected = new Request('https://proxy.example.com/admin/telemetry-probe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: AUTH },
+      body: JSON.stringify({ probeId: 'attacker-chosen', critical: 'conflict', noteId: 'n-1' }),
+    });
+    const { lines } = await captureLines(() => worker.fetch(injected, configuredEnv()));
+    const line = lines.find(l => l.startsWith('{'))!;
+
+    expect(line).not.toContain('attacker-chosen');
+    expect(line).not.toContain('conflict');
+    expect(line).not.toContain('n-1');
+  });
+
+  it('auth order matches /admin/metrics: 503 without the secret, 401 on a wrong bearer', async () => {
+    const noSecret = await worker.fetch(probeReq(), configuredEnv({ METRICS_ADMIN_SECRET: undefined }));
+    expect(noSecret.status).toBe(503);
+
+    for (const auth of ['Bearer wrong', 'Bearer test-admin-secret', null]) {
+      const r = await worker.fetch(probeReq({ auth }), configuredEnv());
+      expect(r.status).toBe(401);
+    }
+  });
+
+  it('writes NOTHING when the caller is not authorised', async () => {
+    const { lines } = await captureLines(() => worker.fetch(probeReq({ auth: 'Bearer wrong' }), configuredEnv()));
+    expect(lines.filter(l => l.startsWith('{'))).toEqual([]);
+  });
+
+  it('carries no-store on every response of the path, 4xx included', async () => {
+    for (const r of [
+      await worker.fetch(probeReq(), configuredEnv()),
+      await worker.fetch(probeReq({ auth: 'Bearer wrong' }), configuredEnv()),
+      await worker.fetch(probeReq({ method: 'GET' }), configuredEnv()),          // 404
+      await worker.fetch(probeReq({ contentType: 'text/plain' }), configuredEnv()), // 415
+    ]) {
+      expect(r.headers.get('Cache-Control')).toBe('no-store');
+    }
+  });
+
+  // No outbound mock is registered ON PURPOSE: the harness throws on any
+  // unmocked outbound fetch, so a probe that reached for the SQL API — or for
+  // anything else — would fail this test rather than pass it quietly.
+  it('costs nothing: the probe makes NO outbound request at all', async () => {
+    const r = await worker.fetch(probeReq(), configuredEnv());
+    expect(r.status).toBe(200);
   });
 });

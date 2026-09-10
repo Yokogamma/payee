@@ -9,7 +9,7 @@ import {
   postSignedTx,
   readCappedText,
 } from '../src/arweave-transport';
-import { makeEmit } from '../src/metrics';
+import { makeEmit, metricIndexKey } from '../src/metrics';
 import { setupOutboundMock } from './helpers/outbound-mock';
 
 // Unit tests of the PR-2 transport adapter (spec: §4.PR-2 «Реализация», §R1).
@@ -223,7 +223,8 @@ describe('postSignedTx — a passive stopwatch, nothing more', () => {
 });
 
 describe('makeEmit — fail-closed telemetry, fail-open requests', () => {
-  const point = () => ({ indexes: ['upload_outcome'], blobs: ['upload_outcome', 'accepted', '2'], doubles: [] });
+  // The index carries the DISCRIMINATOR too — one sampling bucket per outcome.
+  const point = () => ({ indexes: ['upload_outcome:accepted'], blobs: ['upload_outcome', 'accepted', '2'], doubles: [] });
 
   it("writes STRICTLY when METRICS_ENABLED === 'true' and the binding exists", () => {
     const written: unknown[] = [];
@@ -245,5 +246,52 @@ describe('makeEmit — fail-closed telemetry, fail-open requests', () => {
   it('a throwing writeDataPoint never propagates', () => {
     const dataset = { writeDataPoint: () => { throw new Error('AE down'); } } as unknown as AnalyticsEngineDataset;
     expect(() => makeEmit({ METRICS_ENABLED: 'true', METRICS: dataset })('e', [], [])).not.toThrow();
+  });
+});
+/**
+ * The index split.
+ *
+ * Analytics Engine samples PER INDEX. Measured on 2026-09-09 over the narrow
+ * window 2026-09-08 12:00–13:00 UTC: `gateway_call` kept FIVE rows — three
+ * `anchor` and two `price` — and not one surviving row for `post` or for either
+ * `payload_*` kind, although the branches emitting all three were REACHED
+ * (`post_accepted` and `legacy_backfilled` prove the call sites ran, not that
+ * the writes landed). SUM(_sample_interval) over those five estimated 13
+ * events, which matched the 13 expected from the runs.
+ *
+ * So a rare outcome sharing a bucket with a frequent one CAN vanish from the
+ * report — fatal for a criterion that must read strictly zero.
+ */
+describe('metricIndexKey — one sampling bucket per outcome', () => {
+  it('puts the discriminator in the index and leaves blob1 the bare event', () => {
+    expect(metricIndexKey('gateway_call', ['post', 'arweave.net', '2xx'])).toBe('gateway_call:post');
+    expect(metricIndexKey('semantic_idempotency', ['conflict', '3'])).toBe('semantic_idempotency:conflict');
+    expect(metricIndexKey('upload_outcome', ['arweave_throw', '3'])).toBe('upload_outcome:arweave_throw');
+    // Hosts are bounded by the configured pool, so they may ride too.
+    expect(metricIndexKey('post_accepted', ['arweave.net'])).toBe('post_accepted:arweave.net');
+  });
+
+  it('falls back to the bare event when there is no discriminator', () => {
+    expect(metricIndexKey('some_event', [])).toBe('some_event');
+  });
+
+  // The guard exists so a careless call site can never put user data or an
+  // unbounded value into the index — that would multiply the buckets and
+  // reintroduce sampling by the back door.
+  it('refuses anything that is not a short enum-like label', () => {
+    expect(metricIndexKey('e', ['Has Spaces'])).toBe('e');
+    expect(metricIndexKey('e', ['UPPER'])).toBe('e');
+    expect(metricIndexKey('e', ['x'.repeat(49)])).toBe('e');
+    expect(metricIndexKey('e', [''])).toBe('e');
+    expect(metricIndexKey('e', ['{"note":"content"}'])).toBe('e');
+    expect(metricIndexKey('e', [undefined as unknown as string])).toBe('e');
+  });
+
+  it('makeEmit writes the split index, and blob1 still carries the event', () => {
+    const written: { indexes?: unknown[]; blobs?: unknown[] }[] = [];
+    const dataset = { writeDataPoint: (p: never) => { written.push(p); } } as unknown as AnalyticsEngineDataset;
+    makeEmit({ METRICS_ENABLED: 'true', METRICS: dataset })('semantic_idempotency', ['conflict', '3'], []);
+    expect(written[0].indexes).toEqual(['semantic_idempotency:conflict']);
+    expect(written[0].blobs).toEqual(['semantic_idempotency', 'conflict', '3']);
   });
 });
