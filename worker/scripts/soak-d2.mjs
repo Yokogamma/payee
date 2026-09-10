@@ -182,8 +182,8 @@ export function redropSends(state) {
 // automatically is exactly the double-paid publication D2 exists to prevent.
 
 /** An attempt record, created before the request leaves. */
-export function newAttempt(noteId, at) {
-  return { id: crypto.randomUUID(), at, noteId, outcome: 'pending' };
+export function newAttempt(noteId, at, mode) {
+  return { id: crypto.randomUUID(), at, noteId, mode, outcome: 'pending' };
 }
 
 /**
@@ -456,24 +456,49 @@ export function estimateCost(priceWinstonForBytes, count) {
 
 /** Progress against VOLUME from the ledger — a plan, not the verdict. */
 /**
- * Paid outcomes that count toward the WINDOW — `day` runs only.
+ * Confirmed paid publications of one driver mode, counted from the DURABLE
+ * attempt records.
  *
- * NOT `state.paidPosts`. That counter is the lifetime total of the ledger and
- * includes `seed-legacy`, whose publications are made by the PRE-D2 worker,
- * before the window exists. docs/ROLLBACK.md («Volume») requires 20 paid
- * outcomes as `upload_outcome` INSIDE the window, on one worker version — and
- * the seeded five emit no `upload_outcome` of the release at all.
+ * NOT from `state.runs`, and this is the whole point. A run object is appended
+ * to `runs` only by `finish()`, at the very END of the pass, while `settle()`
+ * has already persisted the successful attempt, the note and `paidPosts` the
+ * moment the answer arrived. A process killed between those two leaves a
+ * publication that is durably recorded but belongs to no run — invisible to a
+ * `runs`-based count, and, with a subtraction, misfiled as seeding.
  *
- * Counting them would report 20 while the release itself had produced 15: the
- * volume bar would clear on evidence the criterion does not accept.
+ * NOT `state.paidPosts` either: that is the lifetime total and includes
+ * `seed-legacy`, whose publications are made by the PRE-D2 worker before the
+ * window exists and emit no `upload_outcome` of the release at all.
+ * docs/ROLLBACK.md («Volume») requires 20 paid outcomes INSIDE the window on
+ * one worker version, so counting the seeded five would report 20 where the
+ * release produced 15.
  *
- * The budget is deliberately the other way round (`attemptsSpent` counts the
- * seeding too): money spent is money spent, whichever worker spent it.
+ * The budget is deliberately the other way round (`attemptsSpent` counts every
+ * record, seeding included): money spent is money spent, whichever worker
+ * spent it.
+ *
+ * A record written before attempts carried a `mode` matches NEITHER mode and
+ * is counted in neither figure — an unlabelled record cannot be attributed,
+ * and guessing would reintroduce exactly the misfiling this replaces.
  */
+export function confirmedPaidByMode(state, mode) {
+  return paidAttempts(state).records
+    .filter(r => r.mode === mode && r.outcome === 'accepted-new')
+    .length;
+}
+
 export function paidOutcomesInWindow(state) {
-  return (state.runs ?? [])
-    .filter(r => r.mode === 'day')
-    .reduce((n, r) => n + (r.paid ?? 0), 0);
+  return confirmedPaidByMode(state, 'day');
+}
+
+/**
+ * Seeding publications — counted from THEIR OWN records, never by subtracting
+ * the window figure from the lifetime one. Subtraction attributes anything the
+ * window failed to count to the seeding, which is exactly the wrong answer in
+ * the crash case above.
+ */
+export function seededPaid(state) {
+  return confirmedPaidByMode(state, 'seed-legacy');
 }
 
 export function summarize(state) {
@@ -770,7 +795,7 @@ export async function seedLegacy({ origin, signer, state, count, dryRun, opts, p
   let seeded = 0;
   for (let i = 0; i < planned; i++) {
     const note = { noteId: randomUuidV8(), c: b64(crypto.getRandomValues(new Uint8Array(64))), iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
-    const attempt = newAttempt(note.noteId, Date.now());
+    const attempt = newAttempt(note.noteId, Date.now(), 'seed-legacy');
     try {
       await chargeAttempt(state, attempt, persist);
     } catch (e) {
@@ -889,7 +914,7 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
     const note = { noteId: randomUuidV8(), c: b64(crypto.getRandomValues(new Uint8Array(64))), iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
     // Durable BEFORE the request leaves: a ledger that will not take the
     // attempt is a budget that bounds nothing, so refuse to send.
-    const attempt = newAttempt(note.noteId, Date.now());
+    const attempt = newAttempt(note.noteId, Date.now(), 'day');
     try {
       await chargeAttempt(state, attempt, persist);
     } catch (e) {
@@ -1044,11 +1069,16 @@ async function snapshot({ origin, secret, stateDir }) {
 function printStatus(state) {
   log(`state: origin=${state.origin ?? '-'} release=${state.release?.sha?.slice(0, 7) ?? '-'} versionId=${state.release?.workerVersionId ?? '-'}`);
   log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length})`);
-  // Two DIFFERENT numbers, printed together so they cannot be mistaken for one
-  // another: the lifetime total includes `seed-legacy` (made by the pre-D2
-  // worker, outside any window), the window figure counts `day` runs only.
-  const seeded = state.paidPosts - paidOutcomesInWindow(state);
-  log(`paid POSTs: ${paidOutcomesInWindow(state)} in the window (day runs) + ${seeded} outside it (seeding) = ${state.paidPosts} lifetime`);
+  // Three numbers, each counted DIRECTLY from its own source. The window and
+  // seeding figures come from the durable attempt records; `paidPosts` is the
+  // lifetime counter. Deriving any of them by subtraction would blame the
+  // seeding for whatever the others failed to see.
+  const inWindow = paidOutcomesInWindow(state);
+  const seeded = seededPaid(state);
+  log(`paid POSTs: ${inWindow} in the window (day) + ${seeded} seeding = ${inWindow + seeded} attributed; ${state.paidPosts} lifetime`);
+  if (inWindow + seeded !== state.paidPosts) {
+    log(`  ! ${state.paidPosts - inWindow - seeded} paid POST(s) are unattributed — records without a mode, or a counter written without one`);
+  }
   const sent = redropSends(state);
   log(`redrop-capable sends: recheck ${sent.recheck}/${DEFAULTS.redropRecheckTotal}, legacy ${sent.legacy}/${DEFAULTS.redropLegacyTotal}`);
   // An unmigrated ledger must not read as "0 attempts" — that is exactly the

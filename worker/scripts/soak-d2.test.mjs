@@ -9,7 +9,7 @@ import {
   estimateCost, summarize, parseArgs, randomUuidV8, v3Tags,
   redropSends, chargeBudget, acquireLedgerLock, saveState, loadState, dayRun,
   newAttempt, paidAttempts, attemptsSpent, attemptsSummary, chargeAttempt,
-  seedLegacy, paidOutcomesInWindow,
+  seedLegacy, paidOutcomesInWindow, seededPaid,
   needsAttemptsMigration, migrateAttempts, reconcilePendingAttempts,
 } from './soak-d2.mjs';
 
@@ -273,6 +273,7 @@ describe('summarize', () => {
     const state = {
       ...emptyState(),
       paidPosts: 21,
+      paidAttempts: { records: Array.from({ length: 21 }, (_, i) => ({ id: `a${i}`, at: 0, noteId: `n${i}`, mode: 'day', outcome: 'accepted-new' })), priorEra: null },
       notes: [note({ kind: 'legacy', backfilledAt: 1 }), note({ kind: 'legacy', backfilledAt: 1 }), note({ kind: 'legacy' })],
       // `paid` per run is what the WINDOW counts; `paidPosts` above is the
       // lifetime total and is deliberately NOT what the volume row reads.
@@ -673,66 +674,110 @@ describe('paid-attempt ledger', () => {
     });
   });
 });
+
 /**
- * Budget and window volume are DIFFERENT numbers.
+ * Budget and window volume are DIFFERENT numbers, and BOTH are counted from the
+ * durable attempt records — never from `runs`, never by subtraction.
  *
- * `seed-legacy` publishes from the PRE-D2 worker, before the window exists, so
- * those publications emit no `upload_outcome` of the release. Counting them
- * toward the 20 required by docs/ROLLBACK.md would clear the volume bar on
- * evidence the criterion does not accept — 20 reported while the release
- * itself had produced 15. The budget goes the other way: money spent is money
- * spent, whichever worker spent it.
+ * `runs` is the wrong source because `finish()` appends the run at the very END
+ * of a pass, while `settle()` has already persisted the successful attempt, the
+ * note and `paidPosts` the moment the answer arrived. A process killed between
+ * those two leaves a publication that IS durably recorded and belongs to no
+ * run. Counting from `runs` loses it; deriving the seeding by subtraction then
+ * blames the seeding for it.
  */
-describe('seeding counts against the budget, never toward the window volume', () => {
-  const seededState = (seedPaid, dayPaids) => ({
+describe('paid publications are attributed from durable records', () => {
+  const rec = (n, mode, outcome = 'accepted-new') =>
+    Array.from({ length: n }, (_, i) => ({ id: `${mode}-${i}`, at: 0, noteId: `n-${mode}-${i}`, mode, outcome }));
+
+  const ledger = (seed, day, extraRuns = []) => ({
     ...emptyState(),
-    paidPosts: seedPaid + dayPaids.reduce((a, b) => a + b, 0),
+    paidPosts: seed + day,
     runs: [
-      { at: Date.UTC(2026, 8, 1), mode: 'seed-legacy', paid: seedPaid, failures: 0 },
-      ...dayPaids.map((p, i) => ({
-        at: Date.UTC(2026, 8, 2 + i), mode: 'day', paid: p, deduped: 0, rechecked: 0, legacyBackfilled: 0, problems: [],
-      })),
+      { at: Date.UTC(2026, 8, 1), mode: 'seed-legacy', paid: seed, failures: 0 },
+      ...extraRuns,
     ],
-    paidAttempts: {
-      records: Array.from({ length: seedPaid + dayPaids.reduce((a, b) => a + b, 0) },
-        (_, i) => ({ id: `a${i}`, at: 0, noteId: `n${i}`, outcome: 'accepted-new' })),
-      priorEra: null,
-    },
+    paidAttempts: { records: [...rec(seed, 'seed-legacy'), ...rec(day, 'day')], priorEra: null },
   });
 
-  it('counts ONLY day runs toward the window', () => {
-    const s = seededState(5, [3, 3, 3]);
-    expect(s.paidPosts).toBe(14);              // lifetime, seeding included
-    expect(paidOutcomesInWindow(s)).toBe(9);   // the window saw nine
+  it('counts ONLY day-mode confirmations toward the window', () => {
+    const s = ledger(5, 9);
+    expect(s.paidPosts).toBe(14);
+    expect(paidOutcomesInWindow(s)).toBe(9);
+    expect(seededPaid(s)).toBe(5);
+  });
+
+  it('counts the seeding from ITS OWN records, not by subtraction', () => {
+    // A record with no mode (written before attempts carried one) belongs to
+    // neither figure — and must NOT be swept into the seeding.
+    const s = ledger(2, 3);
+    s.paidAttempts.records.push({ id: 'x', at: 0, noteId: 'n-x', outcome: 'accepted-new' });
+    s.paidPosts = 6;
+    expect(seededPaid(s)).toBe(2);          // subtraction would have said 3
+    expect(paidOutcomesInWindow(s)).toBe(3);
+  });
+
+  it('only CONFIRMED publications count — errors and unknowns do not', () => {
+    const s = ledger(0, 2);
+    s.paidAttempts.records.push(...rec(1, 'day', 'error'), ...rec(1, 'day', 'unknown'), ...rec(1, 'day', 'pending'));
+    expect(paidOutcomesInWindow(s)).toBe(2);
+    expect(attemptsSpent(s)).toBe(5); // …but all five took budget
   });
 
   it('the volume row reports the WINDOW figure, not the lifetime one', () => {
-    const s = seededState(5, [3, 3, 3]);
+    const s = ledger(5, 9);
     const row = summarize(s).find(r => /paid outcomes/i.test(r.name));
-    expect(row.have).toBe(9);
+    expect(row).toMatchObject({ have: 9, need: VOLUME.paidOutcomes, ok: false });
     expect(row.have).not.toBe(s.paidPosts);
-    expect(row.need).toBe(VOLUME.paidOutcomes);
-    expect(row.ok).toBe(false); // 9 of 20 — seeding must not clear this bar
   });
 
-  it('a window that reaches 20 by day runs alone passes; one padded by seeding does not', () => {
-    const real = seededState(0, [4, 4, 4, 4, 4]);          // 20 in the window
-    const padded = seededState(5, [3, 3, 3, 3, 3]);        // 20 lifetime, 15 in the window
-    expect(summarize(real).find(r => /paid outcomes/i.test(r.name)).ok).toBe(true);
+  it('a window padded by seeding does NOT clear the bar', () => {
+    const real = ledger(0, 20);
+    const padded = ledger(5, 15);
     expect(padded.paidPosts).toBe(20);
+    expect(summarize(real).find(r => /paid outcomes/i.test(r.name)).ok).toBe(true);
     expect(summarize(padded).find(r => /paid outcomes/i.test(r.name)).ok).toBe(false);
   });
 
-  it('the BUDGET still counts the seeding — money spent is money spent', () => {
-    const s = seededState(5, [3]);
+  it('the BUDGET counts the seeding — money spent is money spent', () => {
+    const s = ledger(5, 3);
     expect(attemptsSpent(s)).toBe(8);
     expect(planRun(s, { ...DEFAULTS, paidPerRun: 3, maxPaidTotal: 10 }, 0).paid).toBe(2);
   });
 
-  // The seed run IS in `runs`; it simply is not a `day` run.
-  it('the seed run does not add a distinct day', () => {
-    const s = seededState(5, [3]);
+  it('the seed run is in `runs` but adds no distinct DAY', () => {
+    const s = ledger(5, 3, [{ at: Date.UTC(2026, 8, 2), mode: 'day', paid: 3, deduped: 0, problems: [] }]);
     expect(s.runs).toHaveLength(2);
     expect(summarize(s).find(r => /distinct days/i.test(r.name)).have).toBe(1);
+  });
+
+  /**
+   * The crash the `runs`-based count got wrong: killed after `settle()`
+   * persisted the success, before `finish()` appended the run.
+   */
+  it('a publication settled but never finished still counts in the window', async () => {
+    const dir = join(tmpdir(), `soak-d2-${randomUUID()}`);
+    const path = join(dir, 'state.json');
+    const state = emptyState();
+    const persist = () => saveState(path, state);
+
+    // Exactly what a paid send does, up to and including settle…
+    const attempt = newAttempt('n-1', 0, 'day');
+    await chargeAttempt(state, attempt, persist);
+    state.notes.push({ noteId: 'n-1', c: 'c', iv: 'iv', kind: 'paid', txId: TX, createdAt: 0, dedupes: 0, rechecks: 0 });
+    state.paidPosts += 1;
+    attempt.outcome = 'accepted-new';
+    attempt.txId = TX;
+    await persist();
+    // …and then the process dies. `finish()` never ran, so `runs` stays empty.
+
+    const reloaded = await loadState(path);
+    expect(reloaded.runs).toEqual([]);
+    expect(reloaded.paidPosts).toBe(1);
+    // The publication belongs to the WINDOW, and is not misfiled as seeding.
+    expect(paidOutcomesInWindow(reloaded)).toBe(1);
+    expect(seededPaid(reloaded)).toBe(0);
+    expect(summarize(reloaded).find(r => /paid outcomes/i.test(r.name)).have).toBe(1);
+    await rm(dir, { recursive: true, force: true });
   });
 });
