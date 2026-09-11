@@ -9,6 +9,7 @@ import {
   sliceRange, assertSliceComplete, assertNotSampled, assertAllFromWorker, pickScriptKey,
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
   assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS, INGEST_LAG_MS,
+  assertWithinRetention, LOG_RETENTION_DAYS_DEFAULT, LOG_RETENTION_DAYS_MAX,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
   messageOf, probeLines, assertProbeSeen, parseStructured, criticalLines, structuredOf,
 } from './metrics-export.mjs';
@@ -208,10 +209,10 @@ describe('parseArgs', () => {
   it('reads the modes and flags', () => {
     expect(parseArgs(['metrics'])).toEqual({
       mode: 'metrics',
-      opts: { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: 'eternal-notes-proxy', expectProbe: null },
+      opts: { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: 'eternal-notes-proxy', expectProbe: null, retentionDays: 3, retentionGiven: false },
     });
     expect(parseArgs(['logs', '--hours', '168', '--slice-minutes', '15', '--out', 'D', '--worker', 'w-1']))
-      .toEqual({ mode: 'logs', opts: { hours: 168, hoursGiven: true, from: null, to: null, out: 'D', sliceMinutes: 15, worker: 'w-1', expectProbe: null } });
+      .toEqual({ mode: 'logs', opts: { hours: 168, hoursGiven: true, from: null, to: null, out: 'D', sliceMinutes: 15, worker: 'w-1', expectProbe: null, retentionDays: 3, retentionGiven: false } });
   });
 
   it('refuses junk rather than exporting a wrong range', () => {
@@ -711,6 +712,60 @@ describe('the live Workers Logs event shape', () => {
     expect(structuredOf({ source: ['a'] })).toBe(null);
     expect(structuredOf({ source: null, $metadata: {} })).toBe(null);
     expect(structuredOf({})).toBe(null);
+  });
+});
+
+/**
+ * Retention is the one shortfall no re-read can catch: the store answers a
+ * query that reaches past it with whatever it still holds, and the archive
+ * looks complete. Found in review of the ingestion lag: `--hours 168` now
+ * starts 168 h 5 min ago — past even the seven-day maximum.
+ */
+describe('the start of a logs interval is checked against retention', () => {
+  const NOW = Date.UTC(2026, 8, 11, 12, 0, 0);
+  const DAY = 86_400_000;
+  const rel = (over = {}) => ({ hours: 24, hoursGiven: false, from: null, to: null, ...over });
+
+  it('defaults to the CONSERVATIVE (Free-plan) bound, and the maximum is the documented seven days', () => {
+    expect(LOG_RETENTION_DAYS_DEFAULT).toBe(3);
+    expect(LOG_RETENTION_DAYS_MAX).toBe(7);
+    expect(parseArgs(['logs']).opts.retentionDays).toBe(LOG_RETENTION_DAYS_DEFAULT);
+  });
+
+  it('the P1 reproduction: --hours 168 plus the lag is refused — by default AND at the maximum', () => {
+    const { fromMs } = resolveInterval(rel({ hours: 168, hoursGiven: true }), NOW);
+    expect(NOW - fromMs).toBe(168 * 3600_000 + INGEST_LAG_MS);
+    expect(() => assertWithinRetention(fromMs, NOW, LOG_RETENTION_DAYS_DEFAULT)).toThrow(/older than the 3-day.*daily archives/s);
+    expect(() => assertWithinRetention(fromMs, NOW, LOG_RETENTION_DAYS_MAX)).toThrow(/older than the 7-day/);
+  });
+
+  it('refuses one millisecond past the bound and admits the bound itself', () => {
+    expect(() => assertWithinRetention(NOW - 3 * DAY - 1, NOW, 3)).toThrow(/168\.0 h ago|72\.0 h ago/);
+    expect(() => assertWithinRetention(NOW - 3 * DAY, NOW, 3)).not.toThrow();
+    expect(() => assertWithinRetention(NOW - 7 * DAY, NOW, 7)).not.toThrow();
+    expect(() => assertWithinRetention(NOW - 7 * DAY - 1, NOW, 7)).toThrow(/older than the 7-day/);
+  });
+
+  it('every documented procedure stays inside the default: a daily UTC day the next morning, the delivery check, --hours 1', () => {
+    const morningAfter = Date.UTC(2026, 8, 11, 0, 5, 0);
+    expect(() => assertWithinRetention(Date.UTC(2026, 8, 10), morningAfter, 3)).not.toThrow();
+    // a missed day, caught up the day after, is still inside
+    expect(() => assertWithinRetention(Date.UTC(2026, 8, 9), morningAfter, 3)).not.toThrow();
+    const check = resolveInterval(rel({ hours: 1, hoursGiven: true }), NOW);
+    expect(() => assertWithinRetention(check.fromMs, NOW, 3)).not.toThrow();
+  });
+
+  it('--retention-days is bounded by the maximum and belongs to logs only', () => {
+    expect(parseArgs(['logs', '--retention-days', '7']).opts.retentionDays).toBe(7);
+    expect(parseArgs(['logs', '--retention-days', '1']).opts.retentionDays).toBe(1);
+    expect(() => parseArgs(['logs', '--retention-days', '8'])).toThrow(/1\.\.7/);
+    expect(() => parseArgs(['logs', '--retention-days', '0'])).toThrow(/1\.\.7/);
+    expect(() => parseArgs(['logs', '--retention-days', '2.5'])).toThrow(/1\.\.7/);
+    expect(() => parseArgs(['logs', '--retention-days'])).toThrow(/1\.\.7/);
+    // Analytics Engine keeps data far longer; the flag would be a silent no-op.
+    expect(() => parseArgs(['metrics', '--retention-days', '7'])).toThrow(/applies only to .logs/);
+    // …but the DEFAULT is not a «given» flag, so metrics without it is fine.
+    expect(parseArgs(['metrics']).opts.retentionGiven).toBe(false);
   });
 });
 

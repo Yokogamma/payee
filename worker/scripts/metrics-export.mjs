@@ -636,6 +636,40 @@ export const SECOND_MS = 1000;
  */
 export const INGEST_LAG_MS = 5 * 60_000;
 
+/**
+ * Workers Logs retention. The store keeps events for a bounded number of days
+ * — seven at most, three on the Free plan — and a query that reaches further
+ * back does not fail: it returns what is left and the archive looks complete.
+ * That is the one shortfall no later re-read can detect, so the START of a
+ * `logs` interval is checked against retention before any request goes out.
+ *
+ * The plan is not something this script can read, so the default is the
+ * CONSERVATIVE bound (Free). `--retention-days` raises it, up to the documented
+ * maximum, for an operator who knows the account is on a paid plan. The full
+ * soak window is assembled from the daily archives, never from one export:
+ * `--hours 168` plus the ingestion lag starts before even the maximum.
+ */
+export const LOG_RETENTION_DAYS_DEFAULT = 3;
+export const LOG_RETENTION_DAYS_MAX = 7;
+const DAY_MS = 86_400_000;
+
+/**
+ * Refuses a `logs` interval whose start is older than the retention the
+ * operator is prepared to vouch for. Pure; `nowMs` is injected.
+ */
+export function assertWithinRetention(fromMs, nowMs, retentionDays) {
+  const oldest = nowMs - retentionDays * DAY_MS;
+  if (fromMs < oldest) {
+    const ageH = ((nowMs - fromMs) / 3600_000).toFixed(1);
+    throw new Error(
+      `the interval starts ${ageH} h ago, older than the ${retentionDays}-day Workers Logs retention this run `
+      + 'vouches for: the store would answer with whatever it still holds and the archive would look complete. '
+      + `Assemble the window from the daily archives; --retention-days (max ${LOG_RETENTION_DAYS_MAX}) `
+      + 'raises the bound only for an account known to be on a paid plan.',
+    );
+  }
+}
+
 export function resolveInterval(opts, nowMs) {
   const hasAbsolute = opts.from !== null || opts.to !== null;
   if (!hasAbsolute) {
@@ -673,7 +707,7 @@ export function resolveInterval(opts, nowMs) {
 
 export function parseArgs(argv) {
   const [mode, ...rest] = argv;
-  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER, expectProbe: null };
+  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER, expectProbe: null, retentionDays: LOG_RETENTION_DAYS_DEFAULT, retentionGiven: false };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--hours') { opts.hours = Number(rest[++i]); opts.hoursGiven = true; continue; }
@@ -683,6 +717,7 @@ export function parseArgs(argv) {
     if (a === '--slice-minutes') { opts.sliceMinutes = Number(rest[++i]); continue; }
     if (a === '--worker') { opts.worker = String(rest[++i] ?? ''); continue; }
     if (a === '--expect-probe') { opts.expectProbe = String(rest[++i] ?? ''); continue; }
+    if (a === '--retention-days') { opts.retentionDays = Number(rest[++i]); opts.retentionGiven = true; continue; }
     throw new Error(`unknown argument: ${a}`);
   }
   if (!Number.isInteger(opts.hours) || opts.hours < 1 || opts.hours > 168) {
@@ -702,20 +737,30 @@ export function parseArgs(argv) {
   if (opts.expectProbe !== null && mode !== 'logs') {
     throw new Error(`--expect-probe applies only to \`logs\`; in \`${mode}\` there are no log lines to find it in`);
   }
+  if (!Number.isInteger(opts.retentionDays) || opts.retentionDays < 1 || opts.retentionDays > LOG_RETENTION_DAYS_MAX) {
+    throw new Error(`--retention-days must be an integer in 1..${LOG_RETENTION_DAYS_MAX} (the documented maximum)`);
+  }
+  // Analytics Engine has its own, much longer retention; the flag would be a
+  // silent no-op there, and a silently ignored flag is a wrong answer waiting.
+  if (opts.retentionGiven && mode !== 'logs') {
+    throw new Error(`--retention-days applies only to \`logs\`; \`${mode}\` reads Analytics Engine`);
+  }
   return { mode, opts };
 }
 
 export async function main(argv) {
   const { mode, opts } = parseArgs(argv);
   if (!['metrics', 'logs'].includes(mode)) {
-    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--expect-probe UUID] [--out DIR]');
+    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--expect-probe UUID] [--retention-days N] [--out DIR]');
     return 2;
   }
   const accountId = process.env.CF_ACCOUNT_ID ?? DEFAULT_ACCOUNT_ID;
   const dataset = process.env.METRICS_DATASET ?? DEFAULT_DATASET;
   const outDir = opts.out ?? join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.eternal-notes-soak', 'snapshots');
   // ONE interval for the whole run, fixed before the first request.
-  const { fromMs, toMs, youngTail } = resolveInterval(opts, Date.now());
+  const nowMs = Date.now();
+  const { fromMs, toMs, youngTail } = resolveInterval(opts, nowMs);
+  if (mode === 'logs') assertWithinRetention(fromMs, nowMs, opts.retentionDays);
 
   console.log(`${mode}: ${new Date(fromMs).toISOString()} .. ${new Date(toMs).toISOString()} → ${outDir}`);
   if (youngTail) {
