@@ -8,9 +8,9 @@ import {
   REPORTS, reportSql, reportSqlAbsolute, rawRowsSqlAbsolute, indexFilter, sqlTime,
   sliceRange, assertSliceComplete, assertNotSampled, assertAllFromWorker, pickScriptKey,
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
-  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS,
+  assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS, INGEST_LAG_MS,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
-  messageOf, probeLines, assertProbeSeen, parseStructured, criticalLines,
+  messageOf, probeLines, assertProbeSeen, parseStructured, criticalLines, structuredOf,
 } from './metrics-export.mjs';
 
 const tmpDir = () => join(tmpdir(), `mx-${randomUUID()}`);
@@ -102,7 +102,7 @@ describe('an incomplete answer is refused, never archived', () => {
     expect(() => assertSliceComplete(LOG_QUERY_LIMIT - 1, slice)).not.toThrow();
   });
 
-  it('the page size and the query cap are different knobs', () => {
+  it('the page size and the per-slice cap are different knobs', () => {
     // Passing one number to both made the completeness check meaningless.
     expect(LOG_PAGE_LIMIT).toBe(100);
     expect(LOG_QUERY_LIMIT).toBe(2000);
@@ -250,16 +250,20 @@ describe('paging follows the documented cursor', () => {
       return ok(page(5, 200));
     };
 
-    const { events, runStatus, abrLevel } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    const { events, pages, runStatus, abrLevel } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
 
     expect(events).toHaveLength(2 * LOG_PAGE_LIMIT + 5);
+    // the archived proof of paging: every page size, in order, second one non-empty
+    expect(pages).toEqual([LOG_PAGE_LIMIT, LOG_PAGE_LIMIT, 5]);
     expect(sent).toHaveLength(3);
     expect(sent[0].offset).toBeUndefined();            // the first page carries no cursor
     expect(sent[1].offset).toBe('id-99');              // the LAST id of page one…
     expect(sent[2].offset).toBe('id-199');             // …then of page two
     expect(sent[1].parameters.offset).toBeUndefined(); // NOT a number inside parameters
-    expect(sent[1].parameters.limit).toBe(LOG_PAGE_LIMIT);
-    expect(sent[1].limit).toBe(LOG_QUERY_LIMIT);
+    // Measured live: the TOP-LEVEL limit is the page size; parameters.limit is
+    // not a page knob for view:'events' and is not sent at all.
+    expect(sent[1].limit).toBe(LOG_PAGE_LIMIT);
+    expect(sent[1].parameters.limit).toBeUndefined();
     expect(sent[1].parameters.filters).toEqual([{ key: KEY, operation: 'eq', value: 'w', type: 'string' }]);
     expect(runStatus).toBe('COMPLETED');
     expect(abrLevel).toBe(1);
@@ -268,16 +272,18 @@ describe('paging follows the documented cursor', () => {
   it('a single short page needs no second request', async () => {
     let calls = 0;
     const post = async () => { calls += 1; return ok(page(3, 0)); };
-    const { events } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    const { events, pages } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
     expect(events).toHaveLength(3);
+    expect(pages).toEqual([3]);
     expect(calls).toBe(1);
   });
 
   it('an empty first page ends the slice without a cursor', async () => {
     let calls = 0;
     const post = async () => { calls += 1; return ok([]); };
-    const { events } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    const { events, pages } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
     expect(events).toEqual([]);
+    expect(pages).toEqual([0]);
     expect(calls).toBe(1);
   });
 
@@ -399,9 +405,31 @@ describe('resolveInterval', () => {
   const NOW = Date.UTC(2026, 8, 10, 12, 0, 0);
   const rel = (over = {}) => ({ hours: 24, hoursGiven: false, from: null, to: null, ...over });
 
-  it('relative: ends at now and reaches back --hours', () => {
-    expect(resolveInterval(rel(), NOW)).toEqual({ fromMs: NOW - 24 * 3600_000, toMs: NOW });
-    expect(resolveInterval(rel({ hours: 1 }), NOW)).toEqual({ fromMs: NOW - 3600_000, toMs: NOW });
+  // Measured: an export 11 s after a burst lacked 10 of 130 invocations that
+  // were there 72 s later. A window ending at «now» archives an incomplete
+  // tail by construction, so the relative window ends behind the present.
+  it('relative: ends INGEST_LAG behind now and reaches back --hours from there', () => {
+    const END = NOW - INGEST_LAG_MS;
+    expect(resolveInterval(rel(), NOW)).toEqual({ fromMs: END - 24 * 3600_000, toMs: END });
+    expect(resolveInterval(rel({ hours: 1 }), NOW)).toEqual({ fromMs: END - 3600_000, toMs: END });
+    expect(INGEST_LAG_MS).toBe(5 * 60_000);
+    expect(INGEST_LAG_MS % SECOND_MS).toBe(0); // keeps the whole-second guarantee
+  });
+
+  it('relative: still lands on whole seconds after the lag', () => {
+    const { fromMs, toMs } = resolveInterval(rel({ hours: 1 }), NOW + 123);
+    expect(toMs % SECOND_MS).toBe(0);
+    expect(fromMs % SECOND_MS).toBe(0);
+    expect(toMs).toBe(NOW - INGEST_LAG_MS);
+  });
+
+  it('absolute: honoured as typed, but a --to inside the lag is flagged as a young tail', () => {
+    const iso = (ms) => new Date(ms).toISOString();
+    const young = resolveInterval(rel({ from: iso(NOW - 3600_000), to: iso(NOW - 60_000) }), NOW);
+    expect(young).toMatchObject({ fromMs: NOW - 3600_000, toMs: NOW - 60_000, youngTail: true });
+    const settled = resolveInterval(rel({ from: iso(NOW - 3600_000), to: iso(NOW - INGEST_LAG_MS) }), NOW);
+    expect(settled.youngTail).toBeUndefined();
+    expect(settled).toEqual({ fromMs: NOW - 3600_000, toMs: NOW - INGEST_LAG_MS });
   });
 
   it('two relative runs of the SAME command cover different windows', () => {
@@ -461,12 +489,12 @@ describe('interval precision is consistent across SQL, metadata and the file nam
 
     expect(toMs % SECOND_MS).toBe(0);
     expect(fromMs % SECOND_MS).toBe(0);
-    expect(toMs).toBe(Date.UTC(2026, 8, 10, 12, 0, 1));
+    expect(toMs).toBe(Date.UTC(2026, 8, 10, 12, 0, 1) - INGEST_LAG_MS); // floored, then the lag
     // The SQL bound means exactly what the metadata says.
     expect(readBack(fromMs)).toBe(fromMs);
     expect(readBack(toMs)).toBe(toMs);
     // …and so does the archive name, which strips the milliseconds.
-    expect(archiveName('logs', 'w', fromMs, toMs)).toContain('2026-09-10T120001Z');
+    expect(archiveName('logs', 'w', fromMs, toMs)).toContain('2026-09-10T115501Z');
     expect(archiveName('logs', 'w', fromMs, toMs)).not.toMatch(/.d{3}Z/); // no lost milliseconds to hide
   });
 
@@ -597,6 +625,92 @@ describe('lines are classified by what they ARE, not by text they contain', () =
     expect(criticalLines([real, quoting, nonJson])).toHaveLength(1);
     // …and a probe never lands in the number that must read zero.
     expect(criticalLines(probeLines([real, quoting]))).toEqual([]);
+  });
+});
+
+/**
+ * The shape Workers Logs ACTUALLY stores — the reproduction of the first live
+ * delivery check (2026-09-11, worker 9e0a9a1, probe d6197018…).
+ *
+ * The probe had arrived. The exporter refused the run anyway, because it was
+ * reading `$metadata.message`, and for a `console.error(JSON.stringify(x))`
+ * the store fills no such field: it parses the JSON and puts the fields in
+ * the top-level `source` object, next to `level`. `$metadata.error` holds
+ * just the string "error". A check that fails for a shape reason is not a
+ * delivery result in either direction — so the shape is pinned here verbatim.
+ */
+describe('the live Workers Logs event shape', () => {
+  const ID = 'd6197018-8bea-4573-8d94-408270e6b129';
+  const OTHER = '99999999-2222-4333-8444-555555555555';
+  const meta = (extra) => ({
+    id: '01K4V7…', requestId: 'f5b9fe23…', service: 'eternal-notes-proxy',
+    account: 'acc', trigger: 'POST /admin/telemetry-probe', ...extra,
+  });
+  // A structured console.error line, as stored: parsed into `source`, no message.
+  const structured = (fields) => ({
+    source: { level: 'error', ...fields },
+    dataset: 'cloudflare-workers', timestamp: 1789132084768,
+    $workers: { truncated: false, scriptVersion: { id: '2fd1afee-3ab2-44f2-9a31-e1b526f37550' } },
+    $metadata: meta({ type: 'cf-worker', level: 'error', error: 'error' }),
+  });
+  // The request event of the same invocation: `source.message` = the request line.
+  const request = (line) => ({
+    source: { level: 'info', message: line },
+    dataset: 'cloudflare-workers', timestamp: 1789132084700,
+    $workers: { truncated: false },
+    $metadata: meta({ type: 'cf-worker-event', level: 'info', message: line }),
+  });
+  const liveProbe = structured({ probe: 'telemetry_probe', probeId: ID, at: 1789132084768 });
+  const liveRequest = request('POST https://eternal-notes-proxy.sopi-88c.workers.dev/admin/telemetry-probe');
+  const liveHealth = request('GET https://eternal-notes-proxy.sopi-88c.workers.dev/health');
+
+  it('reads the structured line from the top-level source object', () => {
+    expect(structuredOf(liveProbe)).toMatchObject({ probe: 'telemetry_probe', probeId: ID });
+    // and there is nothing in the old place to read
+    expect(messageOf(liveProbe)).toBe('');
+  });
+
+  it('the first live check, replayed: the probe IS in the export', () => {
+    const events = [liveRequest, liveProbe, liveHealth];
+    expect(probeLines(events)).toHaveLength(1);
+    expect(assertProbeSeen(events, ID)).toBe(1);
+    expect(criticalLines(events)).toEqual([]);
+  });
+
+  it('a request event is neither a probe nor a critical line', () => {
+    expect(structuredOf(liveRequest)).toEqual({ level: 'info', message: expect.stringMatching(/^POST /) });
+    expect(probeLines([liveRequest, liveHealth])).toEqual([]);
+    expect(criticalLines([liveRequest, liveHealth])).toEqual([]);
+    // the request line itself is still readable as text
+    expect(messageOf(liveRequest)).toMatch(/^POST https:/);
+  });
+
+  it('a critical outcome in the live shape is counted by its field', () => {
+    const liveCritical = structured({ critical: 'conflict', noteId: 'n-1', at: 1 });
+    expect(criticalLines([liveCritical, liveProbe, liveRequest])).toHaveLength(1);
+    expect(probeLines([liveCritical])).toEqual([]);
+  });
+
+  it('matches the probeId FIELD in the live shape too — a decoy stays a decoy', () => {
+    const decoy = structured({ probe: 'telemetry_probe', probeId: OTHER, detail: ID });
+    expect(probeLines([decoy])).toHaveLength(1);
+    expect(() => assertProbeSeen([decoy], ID)).toThrow(/NOT in this export/);
+    // and a plain text line quoting the id is nothing at all
+    expect(structuredOf(request(`log ${ID}`))?.probe).toBeUndefined();
+  });
+
+  it('falls back to parsing the text when a store leaves the line unparsed', () => {
+    const asText = `{"probe":"telemetry_probe","probeId":"${ID}","at":1}`;
+    expect(structuredOf({ source: { level: 'error', message: asText } })).toMatchObject({ probeId: ID });
+    expect(structuredOf({ $metadata: { message: asText } })).toMatchObject({ probeId: ID });
+    expect(assertProbeSeen([{ source: { level: 'error', message: asText } }], ID)).toBe(1);
+  });
+
+  it('a source that is not an object is not a structured line', () => {
+    expect(structuredOf({ source: 'error text' })).toBe(null);
+    expect(structuredOf({ source: ['a'] })).toBe(null);
+    expect(structuredOf({ source: null, $metadata: {} })).toBe(null);
+    expect(structuredOf({})).toBe(null);
   });
 });
 
