@@ -518,9 +518,13 @@ export function summarize(state) {
     // NOT the criterion, and the name must not pretend otherwise: the runbook
     // counts `upload_outcome` TOTAL in Analytics Engine, and that includes
     // `arweave_error` and `arweave_throw` — a FAILED publication RAISES the
-    // criterion's number. This row counts confirmed successes instead, a
-    // deliberately stricter planning target: 20 successes guarantee 20
-    // outcomes, 20 outcomes guarantee nothing about success.
+    // criterion's number. This row counts the driver's confirmed successes, a
+    // LOAD target. It guarantees nothing about what AE will show: a success
+    // means the emit branch was REACHED, not that the row was delivered —
+    // `makeEmit` swallows write failures and AE samples. Twenty successes here
+    // can still be fewer than twenty rows there, and then the criterion is not
+    // met whatever this row says. Conversely twenty rows there satisfy the
+    // volume criterion by definition while saying nothing about health.
     // The metrics are the verdict; the ledger is the plan.
     row('confirmed paid publications in the window (plan; criterion = upload_outcome in AE)', paidOutcomesInWindow(state), VOLUME.paidOutcomes),
   ];
