@@ -103,6 +103,23 @@ export const DEPLOY_PROFILES = Object.freeze({
     semanticIdempotency: undefined,
     requireUploadsOff: true,
   }),
+  // The PR-3a lineage, and it fits NEITHER profile above: it has the quorum
+  // (`normal` would pass that) but no fingerprinting (`normal` demands
+  // `semanticIdempotency: 1`), and its uploads must be ON — `seed-legacy`
+  // exists to publish through it — so `emergency` is wrong twice over.
+  //
+  // Exists for one build, `ff0954d`, pinned in scripts/historical-candidates.mjs
+  // with a two-way binding the workflow checks BEFORE materialization: this
+  // profile activates only that SHA, and that SHA deploys only under this
+  // profile. The exact-equality rule cuts the other way too, as it does for
+  // `emergency`: a D2 build reports `semanticIdempotency: 1`, which is NOT
+  // `undefined`, so a modern build cannot slip through under this profile even
+  // if the binding were somehow bypassed.
+  'pre-d2': Object.freeze({
+    statusQuorumPolicy: 'all-configured-v1',
+    semanticIdempotency: undefined,
+    requireUploadsOff: false,
+  }),
 });
 
 /**

@@ -45,7 +45,7 @@ describe('the repo registry itself', () => {
 
 describe('worker coverage, per block', () => {
   it('passes when both tables carry the whole registry', () => {
-    expect(checkTrustedOwners(A, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [] });
+    expect(checkTrustedOwners(A, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [], skippedWorkerCoverage: false });
   });
 
   it('a table with MORE owners than the registry passes — containment, not equality', () => {
@@ -102,7 +102,7 @@ describe('worker coverage, per block', () => {
 
 describe('client/worker agreement (deploy mode)', () => {
   it('passes when both halves trust the same set', () => {
-    expect(checkTrustedOwners(A, toml())).toEqual({ ok: true, problems: [] });
+    expect(checkTrustedOwners(A, toml())).toEqual({ ok: true, problems: [], skippedWorkerCoverage: false });
   });
 
   it('refuses when the client trusts an owner the worker does not', () => {
@@ -148,12 +148,55 @@ describe('against the real worker/wrangler.toml', () => {
   });
 
   it('the shipped config passes the repo-only gate', () => {
-    expect(checkTrustedOwners(undefined, real, { repoOnly: true })).toEqual({ ok: true, problems: [] });
+    expect(checkTrustedOwners(undefined, real, { repoOnly: true })).toEqual({ ok: true, problems: [], skippedWorkerCoverage: false });
   });
 
   it('the shipped config agrees with the pinned client expectation', () => {
     // Same value scripts/check-deploy-config.mjs requires VITE_TRUSTED_OWNERS
     // to include, so the two gates cannot drift apart.
-    expect(checkTrustedOwners(HISTORICAL_OWNERS_CSV, real)).toEqual({ ok: true, problems: [] });
+    expect(checkTrustedOwners(HISTORICAL_OWNERS_CSV, real)).toEqual({ ok: true, problems: [], skippedWorkerCoverage: false });
+  });
+});
+
+/**
+ * The historical exception — narrow on purpose.
+ *
+ * ff0954d predates D9 and therefore TRUSTED_OWNERS: the var is absent and no
+ * code in that build would read it, so worker coverage is vacuous. The gate
+ * skips ONLY that, ONLY for that SHA. The repo registry (step 1) is still
+ * verified — it belongs to this checkout, not to the candidate.
+ */
+describe('a registered historical candidate is exempt from worker coverage only', () => {
+  const FF = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
+  const MODERN = 'de41d287a89e293d7ea611db6f4e3386355b6a74';
+  /** What ff0954d's wrangler.toml looks like: no TRUSTED_OWNERS anywhere. */
+  const preD9 = `
+[vars]
+STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev"
+UPLOADS_ENABLED = "true"
+
+[env.staging.vars]
+STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev"
+UPLOADS_ENABLED = "true"
+`;
+
+  it('passes the pre-D9 config for ff0954d, and says coverage was skipped', () => {
+    const r = checkTrustedOwners(undefined, preD9, { repoOnly: true, candidate: FF });
+    expect(r.ok).toBe(true);
+    expect(r.skippedWorkerCoverage).toBe(true);
+  });
+
+  it('the SAME config is refused for any other SHA', () => {
+    for (const candidate of [MODERN, 'b6cea2f'.padEnd(40, '0'), null]) {
+      const r = checkTrustedOwners(undefined, preD9, { repoOnly: true, candidate });
+      expect(r.ok).toBe(false);
+      expect(r.problems.join(' ')).toMatch(/TRUSTED_OWNERS is not declared/);
+      expect(r.skippedWorkerCoverage).toBe(false);
+    }
+  });
+
+  it('the modern candidate keeps the full gate', () => {
+    const r = checkTrustedOwners(A, toml(), { repoOnly: true, candidate: MODERN });
+    expect(r).toEqual({ ok: true, problems: [], skippedWorkerCoverage: false });
   });
 });

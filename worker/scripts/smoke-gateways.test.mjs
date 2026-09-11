@@ -239,3 +239,48 @@ describe('the capability the release exists for (D2a)', () => {
     expect(checkHealth(body, emergency)).toEqual({ ok: true, problems: [] });
   });
 });
+
+/**
+ * The `pre-d2` profile: the PR-3a lineage, exactly as ff0954d answers /health.
+ *
+ * Quorum yes, fingerprinting no, uploads ON. It fits neither `normal` (which
+ * demands `semanticIdempotency: 1`) nor `emergency` (which demands the old
+ * single-gateway quorum and uploads OFF). Deploying ff0954d under `normal` would
+ * pass every config gate and fail HERE — after activation. This profile is what
+ * lets the smoke judge that build correctly, and the exact-equality rule keeps
+ * it from ever admitting a modern build.
+ */
+describe('the pre-d2 profile judges the seed-legacy build, and only that build', () => {
+  const preD2 = { ...expected, profile: 'pre-d2' };
+  /** What ff0954d actually answers: everything of `normal` except the marker. */
+  const ff0954d = (over = {}) => healthy({ semanticIdempotency: undefined, ...over });
+
+  it('accepts ff0954d-shaped health — quorum present, marker absent, uploads on', () => {
+    const verdict = checkHealth(ff0954d(), preD2);
+    expect(verdict.ok).toBe(true);
+    expect(verdict.problems).toEqual([]);
+  });
+
+  // The other half of the two-way binding, enforced by the smoke itself.
+  it('REFUSES a modern build — a D2 worker reports 1, and 1 is not undefined', () => {
+    const verdict = checkHealth(healthy(), preD2);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/semanticIdempotency is 1.*requires undefined/s);
+  });
+
+  it('still requires the quorum — a single-gateway build is not pre-d2', () => {
+    const verdict = checkHealth(ff0954d({ statusQuorumPolicy: 'legacy-single-v0' }), preD2);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('; ')).toMatch(/statusQuorumPolicy/);
+  });
+
+  it('does NOT require uploads off — seed-legacy has to publish through it', () => {
+    expect(checkHealth(ff0954d({ uploads: true, v3Uploads: true, v4Uploads: true }), preD2).ok).toBe(true);
+  });
+
+  // And the same ff0954d body is still refused by `normal`: the profiles are
+  // disjoint, so a mislabelled dispatch cannot succeed either way.
+  it('the ff0954d body FAILS the normal profile', () => {
+    expect(checkHealth(ff0954d(), expected).ok).toBe(false);
+  });
+});

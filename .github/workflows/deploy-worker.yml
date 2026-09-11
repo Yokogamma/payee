@@ -80,11 +80,11 @@ on:
       # Cloudflare action runs — an unsafe build must never be activated first
       # and rejected afterwards.
       profile:
-        description: 'normal (default) | emergency — emergency requires all upload switches off'
+        description: 'normal (default) | emergency — every upload switch off | pre-d2 — ONLY the registered historical build (scripts/historical-candidates.mjs)'
         required: false
         default: normal
         type: choice
-        options: [normal, emergency]
+        options: [normal, emergency, pre-d2]
 
 # Least privilege for GITHUB_TOKEN (repo defaults may be write-all); this
 # workflow only needs to read the code it deploys.
@@ -209,6 +209,18 @@ jobs:
       # commit, and a candidate below the floor. An unset floor is also a
       # refusal — a floor already exists (docs/ROLLBACK.md), so a missing
       # variable is missing configuration, not an absent constraint.
+      # ── Historical candidate ↔ profile binding, BEFORE anything else ────
+      # A build that predates D9 (ff0954d, the pinned floor and the only build
+      # seed-legacy accepts) has no PAYLOAD_GATEWAYS, no TRUSTED_OWNERS and no
+      # semanticIdempotency. Under `normal` it would pass the config gates and
+      # fail the post-deploy smoke AFTER activation — the worst order there is.
+      # So the registry in scripts/historical-candidates.mjs binds such a SHA to
+      # its own profile both ways, and this step refuses any other pairing while
+      # nothing of the candidate exists on disk. Modern builds pass untouched.
+      - run: node scripts/historical-candidates.mjs
+        env:
+          WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
+          DEPLOY_PROFILE: ${{ inputs.profile }}
       - run: node scripts/check-worker-floor.mjs
         env:
           WORKER_FLOOR_SHA: ${{ vars.WORKER_FLOOR_SHA }}
@@ -244,7 +256,10 @@ jobs:
       - run: node scripts/check-gateways-vs-worker.mjs --config=candidate/worker/wrangler.toml
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+          WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
       - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
+        env:
+          WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
       # ── Emergency preflight, BEFORE anything is activated ──
       #
       # An emergency release is defined by every upload switch being off, and

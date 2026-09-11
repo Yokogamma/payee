@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { parseTrustedOwners } from './trusted-owners-parse.mjs';
 import { readTomlString } from './toml-scan.mjs';
 import { HISTORICAL_OWNERS, NEVER_REMOVE, HISTORICAL_OWNERS_CSV } from './owner-pins.mjs';
+import { candidateLacksVar } from './historical-candidates.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -75,7 +76,7 @@ function missingFrom(have, required) {
  * and compiled into the client bundle — so naming them in a message leaks
  * nothing and is what makes a refusal diagnosable.
  */
-export function checkTrustedOwners(clientCsv, toml, { repoOnly = false } = {}) {
+export function checkTrustedOwners(clientCsv, toml, { repoOnly = false, candidate = null } = {}) {
   const problems = [];
 
   // ── 1. The registry itself ──
@@ -92,8 +93,15 @@ export function checkTrustedOwners(clientCsv, toml, { repoOnly = false } = {}) {
   }
 
   // ── 2. Worker coverage, per block ──
+  //
+  // Skipped for ONE registered historical candidate and nothing else: a build
+  // that predates D9 has no TRUSTED_OWNERS and no code that would read it, so
+  // there is nothing to cover. The registry (step 1) is still checked — it is
+  // the repo's, not the candidate's. Keyed by full SHA in
+  // scripts/historical-candidates.mjs; nothing here can widen it.
+  const skipWorker = candidateLacksVar(candidate, 'TRUSTED_OWNERS');
   const workerSets = new Map();
-  for (const [label, prefix] of [['production', ''], ['staging', 'env.staging.']]) {
+  for (const [label, prefix] of skipWorker ? [] : [['production', ''], ['staging', 'env.staging.']]) {
     const read = readWorkerOwners(toml, prefix);
     if (read.error) {
       // A MISSING key is the likeliest way this gate fires, and the bare
@@ -165,7 +173,7 @@ export function checkTrustedOwners(clientCsv, toml, { repoOnly = false } = {}) {
     }
   }
 
-  return { ok: problems.length === 0, problems };
+  return { ok: problems.length === 0, problems, skippedWorkerCoverage: skipWorker };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -179,14 +187,17 @@ if (process.argv[1]?.endsWith('check-trusted-owners.mjs')) {
     ?.slice('--config='.length);
   const toml = readFileSync(configArg ?? join(ROOT, 'worker', 'wrangler.toml'), 'utf8');
 
-  const { ok, problems } = checkTrustedOwners(process.env.VITE_TRUSTED_OWNERS, toml, { repoOnly });
+  const candidate = process.env.WORKER_CANDIDATE_SHA ?? null;
+  const { ok, problems, skippedWorkerCoverage } = checkTrustedOwners(process.env.VITE_TRUSTED_OWNERS, toml, { repoOnly, candidate });
   if (!ok) {
     console.error('✗ check-trusted-owners:');
     for (const p of problems) console.error(`  - ${p}`);
     process.exit(1);
   }
   console.log(
-    `✓ check-trusted-owners: worker tables cover the repo registry ` +
+    (skippedWorkerCoverage
+      ? `✓ check-trusted-owners: worker coverage SKIPPED for historical candidate ${candidate.slice(0, 7)} (no D9 in that build); registry itself verified `
+      : `✓ check-trusted-owners: worker tables cover the repo registry `) +
       `(${HISTORICAL_OWNERS.length} owner(s))${repoOnly ? '' : ' and agree with the client'}`,
   );
 }
