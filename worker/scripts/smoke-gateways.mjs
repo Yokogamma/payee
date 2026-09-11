@@ -127,6 +127,16 @@ export function checkHealth(body, expected) {
       if (body[flag] !== false) problems.push(`${flag} must be false under the emergency profile`);
     }
   }
+  // The mirror image, and NOT implied by `requireUploadsOff: false` — that only
+  // stops demanding them off, it asserts nothing. A profile whose whole purpose
+  // is publishing (pre-d2 exists so seed-legacy can post) must say so
+  // positively, or a build with every switch off would be declared ready and
+  // the seeding would fail against a worker the smoke had just approved.
+  if (profile.requireUploadsOn) {
+    for (const flag of ['uploads', 'v3Uploads', 'v4Uploads']) {
+      if (body[flag] !== true) problems.push(`${flag} must be true under the ${expected.profile} profile`);
+    }
+  }
 
   if (expected.releaseSha !== undefined && body.releaseSha !== expected.releaseSha) {
     problems.push(

@@ -43,7 +43,7 @@ describe('readWorkerStatusGateways', () => {
 
 describe('checkGateways — client and worker must mean the same pool', () => {
   it('passes when both sides equal the pin', () => {
-    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [] });
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [], skippedPayloadPool: false });
   });
 
   it('normalizes before comparing: a trailing slash is the same origin', () => {
@@ -82,7 +82,7 @@ describe('checkGateways — client and worker must mean the same pool', () => {
   });
 
   it('--repo-only checks the worker against the pin without any Environment', () => {
-    expect(checkGateways(undefined, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [] });
+    expect(checkGateways(undefined, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [], skippedPayloadPool: false });
     const drift = checkGateways(undefined, toml('https://arweave.net,https://b.example'), { repoOnly: true });
     expect(drift.ok).toBe(false);
   });
@@ -129,5 +129,64 @@ describe('the PAYLOAD pool (D2/D9) — pinned WITH its order', () => {
     const slashed = pinned.split(',').map(o => `${o}/`).join(',');
     expect(checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { payloadProd: slashed, payloadStaging: slashed })).ok)
       .toBe(true);
+  });
+});
+
+/**
+ * The historical exception — narrow on purpose.
+ *
+ * ff0954d is the pinned floor and the only build seed-legacy accepts, and it
+ * predates PAYLOAD_GATEWAYS entirely. The gate skips ONLY that check, ONLY for
+ * that SHA; the status pool — which that build does have — is still checked
+ * in full. Any other SHA, including the one that introduced D9, is held to the
+ * complete gate.
+ */
+describe('a registered historical candidate is exempt from the PAYLOAD check only', () => {
+  const FF = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
+  const MODERN = 'de41d287a89e293d7ea611db6f4e3386355b6a74';
+  /** What ff0954d's wrangler.toml looks like: status pool yes, payload pool no. */
+  const preD9 = (prod = EXPECTED_STATUS_CSV, staging = EXPECTED_STATUS_CSV) => `
+[vars]
+STATUS_GATEWAYS = "${prod}"
+UPLOADS_ENABLED = "true"
+
+[env.staging.vars]
+STATUS_GATEWAYS = "${staging}"
+UPLOADS_ENABLED = "true"
+`;
+
+  it('passes the pre-D9 config for ff0954d, and says the payload check was skipped', () => {
+    const r = checkGateways(EXPECTED_STATUS_CSV, preD9(), { candidate: FF });
+    expect(r.ok).toBe(true);
+    expect(r.skippedPayloadPool).toBe(true);
+  });
+
+  it('the SAME config is refused for any other SHA — the exception is the SHA, not the shape', () => {
+    for (const candidate of [MODERN, 'b6cea2f'.padEnd(40, '0'), null, undefined]) {
+      const r = checkGateways(EXPECTED_STATUS_CSV, preD9(), { candidate });
+      expect(r.ok).toBe(false);
+      expect(r.problems.join(' ')).toMatch(/missing PAYLOAD_GATEWAYS/);
+      expect(r.skippedPayloadPool).toBe(false);
+    }
+  });
+
+  it('still checks the STATUS pool for ff0954d — that build has a quorum', () => {
+    const r = checkGateways(EXPECTED_STATUS_CSV, preD9('https://only-one.example'), { candidate: FF });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join(' ')).toMatch(/STATUS_GATEWAYS does not match the repo-pinned set/);
+  });
+
+  it('a modern config under ff0954d is not made worse — the payload check is skipped, nothing else changes', () => {
+    // If someone hands the gate a modern toml with the historical SHA, the
+    // status checks run exactly as before; only the payload block is bypassed.
+    const r = checkGateways(EXPECTED_STATUS_CSV, toml(), { candidate: FF });
+    expect(r.ok).toBe(true);
+    expect(r.skippedPayloadPool).toBe(true);
+  });
+
+  it('the modern candidate keeps the full gate', () => {
+    const r = checkGateways(EXPECTED_STATUS_CSV, toml(), { candidate: MODERN });
+    expect(r.ok).toBe(true);
+    expect(r.skippedPayloadPool).toBe(false);
   });
 });

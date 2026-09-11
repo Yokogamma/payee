@@ -2129,6 +2129,52 @@ A rollback target must be the trusted head or a SHA listed in
 PR-3a, so a no-op redeploy of the currently-live worker costs one reviewed pull
 request.
 
+
+#### Откат на сам флор `ff0954d` — профиль `pre-d2`
+
+Обнаружено 2026-09-11 ([run 34598685134](https://github.com/Yokogamma/payee/actions/runs/34598685134)):
+диспатч с кандидатом `ff0954d` под профилем `normal` упал на
+`check-gateways-vs-worker.mjs` **до** активации — «missing `PAYLOAD_GATEWAYS`».
+Гейты и smoke по дизайну берутся из доверенной ветки, а `ff0954d` предшествует
+D9: в нём нет ни `PAYLOAD_GATEWAYS`, ни `TRUSTED_OWNERS`, а `/health` не отдаёт
+`semanticIdempotency`. Флор — необходимое условие допуска, не гарантия прохождения
+остальных проверок; здесь предусмотренный откат оказался несовместим с нынешними
+гейтами.
+
+Ослабить один гейт было бы хуже отказа: сборка прошла бы конфиг-проверки,
+активировалась, и **уже живой** воркер провалил бы smoke (`normal` требует
+`semanticIdempotency: 1`; `emergency` требует другой кворум и выключенные
+загрузки, а `seed-legacy` обязан публиковать). Поэтому весь путь исторического
+кандидата согласован в одном месте — `scripts/historical-candidates.mjs`:
+
+- реестр ключуется **полным SHA одной проверенной сборки**, не диапазоном и не
+  «всеми предками b6cea2f» — сам `b6cea2f` уже несёт D9 и является собственным
+  предком;
+- связка SHA ↔ профиль **двусторонняя** и проверяется первым шагом workflow,
+  пока кандидата нет на диске: `ff0954d` деплоится только под `pre-d2`,
+  `pre-d2` активирует только `ff0954d`. `ff0954d` под `normal` — отказ до
+  материализации, а не после активации;
+- пропускаются ровно проверки `PAYLOAD_GATEWAYS` и `TRUSTED_OWNERS` — кода,
+  читающего их, в сборке нет. Флор, достижимость, `STATUS_GATEWAYS`, выключатели
+  загрузок проверяются как прежде;
+- профиль `pre-d2` в `DEPLOY_PROFILES`: кворум `all-configured-v1`,
+  `semanticIdempotency: undefined`, загрузки включены. Точное равенство режет в
+  обе стороны — D2-сборка отдаёт `1`, это не `undefined`, и под `pre-d2` она
+  smoke не пройдёт даже в обход связки.
+
+Диспатч:
+
+```
+gh workflow run deploy-worker.yml --ref main \
+  -f candidate=ff0954d1799c2dc0534a4ab73c6d11d3e01645f1 -f profile=pre-d2
+```
+
+Вся последовательность прогнана локально до первого dispatch (11.09): связка,
+флор, оба конфиг-гейта на конфиге `ff0954d` — проходят; `ff0954d` под
+`normal`, современный SHA под `pre-d2`, конфиг `ff0954d` без кандидата или с
+чужим — отказывают; современный путь `de41d28` под `normal` не изменился.
+
+
 ### Release row
 
 | tag | SHA | run id | worker version id | smoked |
