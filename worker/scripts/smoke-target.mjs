@@ -119,6 +119,11 @@ export const DEPLOY_PROFILES = Object.freeze({
     statusQuorumPolicy: 'all-configured-v1',
     semanticIdempotency: undefined,
     requireUploadsOff: false,
+    // Positively required, not merely «not required off»: this profile exists so
+    // seed-legacy can PUBLISH through the build. A worker with any switch off
+    // would be declared ready by the smoke and then refuse the very seeding
+    // it was activated for.
+    requireUploadsOn: true,
   }),
 });
 
