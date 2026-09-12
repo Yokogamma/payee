@@ -242,11 +242,14 @@ describe('paging follows the documented cursor', () => {
     success: true,
     result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, events: { events }, ...over },
   });
-  // The store's own count of the slice: `rows` unweighted rows.
+  // The store's own count of the slice, in the two shapes seen live: a populated
+  // aggregate, or the EXPLICIT zero aggregate for an empty slice.
   const tallyOf = (rows, interval = 1) => ({
     success: true,
     result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 },
-      calculations: rows ? [{ calculation: 'count', aggregates: [{ value: rows * interval, interval, sampleInterval: interval, count: rows * interval }] }] : [{ calculation: 'count', aggregates: [] }] },
+      calculations: [{ calculation: 'count', aggregates: [rows
+        ? { value: rows * interval, interval, sampleInterval: interval, count: rows * interval }
+        : { value: 0, interval: 0, sampleInterval: 0, count: 0 }] }] },
   });
   // Wrap a listing-only post so the tally request is answered with the given row count.
   const withTally = (listPost, rows, interval = 1) => async (body, what) => (body.view === 'calculations' ? tallyOf(rows, interval) : listPost(body, what));
@@ -311,22 +314,35 @@ describe('paging follows the documented cursor', () => {
     expect(tallyBody.parameters.calculations).toEqual([{ operator: 'count' }]);
   });
 
-  it('refuses a listing that returned fewer (or more) rows than the store counts', async () => {
+  it('refuses a listing that disagrees with the store count — without naming a culprit', async () => {
     const short = withTally(async () => ok(page(3, 0)), 4);
     await expect(collectSlice({ post: short, slice, scriptKey: KEY, target: 'w' }))
-      .rejects.toThrow(/listing returned 3 row\(s\) but the store counts 4.*NOT archive/s);
+      .rejects.toThrow(/two reads are not consistent.*listing returned 3 row\(s\), the store's own count is 4.*cause is not established.*NOT archive/s);
     const long = withTally(async () => ok(page(3, 0)), 2);
     await expect(collectSlice({ post: long, slice, scriptKey: KEY, target: 'w' }))
-      .rejects.toThrow(/listing returned 3 row\(s\) but the store counts 2/);
+      .rejects.toThrow(/listing returned 3 row\(s\), the store's own count is 2/);
   });
 
   it('a tally answer that is incomplete or query-sampled is refused like a listing', async () => {
     const bad = (over) => async (body) => (body.view === 'calculations'
-      ? { success: true, result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, calculations: [{ aggregates: [{ value: 3, interval: 1 }] }], ...over } }
+      ? { success: true, result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, calculations: [{ calculation: 'count', aggregates: [{ value: 3, interval: 1, sampleInterval: 1, count: 3 }] }], ...over } }
       : ok(page(3, 0)));
     await expect(collectSlice({ post: bad({ run: { status: 'STARTED' } }), slice, scriptKey: KEY, target: 'w' })).rejects.toThrow(/STARTED/);
     await expect(collectSlice({ post: bad({ statistics: { abr_level: 2 } }), slice, scriptKey: KEY, target: 'w' })).rejects.toThrow(/abr_level/);
     await expect(collectSlice({ post: bad({ calculations: undefined }), slice, scriptKey: KEY, target: 'w' })).rejects.toThrow(/no calculations array/);
+  });
+
+  // The P1 of #165: a damaged tally must not CONFIRM an empty listing.
+  it('an empty listing is confirmed only by the store\'s explicit zero, never by a damaged answer', async () => {
+    const damaged = (calculations) => async (body) => (body.view === 'calculations'
+      ? { success: true, result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, calculations } }
+      : ok([]));
+    for (const calculations of [[{}], [], [{ calculation: 'count' }], [{ calculation: 'count', aggregates: [] }], [{ calculation: 'uniq', aggregates: [{ value: 0, interval: 0, sampleInterval: 0, count: 0 }] }]]) {
+      await expect(collectSlice({ post: damaged(calculations), slice, scriptKey: KEY, target: 'w' }))
+        .rejects.toThrow(/tally: .*refusing to count/);
+    }
+    const explicitZero = withTally(async () => ok([]), 0);
+    await expect(collectSlice({ post: explicitZero, slice, scriptKey: KEY, target: 'w' })).resolves.toMatchObject({ events: [], tally: { rows: 0 } });
   });
 
   it('refuses a cursor that does not advance — paging would loop or repeat', async () => {
@@ -829,22 +845,41 @@ describe('the store tally', () => {
     expect(storeSampled(storeTally(agg(10, 10)))).toBe(true);
   });
 
-  it('an unweighted slice tallies exactly, and an empty one to zero', () => {
+  it('an unweighted slice tallies exactly; an empty one is the store\'s EXPLICIT zero aggregate (seen live)', () => {
     expect(storeTally(agg(130, 1))).toEqual({ rows: 130, estimate: 130, interval: 1 });
     expect(storeSampled(storeTally(agg(130, 1)))).toBe(false);
-    expect(storeTally({ calculations: [{ calculation: 'count', aggregates: [] }] })).toEqual({ rows: 0, estimate: 0, interval: 1 });
-    expect(storeTally({ calculations: [] })).toEqual({ rows: 0, estimate: 0, interval: 1 });
+    const liveEmpty = { calculations: [{ calculation: 'count', aggregates: [{ value: 0, interval: 0, sampleInterval: 0, count: 0 }], series: [] }] };
+    expect(storeTally(liveEmpty)).toEqual({ rows: 0, estimate: 0, interval: 1 });
+    expect(storeSampled(storeTally(liveEmpty))).toBe(false);
   });
 
-  it('refuses a malformed aggregate rather than tallying garbage', () => {
-    expect(() => storeTally({ calculations: [{ aggregates: [{ value: 'x', interval: 1 }] }] })).toThrow(/malformed aggregate/);
-    expect(() => storeTally({ calculations: [{ aggregates: [{ value: 3, interval: 0 }] }] })).toThrow(/malformed aggregate/);
-    expect(() => storeTally({})).toThrow(/no calculations array/);
+  // A zero manufactured by the parser is the one number this tool must never
+  // produce: every shape but the two seen live is refused, not read as «nothing».
+  it('refuses every damaged or unexpected answer instead of tallying zero (P1 of #165)', () => {
+    const zero = { value: 0, interval: 0, sampleInterval: 0, count: 0 };
+    const refused = [
+      {},                                                            // no calculations
+      { calculations: [] },                                          // none
+      { calculations: [{}] },                                        // the reproduction
+      { calculations: [{ calculation: 'count' }] },                  // no aggregates
+      { calculations: [{ calculation: 'count', aggregates: [] }] },  // empty is NOT how the store says «nothing»
+      { calculations: [{ calculation: 'uniq', aggregates: [zero] }] }, // not the requested operation
+      { calculations: [{ calculation: 'count', aggregates: [zero] }, { calculation: 'count', aggregates: [zero] }] },
+      { calculations: [{ calculation: 'count', aggregates: [zero, zero] }] }, // ungrouped → one aggregate
+      { calculations: [{ calculation: 'count', aggregates: [{ value: 'x', interval: 1, count: 1 }] }] },
+      { calculations: [{ calculation: 'count', aggregates: [{ value: 3, interval: 1 }] }] },          // count missing
+      { calculations: [{ calculation: 'count', aggregates: [{ value: 3, interval: 0, count: 3 }] }] }, // zero weight, non-zero rows
+      { calculations: [{ calculation: 'count', aggregates: [{ value: 0, interval: 1, count: 0 }] }] }, // half a zero
+      { calculations: [{ calculation: 'count', aggregates: [{ value: -1, interval: 1, count: -1 }] }] },
+      { calculations: [{ calculation: 'count', aggregates: [{ value: 7, interval: 2, count: 7 }] }] },  // 3.5 rows
+    ];
+    for (const answer of refused) expect(() => storeTally(answer), JSON.stringify(answer)).toThrow(/tally: .*refusing to count/);
   });
 
-  it('the listing must match the store row for row', () => {
+  it('the listing must match the store row for row; a mismatch is «not consistent», not a verdict', () => {
     expect(() => assertListingMatchesStore(131, storeTally(agg(140, 1.0687022900763359)), slice)).not.toThrow();
-    expect(() => assertListingMatchesStore(130, storeTally(agg(140, 1.0687022900763359)), slice)).toThrow(/returned 130 row\(s\) but the store counts 131/);
+    expect(() => assertListingMatchesStore(130, storeTally(agg(140, 1.0687022900763359)), slice))
+      .toThrow(/not consistent.*listing returned 130 row\(s\), the store's own count is 131.*cause is not established/s);
   });
 
   it('the tally body asks the calculations view for a count over the SAME slice and filter', () => {

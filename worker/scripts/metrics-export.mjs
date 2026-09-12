@@ -428,32 +428,53 @@ export function storeTallyBody(slice, scriptKey, target) {
 /**
  * `{ rows, estimate, interval }` from a calculations answer. `value` is the
  * store's estimate (rows × weight) and `interval` the mean weight, so the
- * number of stored rows is `value / interval`. An empty slice has no aggregate
- * and tallies to zero — that is a legitimate answer, not a malformed one.
+ * number of stored rows is `value / interval`.
+ *
+ * The shape is checked in full, and only the shape the store was SEEN to
+ * return is accepted (2026-09-12, both cases live): exactly one calculation,
+ * named `count`, with exactly one aggregate. An EMPTY slice is not a missing
+ * aggregate — the store answers it explicitly, as
+ * `{ value: 0, interval: 0, sampleInterval: 0, count: 0 }`. Anything else is
+ * refused: the first version treated a missing `aggregates` as «zero rows», so
+ * a damaged answer (`calculations: [{}]`) would have CONFIRMED an empty listing
+ * instead of failing it — a zero manufactured by a parser is the one number
+ * this tool must never produce (review of #165, P1).
  */
 export function storeTally(result) {
+  const malformed = (why) => new Error(`tally: ${why} — refusing to count. Answer: ${JSON.stringify(result?.calculations ?? result).slice(0, 300)}`);
   const calc = result?.calculations;
-  if (!Array.isArray(calc)) throw new Error('tally: no calculations array in a successful answer');
-  const agg = calc[0]?.aggregates?.[0];
-  if (agg === undefined) return { rows: 0, estimate: 0, interval: 1 };
-  const { value, interval } = agg;
-  if (!Number.isFinite(value) || !Number.isFinite(interval) || interval <= 0) {
-    throw new Error(`tally: malformed aggregate ${JSON.stringify(agg)}`);
-  }
-  return { rows: Math.round(value / interval), estimate: value, interval };
+  if (!Array.isArray(calc)) throw malformed('no calculations array in a successful answer');
+  if (calc.length !== 1) throw malformed(`expected exactly one calculation, got ${calc.length}`);
+  const c = calc[0];
+  if (!c || typeof c !== 'object' || c.calculation !== 'count') throw malformed('the calculation is not the requested count');
+  if (!Array.isArray(c.aggregates)) throw malformed('no aggregates array');
+  if (c.aggregates.length !== 1) throw malformed(`an ungrouped count has exactly one aggregate, got ${c.aggregates.length}`);
+  const agg = c.aggregates[0];
+  const { value, interval, count } = agg ?? {};
+  if (![value, interval, count].every(Number.isFinite)) throw malformed(`aggregate fields are not all numbers: ${JSON.stringify(agg)}`);
+  if (value === 0 && interval === 0 && count === 0) return { rows: 0, estimate: 0, interval: 1 }; // the store's explicit «nothing here»
+  if (value <= 0 || interval <= 0) throw malformed(`aggregate is neither the explicit zero nor positive: ${JSON.stringify(agg)}`);
+  const rows = value / interval;
+  if (Math.abs(rows - Math.round(rows)) > 1e-6) throw malformed(`value / interval is not a whole number of rows: ${JSON.stringify(agg)}`);
+  return { rows: Math.round(rows), estimate: value, interval };
 }
 
 /**
- * The listing must return every row the store counts. Fewer means the LISTING
- * dropped rows — this tool's defect, not the channel's — and the archive would
- * be short while looking complete. More is impossible and equally a defect.
+ * The listing and the store's count must agree row for row. They do not come
+ * from one snapshot — the two requests run one after the other, and an event
+ * still being ingested, or one crossing the retention edge, can land between
+ * them — so a mismatch says the two reads are NOT CONSISTENT and nothing about
+ * which is right. That is reason enough not to archive: an archive that is
+ * short while looking complete is worse than none. The cause is not
+ * established by the mismatch itself (review of #165, P2).
  */
 export function assertListingMatchesStore(listed, tally, slice) {
   if (listed !== tally.rows) {
     throw new Error(
-      `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()}: the listing returned `
-      + `${listed} row(s) but the store counts ${tally.rows} — the export is not reading everything the store `
-      + 'holds. Do NOT archive this run.',
+      `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()}: the two reads are not `
+      + `consistent — the listing returned ${listed} row(s), the store's own count is ${tally.rows}. The reads `
+      + 'are sequential, not one snapshot, so the cause is not established (ingestion in progress, retention edge '
+      + 'and a reading defect all fit). Do NOT archive this run; re-run later and compare.',
     );
   }
 }
