@@ -10,6 +10,7 @@ import {
   unwrap, archiveName, writeArchive, parseArgs, collectSlice, nextCursor, eventId,
   assertRunComplete, assertNoTruncatedEvents, COMPLETED_RUN_STATUS, resolveInterval, MAX_SPAN_MS, SECOND_MS, INGEST_LAG_MS,
   assertWithinRetention, LOG_RETENTION_DAYS_DEFAULT, LOG_RETENTION_DAYS_MAX,
+  storeTallyBody, storeTally, assertListingMatchesStore, storeSampled, assertUnsampledForDelivery,
   LOG_PAGE_LIMIT, LOG_QUERY_LIMIT, RAW_ROW_LIMIT, SCRIPT_KEY_CANDIDATES,
   messageOf, probeLines, assertProbeSeen, parseStructured, criticalLines, structuredOf,
 } from './metrics-export.mjs';
@@ -241,21 +242,30 @@ describe('paging follows the documented cursor', () => {
     success: true,
     result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, events: { events }, ...over },
   });
+  // The store's own count of the slice: `rows` unweighted rows.
+  const tallyOf = (rows, interval = 1) => ({
+    success: true,
+    result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 },
+      calculations: rows ? [{ calculation: 'count', aggregates: [{ value: rows * interval, interval, sampleInterval: interval, count: rows * interval }] }] : [{ calculation: 'count', aggregates: [] }] },
+  });
+  // Wrap a listing-only post so the tally request is answered with the given row count.
+  const withTally = (listPost, rows, interval = 1) => async (body, what) => (body.view === 'calculations' ? tallyOf(rows, interval) : listPost(body, what));
 
   it('sends the last $metadata.id as a TOP-LEVEL offset until a short page ends it', async () => {
     const sent = [];
-    const post = async (body) => {
+    const post = withTally(async (body) => {
       sent.push(body);
       if (sent.length === 1) return ok(page(LOG_PAGE_LIMIT, 0));
       if (sent.length === 2) return ok(page(LOG_PAGE_LIMIT, 100));
       return ok(page(5, 200));
-    };
+    }, 2 * LOG_PAGE_LIMIT + 5);
 
-    const { events, pages, runStatus, abrLevel } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    const { events, pages, runStatus, abrLevel, tally } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
 
     expect(events).toHaveLength(2 * LOG_PAGE_LIMIT + 5);
     // the archived proof of paging: every page size, in order, second one non-empty
     expect(pages).toEqual([LOG_PAGE_LIMIT, LOG_PAGE_LIMIT, 5]);
+    expect(tally).toEqual({ rows: 205, estimate: 205, interval: 1 });
     expect(sent).toHaveLength(3);
     expect(sent[0].offset).toBeUndefined();            // the first page carries no cursor
     expect(sent[1].offset).toBe('id-99');              // the LAST id of page one…
@@ -270,22 +280,53 @@ describe('paging follows the documented cursor', () => {
     expect(abrLevel).toBe(1);
   });
 
-  it('a single short page needs no second request', async () => {
+  it('a single short page needs no second listing request (plus the one tally)', async () => {
     let calls = 0;
-    const post = async () => { calls += 1; return ok(page(3, 0)); };
+    const post = withTally(async () => { calls += 1; return ok(page(3, 0)); }, 3);
     const { events, pages } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
     expect(events).toHaveLength(3);
     expect(pages).toEqual([3]);
     expect(calls).toBe(1);
   });
 
-  it('an empty first page ends the slice without a cursor', async () => {
+  it('an empty first page ends the slice without a cursor; an empty tally agrees', async () => {
     let calls = 0;
-    const post = async () => { calls += 1; return ok([]); };
-    const { events, pages } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
+    const post = withTally(async () => { calls += 1; return ok([]); }, 0);
+    const { events, pages, tally } = await collectSlice({ post, slice, scriptKey: KEY, target: 'w' });
     expect(events).toEqual([]);
     expect(pages).toEqual([0]);
+    expect(tally).toEqual({ rows: 0, estimate: 0, interval: 1 });
     expect(calls).toBe(1);
+  });
+
+  it('the tally is asked AFTER the listing, for the same slice and the same filter', async () => {
+    const sent = [];
+    const post = withTally(async (body) => { sent.push(body); return ok(page(2, 0)); }, 2);
+    const wrapped = async (body, what) => { if (body.view === 'calculations') sent.push(body); return post(body, what); };
+    await collectSlice({ post: wrapped, slice, scriptKey: KEY, target: 'w' });
+    expect(sent.map((b) => b.view)).toEqual(['events', 'calculations']);
+    const tallyBody = sent[1];
+    expect(tallyBody.timeframe).toEqual({ from: slice.from, to: slice.to });
+    expect(tallyBody.parameters.filters).toEqual([{ key: KEY, operation: 'eq', value: 'w', type: 'string' }]);
+    expect(tallyBody.parameters.calculations).toEqual([{ operator: 'count' }]);
+  });
+
+  it('refuses a listing that returned fewer (or more) rows than the store counts', async () => {
+    const short = withTally(async () => ok(page(3, 0)), 4);
+    await expect(collectSlice({ post: short, slice, scriptKey: KEY, target: 'w' }))
+      .rejects.toThrow(/listing returned 3 row\(s\) but the store counts 4.*NOT archive/s);
+    const long = withTally(async () => ok(page(3, 0)), 2);
+    await expect(collectSlice({ post: long, slice, scriptKey: KEY, target: 'w' }))
+      .rejects.toThrow(/listing returned 3 row\(s\) but the store counts 2/);
+  });
+
+  it('a tally answer that is incomplete or query-sampled is refused like a listing', async () => {
+    const bad = (over) => async (body) => (body.view === 'calculations'
+      ? { success: true, result: { run: { status: 'COMPLETED' }, statistics: { abr_level: 1 }, calculations: [{ aggregates: [{ value: 3, interval: 1 }] }], ...over } }
+      : ok(page(3, 0)));
+    await expect(collectSlice({ post: bad({ run: { status: 'STARTED' } }), slice, scriptKey: KEY, target: 'w' })).rejects.toThrow(/STARTED/);
+    await expect(collectSlice({ post: bad({ statistics: { abr_level: 2 } }), slice, scriptKey: KEY, target: 'w' })).rejects.toThrow(/abr_level/);
+    await expect(collectSlice({ post: bad({ calculations: undefined }), slice, scriptKey: KEY, target: 'w' })).rejects.toThrow(/no calculations array/);
   });
 
   it('refuses a cursor that does not advance — paging would loop or repeat', async () => {
@@ -766,6 +807,61 @@ describe('the start of a logs interval is checked against retention', () => {
     expect(() => parseArgs(['metrics', '--retention-days', '7'])).toThrow(/applies only to .logs/);
     // …but the DEFAULT is not a «given» flag, so metrics without it is fine.
     expect(parseArgs(['metrics']).opts.retentionGiven).toBe(false);
+  });
+});
+
+/**
+ * The store's own count, with the per-row sample weight the listing never
+ * shows. The live numbers of 2026-09-12: a window listed as 131 rows was
+ * counted by the store as `value 140, interval 1.0687` — one row weighted ten.
+ */
+describe('the store tally', () => {
+  const slice = { from: 0, to: 3600_000 };
+  const agg = (value, interval) => ({ calculations: [{ calculation: 'count', aggregates: [{ value, interval, sampleInterval: interval, count: value }] }] });
+
+  it('recovers the row count from the estimate and the mean weight — the live case', () => {
+    const t = storeTally(agg(140, 1.0687022900763359));
+    expect(t.rows).toBe(131);
+    expect(t.estimate).toBe(140);
+    expect(storeSampled(t)).toBe(true);
+    // the single-row case that produced it
+    expect(storeTally(agg(10, 10))).toEqual({ rows: 1, estimate: 10, interval: 10 });
+    expect(storeSampled(storeTally(agg(10, 10)))).toBe(true);
+  });
+
+  it('an unweighted slice tallies exactly, and an empty one to zero', () => {
+    expect(storeTally(agg(130, 1))).toEqual({ rows: 130, estimate: 130, interval: 1 });
+    expect(storeSampled(storeTally(agg(130, 1)))).toBe(false);
+    expect(storeTally({ calculations: [{ calculation: 'count', aggregates: [] }] })).toEqual({ rows: 0, estimate: 0, interval: 1 });
+    expect(storeTally({ calculations: [] })).toEqual({ rows: 0, estimate: 0, interval: 1 });
+  });
+
+  it('refuses a malformed aggregate rather than tallying garbage', () => {
+    expect(() => storeTally({ calculations: [{ aggregates: [{ value: 'x', interval: 1 }] }] })).toThrow(/malformed aggregate/);
+    expect(() => storeTally({ calculations: [{ aggregates: [{ value: 3, interval: 0 }] }] })).toThrow(/malformed aggregate/);
+    expect(() => storeTally({})).toThrow(/no calculations array/);
+  });
+
+  it('the listing must match the store row for row', () => {
+    expect(() => assertListingMatchesStore(131, storeTally(agg(140, 1.0687022900763359)), slice)).not.toThrow();
+    expect(() => assertListingMatchesStore(130, storeTally(agg(140, 1.0687022900763359)), slice)).toThrow(/returned 130 row\(s\) but the store counts 131/);
+  });
+
+  it('the tally body asks the calculations view for a count over the SAME slice and filter', () => {
+    const b = storeTallyBody(slice, '$metadata.service', 'w');
+    expect(b.view).toBe('calculations');
+    expect(b.timeframe).toEqual({ from: 0, to: 3600_000 });
+    expect(b.parameters.filters).toEqual([{ key: '$metadata.service', operation: 'eq', value: 'w', type: 'string' }]);
+    expect(b.parameters.calculations).toEqual([{ operator: 'count' }]);
+    expect(b.dry).toBe(false);
+  });
+
+  // A probe seen in a slice the store calls a sample proves that line arrived
+  // and nothing about the rest — the check must not certify the channel on it.
+  it('the delivery check refuses a store-sampled slice even when the probe was seen', () => {
+    expect(() => assertUnsampledForDelivery([])).not.toThrow();
+    expect(() => assertUnsampledForDelivery([slice]))
+      .toThrow(/store weights rows in 1 slice.*1970-01-01T00:00:00.000Z\.\.1970-01-01T01:00:00.000Z.*delivery check has FAILED.*must not be opened/s);
   });
 });
 
