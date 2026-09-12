@@ -348,6 +348,22 @@ export function assertProbeSeen(events, probeId) {
   return seen.length;
 }
 
+/**
+ * The delivery check certifies a channel, and a slice the store itself calls a
+ * sample cannot certify one — however many times the probe was seen in it.
+ * The daily archive still keeps such a slice (flagged); the CHECK refuses it.
+ */
+export function assertUnsampledForDelivery(sampledSlices) {
+  if (sampledSlices.length) {
+    const list = sampledSlices.map((s) => `${new Date(s.from).toISOString()}..${new Date(s.to).toISOString()}`).join(', ');
+    throw new Error(
+      `the store weights rows in ${sampledSlices.length} slice(s) of this check (${list}): by its own account the `
+      + 'channel sampled here, so a probe that was seen proves delivery of THAT line and nothing about the rest. '
+      + 'The delivery check has FAILED and the soak window must not be opened on it.',
+    );
+  }
+}
+
 /** The events cursor: `$metadata.id`, passed at the TOP level as `offset`. */
 export function eventId(e) {
   return e?.$metadata?.id;
@@ -370,6 +386,102 @@ export function nextCursor(batch, previous) {
     throw new Error(`the cursor did not advance (${last}) — paging would loop or silently repeat. Do NOT archive this run.`);
   }
   return last;
+}
+
+/**
+ * The store's OWN count of a slice, from the `calculations` view — a second
+ * path to the same rows, with one thing the events listing never shows: the
+ * per-row sample weight.
+ *
+ * Found 2026-09-12 while chasing two invocations that were absent from every
+ * listing. In a window whose listing held 131 rows the store answered
+ * `count = 140, interval = 1.0687`: one row (a different one from the two
+ * that were missing) carried `sampleInterval = 10` — `uniq($metadata.id) = 1`,
+ * so ONE stored row that the store treats as standing for ten. That is what an
+ * ingest-side sampler leaves behind, with `head_sampling_rate = 1` and the
+ * account nowhere near the documented 5-billion-a-day threshold. The events
+ * view carries no such field, so an export that reads only the listing cannot
+ * see it; `abr_level` is about query-time sampling and stayed 1 throughout.
+ *
+ * The tally makes two things checkable per slice: that the listing returned
+ * as many rows as the store counts (a listing that drops rows is a defect of
+ * THIS tool), and whether any row in the slice is weighted (the STORE admits
+ * the slice is a sample). Neither is a cause of the two absences — those rows
+ * are in no view at all — but the second is the mechanism the delivery check
+ * exists to detect.
+ */
+export function storeTallyBody(slice, scriptKey, target) {
+  return {
+    queryId: `soak-export-tally-${slice.from}`,
+    timeframe: { from: slice.from, to: slice.to },
+    parameters: {
+      datasets: ['cloudflare-workers'],
+      filters: [{ key: scriptKey, operation: 'eq', value: target, type: 'string' }],
+      calculations: [{ operator: 'count' }],
+    },
+    view: 'calculations',
+    limit: LOG_PAGE_LIMIT,
+    dry: false,
+  };
+}
+
+/**
+ * `{ rows, estimate, interval }` from a calculations answer. `value` is the
+ * store's estimate (rows × weight) and `interval` the mean weight, so the
+ * number of stored rows is `value / interval`.
+ *
+ * The shape is checked in full, and only the shape the store was SEEN to
+ * return is accepted (2026-09-12, both cases live): exactly one calculation,
+ * named `count`, with exactly one aggregate. An EMPTY slice is not a missing
+ * aggregate — the store answers it explicitly, as
+ * `{ value: 0, interval: 0, sampleInterval: 0, count: 0 }`. Anything else is
+ * refused: the first version treated a missing `aggregates` as «zero rows», so
+ * a damaged answer (`calculations: [{}]`) would have CONFIRMED an empty listing
+ * instead of failing it — a zero manufactured by a parser is the one number
+ * this tool must never produce (review of #165, P1).
+ */
+export function storeTally(result) {
+  const malformed = (why) => new Error(`tally: ${why} — refusing to count. Answer: ${JSON.stringify(result?.calculations ?? result).slice(0, 300)}`);
+  const calc = result?.calculations;
+  if (!Array.isArray(calc)) throw malformed('no calculations array in a successful answer');
+  if (calc.length !== 1) throw malformed(`expected exactly one calculation, got ${calc.length}`);
+  const c = calc[0];
+  if (!c || typeof c !== 'object' || c.calculation !== 'count') throw malformed('the calculation is not the requested count');
+  if (!Array.isArray(c.aggregates)) throw malformed('no aggregates array');
+  if (c.aggregates.length !== 1) throw malformed(`an ungrouped count has exactly one aggregate, got ${c.aggregates.length}`);
+  const agg = c.aggregates[0];
+  const { value, interval, count } = agg ?? {};
+  if (![value, interval, count].every(Number.isFinite)) throw malformed(`aggregate fields are not all numbers: ${JSON.stringify(agg)}`);
+  if (value === 0 && interval === 0 && count === 0) return { rows: 0, estimate: 0, interval: 1 }; // the store's explicit «nothing here»
+  if (value <= 0 || interval <= 0) throw malformed(`aggregate is neither the explicit zero nor positive: ${JSON.stringify(agg)}`);
+  const rows = value / interval;
+  if (Math.abs(rows - Math.round(rows)) > 1e-6) throw malformed(`value / interval is not a whole number of rows: ${JSON.stringify(agg)}`);
+  return { rows: Math.round(rows), estimate: value, interval };
+}
+
+/**
+ * The listing and the store's count must agree row for row. They do not come
+ * from one snapshot — the two requests run one after the other, and an event
+ * still being ingested, or one crossing the retention edge, can land between
+ * them — so a mismatch says the two reads are NOT CONSISTENT and nothing about
+ * which is right. That is reason enough not to archive: an archive that is
+ * short while looking complete is worse than none. The cause is not
+ * established by the mismatch itself (review of #165, P2).
+ */
+export function assertListingMatchesStore(listed, tally, slice) {
+  if (listed !== tally.rows) {
+    throw new Error(
+      `slice ${new Date(slice.from).toISOString()}..${new Date(slice.to).toISOString()}: the two reads are not `
+      + `consistent — the listing returned ${listed} row(s), the store's own count is ${tally.rows}. The reads `
+      + 'are sequential, not one snapshot, so the cause is not established (ingestion in progress, retention edge '
+      + 'and a reading defect all fit). Do NOT archive this run; re-run later and compare.',
+    );
+  }
+}
+
+/** Does the store weight any row of this slice above one? */
+export function storeSampled(tally) {
+  return tally.interval !== 1;
 }
 
 /**
@@ -411,12 +523,20 @@ export async function collectSlice({ post, slice, scriptKey, target }) {
     pages.push(batch.length);
     assertSliceComplete(events.length, slice);
 
-    if (batch.length < LOG_PAGE_LIMIT) return { events, pages, abrLevel, runStatus };
+    if (batch.length < LOG_PAGE_LIMIT) break;
     cursor = nextCursor(batch, cursor);
+    // Every page came back full and the pages ran out: the slice is too broad.
+    if (page === MAX_PAGES_PER_SLICE - 1) assertSliceComplete(LOG_QUERY_LIMIT, slice);
   }
-  // Every page came back full and the pages ran out: the slice is too broad.
-  assertSliceComplete(LOG_QUERY_LIMIT, slice);
-  return { events, pages, abrLevel, runStatus };
+
+  // The store's own count, AFTER the listing: the same rows through a second
+  // path, plus the sample weight the listing cannot show.
+  const tallyResult = unwrap(await post(storeTallyBody(slice, scriptKey, target), 'tally'), 'query');
+  assertRunComplete(tallyResult?.run, slice);
+  assertNotSampled(tallyResult?.statistics, slice);
+  const tally = storeTally(tallyResult);
+  assertListingMatchesStore(events.length, tally, slice);
+  return { events, pages, abrLevel, runStatus, tally };
 }
 
 /**
@@ -587,20 +707,33 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs, expectProb
   const slices = sliceRange(fromMs, toMs, sliceMs);
   const events = [];
   const sliceMeta = [];
+  const sampledSlices = [];
   for (const slice of slices) {
-    const { events: batch, pages, abrLevel, runStatus } = await collectSlice({ post, slice, scriptKey, target });
+    const { events: batch, pages, abrLevel, runStatus, tally } = await collectSlice({ post, slice, scriptKey, target });
     events.push(...batch);
+    const sampled = storeSampled(tally);
+    if (sampled) sampledSlices.push(slice);
     sliceMeta.push({
       from: new Date(slice.from).toISOString(), to: new Date(slice.to).toISOString(),
       events: batch.length, pages, abrLevel, runStatus,
+      store: { rows: tally.rows, estimate: tally.estimate, interval: tally.interval, sampled },
     });
-    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s), pages [${pages.join(', ')}]`);
+    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s), pages [${pages.join(', ')}], `
+      + `store counts ${tally.rows} row(s) for an estimate of ${tally.estimate}`
+      + (sampled ? ` — ! the store weights rows in this slice (mean interval ${tally.interval}): it is a SAMPLE by the store's own account` : ''));
+  }
+  if (sampledSlices.length) {
+    console.log(`  ! ${sampledSlices.length} slice(s) carry store-weighted rows. The archive records this per slice; `
+      + 'a zero read from such a slice is not a zero.');
   }
 
   const critical = criticalLines(events);
   const probes = probeLines(events);
   console.log(`  total ${events.length} event(s): ${critical.length} critical, ${probes.length} probe`);
-  if (expectProbe) console.log(`  probe ${expectProbe}: seen ${assertProbeSeen(events, expectProbe)} time(s)`);
+  if (expectProbe) {
+    console.log(`  probe ${expectProbe}: seen ${assertProbeSeen(events, expectProbe)} time(s)`);
+    assertUnsampledForDelivery(sampledSlices);
+  }
   if (events.length === 0) {
     console.log('  ! ZERO events for this worker in the whole range — that is what «logs were never');
     console.log('  ! collected» looks like. Do not read it as «nothing happened».');
@@ -609,7 +742,8 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs, expectProb
     at: new Date().toISOString(), kind: 'logs', target, scriptKey,
     interval: { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), fromMs, toMs },
     sliceMinutes: sliceMs / 60_000, slices: sliceMeta,
-    counts: { events: events.length, critical: critical.length, probes: probes.length },
+    counts: { events: events.length, critical: critical.length, probes: probes.length,
+      storeEstimate: sliceMeta.reduce((a, m) => a + m.store.estimate, 0), storeSampledSlices: sampledSlices.length },
     expectProbe: expectProbe ?? null,
     critical, probes, events,
   };
