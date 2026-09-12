@@ -123,10 +123,23 @@ export function sqlTime(ms) {
 // ── Completeness guards ───────────────────────────────────────────────
 
 /**
- * The observability API's documented caps. `parameters.limit` is the PAGE size
- * (max 100); the top-level `limit` bounds the whole query (max 2000). They are
- * different knobs and passing one value to both — as the first version of this
- * script did — makes any completeness check meaningless.
+ * How `view: 'events'` ACTUALLY pages — measured live 2026-09-11 against a
+ * slice of 131 events, not read off a doc page:
+ *
+ *  - the TOP-LEVEL `limit` is the page size. `limit: 100` returned 100, then
+ *    `offset: <last $metadata.id>` returned the remaining 31 (no overlap),
+ *    then 0. `limit: 20` returned 20 and 20;
+ *  - `parameters.limit` is NOT a page size for this view: 100 or 10, the answer
+ *    was the same 131 events in one response. The previous version sent it as
+ *    the page knob and put 2000 at the top level — so it never paged: the
+ *    «second page» it asked for after a full 100 was the API's opinion of
+ *    what came after event 131, i.e. nothing. Correct totals, wrong contract,
+ *    and a pagination check that could not have been passed.
+ *
+ * `LOG_PAGE_LIMIT` is therefore the top-level `limit`; `parameters.limit` is
+ * not sent. `LOG_QUERY_LIMIT` is this script's OWN cap per slice: the cursor
+ * would page further, but a slice that wide is re-run narrower rather than
+ * trusted, and the cap is also the guard should paging ever stop advancing.
  */
 export const LOG_PAGE_LIMIT = 100;
 export const LOG_QUERY_LIMIT = 2000;
@@ -241,9 +254,13 @@ export function assertNoTruncatedEvents(events, slice) {
   }
 }
 
-/** The log line an event carries, wherever the store puts it. */
+/**
+ * The TEXT of a log line, wherever the store puts it — the request line of a
+ * `cf-worker-event` (`$metadata.message`), or whatever a store that does not
+ * parse console output would leave there.
+ */
 export function messageOf(event) {
-  const msg = event?.$metadata?.message ?? event?.message ?? '';
+  const msg = event?.$metadata?.message ?? event?.source?.message ?? event?.message ?? '';
   return typeof msg === 'string' ? msg : '';
 }
 
@@ -266,18 +283,42 @@ export function parseStructured(message) {
 }
 
 /**
+ * The structured object an event carries, or null.
+ *
+ * What Workers Logs ACTUALLY stores for `console.error(JSON.stringify(x))`
+ * (verified live 2026-09-11, worker 9e0a9a1, versionId 2fd1afee…): the JSON is
+ * parsed by the store and its fields land in the TOP-LEVEL `source` object,
+ * next to a `level` — there is no `$metadata.message` at all, and
+ * `$metadata.error` holds just the string "error". The first delivery check
+ * failed on exactly this: the probe HAD arrived, and the exporter was looking
+ * for it in a field the store never fills for structured lines.
+ *
+ * So: `source` first, when the store parsed the line for us; and if the store
+ * left the line as text (`source.message` / `$metadata.message`), parse it
+ * ourselves. A request event's `source` is `{level, message}` and carries none
+ * of the classifying fields, so it falls through both classifiers below.
+ */
+export function structuredOf(event) {
+  const source = event?.source;
+  if (source && typeof source === 'object' && !Array.isArray(source)) {
+    return parseStructured(source.message) ?? source;
+  }
+  return parseStructured(messageOf(event));
+}
+
+/**
  * The control event of the delivery check (`POST /admin/telemetry-probe`).
  *
  * Counted SEPARATELY from `critical`: a probe is not a soak outcome and must
  * never be added to a number that has to read zero.
  */
 export function probeLines(events) {
-  return events.filter((e) => parseStructured(messageOf(e))?.probe === 'telemetry_probe');
+  return events.filter((e) => structuredOf(e)?.probe === 'telemetry_probe');
 }
 
 /** The critical-outcome lines — by the parsed field, for the same reason. */
 export function criticalLines(events) {
-  return events.filter((e) => typeof parseStructured(messageOf(e))?.critical === 'string');
+  return events.filter((e) => typeof structuredOf(e)?.critical === 'string');
 }
 
 /**
@@ -294,7 +335,7 @@ export function criticalLines(events) {
  */
 export function assertProbeSeen(events, probeId) {
   const seen = events.filter((e) => {
-    const line = parseStructured(messageOf(e));
+    const line = structuredOf(e);
     return line?.probe === 'telemetry_probe' && line.probeId === probeId;
   });
   if (!seen.length) {
@@ -334,9 +375,14 @@ export function nextCursor(batch, previous) {
 /**
  * One slice, paged to exhaustion. `post` is injected so the whole loop —
  * cursor handling included — is exercised by the tests without a network.
+ *
+ * `pages` records the size of every page fetched, in order. The pagination
+ * check needs a SECOND NON-EMPTY page to have been read, and that is a fact to
+ * archive, not to infer from a total that happens to exceed the page size.
  */
 export async function collectSlice({ post, slice, scriptKey, target }) {
   const events = [];
+  const pages = [];
   let cursor = null;
   let abrLevel = null;
   let runStatus = null;
@@ -346,11 +392,10 @@ export async function collectSlice({ post, slice, scriptKey, target }) {
       timeframe: { from: slice.from, to: slice.to },
       parameters: {
         datasets: ['cloudflare-workers'],
-        limit: LOG_PAGE_LIMIT,
         filters: [{ key: scriptKey, operation: 'eq', value: target, type: 'string' }],
       },
       view: 'events',
-      limit: LOG_QUERY_LIMIT,
+      limit: LOG_PAGE_LIMIT, // the page size — see the note on LOG_PAGE_LIMIT
       dry: false,
     };
     if (cursor) body.offset = cursor;
@@ -363,14 +408,15 @@ export async function collectSlice({ post, slice, scriptKey, target }) {
     assertNoTruncatedEvents(batch, slice);
     assertAllFromWorker(batch, scriptKey, target);
     events.push(...batch);
+    pages.push(batch.length);
     assertSliceComplete(events.length, slice);
 
-    if (batch.length < LOG_PAGE_LIMIT) return { events, abrLevel, runStatus };
+    if (batch.length < LOG_PAGE_LIMIT) return { events, pages, abrLevel, runStatus };
     cursor = nextCursor(batch, cursor);
   }
   // Every page came back full and the pages ran out: the slice is too broad.
   assertSliceComplete(LOG_QUERY_LIMIT, slice);
-  return { events, abrLevel, runStatus };
+  return { events, pages, abrLevel, runStatus };
 }
 
 /**
@@ -542,13 +588,13 @@ async function exportLogs({ accountId, target, fromMs, toMs, sliceMs, expectProb
   const events = [];
   const sliceMeta = [];
   for (const slice of slices) {
-    const { events: batch, abrLevel, runStatus } = await collectSlice({ post, slice, scriptKey, target });
+    const { events: batch, pages, abrLevel, runStatus } = await collectSlice({ post, slice, scriptKey, target });
     events.push(...batch);
     sliceMeta.push({
       from: new Date(slice.from).toISOString(), to: new Date(slice.to).toISOString(),
-      events: batch.length, abrLevel, runStatus,
+      events: batch.length, pages, abrLevel, runStatus,
     });
-    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s)`);
+    console.log(`  ${new Date(slice.from).toISOString()} .. ${new Date(slice.to).toISOString()}: ${batch.length} event(s), pages [${pages.join(', ')}]`);
   }
 
   const critical = criticalLines(events);
@@ -581,13 +627,56 @@ export const MAX_SPAN_MS = 168 * 3600_000;
  * never exercised). `--from/--to` give the reproducible form.
  */
 export const SECOND_MS = 1000;
+/**
+ * How far behind «now» a relative export ends. Measured 2026-09-11: an export
+ * 11 s after a burst was missing 10 of its 130 invocations; 72 s later 9 of
+ * them had arrived. An export that ends at the present moment archives a tail
+ * that is incomplete BY CONSTRUCTION, and is then read as loss. Five minutes
+ * is a margin over what was seen, not a documented bound.
+ */
+export const INGEST_LAG_MS = 5 * 60_000;
+
+/**
+ * Workers Logs retention. The store keeps events for a bounded number of days
+ * — seven at most, three on the Free plan — and a query that reaches further
+ * back does not fail: it returns what is left and the archive looks complete.
+ * That is a shortfall no later re-read can detect, so the START of a
+ * `logs` interval is checked against retention before any request goes out.
+ *
+ * The plan is not something this script can read, so the default is the
+ * CONSERVATIVE bound (Free). `--retention-days` raises it, up to the documented
+ * maximum, for an operator who knows the account is on a paid plan. The full
+ * soak window is assembled from the daily archives, never from one export:
+ * `--hours 168` plus the ingestion lag starts before even the maximum.
+ */
+export const LOG_RETENTION_DAYS_DEFAULT = 3;
+export const LOG_RETENTION_DAYS_MAX = 7;
+const DAY_MS = 86_400_000;
+
+/**
+ * Refuses a `logs` interval whose start is older than the retention the
+ * operator is prepared to vouch for. Pure; `nowMs` is injected.
+ */
+export function assertWithinRetention(fromMs, nowMs, retentionDays) {
+  const oldest = nowMs - retentionDays * DAY_MS;
+  if (fromMs < oldest) {
+    const ageH = ((nowMs - fromMs) / 3600_000).toFixed(1);
+    throw new Error(
+      `the interval starts ${ageH} h ago, older than the ${retentionDays}-day Workers Logs retention this run `
+      + 'vouches for: the store would answer with whatever it still holds and the archive would look complete. '
+      + `Assemble the window from the daily archives; --retention-days (max ${LOG_RETENTION_DAYS_MAX}) `
+      + 'raises the bound only for an account known to be on a paid plan.',
+    );
+  }
+}
 
 export function resolveInterval(opts, nowMs) {
   const hasAbsolute = opts.from !== null || opts.to !== null;
   if (!hasAbsolute) {
     // Floored to a whole second BEFORE anything derives from it. `--hours` is a
-    // whole number of seconds, so the lower bound stays exact too.
-    const toMs = Math.floor(nowMs / SECOND_MS) * SECOND_MS;
+    // whole number of seconds, so the lower bound stays exact too. Ends behind
+    // the present by the ingestion lag — see INGEST_LAG_MS.
+    const toMs = Math.floor(nowMs / SECOND_MS) * SECOND_MS - INGEST_LAG_MS;
     return { fromMs: toMs - opts.hours * 3600_000, toMs };
   }
   if (opts.from === null || opts.to === null) throw new Error('--from and --to must be given together');
@@ -609,12 +698,16 @@ export function resolveInterval(opts, nowMs) {
   }
   if (toMs <= fromMs) throw new Error('--to must be after --from');
   if (toMs - fromMs > MAX_SPAN_MS) throw new Error('the interval must not exceed 168 hours');
-  return { fromMs, toMs };
+  // Absolute bounds are the operator's and are honoured as typed — but a --to
+  // inside the ingestion lag is archived as an interval that may still be
+  // filling, and the archive does not say so by itself.
+  const young = nowMs - toMs < INGEST_LAG_MS;
+  return { fromMs, toMs, ...(young ? { youngTail: true } : {}) };
 }
 
 export function parseArgs(argv) {
   const [mode, ...rest] = argv;
-  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER, expectProbe: null };
+  const opts = { hours: 24, hoursGiven: false, from: null, to: null, out: null, sliceMinutes: 60, worker: DEFAULT_WORKER, expectProbe: null, retentionDays: LOG_RETENTION_DAYS_DEFAULT, retentionGiven: false };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--hours') { opts.hours = Number(rest[++i]); opts.hoursGiven = true; continue; }
@@ -624,6 +717,7 @@ export function parseArgs(argv) {
     if (a === '--slice-minutes') { opts.sliceMinutes = Number(rest[++i]); continue; }
     if (a === '--worker') { opts.worker = String(rest[++i] ?? ''); continue; }
     if (a === '--expect-probe') { opts.expectProbe = String(rest[++i] ?? ''); continue; }
+    if (a === '--retention-days') { opts.retentionDays = Number(rest[++i]); opts.retentionGiven = true; continue; }
     throw new Error(`unknown argument: ${a}`);
   }
   if (!Number.isInteger(opts.hours) || opts.hours < 1 || opts.hours > 168) {
@@ -643,22 +737,36 @@ export function parseArgs(argv) {
   if (opts.expectProbe !== null && mode !== 'logs') {
     throw new Error(`--expect-probe applies only to \`logs\`; in \`${mode}\` there are no log lines to find it in`);
   }
+  if (!Number.isInteger(opts.retentionDays) || opts.retentionDays < 1 || opts.retentionDays > LOG_RETENTION_DAYS_MAX) {
+    throw new Error(`--retention-days must be an integer in 1..${LOG_RETENTION_DAYS_MAX} (the documented maximum)`);
+  }
+  // Analytics Engine has its own, much longer retention; the flag would be a
+  // silent no-op there, and a silently ignored flag is a wrong answer waiting.
+  if (opts.retentionGiven && mode !== 'logs') {
+    throw new Error(`--retention-days applies only to \`logs\`; \`${mode}\` reads Analytics Engine`);
+  }
   return { mode, opts };
 }
 
 export async function main(argv) {
   const { mode, opts } = parseArgs(argv);
   if (!['metrics', 'logs'].includes(mode)) {
-    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--expect-probe UUID] [--out DIR]');
+    console.error('usage: metrics-export.mjs <metrics | logs> [--hours N | --from ISO --to ISO] [--slice-minutes N] [--worker NAME] [--expect-probe UUID] [--retention-days N] [--out DIR]');
     return 2;
   }
   const accountId = process.env.CF_ACCOUNT_ID ?? DEFAULT_ACCOUNT_ID;
   const dataset = process.env.METRICS_DATASET ?? DEFAULT_DATASET;
   const outDir = opts.out ?? join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.eternal-notes-soak', 'snapshots');
   // ONE interval for the whole run, fixed before the first request.
-  const { fromMs, toMs } = resolveInterval(opts, Date.now());
+  const nowMs = Date.now();
+  const { fromMs, toMs, youngTail } = resolveInterval(opts, nowMs);
+  if (mode === 'logs') assertWithinRetention(fromMs, nowMs, opts.retentionDays);
 
   console.log(`${mode}: ${new Date(fromMs).toISOString()} .. ${new Date(toMs).toISOString()} → ${outDir}`);
+  if (youngTail) {
+    console.log(`  ! --to is less than ${INGEST_LAG_MS / 60_000} min old: events of the tail may not have been ingested yet `
+      + '(measured lag: 10 of 130 missing at +11 s, present at +72 s). A shortfall at the end of this archive is not loss until re-read later.');
+  }
   const payload = mode === 'metrics'
     ? await exportMetrics({ accountId, dataset, fromMs, toMs })
     : await exportLogs({ accountId, target: opts.worker, fromMs, toMs, sliceMs: opts.sliceMinutes * 60_000, expectProbe: opts.expectProbe });
