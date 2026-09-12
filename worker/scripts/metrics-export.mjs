@@ -640,7 +640,7 @@ export const INGEST_LAG_MS = 5 * 60_000;
  * Workers Logs retention. The store keeps events for a bounded number of days
  * — seven at most, three on the Free plan — and a query that reaches further
  * back does not fail: it returns what is left and the archive looks complete.
- * That is the one shortfall no later re-read can detect, so the START of a
+ * That is a shortfall no later re-read can detect, so the START of a
  * `logs` interval is checked against retention before any request goes out.
  *
  * The plan is not something this script can read, so the default is the
