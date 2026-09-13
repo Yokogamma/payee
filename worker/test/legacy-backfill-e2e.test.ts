@@ -169,6 +169,21 @@ describe('a legacy record whose publication IS the payload being sent', () => {
     // The proof was expensive, so its RESULT is kept: the record is no longer
     // legacy and the next request compares without any network at all.
     expect(await storedFp(noteId)).toBe(await computePublicationFp(VERSION, dataFor(noteId)));
+
+    // The operation journal saw ONE operation decide twice — `legacy`, then
+    // `exists` after the backfill — and closed it with the whole attest
+    // sequence: this is the record the soak's «legacy_backfilled» criterion
+    // will be read from (docs/METRICS.md «The operation journal»).
+    const opId = r.headers.get('X-Operation-Id')!;
+    expect(opId).toMatch(/^[0-9a-f-]{36}$/);
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(identity.pkB64));
+    const { op } = await (await stub.fetch('http://do/op-get', { method: 'POST', body: JSON.stringify({ id: opId }) })).json() as {
+      op: { status: string; outcome: string; checkVerdicts: string[]; attests: string[]; txId: string; paidResult: string } | null;
+    };
+    expect(op).toMatchObject({
+      status: 'finished', outcome: 'deduped', paidResult: 'none', txId: tx.txId,
+      checkVerdicts: ['legacy', 'exists'], attests: ['legacy_backfilled', 'deduped'],
+    });
   });
 
   it('does not repeat the verification on the next request', async () => {

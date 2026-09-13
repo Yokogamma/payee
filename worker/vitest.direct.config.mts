@@ -48,6 +48,10 @@ export default defineConfig({
       // Imports src/index directly with per-request env overrides, and drives
       // the legacy backfill loop end to end.
       'test/legacy-backfill-e2e.test.ts',
+      // The operation journal through the real route with a WRAPPED RateLimiter
+      // namespace (failure injection), and /admin/ops with env overrides.
+      'test/op-journal-e2e.test.ts',
+      'test/admin-ops.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.

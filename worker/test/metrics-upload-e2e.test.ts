@@ -336,9 +336,12 @@ describe('upload_outcome matrix — paid-path returns ONLY (L r19/r20)', () => {
   it('quota 429 emits nothing', async () => {
     const id = await makeIdentity();
     const cap = capture();
+    // `opAccepted` is what the journal answers when it took the operation; a
+    // DO answer without it is a refused admission (503 audit_unavailable), not
+    // a 429 — see op-journal-e2e.test.ts.
     const rateLimited = {
       idFromName: () => ({}),
-      get: () => ({ fetch: async () => new Response(JSON.stringify({ status: 'rate_limited' })) }),
+      get: () => ({ fetch: async () => new Response(JSON.stringify({ status: 'rate_limited', opAccepted: true })) }),
     } as unknown as DurableObjectNamespace;
     const { request } = await uploadRequest(id, crypto.randomUUID());
     const r = await worker.fetch(request, metricsEnv(cap.dataset, { RATE_LIMITER: rateLimited }));

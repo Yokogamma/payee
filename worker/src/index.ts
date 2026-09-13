@@ -21,6 +21,10 @@ import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
 import {
+  type IdOrigin, type OpBegin, type OpMode, type PaidResult, type PostDecision, type OpProjection,
+  isValidOperationId,
+} from './op-journal';
+import {
   ARWEAVE_HOST,
   assertStructurallyCompleteJwk,
   classifyStatus,
@@ -259,7 +263,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (request.method === 'POST') {
     const ct = request.headers.get('Content-Type') || '';
     if (!ct.includes('application/json')) {
-      return error('Content-Type must be application/json', 415);
+      return url.pathname === '/upload'
+        ? uploadError(415, 'unsupported_media_type', 'Content-Type must be application/json')
+        : error('Content-Type must be application/json', 415);
     }
   }
 
@@ -283,6 +289,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === '/admin/telemetry-probe' && request.method === 'POST') {
     return handleTelemetryProbe(request, env);
+  }
+  if (url.pathname === '/admin/ops' && request.method === 'POST') {
+    return handleAdminOps(request, env);
   }
 
   return new Response('Not found', { status: 404 });
@@ -706,7 +715,7 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 
 async function handleUpload(request: Request, env: Env): Promise<Response> {
   const ipBlock = await enforceIpLimit(request, env);
-  if (ipBlock) return ipBlock;
+  if (ipBlock) return uploadIpBlock(ipBlock);
 
   // 0a. GLOBAL kill switch — the incident lever, checked before ANYTHING else
   // (even body read): during e.g. a RECOVERY_HMAC_SECRET compromise the whole
@@ -714,22 +723,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // other config value. Deliberately 503, never 403 (the client reads 403 as
   // "not registered" and drops its registration marker).
   if (!uploadsEnabled(env)) {
-    return new Response(JSON.stringify({ code: 'uploads_disabled' }), {
-      status: 503,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return uploadError(503, 'uploads_disabled', 'Uploads are disabled');
   }
 
   // 0. Strict config — fail CLOSED (503) rather than disabling a limit on NaN.
   const maxBytes = parsePositiveInt(env.MAX_BODY_BYTES);
   const quotaLimit = parsePositiveInt(env.RATE_LIMIT_PER_HOUR);
-  if (maxBytes === null || quotaLimit === null) return error('Server misconfigured', 503);
+  if (maxBytes === null || quotaLimit === null) return uploadError(503, 'server_misconfigured', 'Server misconfigured');
   // RECOVERY_HMAC_SECRET is MANDATORY for uploads: without it a triple-failure
   // (POST ok, mark-posted + commit both lost) leaves the client with no provable
   // recovery hint, and once the reservation TTL lapses the recheck degrades into
   // a duplicate paid POST. Refuse to post at all rather than post unrecoverably.
   if (typeof env.RECOVERY_HMAC_SECRET !== 'string' || env.RECOVERY_HMAC_SECRET.length < 16) {
-    return error('Server misconfigured', 503);
+    return uploadError(503, 'server_misconfigured', 'Server misconfigured');
   }
   // TRUSTED_OWNERS is MANDATORY for uploads (D2/D9): it is what a publication
   // is authenticated against before the worker binds an existing txId to a
@@ -737,12 +743,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // missing root of trust, so it fails closed here rather than being skipped
   // at the point of use.
   const trustedOwners = resolveTrustedOwners(env);
-  if (trustedOwners === null) return error('Server misconfigured', 503);
+  if (trustedOwners === null) return uploadError(503, 'server_misconfigured', 'Server misconfigured');
   // …and the wallet about to SIGN must itself be trusted, or this request
   // would create a transaction nobody can ever authenticate. Only a DERIVABLE
   // address that is absent from the set refuses here — see walletTrust.
   if ((await walletTrust(env, trustedOwners)) === 'untrusted') {
-    return error('Server misconfigured', 503);
+    return uploadError(503, 'server_misconfigured', 'Server misconfigured');
   }
 
   // Metrics emitter (PR-2). Telemetry is fail-closed / request path fail-open:
@@ -751,34 +757,44 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   // 1. Read body under the configured cap (Content-Length pre-check included)
   const body = await readLimitedBody(request, maxBytes);
-  if ('tooLarge' in body) return body.tooLarge;
+  if ('tooLarge' in body) return uploadError(413, 'body_too_large', 'Body too large');
   const bodyText = body.text;
 
   // 2. Parse headers + body
   const publicKeyB64 = request.headers.get('X-Public-Key');
   const signatureB64 = request.headers.get('X-Signature');
-  if (!publicKeyB64 || !signatureB64) return error('Missing auth headers', 401);
+  if (!publicKeyB64 || !signatureB64) return uploadError(401, 'auth_failed', 'Missing auth headers');
   // Canonical spelling only — the allowlist/quota keys are derived from this
   // exact string (see handleRegister).
   if (!isValidPublicKeyB64(publicKeyB64)) {
-    return error('publicKey must be canonical base64 of a 32-byte key', 400);
+    return uploadError(400, 'validation_failed', 'publicKey must be canonical base64 of a 32-byte key');
   }
 
   let parsedBody: unknown;
   try {
     parsedBody = JSON.parse(bodyText);
   } catch {
-    return error('Invalid JSON', 400);
+    return uploadError(400, 'validation_failed', 'Invalid JSON');
   }
   if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
-    return error('Invalid body: must be a JSON object', 400);
+    return uploadError(400, 'validation_failed', 'Invalid body: must be a JSON object');
   }
-  const { data, tags, ownerHash, timestamp, recheck, recovery } = parsedBody as {
+  const { data, tags, ownerHash, timestamp, recheck, recovery, operationId } = parsedBody as {
     data?: unknown; tags?: unknown; ownerHash?: unknown; timestamp?: unknown; recheck?: unknown; recovery?: unknown;
+    operationId?: unknown;
   };
   if (typeof data !== 'string' || typeof ownerHash !== 'string' || !Array.isArray(tags)) {
-    return error('Missing/invalid required fields', 400);
+    return uploadError(400, 'validation_failed', 'Missing/invalid required fields');
   }
+  // Operation identity (journal). Client-supplied — it rides inside the signed
+  // body, so it is the OWNER's id — or minted here for an older client. A
+  // present-but-malformed one is a validation failure, never silently replaced:
+  // the reconciliation joins the two books on this value.
+  if (operationId !== undefined && !isValidOperationId(operationId)) {
+    return uploadError(400, 'validation_failed', 'operationId must be a UUIDv4');
+  }
+  const opId: string = isValidOperationId(operationId) ? operationId : crypto.randomUUID();
+  const idOrigin: IdOrigin = isValidOperationId(operationId) ? 'client' : 'server';
   const wantsRecheck = recheck === true;
   // Optional server-signed recovery hint (validated by HMAC below, never trusted raw).
   const hasRecoveryField = recovery !== undefined && recovery !== null;
@@ -801,24 +817,30 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
 
   // 3. Validate timestamp (5 min window) — reject NaN/non-number (anti-replay)
-  if (!isFreshTimestamp(timestamp)) return error('Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time', 401);
+  if (!isFreshTimestamp(timestamp)) return uploadError(401, 'auth_failed', 'Timestamp expired or device clock skew (allowed drift: 5 min) — check the device date/time');
 
   // 4. Verify Ed25519 signature FIRST — before any KV/DO lookups
   const verifyResult = await verifySignature(publicKeyB64, signatureB64, bodyText);
-  if (verifyResult) return verifyResult;
+  if (verifyResult) {
+    return uploadError(
+      verifyResult.status,
+      verifyResult.status === 401 ? 'auth_failed' : 'validation_failed',
+      await verifyResult.text(),
+    );
+  }
 
   // 5. Verify ownerHash = SHA-256(publicKey) (R5)
   const publicKey = base64ToBytes(publicKeyB64);
   const expectedOwnerHash = bytesToBase64(
     new Uint8Array(await crypto.subtle.digest('SHA-256', publicKey))
   );
-  if (ownerHash !== expectedOwnerHash) return error('ownerHash/publicKey mismatch', 400);
+  if (ownerHash !== expectedOwnerHash) return uploadError(400, 'validation_failed', 'ownerHash/publicKey mismatch');
 
   // 6. Validate publicKey in allowlist (anti-sybil, R6) — typed model (D3).
   // On a miss, /refresh-allowed re-derives AND caches inside the DO's critical
   // section; its verdict is FINAL (a mid-flight revoke yields allowed:false).
   const cachedAccess = await readAllowCache(env.ALLOWLIST, publicKeyB64);
-  if (cachedAccess === 'denied') return error('Not registered', 403);
+  if (cachedAccess === 'denied') return uploadError(403, 'not_registered', 'Not registered');
   if (cachedAccess === 'miss') {
     const inviteMgr = env.INVITE_MANAGER.get(env.INVITE_MANAGER.idFromName('global'));
     const checkResp = await inviteMgr.fetch(new Request('http://internal/refresh-allowed', {
@@ -826,7 +848,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       body: JSON.stringify({ publicKey: publicKeyB64 }),
     }));
     const checkResult: { allowed: boolean } = await checkResp.json();
-    if (!checkResult.allowed) return error('Not registered', 403);
+    if (!checkResult.allowed) return uploadError(403, 'not_registered', 'Not registered');
   }
 
   // 7. Validate tags — STRICT, version-specific (reader-before-writer: accept all).
@@ -843,7 +865,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     ? tags.find(t => t && t.name === 'App-Version')?.value
     : undefined;
   if (!isSupportedVersion(declaredVersion)) {
-    return error('Unsupported App-Version', 400);
+    return uploadError(400, 'validation_failed', 'Unsupported App-Version');
   }
   const hasTimestamp = declaredVersion === '1';
   const isSplitEnvelope = declaredVersion === '4';
@@ -859,9 +881,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // also writes one structured log line, on a channel that does not share
   // Analytics Engine's sampling. Routed through THIS one closure on purpose:
   // a per-call-site logger is a logger somebody forgets at the next branch.
+  const attests: string[] = [];
   const attest = (outcome: string, txId?: string) => {
     emit('semantic_idempotency', [outcome, declaredVersion], []);
     if (CRITICAL_OUTCOMES.has(outcome)) logCritical(outcome, noteId, declaredVersion, txId);
+    // The journal gets the whole sequence with /op-finish (docs: op-journal.ts).
+    attests.push(outcome);
   };
 
   const REQUIRED_TAGS = new Map<string, string>([
@@ -874,24 +899,24 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     : new Set(['Owner-Hash', 'Note-Id']);
   const ALL_EXPECTED = new Set([...REQUIRED_TAGS.keys(), ...REQUIRED_DYNAMIC]);
 
-  if (!Array.isArray(tags)) return error('tags must be an array', 400);
-  if (tags.length !== ALL_EXPECTED.size) return error(`Expected exactly ${ALL_EXPECTED.size} tags`, 400);
+  if (!Array.isArray(tags)) return uploadError(400, 'validation_failed', 'tags must be an array');
+  if (tags.length !== ALL_EXPECTED.size) return uploadError(400, 'validation_failed', `Expected exactly ${ALL_EXPECTED.size} tags`);
 
   const tagMap = new Map<string, string>();
   for (const tag of tags) {
     if (typeof tag !== 'object' || tag === null ||
         typeof tag.name !== 'string' || typeof tag.value !== 'string') {
-      return error('Invalid tag structure', 400);
+      return uploadError(400, 'validation_failed', 'Invalid tag structure');
     }
     // Timestamp is not in ALL_EXPECTED for v2, so a v2 upload carrying it is rejected here.
-    if (!ALL_EXPECTED.has(tag.name)) return error(`Forbidden tag: ${tag.name}`, 400);
-    if (tagMap.has(tag.name)) return error(`Duplicate tag: ${tag.name}`, 400);
+    if (!ALL_EXPECTED.has(tag.name)) return uploadError(400, 'validation_failed', `Forbidden tag: ${tag.name}`);
+    if (tagMap.has(tag.name)) return uploadError(400, 'validation_failed', `Duplicate tag: ${tag.name}`);
     tagMap.set(tag.name, tag.value);
   }
 
   // Validate fixed-value tags
   for (const [name, expected] of REQUIRED_TAGS) {
-    if (tagMap.get(name) !== expected) return error(`Invalid ${name}: expected "${expected}"`, 400);
+    if (tagMap.get(name) !== expected) return uploadError(400, 'validation_failed', `Invalid ${name}: expected "${expected}"`);
   }
 
   // 8. Parse data — must be a plain object (not null/array/primitive)
@@ -902,10 +927,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   try {
     parsedData = JSON.parse(data);
   } catch {
-    return error('Invalid data JSON', 400);
+    return uploadError(400, 'validation_failed', 'Invalid data JSON');
   }
   if (typeof parsedData !== 'object' || parsedData === null || Array.isArray(parsedData)) {
-    return error('Invalid data: must be a JSON object', 400);
+    return uploadError(400, 'validation_failed', 'Invalid data: must be a JSON object');
   }
 
   // 9. STRICT data schema — EXACT key set per version (no extra fields, so a
@@ -916,29 +941,29 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     : hasTimestamp ? ['id', 'c', 'iv', 't'] : ['id', 'c', 'iv'];
   const actualKeys = Object.keys(parsedData);
   if (actualKeys.length !== allowedKeys.length || actualKeys.some(k => !allowedKeys.includes(k))) {
-    return error(`Invalid data fields: expected exactly [${allowedKeys.join(', ')}]`, 400);
+    return uploadError(400, 'validation_failed', `Invalid data fields: expected exactly [${allowedKeys.join(', ')}]`);
   }
 
   if (typeof parsedData.id !== 'string') {
-    return error('Invalid data structure: id (string) required', 400);
+    return uploadError(400, 'validation_failed', 'Invalid data structure: id (string) required');
   }
 
   /** ciphertext+iv pair: non-empty strings, valid base64, iv exactly 12 bytes. */
   const checkEnvelope = (cName: string, cVal: unknown, ivName: string, ivVal: unknown): Response | null => {
     if (typeof cVal !== 'string' || typeof ivVal !== 'string') {
-      return error(`Invalid data structure: ${cName}, ${ivName} (strings) required`, 400);
+      return uploadError(400, 'validation_failed', `Invalid data structure: ${cName}, ${ivName} (strings) required`);
     }
     if (cVal.length === 0 || ivVal.length === 0) {
-      return error(`Invalid data: ${cName} and ${ivName} must be non-empty`, 400);
+      return uploadError(400, 'validation_failed', `Invalid data: ${cName} and ${ivName} must be non-empty`);
     }
     let bytes: Uint8Array;
     try {
       bytes = base64ToBytes(ivVal);
       base64ToBytes(cVal); // validate base64
     } catch {
-      return error(`Invalid data: ${cName} and ${ivName} must be base64`, 400);
+      return uploadError(400, 'validation_failed', `Invalid data: ${cName} and ${ivName} must be base64`);
     }
-    if (bytes.length !== 12) return error(`Invalid data: ${ivName} must be 12 bytes`, 400);
+    if (bytes.length !== 12) return uploadError(400, 'validation_failed', `Invalid data: ${ivName} must be 12 bytes`);
     return null;
   };
 
@@ -955,15 +980,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     const bad = checkEnvelope('c', parsedData.c, 'iv', parsedData.iv);
     if (bad) return bad;
     if (hasTimestamp && typeof parsedData.t !== 'number') {
-      return error('Invalid data structure: t (number) required for v1', 400);
+      return uploadError(400, 'validation_failed', 'Invalid data structure: t (number) required for v1');
     }
   }
 
   // Cross-check tags ↔ data
-  if (tagMap.get('Note-Id') !== parsedData.id) return error('Note-Id mismatch', 400);
-  if (tagMap.get('Owner-Hash') !== ownerHash) return error('Owner-Hash mismatch', 400);
+  if (tagMap.get('Note-Id') !== parsedData.id) return uploadError(400, 'validation_failed', 'Note-Id mismatch');
+  if (tagMap.get('Owner-Hash') !== ownerHash) return uploadError(400, 'validation_failed', 'Owner-Hash mismatch');
   if (hasTimestamp && tagMap.get('Timestamp') !== String(parsedData.t)) {
-    return error('Timestamp mismatch', 400);
+    return uploadError(400, 'validation_failed', 'Timestamp mismatch');
   }
 
   // UUID namespace barrier (mixed-client protection): v3/v4 ids live in a
@@ -973,11 +998,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // the permanent noteId idempotency can never commit garbage ciphertext.
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const uuidMatch = uuidRegex.exec(parsedData.id);
-  if (!uuidMatch) return error('Note-Id must be a valid UUID', 400);
+  if (!uuidMatch) return uploadError(400, 'validation_failed', 'Note-Id must be a valid UUID');
   const uuidVersion = uuidMatch[1].toLowerCase();
   const expectedUuidVersion = (declaredVersion === '3' || declaredVersion === '4') ? '8' : '4';
   if (uuidVersion !== expectedUuidVersion) {
-    return error(`Note-Id must be a UUIDv${expectedUuidVersion} for App-Version ${declaredVersion}`, 400);
+    return uploadError(400, 'validation_failed', `Note-Id must be a UUIDv${expectedUuidVersion} for App-Version ${declaredVersion}`);
   }
 
   // Upload kill switch (v3 only) — checked AFTER auth + full schema validation,
@@ -986,20 +1011,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // states and recovery hints) pauses until re-enabled: /check-and-reserve
   // mutates state even on a lookup, so no disabled branch may reach the DO.
   if (declaredVersion === '3' && !v3UploadsEnabled(env)) {
-    return new Response(JSON.stringify({ code: 'v3_uploads_disabled' }), {
-      status: 503,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return uploadError(503, 'v3_uploads_disabled', 'v3 uploads are disabled');
   }
 
   // Same contract for v4 (safebox), on its OWN switch: one version's pause must
   // never stop the other. Deliberately 503 (never 403 — the client reads 403 as
   // "not registered" and drops its registration marker).
   if (declaredVersion === '4' && !v4UploadsEnabled(env)) {
-    return new Response(JSON.stringify({ code: 'v4_uploads_disabled' }), {
-      status: 503,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return uploadError(503, 'v4_uploads_disabled', 'v4 uploads are disabled');
   }
 
   // 10. Idempotency + rate limit + reserve (C1/M6 lifecycle).
@@ -1015,6 +1034,86 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const safeRelease = async (token: string) => {
     try { await doCall('/release', { noteId, token }); }
     catch (e) { console.error('RELEASE_FAILED', noteId, e); }
+  };
+
+  const opMode: OpMode = recoveryHint ? 'recovery' : wantsRecheck ? 'recheck' : 'plain';
+
+  /**
+   * The ONE exit for every answer after admission: closes the journal record
+   * (`/op-finish`, before the answer leaves) and stamps the echo — the
+   * `X-Operation-Id` header plus `operationId` in the JSON body — that tells
+   * the driver «this answer was admitted; a record exists for it».
+   *
+   * A refused or failed finish NEVER changes the answer: the decision is made,
+   * the note record is in whatever state it is, money (if any) is spent. The
+   * record stays `begun`/`posting`, which the reconciliation reads as an
+   * unresolved operation. That is the contract, not a fallback.
+   */
+  const settle = async (
+    outcome: string,
+    response: Response,
+    opts: { paidResult?: PaidResult; txId?: string } = {},
+  ): Promise<Response> => {
+    const text = await response.text();
+    let bodyObj: Record<string, unknown> = {};
+    if (text.length > 0) {
+      try {
+        const parsed: unknown = JSON.parse(text);
+        bodyObj = (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
+          ? parsed as Record<string, unknown> : { error: text };
+      } catch {
+        bodyObj = { error: text };
+      }
+    }
+    const code = typeof bodyObj.code === 'string' ? bodyObj.code : undefined;
+    try {
+      const fin: { ok: boolean; reason?: string } = await (await doCall('/op-finish', {
+        id: opId, outcome, httpStatus: response.status,
+        ...(code !== undefined ? { code } : {}),
+        ...(opts.txId !== undefined ? { txId: opts.txId } : {}),
+        paidResult: opts.paidResult ?? 'none',
+        attests,
+      })).json();
+      if (!fin.ok) console.error('OP_FINISH_REFUSED', opId, fin.reason);
+    } catch (e) {
+      console.error('OP_FINISH_FAILED', opId, e);
+    }
+    const headers = new Headers(response.headers);
+    headers.set('Content-Type', 'application/json');
+    headers.set('X-Operation-Id', opId);
+    return new Response(JSON.stringify({ ...bodyObj, operationId: opId }), { status: response.status, headers });
+  };
+
+  /** Journal the intent to POST — the signed txId and the decision — BEFORE
+   *  the send. Three answers, as for begin: confirmed / refused / unknown. */
+  const opPosting = async (candidateTxId: string, decision: PostDecision, token: string):
+    Promise<'ok' | 'unavailable' | 'unconfirmed'> => {
+    try {
+      const b: { ok: boolean; reason?: string } =
+        await (await doCall('/op-posting', { id: opId, token, txId: candidateTxId, decision })).json();
+      if (b.ok) return 'ok';
+      console.error('OP_POSTING_REFUSED', opId, b.reason);
+      return 'unavailable';
+    } catch (e) {
+      console.error('OP_POSTING_UNCONFIRMED', opId, e);
+      return 'unconfirmed';
+    }
+  };
+
+  /** Token-CAS abort of a `posting` record whose confirmation was lost. Only
+   *  ever called on the path BEFORE the POST (checked statically by
+   *  worker/scripts/upload-codes-static.test.mjs): after a send, «unknown» is
+   *  the truth and nothing may overwrite it. */
+  const opAbort = async (token: string): Promise<boolean> => {
+    try {
+      const b: { ok: boolean; reason?: string } =
+        await (await doCall('/op-abort', { id: opId, token, reason: 'audit_unconfirmed' })).json();
+      if (!b.ok) console.error('OP_ABORT_REFUSED', opId, b.reason);
+      return b.ok === true;
+    } catch (e) {
+      console.error('OP_ABORT_FAILED', opId, e);
+      return false;
+    }
   };
 
   // Convert a dropped server TX back to a fresh reservation for re-post.
@@ -1057,11 +1156,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   } catch {
     // Unreachable after the validation above; fail closed rather than reserve
     // without a fingerprint, which would write a legacy-shaped record.
-    return error('Payload could not be fingerprinted', 400);
+    return uploadError(400, 'validation_failed', 'Payload could not be fingerprinted');
   }
 
   type CheckResult = {
     status: string;
+    opAccepted?: boolean;
     txId?: string;
     committedAt?: number;
     postedAt?: number;
@@ -1079,7 +1179,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const resolveLegacy = async (
     snapshot: LegacySnapshot,
     age: number,
-  ): Promise<{ kind: 'respond'; response: Response } | { kind: 'retry' } | { kind: 'dead' }> => {
+  ): Promise<{ kind: 'respond'; outcome: string; response: Response; txId?: string } | { kind: 'retry' } | { kind: 'dead' }> => {
     const auth = await authenticatePublication(snapshot.txId, {
       origins: payloadOrigins(env),
       trustedOwners,
@@ -1101,7 +1201,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // Alive-but-unfetchable, unavailable, or too recent: retryable, and
       // nothing is written.
       attest('legacy_unproven');
-      return { kind: 'respond', response: error('Publication could not be authenticated', 503) };
+      return { kind: 'respond', outcome: 'legacy_unproven', response: uploadError(503, 'publication_unproven', 'Publication could not be authenticated') };
     }
     if (auth.kind === 'not-ours') {
       // PROVEN to be something else: another wallet, another vault, or a body
@@ -1109,7 +1209,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // forever — and the historical txId must never be returned as a success.
       // Nothing is written: no observedFp, no binding.
       attest('legacy_not_ours', snapshot.txId);
-      return { kind: 'respond', response: idPayloadConflict(snapshot.txId) };
+      return { kind: 'respond', outcome: 'legacy_not_ours', response: idPayloadConflict(snapshot.txId), txId: snapshot.txId };
     }
 
     // Proven. The fingerprint is recorded WHATEVER the comparison then says —
@@ -1124,8 +1224,40 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return { kind: 'retry' };
   };
 
-  let checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
-  let checkResult: CheckResult = await checkResp.json();
+  // ── Admission = the journal's `begin` ──────────────────────────────
+  //
+  // The DO writes `op:<opId>` in the same transaction as its decision. Three
+  // answers are possible from here and they are NOT the same answer:
+  //   - opAccepted: the operation is journaled; every answer from now on is
+  //     echoed (X-Operation-Id) and closed through `settle`;
+  //   - a DO answer without it (op_reused / op_invalid / older DO): the journal
+  //     refused — rollback is CONFIRMED, nothing was reserved for this call;
+  //   - an exception: the journal MAY have taken it (transaction committed,
+  //     response lost). The worker answers `audit_unconfirmed` with the id in
+  //     the body but NO echo header, and makes no further DO call — it cannot
+  //     tell a lost first begin from a lost `op_reused` refusal to a repeat,
+  //     and a repeat must never touch the operation still running under this
+  //     id. An unconfirmed begin stays `begun` in the journal and is red.
+  const opBegin: OpBegin = {
+    id: opId, mode: opMode, declaredVersion, idOrigin,
+    releaseSha: env.RELEASE_SHA ?? null,
+    workerVersionId: env.CF_VERSION_METADATA?.id ?? null,
+  };
+  let checkResp: Response;
+  let checkResult: CheckResult;
+  try {
+    checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp, op: opBegin });
+    checkResult = await checkResp.json();
+  } catch (e) {
+    console.error('OP_BEGIN_UNCONFIRMED', opId, e);
+    return uploadError(503, 'audit_unconfirmed', 'Audit record unconfirmed', { operationId: opId });
+  }
+  if (checkResult.status === 'op_reused') {
+    return uploadError(409, 'operation_id_reused', 'operationId was already used');
+  }
+  if (checkResult.opAccepted !== true) {
+    return uploadError(503, 'audit_unavailable', 'Audit record could not be written');
+  }
 
   let legacyRedrop: LegacySnapshot | null = null;
   if (checkResult.status === 'legacy' && checkResult.snapshot) {
@@ -1133,7 +1265,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       ? (checkResult.committedAt ?? 0)
       : (checkResult.postedAt ?? 0);
     const outcome = await resolveLegacy(checkResult.snapshot, age);
-    if (outcome.kind === 'respond') return outcome.response;
+    if (outcome.kind === 'respond') return settle(outcome.outcome, outcome.response, { txId: outcome.txId });
     if (outcome.kind === 'dead') {
       legacyRedrop = checkResult.snapshot;
     } else {
@@ -1141,9 +1273,21 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // it, or a concurrent one did), so a second `legacy` would mean the record
       // is being rewritten under us — and looping on that is how a retry storm
       // starts. Whatever the DO says now is the answer.
-      checkResp = await doCall('/check-and-reserve', { noteId, limit: quotaLimit, fp: requestedFp });
-      checkResult = await checkResp.json();
-      if (checkResult.status === 'legacy') return error('Record is being reconciled, retry', 503);
+      try {
+        checkResp = await doCall('/check-and-reserve', {
+          noteId, limit: quotaLimit, fp: requestedFp, op: { ...opBegin, retry: true },
+        });
+        checkResult = await checkResp.json();
+      } catch (e) {
+        console.error('OP_RETRY_UNCONFIRMED', opId, e);
+        return settle('audit_unconfirmed', uploadError(503, 'audit_unconfirmed', 'Audit record unconfirmed'));
+      }
+      if (checkResult.opAccepted !== true) {
+        return settle('audit_unavailable', uploadError(503, 'audit_unavailable', 'Audit record could not be written'));
+      }
+      if (checkResult.status === 'legacy') {
+        return settle('record_reconciling', uploadError(503, 'record_reconciling', 'Record is being reconciled, retry'));
+      }
     }
   }
 
@@ -1151,7 +1295,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // The same noteId under DIFFERENT bytes. Typed, never a silent replay of
     // the historical txId.
     attest('conflict', checkResult.txId);
-    return idPayloadConflict(checkResult.txId);
+    return settle('conflict', idPayloadConflict(checkResult.txId), { txId: checkResult.txId });
   }
 
   let reserveToken: string;
@@ -1160,6 +1304,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // recovery-hint branch (dead verdict + age guard). A successful POST then
   // additionally emits redrop_new_tx.
   let viaRedrop = false;
+  /** Which decision the upcoming POST executes — journaled with the txId. */
+  let decision: PostDecision = 'new';
 
   if (legacyRedrop !== null) {
     // A legacy record over a PROVEN dead transaction, past the age guard. This
@@ -1170,16 +1316,17 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     const rd = await doRedrop(legacyRedrop.txId, legacyRedrop);
     if (rd.kind === 'resolved') {
       attest('deduped');
-      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+      return settle('deduped', uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true }), { txId: rd.txId });
     }
-    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return idPayloadConflict(rd.txId); }
-    if (rd.kind === 'defer') { attest('legacy_dead_deferred'); return error('Recheck deferred', 503); }
+    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return settle('redrop_conflict', idPayloadConflict(rd.txId), { txId: rd.txId }); }
+    if (rd.kind === 'defer') { attest('legacy_dead_deferred'); return settle('legacy_dead_deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred')); }
     // Only NOW is a redrop a fact: the CAS held and a reservation carrying this
     // payload's fp exists. The dead verdict alone proved nothing about what
     // followed it.
     attest('legacy_dead_redrop');
     reserveToken = rd.token;
     viaRedrop = true;
+    decision = 'legacy_dead_redrop';
   } else if (checkResult.status === 'exists') {
     // Already committed. Without recheck this is the idempotent happy path.
     if (!wantsRecheck) {
@@ -1188,18 +1335,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // client ignores it, which is safe precisely because the proof was done
       // by the server, not asserted by the client.
       attest('deduped');
-      return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+      return settle('deduped', uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true }), { txId: checkResult.txId });
     }
 
     // Recheck: is the committed TX still alive on-chain?
     const live = await getTxStatusWorker(checkResult.txId!, emit, env);
     if (live === 'alive') {
       attest('deduped');
-      return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+      return settle('deduped', uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true }), { txId: checkResult.txId });
     }
-    if (live === 'unavailable') return error('Arweave status unavailable', 503);
+    if (live === 'unavailable') return settle('status_unavailable', uploadError(503, 'status_unavailable', 'Arweave status unavailable'));
     if (Date.now() - (checkResult.committedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
-      return error('Recheck deferred: committed too recently', 503); // race guard
+      return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred: committed too recently')); // race guard
     }
     const rd = await doRedrop(checkResult.txId!);
     if (rd.kind === 'resolved') {
@@ -1207,17 +1354,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // deciding — the DO confirmed the SAME fingerprint. This response paid
       // for nothing, so it is a dedupe.
       attest('deduped');
-      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+      return settle('deduped', uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true }), { txId: rd.txId });
     }
-    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return idPayloadConflict(rd.txId); }
-    if (rd.kind === 'defer') return error('Recheck deferred', 503);
+    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return settle('redrop_conflict', idPayloadConflict(rd.txId), { txId: rd.txId }); }
+    if (rd.kind === 'defer') return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred'));
     reserveToken = rd.token;
     viaRedrop = true;
+    decision = 'recheck_dead_redrop';
   } else if (checkResult.status === 'posted') {
     // POST succeeded but the commit was lost. Reconcile using the SERVER's txId
     // (never a client-supplied one), its CAS token, and the postedAt age guard.
     const live = await getTxStatusWorker(checkResult.txId!, emit, env);
-    if (live === 'unavailable') return error('Arweave status unavailable', 503);
+    if (live === 'unavailable') return settle('status_unavailable', uploadError(503, 'status_unavailable', 'Arweave status unavailable'));
     if (live === 'alive') {
       try {
         const commitResp = await doCall('/commit', { noteId, txId: checkResult.txId, token: checkResult.token });
@@ -1227,13 +1375,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
           // checked and the DO finalized — which is what the plan requires
           // before this answer may be given.
           attest('deduped');
-          return uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true });
+          return settle('deduped', uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true }), { txId: checkResult.txId });
         }
       } catch { /* fall through to retryable 503 */ }
-      return error('Recheck deferred', 503); // raced / DO error — retry
+      return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred')); // raced / DO error — retry
     }
     if (Date.now() - (checkResult.postedAt ?? 0) <= MIN_COMMITTED_AGE_MS) {
-      return error('Recheck deferred: posted too recently', 503);
+      return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred: posted too recently'));
     }
     const rd = await doRedrop(checkResult.txId!);
     if (rd.kind === 'resolved') {
@@ -1241,16 +1389,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // deciding — the DO confirmed the SAME fingerprint. This response paid
       // for nothing, so it is a dedupe.
       attest('deduped');
-      return uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true });
+      return settle('deduped', uploadAccepted({ txId: rd.txId, status: 'accepted', committed: true, deduped: true }), { txId: rd.txId });
     }
-    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return idPayloadConflict(rd.txId); }
-    if (rd.kind === 'defer') return error('Recheck deferred', 503);
+    if (rd.kind === 'conflict') { attest('redrop_conflict', rd.txId); return settle('redrop_conflict', idPayloadConflict(rd.txId), { txId: rd.txId }); }
+    if (rd.kind === 'defer') return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred'));
     reserveToken = rd.token;
     viaRedrop = true;
+    decision = 'recheck_dead_redrop';
   } else if (checkResult.status === 'reserved') {
-    return error('Upload already in progress for this noteId', 409);
+    // The DO closed this record itself (DO_TERMINAL_VERDICTS); settle repeats
+    // the identical finish, which is idempotent.
+    return settle('in_progress', uploadError(409, 'upload_in_progress', 'Upload already in progress for this noteId'));
   } else if (checkResult.status === 'rate_limited') {
-    return error('Rate limit exceeded', 429);
+    return settle('rate_limited', uploadError(429, 'rate_limited', 'Rate limit exceeded'));
   } else {
     reserveToken = checkResult.token!;
 
@@ -1266,10 +1417,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         await safeRelease(reserveToken);
         // Same structured body as the malformed-hint branch above: both
         // "Invalid recovery token" responses must carry the SAME code.
-        return recoveryInvalid();
+        return settle('recovery_invalid', recoveryInvalid());
       }
       const live = await getTxStatusWorker(recoveryHint.txId, emit, env);
-      if (live === 'unavailable') { await safeRelease(reserveToken); return error('Arweave status unavailable', 503); }
+      if (live === 'unavailable') { await safeRelease(reserveToken); return settle('status_unavailable', uploadError(503, 'status_unavailable', 'Arweave status unavailable')); }
       if (live === 'alive') {
         // The token proves noteId, txId and postedAt — it says NOTHING about
         // the bytes. Committing here binds THIS request's fingerprint to that
@@ -1287,14 +1438,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         if (auth.kind === 'unproven') {
           attest('recovery_unproven');
           await safeRelease(reserveToken);
-          return error('Publication could not be authenticated', 503);
+          return settle('recovery_unproven', uploadError(503, 'publication_unproven', 'Publication could not be authenticated'));
         }
         if (auth.kind !== 'authenticated' || auth.observedFp !== requestedFp) {
           // Proven to be different bytes (or not ours at all). The reservation
           // is released and NOTHING is bound to the old transaction.
           attest('recovery_conflict', recoveryHint.txId);
           await safeRelease(reserveToken);
-          return idPayloadConflict(recoveryHint.txId);
+          return settle('recovery_conflict', idPayloadConflict(recoveryHint.txId), { txId: recoveryHint.txId });
         }
         try {
           const commitResp = await doCall('/commit', { noteId, txId: recoveryHint.txId, token: reserveToken });
@@ -1305,65 +1456,113 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
             // `recovery_*` must be a complete family — refusals AND successes —
             // or the share of refusals in it is not a number anyone can read.
             attest('recovery_reconciled');
-            return uploadAccepted({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true });
+            return settle('recovery_reconciled', uploadAccepted({ txId: recoveryHint.txId, status: 'accepted', committed: true, deduped: true }), { txId: recoveryHint.txId });
           }
         } catch { /* fall through */ }
         await safeRelease(reserveToken);
-        return error('Recheck deferred', 503);
+        return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred'));
       }
       // dead — only re-post once past the age guard (uses signed postedAt).
       if (Date.now() - recoveryHint.postedAt <= MIN_COMMITTED_AGE_MS) {
         await safeRelease(reserveToken);
-        return error('Recheck deferred: posted too recently', 503);
+        return settle('deferred', uploadError(503, 'recheck_deferred', 'Recheck deferred: posted too recently'));
       }
       // dead & old enough → fall through to re-post under reserveToken.
       // This IS a new paid txId after a proven dead — same event as /redrop
       // (missing it would hide exactly the riskiest triple-failure scenario
       // from the security metric).
       viaRedrop = true;
+      decision = 'recovery_dead_repost';
     }
   }
 
-  // 11. Create + sign + post the Arweave TX. Any failure releases the reservation
-  //     (quota is not spent, so the note can be retried) and returns 502.
-  //     PR-2: anchor and price are EXPLICIT (transport adapter) and handed to
-  //     createTransaction pre-loaded as {last_tx, reward} — the SDK makes no
-  //     hidden network calls. Status codes, safeRelease and error texts are
-  //     unchanged; the POST deliberately still has NO timeout (a response lost
-  //     to our own timeout would not prove the gateway rejected the TX — see
-  //     postSignedTx).
-  let txId: string;
+  // 11. Create + sign + post the Arweave TX, in three phases the journal and
+  //     the catch can tell apart (plan v6.1 §3.3):
+  //       A. prepare (JWK, create, sign) and the two gateway GETs — nothing
+  //          here can cost money. A throw is either a defect of the release
+  //          (`arweave_throw`, strictly zero) or a gateway that did not answer
+  //          (`gateway_unavailable_pre_post`, an availability incident) — the
+  //          phase variable, not the exception type, tells them apart: the
+  //          POST re-throws the SDK's own error, so `instanceof` could not.
+  //       B. journal the intent — signed txId + decision — BEFORE the send.
+  //          Not confirmed → no POST.
+  //       C. the POST. A throw here is `post_unknown`: the transaction MAY be
+  //          accepted, and nothing renames that into a refusal.
+  //     Any failure releases the reservation (quota is not spent, so the note
+  //     can be retried) and returns 502/503. PR-2: anchor and price are
+  //     EXPLICIT (transport adapter) and handed to createTransaction pre-loaded
+  //     as {last_tx, reward} — the SDK makes no hidden network calls. The POST
+  //     deliberately still has NO timeout (a response lost to our own timeout
+  //     would not prove the gateway rejected the TX — see postSignedTx).
   const transportDeps = { host: ARWEAVE_HOST, emit };
+  let phase: 'prepare' | 'anchor_price' = 'prepare';
+  let arweave!: ReturnType<typeof getArweave>;
+  let signedTx!: Awaited<ReturnType<ReturnType<typeof getArweave>['createTransaction']>>;
   try {
-    const arweave = getArweave();
+    arweave = getArweave();
     const serverWallet = assertStructurallyCompleteJwk(env.ARWEAVE_JWK);
+    phase = 'anchor_price';
     const last_tx = await getAnchor(transportDeps);
     // Exactly the byte count the SDK itself would price — the UTF-8 length of
     // the data string (arweave/node/common.js: stringToBuffer(data).byteLength).
     // An underpriced reward is a network-rejected transaction.
     const reward = await getPrice(new TextEncoder().encode(data).byteLength, transportDeps);
-    const tx = await arweave.createTransaction({ data, last_tx, reward }, serverWallet);
-    for (const tag of tags) tx.addTag(tag.name, tag.value);
-    await arweave.transactions.sign(tx, serverWallet);
-    const response = await postSignedTx(arweave, tx, transportDeps);
-    if (response.status !== 200 && response.status !== 202) {
-      await safeRelease(reserveToken);
-      emit('upload_outcome', ['arweave_error', declaredVersion], []);
-      return error(`Arweave error: ${response.status}`, 502);
-    }
-    // post_accepted = the gateway ACCEPTED the POST — before mark-posted/commit.
-    emit('post_accepted', [ARWEAVE_HOST], []);
-    if (viaRedrop) emit('redrop_new_tx', [ARWEAVE_HOST], []);
-    txId = tx.id;
+    phase = 'prepare';
+    signedTx = await arweave.createTransaction({ data, last_tx, reward }, serverWallet);
+    for (const tag of tags) signedTx.addTag(tag.name, tag.value);
+    await arweave.transactions.sign(signedTx, serverWallet);
   } catch (e) {
     await safeRelease(reserveToken);
+    if (phase === 'anchor_price') {
+      console.error('ARWEAVE_PRE_POST_FAILED', noteId, e);
+      emit('upload_outcome', ['gateway_unavailable_pre_post', declaredVersion], []);
+      return settle('gateway_unavailable_pre_post',
+        uploadError(502, 'arweave_gateway_unavailable', 'Arweave gateway unavailable'));
+    }
     console.error('ARWEAVE_POST_FAILED', noteId, e);
-    // The fifth strictly-zero criterion. Same reasoning as the conflict
-    // outcomes: the metric alone cannot establish that this never happened.
+    // The fifth strictly-zero criterion, now in its narrow sense: a throw in
+    // OUR OWN preparation — never a gateway that did not answer.
     logCritical('arweave_throw', noteId, declaredVersion);
     emit('upload_outcome', ['arweave_throw', declaredVersion], []);
-    return error('Arweave upload failed', 502);
+    return settle('arweave_throw', uploadError(502, 'arweave_internal', 'Arweave upload failed'));
   }
+
+  // Phase B. The journal learns the signed txId and the decision before the
+  // send. `unconfirmed` (the DO call threw) is aborted with the token — the
+  // record may say `posting`, and nothing has been posted — and if that abort
+  // fails too the record stays `posting`: red, resolved only by a human.
+  const candidateTxId = signedTx.id;
+  const posting = await opPosting(candidateTxId, decision, reserveToken);
+  if (posting !== 'ok') {
+    const aborted = posting === 'unconfirmed' ? await opAbort(reserveToken) : false;
+    await safeRelease(reserveToken);
+    const code = posting === 'unconfirmed' ? 'audit_unconfirmed' : 'audit_unavailable';
+    return settle(aborted ? 'audit_aborted' : code, uploadError(503, code, 'Audit record could not be written'));
+  }
+
+  // Phase C. The send.
+  let response: { status: number };
+  try {
+    response = await postSignedTx(arweave, signedTx, transportDeps);
+  } catch (e) {
+    await safeRelease(reserveToken);
+    console.error('ARWEAVE_POST_UNKNOWN', noteId, e);
+    emit('upload_outcome', ['post_unknown', declaredVersion], []);
+    return settle('post_unknown',
+      uploadError(502, 'arweave_post_unknown', 'Arweave POST outcome unknown', { txId: candidateTxId }),
+      { paidResult: 'unknown', txId: candidateTxId });
+  }
+  if (response.status !== 200 && response.status !== 202) {
+    await safeRelease(reserveToken);
+    emit('upload_outcome', ['arweave_error', declaredVersion], []);
+    return settle('arweave_error',
+      uploadError(502, 'arweave_rejected', `Arweave error: ${response.status}`),
+      { paidResult: 'rejected', txId: candidateTxId });
+  }
+  // post_accepted = the gateway ACCEPTED the POST — before mark-posted/commit.
+  emit('post_accepted', [ARWEAVE_HOST], []);
+  if (viaRedrop) emit('redrop_new_tx', [ARWEAVE_HOST], []);
+  const txId = candidateTxId;
 
   // 12a. Anchor the POST in the DO BEFORE commit (retry). This is the
   //      server-authoritative record that makes a lost commit reconcilable.
@@ -1399,7 +1598,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // answers "how do paid publications end", not "how do requests end".
   if (committed) {
     emit('upload_outcome', ['accepted', declaredVersion], []);
-    return uploadAccepted({ txId, status: 'accepted', committed: true, deduped: false });
+    return settle('accepted', uploadAccepted({ txId, status: 'accepted', committed: true, deduped: false }),
+      { paidResult: 'accepted', txId });
   }
 
   // Not committed. If it's ANCHORED, the DO holds a `posted` record → the client
@@ -1409,7 +1609,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (anchored) {
     console.error(`COMMIT_FAILED noteId=${noteId} txId=${txId}`);
     emit('upload_outcome', ['accepted', declaredVersion], []);
-    return uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false });
+    return settle('accepted', uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false }),
+      { paidResult: 'accepted', txId });
   }
   console.error(`ANCHOR_AND_COMMIT_FAILED noteId=${noteId} txId=${txId}`);
   // accepted is emitted only AFTER signRecovery resolves: should WebCrypto
@@ -1420,12 +1621,13 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if (recoveryToken === null) {
     // Unreachable: the step-0 gate 503s uploads without RECOVERY_HMAC_SECRET.
     // Kept as defense in depth — never imply a hint exists when it doesn't.
-    return uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false });
+    return settle('accepted', uploadAccepted({ txId, status: 'accepted', committed: false, deduped: false }),
+      { paidResult: 'accepted', txId });
   }
-  return uploadAccepted({
+  return settle('accepted', uploadAccepted({
     txId, status: 'accepted', committed: false, deduped: false,
     recovery: { txId, postedAt, token: recoveryToken },
-  });
+  }), { paidResult: 'accepted', txId });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1528,6 +1730,27 @@ function json(data: unknown): Response {
 
 function error(message: string, status: number): Response {
   return new Response(message, { status });
+}
+
+/**
+ * Every non-200 answer of /upload: the human text under `error` (unchanged
+ * wording, so an old client that shows it sees what it saw) plus a
+ * machine-readable `code` from the closed lists in upload-codes.json. HTTP
+ * statuses are unchanged; the client classifies by status and reads `code`
+ * only where it already did. `no-store` as for every /upload verdict.
+ */
+function uploadError(status: number, code: string, message: string, extra: Record<string, unknown> = {}): Response {
+  return new Response(JSON.stringify({ error: message, code, ...extra }), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+}
+
+/** The shared IP limiter answers plain text for every route; /upload names
+ *  its two refusals so the driver can file them as pre-admission. */
+async function uploadIpBlock(block: Response): Promise<Response> {
+  const text = await block.text();
+  return uploadError(block.status, block.status === 429 ? 'ip_rate_limited' : 'rate_limiter_unavailable', text);
 }
 
 /** Both `Invalid recovery token` branches answer with THIS response: HTTP 400
@@ -1754,7 +1977,82 @@ function logTelemetryProbe(probeId: string): void {
  * question, and the metrics reader is the least-privilege identity that already
  * exists for telemetry (it holds no seed-invite or revoke rights).
  */
-const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe']);
+const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops']);
+
+// ─── /admin/ops — the operation journal, projected ──────────────────
+
+const OPS_MAX_RANGE_MS = 14 * 24 * 3_600_000;
+const OPS_MAX_LIMIT = 500;
+const OPS_DEFAULT_LIMIT = 100;
+
+/**
+ * POST /admin/ops — read-only projection of one owner's operation journal.
+ *
+ * `{ownerPk, from, to, cursor?, limit?}` lists operations begun in [from, to]
+ * (ms since epoch, inclusive, at most 14 days apart), paged by `cursor`;
+ * `{ownerPk, operationId}` reads one record. Answers carry the worker's own
+ * identity (`workerVersionId`, `releaseSha`) so a reconciliation can refuse a
+ * slice read from a different version than the window's. Never the
+ * reservation token (stripped inside the DO). Same bearer and the same
+ * no-store rule as /admin/metrics; nothing here writes.
+ */
+async function handleAdminOps(request: Request, env: Env): Promise<Response> {
+  if (!env.METRICS_ADMIN_SECRET) return error('Journal endpoint not configured', 503);
+  if (!(await verifyBearerSecret(env.METRICS_ADMIN_SECRET, request.headers.get('Authorization')))) {
+    return error('Unauthorized', 401);
+  }
+  const body = await readLimitedBody(request, METRICS_REQUEST_BODY_CAP_BYTES);
+  if ('tooLarge' in body) return body.tooLarge;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.text);
+  } catch {
+    return error('Invalid JSON', 400);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return error('Invalid body: must be a JSON object', 400);
+  }
+  const { ownerPk, operationId, from, to, cursor, limit } = parsed as {
+    ownerPk?: unknown; operationId?: unknown; from?: unknown; to?: unknown; cursor?: unknown; limit?: unknown;
+  };
+  if (typeof ownerPk !== 'string' || !isValidPublicKeyB64(ownerPk)) {
+    return error('ownerPk must be canonical base64 of a 32-byte key', 400);
+  }
+  const identity = {
+    workerVersionId: env.CF_VERSION_METADATA?.id ?? null,
+    releaseSha: env.RELEASE_SHA ?? null,
+  };
+  const stub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(ownerPk));
+  const doCall = (path: string, payload: unknown) =>
+    stub.fetch(new Request(`http://internal${path}`, { method: 'POST', body: JSON.stringify(payload) }));
+
+  if (operationId !== undefined) {
+    if (!isValidOperationId(operationId)) return error('operationId must be a UUIDv4', 400);
+    try {
+      const { op }: { op: OpProjection | null } = await (await doCall('/op-get', { id: operationId })).json();
+      return json({ ...identity, op });
+    } catch {
+      return error('Journal unavailable', 503);
+    }
+  }
+  if (!Number.isInteger(from) || !Number.isInteger(to) || (from as number) < 0 || (to as number) < (from as number)) {
+    return error('from and to must be integers (ms) with to >= from', 400);
+  }
+  if ((to as number) - (from as number) > OPS_MAX_RANGE_MS) return error('range must not exceed 14 days', 400);
+  if (cursor !== undefined && typeof cursor !== 'string') return error('cursor must be a string', 400);
+  const effectiveLimit = limit === undefined ? OPS_DEFAULT_LIMIT : limit;
+  if (!Number.isInteger(effectiveLimit) || (effectiveLimit as number) < 1 || (effectiveLimit as number) > OPS_MAX_LIMIT) {
+    return error(`limit must be an integer in 1..${OPS_MAX_LIMIT}`, 400);
+  }
+  try {
+    const page: { ops: OpProjection[]; cursor: string | null; error?: string } =
+      await (await doCall('/ops', { from, to, ...(cursor !== undefined ? { cursor } : {}), limit: effectiveLimit })).json();
+    if (page.error) return error('Invalid range', 400);
+    return json({ ...identity, ops: page.ops, cursor: page.cursor });
+  } catch {
+    return error('Journal unavailable', 503);
+  }
+}
 
 async function handleTelemetryProbe(request: Request, env: Env): Promise<Response> {
   if (!env.METRICS_ADMIN_SECRET) return error('Metrics endpoint not configured', 503);

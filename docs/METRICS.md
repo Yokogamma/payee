@@ -57,7 +57,7 @@ Rows written before the split carry the bare event name, so every report reads
 | Event | blobs (in order) | doubles |
 |---|---|---|
 | `gateway_call` | event, kind (`anchor`/`price`/`post`/`status`), host, statusClass (`2xx`/`404`/`4xx`/`5xx`/`timeout`/`network`/`invalid_response`) | latencyMs; for kind=`price` a second double — quotedWinston |
-| `upload_outcome` | event, outcome (`accepted`/`arweave_error`/`arweave_throw`), appVersion | — |
+| `upload_outcome` | event, outcome (`accepted` / `arweave_error` / `arweave_throw` / `gateway_unavailable_pre_post` / `post_unknown`), appVersion | — |
 | `status_verdict` | event, verdict (`alive`/`dead`/`unavailable`), host | confirmations (from a 200 body, else −1) |
 
 **PR-3a — the status leg is now a POOL.** The blob schema is unchanged; the
@@ -90,10 +90,10 @@ that is exactly the signal D9 introduces verification for.
 
 | Execution point | Events |
 |---|---|
-| `getAnchor` / `getPrice` returned or failed (transport adapter) | `gateway_call` kind=`anchor`/`price` with a class; a failure then leads to `upload_outcome=arweave_error`/`arweave_throw` via the existing 502 branches |
+| `getAnchor` / `getPrice` returned or failed (transport adapter) | `gateway_call` kind=`anchor`/`price` with a class; a failure then leads to `upload_outcome=gateway_unavailable_pre_post` (502 `arweave_gateway_unavailable`) — the paid send has NOT started |
 | `postSignedTx` finished (the single paid block) | `gateway_call` kind=`post`; on 200/202 also `post_accepted` (= the gateway ACCEPTED the POST, before `mark-posted`/`commit`) |
 | the same successful POST when the new txId follows a PROVEN dead — the `doRedrop` branches AND the recovery-hint branch (valid token + dead verdict + age guard) | additionally `redrop_new_tx` (the event's definition is «a new paid txId after a confirmed dead», not «went through /redrop»; clarified in the PR #105 review — missing the recovery path would hide the riskiest triple-failure scenario from the security metric) |
-| terminal `return` from `handleUpload` — ONLY from paid-path branches | `upload_outcome`: `accepted` = a final 200 AFTER a POST actually performed by THIS request; `arweave_error` = non-2xx from the gateway; `arweave_throw` = the catch branch. Early returns (validation 4xx, kill switches 503, rate limit 429, idempotent hits, reconciliation without a new POST) emit NOTHING — the metric answers "how do paid publications end" |
+| terminal `return` from `handleUpload` — ONLY from paid-path branches | `upload_outcome`, by PHASE of the paid path (the phase variable, not the exception type, decides — the POST re-throws the SDK's own error, so `instanceof` could not): `accepted` = a final 200 AFTER a POST actually performed by THIS request; `arweave_error` = the gateway answered the POST with non-2xx (502 `arweave_rejected`); `arweave_throw` = a throw in OUR preparation — JWK, createTransaction, sign (502 `arweave_internal`; the strictly-zero criterion, in its narrow sense); `gateway_unavailable_pre_post` = anchor/price GET failed, nothing was sent (502 `arweave_gateway_unavailable`); `post_unknown` = the POST itself threw, the transaction MAY be accepted (502 `arweave_post_unknown`, the signed txId in the body and in the journal). Early returns (validation 4xx, kill switches 503, rate limit 429, idempotent hits, reconciliation without a new POST) emit NOTHING — the metric answers "how do paid publications end" |
 | `getTxStatusWorker` returned a verdict | `gateway_call` kind=`status` + `status_verdict` |
 | every DECISION of the fingerprint protocol (D2) — the paths `upload_outcome` is silent about | `semantic_idempotency`: `deduped` = an existing txId handed back after a fingerprint match (idempotent hit, resolved posted state, resolved redrop, reconciled recovery); `conflict` = 409 from `/check-and-reserve`; `redrop_conflict` = 409 because the superseding transaction carries other bytes; `legacy_backfilled` = the body-CAS on `/backfill-fp` HELD (a stale CAS is `legacy_backfill_stale`: someone else proved it first — counted apart so the backfill number is not inflated); `legacy_not_ours` / `legacy_unproven`; `legacy_dead_redrop` = a redrop reservation was actually MINTED after a dead verdict (a deferred one is `legacy_dead_deferred`) — never on the verdict alone; `recovery_reconciled` / `recovery_unproven` / `recovery_conflict` = the recovery-token branch, as a COMPLETE family, so the refusal share is a number. This is the SOAK instrument: docs/ROLLBACK.md «D2 … release runbook» defines the exit criteria over it |
 
@@ -167,6 +167,60 @@ Operator query example:
 
 ```bash
 curl -sS -X POST https://<worker>/admin/metrics -H 'Content-Type: application/json' -H 'Authorization: Bearer <METRICS_ADMIN_SECRET>' -d '{"report":"gateway_health","hours":24}'
+```
+
+## The operation journal and POST /admin/ops (the third book)
+
+Neither Analytics Engine nor Workers Logs is a receipt for storage (see
+«Sampling» and «Проверка доставки» below), so a strictly-zero criterion cannot
+be read off either. The worker therefore keeps a **journal of every admitted
+`/upload` operation** inside the owner's `RateLimiter` Durable Object, next to
+the note records — the plan «soak D2 operation journal» v6.1 is the contract;
+`worker/src/op-journal.ts` holds the transition rules.
+
+- **Identity.** The client puts `operationId` (UUIDv4) into the signed body —
+  the soak driver uses its attempt id. An older client without it gets a
+  server-minted id (`idOrigin: 'server'`). A repeated id is refused with
+  `409 {code:'operation_id_reused'}` and changes nothing.
+- **Begin.** `/check-and-reserve` writes the `begun` record — with the DO's own
+  verdict (`checkVerdict`) — in the same storage transaction as its decision,
+  BEFORE anything can cost money. A response lost on the way back leaves the
+  record, never a decision without one; the worker then answers
+  `503 {code:'audit_unconfirmed', operationId}` and makes NO further DO call.
+- **Echo.** Every answer after admission carries `X-Operation-Id` and
+  `operationId` in the JSON body. An answer WITHOUT the echo was refused before
+  admission: `worker/src/upload-codes.json` is the closed list of those
+  `(status, code)` pairs, and of the post-admission ones.
+- **Intent before the send.** The paid path journals the signed `txId` and the
+  handler's `decision` (`new` / `legacy_dead_redrop` / `recheck_dead_redrop` /
+  `recovery_dead_repost`) through `/op-posting` BEFORE the POST; not confirmed
+  → no POST. A lost confirmation is aborted with the reservation token
+  (`/op-abort`, token-CAS, only from `posting`, only on the pre-POST path);
+  there is deliberately NO token-less abort.
+- **Finish.** `settle` closes the record (`/op-finish`, idempotent; a different
+  result is refused) before the answer leaves, with the outcome, the HTTP
+  status and code, the txId, `paidResult` (`none` / `accepted` / `rejected` /
+  `unknown`) and the sequence of `semantic_idempotency` attests. A failed
+  finish never changes the answer: the record stays `begun`/`posting`, which
+  the reconciliation reads as an unresolved operation.
+- **Read.** `POST /admin/ops`, bearer `METRICS_ADMIN_SECRET`, `no-store`:
+  `{ownerPk, from, to, cursor?, limit?}` (ms, ≤ 14 days, `limit` ≤ 500,
+  default 100) lists operations begun in the range; `{ownerPk, operationId}`
+  reads one. Every answer carries `workerVersionId` and `releaseSha`. The
+  reservation token never leaves the DO. Records that are `finished` with a
+  known `paidResult`, older than 30 days, are pruned once the owner's journal
+  exceeds 5000 entries; `begun`, `posting` and `paidResult:'unknown'` are never
+  pruned.
+
+What the journal proves and what it does not: a `finished` record confirms the
+handler's decision; a journaled `txId` found on the payload pool confirms the
+publication; an absent record after the window closes proves NOTHING about
+whether a request was sent — that case stays red until the atomic
+admission-closing protocol exists (plan §8). The acceptance criteria that read
+the journal are defined in docs/ROLLBACK.md.
+
+```bash
+curl -sS -X POST https://<worker>/admin/ops -H 'Content-Type: application/json' -H 'Authorization: Bearer <METRICS_ADMIN_SECRET>'   -d '{"ownerPk":"<canonical base64 pk>","from":1789000000000,"to":1789086400000,"limit":200}'
 ```
 
 ## What PR-2 does NOT close (release-notes honesty, P0 r18)
