@@ -186,6 +186,15 @@ describe('§6.2 joinBooks — one row per case (test 13)', () => {
     // A 503 answer carries no txId on either side: still matched.
     const deferred = server({ outcome: 'deferred', httpStatus: 503, code: 'recheck_deferred', txId: undefined, attests: [] });
     expect(compareResults(driver(deferred, { txId: undefined }), deferred)).toEqual([]);
+    // The worker's REAL 502 arweave_rejected (PR-A, op-journal-e2e test 7):
+    // {error, code, operationId}, no txId — while the journal keeps the
+    // rejected transaction. Matched, not mismatch.
+    const rejected = server({ outcome: 'arweave_error', paidResult: 'rejected', httpStatus: 502, code: 'arweave_rejected', postingAt: tick(), decision: 'new', attests: [] });
+    expect(compareResults(driver(rejected, { txId: undefined }), rejected)).toEqual([]);
+    // …whereas arweave_post_unknown DOES answer the txId, so it is required.
+    const unknown = server({ outcome: 'post_unknown', paidResult: 'unknown', httpStatus: 502, code: 'arweave_post_unknown', postingAt: tick(), decision: 'new', attests: [] });
+    expect(compareResults(driver(unknown, { txId: undefined }), unknown)).toEqual([expect.stringMatching(/no txId for post_unknown/)]);
+    expect(compareResults(driver(unknown), unknown)).toEqual([]);
   });
 
   it('aborted_before_post is an infrastructure incident, not red', () => {
@@ -395,6 +404,25 @@ describe('§7.3 verdict (tests 17, 18)', () => {
     const v2 = judge(rows2);
     expect(v2.figures).toMatchObject({ paid: 20, accepted: 20, infra: 1 }); // P2: one abort = ONE incident
     expect(v2.failures).toEqual([]);
+  });
+
+  it('a resolved `posting` is ONE publication in both numerator and denominator: 19 finished + 1 resolved = 20', () => {
+    const rows = greenFixture();
+    // Drop one accepted publication, add a posting the operator confirmed.
+    const idx = rows.findIndex(r => r.s.outcome === 'accepted');
+    const dropped = rows.splice(idx, 1)[0];
+    const p = server({ beganAt: dropped.s.beganAt, status: 'posting', paidResult: 'unknown', postingAt: dropped.s.beganAt + 2, decision: 'new', outcome: undefined, finishedAt: undefined, txId: TX2 });
+    rows.push({ s: p, d: driver(p, { http: 200 }) });
+    const resolutions = { [p.id]: { txId: TX2, evidence: '/tx on the pool, format 2', at: t1 } };
+    const v = judge(rows, { wait: { outcome: 'settled_with_unfinished', unfinished: [p.id] }, resolutions });
+    expect(v.figures).toMatchObject({ paid: 20, accepted: 20, resolved: 1 });
+    expect(v.failures).toEqual([]);
+    // A resolved FINISHED post_unknown is not counted twice either.
+    const rows2 = greenFixture();
+    const u = server({ beganAt: t0 + 24 * 3_600_000, finishedAt: t0 + 24 * 3_600_000 + 5, status: 'finished', paidResult: 'unknown', postingAt: t0 + 24 * 3_600_000 + 2, decision: 'new', outcome: 'post_unknown', httpStatus: 502, code: 'arweave_post_unknown', txId: TX2, attests: [] });
+    rows2.push({ s: u, d: driver(u) });
+    const v2 = judge(rows2, { resolutions: { [u.id]: { txId: TX2, evidence: 'seen', at: t1 } } });
+    expect(v2.figures).toMatchObject({ paid: 21, accepted: 21, resolved: 1 });
   });
 
   it('a resolution without evidence is itself a failure; RED lists what a red class is', () => {

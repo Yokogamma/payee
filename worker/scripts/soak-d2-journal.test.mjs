@@ -324,6 +324,33 @@ describe('reconcile wiring: slice + point reads + observation + policy', () => {
     expect(() => assertJournalRecord({ ...good, beganAt: 'x' })).toThrow(/beganAt/);
   });
 
+  it('P1: the schema is checked by state and by outcome — an incomplete finished record is a broken read, never matched', async () => {
+    const good = rec({});
+    // The reviewer's reproduction: finished/none without outcome, httpStatus, finishedAt.
+    const hollow = { ...good, outcome: undefined, httpStatus: undefined, finishedAt: undefined };
+    expect(() => assertJournalRecord(hollow)).toThrow(/finished without outcome, finished without httpStatus, finished without finishedAt/);
+    expect(() => assertJournalRecord({ ...good, outcome: undefined })).toThrow(/without outcome/);
+    expect(() => assertJournalRecord({ ...good, httpStatus: '200' })).toThrow(/without httpStatus/);
+    // Outcome ↔ paidResult consistency, and a paid result presupposes the intent.
+    expect(() => assertJournalRecord({ ...good, outcome: 'accepted', paidResult: 'none' })).toThrow(/outcome accepted with paidResult none/);
+    expect(() => assertJournalRecord({ ...good, outcome: 'deduped', paidResult: 'accepted' })).toThrow(/outcome deduped with paidResult accepted/);
+    expect(() => assertJournalRecord({ ...good, outcome: 'accepted', paidResult: 'accepted' })).toThrow(/without postingAt/);
+    expect(assertJournalRecord({ ...good, outcome: 'accepted', paidResult: 'accepted', postingAt: good.beganAt + 1, decision: 'new' })).toBeTruthy();
+    expect(() => assertJournalRecord({ ...good, outcome: 'accepted', paidResult: 'accepted', postingAt: good.beganAt + 1 })).toThrow(/intent without txId\/decision/);
+    // By state.
+    expect(() => assertJournalRecord({ ...good, status: 'begun', paidResult: 'none' })).toThrow(/begun with a result/);
+    const begun = { ...good, status: 'begun', outcome: undefined, httpStatus: undefined, finishedAt: undefined, txId: undefined, attests: undefined };
+    expect(assertJournalRecord(begun)).toBeTruthy();
+    expect(() => assertJournalRecord({ ...begun, paidResult: 'unknown' })).toThrow(/begun with a paid result/);
+    const posting = { ...begun, status: 'posting', paidResult: 'unknown', postingAt: good.beganAt + 1, txId: TX, decision: 'new' };
+    expect(assertJournalRecord(posting)).toBeTruthy();
+    expect(() => assertJournalRecord({ ...posting, postingAt: undefined })).toThrow(/posting without postingAt/);
+    expect(() => assertJournalRecord({ ...posting, paidResult: 'accepted' })).toThrow(/posting with paidResult accepted/);
+    expect(() => assertJournalRecord({ ...good, txId: 'short' })).toThrow(/txId/);
+    // …and through the slice read, the hollow record never reaches the join.
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r', ops: [hollow], cursor: null }), 'pk', 0, 10)).rejects.toThrow(/malformed/);
+  });
+
   it('a short or wrong window is a DIAGNOSTIC report, never a verdict (P1-2)', async () => {
     const policy = { allowances: { infrastructure: 2, resolvedManually: 1 }, approvedAt: '2026-09-13T00:00:00Z', approvedBy: 'owner' };
     const s = rec({});

@@ -183,8 +183,15 @@ function classifyPair(d, s, res, now) {
   return row('matched', d, s, s.outcome);
 }
 
-/** Outcomes whose answer carries the transaction id and says whether it was a dedupe. */
-const CARRIES_TX = new Set(['accepted', 'deduped', 'recovery_reconciled', 'conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict', 'post_unknown', 'arweave_error']);
+/**
+ * Outcomes whose ANSWER carries the transaction id (worker/src/index.ts):
+ * a 200 with txId, a 409 id_payload_conflict with the historical txId, and
+ * `arweave_post_unknown` with the signed one. NOT `arweave_error`: the
+ * worker's 502 `arweave_rejected` answers code and text only — the journal
+ * keeps the rejected txId, the client never sees it, so the driver cannot be
+ * asked to echo it.
+ */
+const CARRIES_TX = new Set(['accepted', 'deduped', 'recovery_reconciled', 'conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict', 'post_unknown']);
 const DEDUPE_ANSWERS = new Set(['deduped', 'recovery_reconciled']);
 
 /**
@@ -360,7 +367,16 @@ export function verdict({ rows, wait, policy, window, resolutions = {}, now = Da
   // Success = `accepted`, plus an unknown POST the operator confirmed on the
   // pool (an unconfirmed one is red on its own row). Same criterion as
   // docs/ROLLBACK.md «accepted ÷ all upload_outcome», same denominator.
-  const paidRows = rows.filter(r => r.server && r.server.status === 'finished' && UPLOAD_OUTCOMES.has(r.server.outcome));
+  // …plus the manually resolved publications: a `posting` record the operator
+  // confirmed on the pool never becomes `finished` (the journal is not
+  // rewritten), yet it IS a publication — counted once, in both the numerator
+  // and the denominator, whatever its stored status.
+  const paidIds = new Set();
+  for (const r of rows) {
+    if (!r.server) continue;
+    if ((r.server.status === 'finished' && UPLOAD_OUTCOMES.has(r.server.outcome)) || r.cls === 'resolved_manually') paidIds.add(r.operationId);
+  }
+  const paidRows = rows.filter(r => paidIds.has(r.operationId));
   const paid = paidRows.length;
   const accepted = paidRows.filter(r => r.server.outcome === 'accepted' || r.cls === 'resolved_manually').length;
   if (paid < CRITERIA.paidOutcomes) failures.push(`paid outcomes ${paid} < ${CRITERIA.paidOutcomes}`);

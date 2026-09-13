@@ -1401,8 +1401,20 @@ async function adminOps(origin, secret, payload) {
 /** The whole slice, page by page, plus the worker identity it was read under. */
 const OP_STATUSES = new Set(['begun', 'posting', 'finished']);
 const PAID_RESULTS = new Set(['none', 'accepted', 'rejected', 'unknown']);
+/** The paid-path outcomes and the paidResult each one MUST carry (worker/src/index.ts). */
+const PAID_RESULT_BY_OUTCOME = {
+  accepted: 'accepted', arweave_error: 'rejected', post_unknown: 'unknown',
+  arweave_throw: 'none', gateway_unavailable_pre_post: 'none', audit_aborted: 'none', audit_unavailable: 'none',
+};
+const POST_DECISIONS = new Set(['new', 'legacy_dead_redrop', 'recheck_dead_redrop', 'recovery_dead_repost']);
 
-/** A journal record as /admin/ops projects it — anything else is a broken read. */
+/**
+ * A journal record as /admin/ops projects it — checked by STATE and by
+ * OUTCOME, not only by the presence of the common fields. A `finished` record
+ * without its result, a `posting` record without the intent it stands for, a
+ * paid result without an intent to POST: each is a broken read, never a
+ * record the join may call `matched`.
+ */
 export function assertJournalRecord(r) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) throw new Error('journal record is not an object');
   const bad = [];
@@ -1415,6 +1427,31 @@ export function assertJournalRecord(r) {
   if (!(r.workerVersionId === null || typeof r.workerVersionId === 'string')) bad.push('workerVersionId');
   if (!(r.idOrigin === 'client' || r.idOrigin === 'server')) bad.push('idOrigin');
   if ('token' in r) bad.push('token (must never leave the DO)');
+  if (r.txId !== undefined && !isValidTxId(r.txId)) bad.push('txId');
+  if (r.attests !== undefined && !(Array.isArray(r.attests) && r.attests.every(a => typeof a === 'string'))) bad.push('attests');
+
+  // By state.
+  const hasIntent = Number.isFinite(r.postingAt);
+  if (hasIntent && (!isValidTxId(r.txId) || !POST_DECISIONS.has(r.decision))) bad.push('posting intent without txId/decision');
+  if (r.status === 'begun') {
+    if (r.paidResult !== 'none') bad.push('begun with a paid result');
+    if (hasIntent) bad.push('begun with postingAt');
+    if (r.outcome !== undefined || r.finishedAt !== undefined) bad.push('begun with a result');
+  } else if (r.status === 'posting') {
+    if (!hasIntent) bad.push('posting without postingAt');
+    if (r.paidResult !== 'unknown') bad.push(`posting with paidResult ${r.paidResult}`);
+    if (r.outcome !== undefined || r.finishedAt !== undefined) bad.push('posting with a result');
+  } else if (r.status === 'finished') {
+    if (typeof r.outcome !== 'string' || r.outcome.length === 0) bad.push('finished without outcome');
+    if (!Number.isInteger(r.httpStatus)) bad.push('finished without httpStatus');
+    if (!Number.isFinite(r.finishedAt)) bad.push('finished without finishedAt');
+    // By outcome: a paid outcome fixes its paidResult, and any paid result
+    // other than `none` presupposes the journaled intent to POST.
+    const expected = PAID_RESULT_BY_OUTCOME[r.outcome];
+    if (expected !== undefined && r.paidResult !== expected) bad.push(`outcome ${r.outcome} with paidResult ${r.paidResult}`);
+    if (expected === undefined && r.paidResult !== 'none') bad.push(`outcome ${r.outcome} with paidResult ${r.paidResult}`);
+    if (r.paidResult !== 'none' && !hasIntent) bad.push(`paidResult ${r.paidResult} without postingAt`);
+  }
   if (bad.length) throw new Error(`journal record ${r.id ?? '?'} malformed: ${bad.join(', ')}`);
   return r;
 }
