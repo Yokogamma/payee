@@ -276,26 +276,21 @@ describe('RateLimiter journal routes', () => {
       // A first, healthy admission so the counters and the journal are non-empty.
       const warm = begin();
       expect((await reserve(s, 'warm', warm)).status).toBe('ok');
-      const before = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) => ({
-        keys: [...(await state.storage.list()).keys()].sort(),
-        meta: await state.storage.get<OpMeta>(OP_META_KEY),
-        inFlight: await state.storage.get<number>('inFlight'),
-        attempts: await state.storage.get<number>('attempts'),
-      }));
+      // The FULL storage: every key with its value, so any partial write —
+      // a counter, a note, a record, an index entry, the meta — shows up.
+      const snapshot = () => runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) =>
+        Object.fromEntries([...(await state.storage.list()).entries()].sort(([a], [b]) => (a < b ? -1 : 1))));
+      const before = await snapshot();
 
       await runInDurableObject(s, async (instance: RateLimiter) => { instance.faultAfter = faultAfter; });
       const op = begin();
       await expect(reserve(s, 'n-fault', op)).rejects.toThrow();
       await runInDurableObject(s, async (instance: RateLimiter) => { instance.faultAfter = undefined; });
 
-      const after = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) => ({
-        keys: [...(await state.storage.list()).keys()].sort(),
-        meta: await state.storage.get<OpMeta>(OP_META_KEY),
-        inFlight: await state.storage.get<number>('inFlight'),
-        attempts: await state.storage.get<number>('attempts'),
-      }));
-      // Nothing landed: no reservation, no counters, no record, no index, no meta bump.
+      const after = await snapshot();
+      // Nothing landed: every key–value pair is exactly as before the fault.
       expect(after).toEqual(before);
+      expect(Object.keys(before).length).toBeGreaterThan(4); // the warm-up did leave state to compare
       expect(await opGet(s, op.id)).toBeNull();
       expect((await reserve(s, 'n-fault')).status).toBe('ok'); // the note was never reserved
     }
