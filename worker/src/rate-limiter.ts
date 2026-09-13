@@ -18,12 +18,12 @@
  * compare-and-swap on mark-posted/commit/release/redrop.
  *
  * Operation journal (plan «soak D2 operation journal» v6.1): NEXT TO the note
- * records, never instead of them. `op:<operationId>` is written in the SAME
- * storage transaction as the /check-and-reserve decision — the DO never awaits
- * anything but its own storage between the read and the writes, so the SQLite
- * implicit transaction covers both (a response lost on the way back to the
- * worker leaves a `begun` record with the verdict, never a decision without a
- * record). `note:*` transitions are UNCHANGED by the journal; it only observes.
+ * records, never instead of them. `op:<operationId>` is written in ONE explicit
+ * `storage.transaction()` together with the /check-and-reserve decision, the
+ * time index and the journal counter: either all of it lands or none of it
+ * (a response lost on the way back to the worker leaves a `begun` record with
+ * the verdict, never a decision without a record, never a record without its
+ * index). `note:*` transitions are UNCHANGED by the journal; it only observes.
  */
 
 import {
@@ -68,6 +68,10 @@ export interface LegacySnapshot {
 }
 
 interface Window { count: number; inFlight: number; attempts: number; resetAt: number }
+
+/** The storage handle a routine works against: the object's storage, or the
+ *  transaction it is running inside. Same get/put/delete/list surface. */
+type Store = DurableObjectStorage | DurableObjectTransaction;
 
 /** `fp` is the REQUESTED fingerprint — of the payload this request carries. It
  *  is what a stored `fp` is compared against, and what a fresh reservation
@@ -115,6 +119,16 @@ const FP_RE = /^[0-9a-f]{64}$/;
 
 export class RateLimiter implements DurableObject {
   private state: DurableObjectState;
+  /**
+   * TEST SEAM — never assigned by production code. A test sets it through
+   * `runInDurableObject` to throw INSIDE the admission transaction right after
+   * the named write, which is the only way to prove the transaction rolls the
+   * earlier writes back (a lost response after a successful call cannot show
+   * that window). Read once per admission; `undefined` in every real request.
+   */
+  faultAfter?: 'decide' | 'op' | 'index';
+  /** TEST SEAM for the pruning threshold (production: OP_PRUNE_MIN_COUNT). */
+  pruneMinCount = OP_PRUNE_MIN_COUNT;
 
   constructor(state: DurableObjectState) {
     this.state = state;
@@ -136,17 +150,17 @@ export class RateLimiter implements DurableObject {
     return new Response('Not found', { status: 404 });
   }
 
-  private async window(now: number): Promise<Window> {
-    let count = (await this.state.storage.get<number>('count')) ?? 0;
-    let inFlight = (await this.state.storage.get<number>('inFlight')) ?? 0;
-    let attempts = (await this.state.storage.get<number>('attempts')) ?? 0;
-    let resetAt = (await this.state.storage.get<number>('resetAt')) ?? 0;
+  private async window(store: Store, now: number): Promise<Window> {
+    let count = (await store.get<number>('count')) ?? 0;
+    let inFlight = (await store.get<number>('inFlight')) ?? 0;
+    let attempts = (await store.get<number>('attempts')) ?? 0;
+    let resetAt = (await store.get<number>('resetAt')) ?? 0;
     if (now > resetAt) {
       count = 0; inFlight = 0; attempts = 0; resetAt = now + WINDOW_MS;
-      await this.state.storage.put('count', 0);
-      await this.state.storage.put('inFlight', 0);
-      await this.state.storage.put('attempts', 0);
-      await this.state.storage.put('resetAt', resetAt);
+      await store.put('count', 0);
+      await store.put('inFlight', 0);
+      await store.put('attempts', 0);
+      await store.put('resetAt', resetAt);
     }
     return { count, inFlight, attempts, resetAt };
   }
@@ -172,41 +186,58 @@ export class RateLimiter implements DurableObject {
     const now = Date.now();
 
     if (op === undefined) {
-      const bare = await this.decide(noteId, limit, requestedFp, now);
+      const bare = await this.decide(this.state.storage, noteId, limit, requestedFp, now);
       return Response.json(bare.body, { status: bare.http });
     }
     if (!isValidOpBegin(op)) return Response.json({ status: 'op_invalid' });
 
+    // Reuse is answered OUTSIDE the transaction and before any write: nothing
+    // about a repeated id may change state.
     const existing = await this.state.storage.get<OpRecord>(opKey(op.id));
-    if (op.retry === true) {
-      // The legacy path's second ask: same operation, continued.
-      if (!existing || existing.status !== 'begun' || existing.noteId !== noteId) {
-        return Response.json({ status: 'op_invalid' });
-      }
-      const decided = await this.decide(noteId, limit, requestedFp, now);
-      const verdict = String(decided.body.status);
-      await this.state.storage.put<OpRecord>(opKey(op.id), {
-        ...existing, checkVerdict: verdict, checkVerdicts: [...existing.checkVerdicts, verdict],
-      });
-      return Response.json({ ...decided.body, opAccepted: true }, { status: decided.http });
+    if (op.retry !== true && existing) return Response.json({ status: 'op_reused' });
+    if (op.retry === true && (!existing || existing.status !== 'begun' || existing.noteId !== noteId)) {
+      return Response.json({ status: 'op_invalid' });
     }
-    if (existing) return Response.json({ status: 'op_reused' });
 
-    const decided = await this.decide(noteId, limit, requestedFp, now);
-    const verdict = String(decided.body.status);
-    let record = newOpRecord(op, noteId, requestedFp, verdict, now);
-    const terminal = DO_TERMINAL_VERDICTS[verdict];
-    if (terminal) {
-      record = {
-        ...record, status: 'finished', finishedAt: now,
-        outcome: terminal.outcome, httpStatus: terminal.httpStatus, code: terminal.code,
-      };
+    // ONE transaction: the decision (which may reserve and count), the record,
+    // its index entry and the counter. A throw anywhere inside — the test seam
+    // included — rolls every write back; the worker then sees an exception
+    // and answers `audit_unconfirmed`, and the journal is exactly as it was.
+    const faultAfter = this.faultAfter;
+    const decided = await this.state.storage.transaction(async (txn) => {
+      const d = await this.decide(txn, noteId, limit, requestedFp, now);
+      if (faultAfter === 'decide') throw new Error('fault injected after decide');
+      const verdict = String(d.body.status);
+      if (op.retry === true) {
+        // The legacy path's second ask: same operation, continued.
+        await txn.put<OpRecord>(opKey(op.id), {
+          ...existing!, checkVerdict: verdict, checkVerdicts: [...existing!.checkVerdicts, verdict],
+        });
+        if (faultAfter === 'op') throw new Error('fault injected after op');
+        return d;
+      }
+      let record = newOpRecord(op, noteId, requestedFp, verdict, now);
+      const terminal = DO_TERMINAL_VERDICTS[verdict];
+      if (terminal) {
+        record = {
+          ...record, status: 'finished', finishedAt: now,
+          outcome: terminal.outcome, httpStatus: terminal.httpStatus, code: terminal.code,
+        };
+      }
+      await txn.put<OpRecord>(opKey(op.id), record);
+      if (faultAfter === 'op') throw new Error('fault injected after op');
+      await txn.put(opIndexKey(now, op.id), op.id);
+      if (faultAfter === 'index') throw new Error('fault injected after index');
+      const meta = (await txn.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
+      await txn.put<OpMeta>(OP_META_KEY, { ...meta, count: meta.count + 1 });
+      return d;
+    });
+    // Pruning is bounded housekeeping OUTSIDE the admission transaction: its
+    // deletes must never be able to roll a fresh admission back.
+    if (op.retry !== true) {
+      const meta = (await this.state.storage.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
+      if (meta.count > this.pruneMinCount) await this.pruneOps(now);
     }
-    await this.state.storage.put<OpRecord>(opKey(op.id), record);
-    await this.state.storage.put(opIndexKey(now, op.id), op.id);
-    const meta = (await this.state.storage.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
-    await this.state.storage.put<OpMeta>(OP_META_KEY, { count: meta.count + 1 });
-    if (meta.count + 1 > OP_PRUNE_MIN_COUNT) await this.pruneOps(now);
     return Response.json({ ...decided.body, opAccepted: true }, { status: decided.http });
   }
 
@@ -216,9 +247,9 @@ export class RateLimiter implements DurableObject {
    * semantics (fp comparison, legacy snapshot, stale reservation) unchanged.
    */
   private async decide(
-    noteId: string, limit: number, requestedFp: string | undefined, now: number,
+    store: Store, noteId: string, limit: number, requestedFp: string | undefined, now: number,
   ): Promise<{ http: number; body: Record<string, unknown> }> {
-    const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
+    const record = await store.get<NoteRecord>(`note:${noteId}`);
 
     // ── The fingerprint comparison, in EVERY state that has a txId ──
     //
@@ -295,7 +326,7 @@ export class RateLimiter implements DurableObject {
     }
 
     // No record or a STALE reservation we replace — reuse its own inFlight slot.
-    const w = await this.window(now);
+    const w = await this.window(store, now);
     const staleOwnSlot = record?.status === 'reserved' && record.gen === w.resetAt ? 1 : 0;
     const effectiveInFlight = Math.max(0, w.inFlight - staleOwnSlot);
 
@@ -303,11 +334,11 @@ export class RateLimiter implements DurableObject {
     if (w.attempts >= limit * ATTEMPT_FACTOR) return { http: 429, body: { status: 'rate_limited' } };
 
     const token = crypto.randomUUID();
-    await this.state.storage.put('inFlight', effectiveInFlight + 1);
-    await this.state.storage.put('attempts', w.attempts + 1);
+    await store.put('inFlight', effectiveInFlight + 1);
+    await store.put('attempts', w.attempts + 1);
     // The requested fp is recorded WITH the token: from here on this record is
     // no longer legacy, and every later state carries the same value forward.
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
+    await store.put<NoteRecord>(`note:${noteId}`, withFp({
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
     }, requestedFp));
     return { http: 200, body: { status: 'ok', token } };
@@ -392,13 +423,26 @@ export class RateLimiter implements DurableObject {
     return Response.json({ ops, cursor: nextCursor });
   }
 
-  /** Oldest FINISHED, non-unknown, aged records go; everything unresolved
-   *  stays. Bounded work per call (one batch) — the journal is small on the
-   *  dev contour and this only has to keep it from growing without bound. */
+  /**
+   * Bounded housekeeping: one batch of the time index per call, resuming
+   * behind the previous batch through `opmeta.pruneCursor`, wrapping to the
+   * start when the end is reached. Only FINISHED records with a known
+   * paidResult and older than OP_PRUNE_MIN_AGE_MS are removed; `begun`,
+   * `posting` and `paidResult:'unknown'` are skipped and STAY — an unresolved
+   * operation is visible for as long as it is unresolved. The cursor is what
+   * keeps a protected head (100 unresolved records at the front) from hiding
+   * everything behind it forever.
+   */
   private async pruneOps(now: number): Promise<void> {
-    const page = await this.state.storage.list<string>({ prefix: OP_INDEX_PREFIX, limit: OP_PRUNE_BATCH });
+    const meta = (await this.state.storage.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
+    const page = await this.state.storage.list<string>({
+      prefix: OP_INDEX_PREFIX, limit: OP_PRUNE_BATCH,
+      ...(meta.pruneCursor !== undefined ? { startAfter: meta.pruneCursor } : {}),
+    });
     let removed = 0;
+    let last: string | undefined;
     for (const [indexKey, id] of page.entries()) {
+      last = indexKey;
       const record = await this.state.storage.get<OpRecord>(opKey(id));
       if (!record) { await this.state.storage.delete(indexKey); continue; }
       if (!isPrunable(record, now)) continue;
@@ -406,10 +450,12 @@ export class RateLimiter implements DurableObject {
       await this.state.storage.delete(indexKey);
       removed += 1;
     }
-    if (removed > 0) {
-      const meta = (await this.state.storage.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
-      await this.state.storage.put<OpMeta>(OP_META_KEY, { count: Math.max(0, meta.count - removed) });
-    }
+    const exhausted = page.size < OP_PRUNE_BATCH;
+    const next: OpMeta = {
+      count: Math.max(0, meta.count - removed),
+      ...(exhausted || last === undefined ? {} : { pruneCursor: last }),
+    };
+    await this.state.storage.put<OpMeta>(OP_META_KEY, next);
   }
 
   /** Record a successful Arweave POST BEFORE commit, so a lost commit stays
@@ -441,7 +487,7 @@ export class RateLimiter implements DurableObject {
     }
 
     const now = Date.now();
-    const w = await this.window(now);
+    const w = await this.window(this.state.storage, now);
     let committedGen = record.gen;
     if (record.gen === w.resetAt) {
       if (w.inFlight > 0) await this.state.storage.put('inFlight', w.inFlight - 1);
@@ -460,7 +506,7 @@ export class RateLimiter implements DurableObject {
     const { noteId, token } = await request.json<ReleaseRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     if (record && record.status === 'reserved' && record.token === token) {
-      const w = await this.window(Date.now());
+      const w = await this.window(this.state.storage, Date.now());
       if (record.gen === w.resetAt && w.inFlight > 0) {
         await this.state.storage.put('inFlight', w.inFlight - 1);
       }
@@ -574,7 +620,7 @@ export class RateLimiter implements DurableObject {
     }
 
     const now = Date.now();
-    const w = await this.window(now);
+    const w = await this.window(this.state.storage, now);
     if (w.attempts >= limit * ATTEMPT_FACTOR) return Response.json({ ok: false, rateLimited: true });
 
     if (record.status === 'committed') {

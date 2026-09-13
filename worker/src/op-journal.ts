@@ -108,7 +108,13 @@ export function opIndexUpperBound(at: number): string {
   return `${OP_INDEX_PREFIX}${(Math.max(0, at) + 1).toString(16).padStart(16, '0')}`;
 }
 
-export interface OpMeta { count: number }
+export interface OpMeta {
+  count: number;
+  /** Where the last pruning pass stopped (an index key), so a bounded pass
+   *  resumes behind the records it already visited instead of re-reading the
+   *  same protected head forever. Absent = start from the beginning. */
+  pruneCursor?: string;
+}
 
 /** Records this old and this many trigger pruning of FINISHED, non-unknown
  *  records. `begun`, `posting` and `paidResult:'unknown'` are never pruned:
@@ -228,11 +234,13 @@ function sameFinish(record: OpRecord, req: OpFinishRequest): boolean {
  *
  * `paidResult` is constrained by where the record is:
  *   - from `begun` nothing was ever posted, so only `none` is accepted;
- *   - from `posting`: `accepted` only with the SAME txId that was journaled
- *     before the send (the transaction is the one that was signed, not one the
- *     handler now claims); `rejected` and `unknown` freely; `none` NEVER — the
- *     only way back from «unknown» to «nothing was sent» is /op-abort with the
- *     token, from the pre-POST path.
+ *   - from `posting`: the journaled txId — the one that was SIGNED and sent —
+ *     can never be replaced, whatever the outcome: a finish that names another
+ *     transaction is refused for `accepted`, `rejected` and `unknown` alike,
+ *     because a later manual resolution must look for exactly the sent
+ *     transaction; `accepted` additionally REQUIRES that txId; `none` NEVER —
+ *     the only way back from «unknown» to «nothing was sent» is /op-abort with
+ *     the token, from the pre-POST path.
  */
 export function applyFinish(
   record: OpRecord | undefined,
@@ -258,9 +266,8 @@ export function applyFinish(
   }
   if (record.status === 'posting') {
     if (req.paidResult === 'none') return { ok: false, reason: 'none_after_posting' };
-    if (req.paidResult === 'accepted' && req.txId !== record.txId) {
-      return { ok: false, reason: 'tx_id_mismatch' };
-    }
+    if (req.txId !== undefined && req.txId !== record.txId) return { ok: false, reason: 'tx_id_mismatch' };
+    if (req.paidResult === 'accepted' && req.txId !== record.txId) return { ok: false, reason: 'tx_id_mismatch' };
   }
   const attests = Array.isArray(req.attests)
     ? req.attests.filter((a): a is string => typeof a === 'string' && a.length <= 64).slice(0, 32)

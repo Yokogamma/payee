@@ -1,10 +1,11 @@
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import {
   applyAbort, applyFinish, applyPosting, newOpRecord, projectOp, isPrunable,
-  opIndexKey, opIndexLowerBound, opIndexUpperBound, OP_PRUNE_MIN_AGE_MS,
-  type OpBegin, type OpRecord, type OpProjection,
+  opIndexKey, opIndexLowerBound, opIndexUpperBound, opKey, OP_PRUNE_MIN_AGE_MS, OP_META_KEY,
+  type OpBegin, type OpRecord, type OpProjection, type OpMeta,
 } from '../src/op-journal';
+import type { RateLimiter } from '../src/rate-limiter';
 
 // The operation journal inside the RateLimiter DO (plan «soak D2 operation
 // journal» v6.1 §2, tests 5, 8, 9, 10): the pure transition rules first, then
@@ -98,6 +99,14 @@ describe('op-journal transitions (pure)', () => {
       .toMatchObject({ ok: false, reason: 'tx_id_mismatch' });
     expect(applyFinish(p.record, { id: r.id, outcome: 'audit_unconfirmed', httpStatus: 503, paidResult: 'none' }, 4000))
       .toMatchObject({ ok: false, reason: 'none_after_posting' });
+    // The journaled (signed, sent) txId can never be replaced — for ANY outcome.
+    expect(applyFinish(p.record, { id: r.id, outcome: 'post_unknown', httpStatus: 502, paidResult: 'unknown', txId: TX2 }, 4000))
+      .toMatchObject({ ok: false, reason: 'tx_id_mismatch' });
+    expect(applyFinish(p.record, { id: r.id, outcome: 'arweave_error', httpStatus: 502, paidResult: 'rejected', txId: TX2 }, 4000))
+      .toMatchObject({ ok: false, reason: 'tx_id_mismatch' });
+    const rej = applyFinish(p.record, { id: r.id, outcome: 'arweave_error', httpStatus: 502, paidResult: 'rejected' }, 4000);
+    expect(rej.ok).toBe(true);
+    if (rej.ok) expect(rej.record.txId).toBe(TX);
     const u = applyFinish(p.record, { id: r.id, outcome: 'post_unknown', httpStatus: 502, code: 'arweave_post_unknown', paidResult: 'unknown', txId: TX }, 4000);
     expect(u.ok).toBe(true);
     if (!u.ok) return;
@@ -259,6 +268,91 @@ describe('RateLimiter journal routes', () => {
     expect(await opGet(s, op.id)).toMatchObject({
       status: 'finished', outcome: 'audit_aborted', paidResult: 'none', code: 'audit_unconfirmed', httpStatus: 503, txId: TX, checkVerdict: 'ok',
     });
+  });
+
+  it('admission is ONE transaction: a throw after decide / op / index rolls every write back', async () => {
+    for (const faultAfter of ['decide', 'op', 'index'] as const) {
+      const s = stubFor(`tx-${faultAfter}`);
+      // A first, healthy admission so the counters and the journal are non-empty.
+      const warm = begin();
+      expect((await reserve(s, 'warm', warm)).status).toBe('ok');
+      const before = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) => ({
+        keys: [...(await state.storage.list()).keys()].sort(),
+        meta: await state.storage.get<OpMeta>(OP_META_KEY),
+        inFlight: await state.storage.get<number>('inFlight'),
+        attempts: await state.storage.get<number>('attempts'),
+      }));
+
+      await runInDurableObject(s, async (instance: RateLimiter) => { instance.faultAfter = faultAfter; });
+      const op = begin();
+      await expect(reserve(s, 'n-fault', op)).rejects.toThrow();
+      await runInDurableObject(s, async (instance: RateLimiter) => { instance.faultAfter = undefined; });
+
+      const after = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) => ({
+        keys: [...(await state.storage.list()).keys()].sort(),
+        meta: await state.storage.get<OpMeta>(OP_META_KEY),
+        inFlight: await state.storage.get<number>('inFlight'),
+        attempts: await state.storage.get<number>('attempts'),
+      }));
+      // Nothing landed: no reservation, no counters, no record, no index, no meta bump.
+      expect(after).toEqual(before);
+      expect(await opGet(s, op.id)).toBeNull();
+      expect((await reserve(s, 'n-fault')).status).toBe('ok'); // the note was never reserved
+    }
+  });
+
+  it('pruning walks the index with a cursor: a protected head of unresolved records does not hide old finished ones', async () => {
+    const s = stubFor('prune');
+    const old = Date.now() - OP_PRUNE_MIN_AGE_MS - 60_000;
+    // 100 unresolved records at the FRONT of the index (older beganAt), then
+    // 3 finished + aged ones, then a fresh finished one that must stay.
+    const front: string[] = [];
+    const prunable: string[] = [];
+    await runInDurableObject(s, async (instance: RateLimiter, state: DurableObjectState) => {
+      instance.pruneMinCount = 10;
+      let t = old - 1_000_000;
+      const write = async (rec: OpRecord) => {
+        await state.storage.put(opKey(rec.id), rec);
+        await state.storage.put(opIndexKey(rec.beganAt, rec.id), rec.id);
+      };
+      for (let i = 0; i < 100; i++) {
+        const rec = newOpRecord(begin(), `u${i}`, FP, 'ok', t++);
+        front.push(rec.id);
+        await write(rec);
+      }
+      for (let i = 0; i < 3; i++) {
+        const rec: OpRecord = {
+          ...newOpRecord(begin(), `f${i}`, FP, 'exists', t++), status: 'finished', paidResult: 'none', outcome: 'deduped', httpStatus: 200, finishedAt: old,
+        };
+        prunable.push(rec.id);
+        await write(rec);
+      }
+      const fresh: OpRecord = {
+        ...newOpRecord(begin(), 'fresh', FP, 'exists', t), status: 'finished', paidResult: 'none', outcome: 'deduped', httpStatus: 200, finishedAt: Date.now(),
+      };
+      await write(fresh);
+      await state.storage.put<OpMeta>(OP_META_KEY, { count: 104 });
+    });
+
+    // First admission: the pass visits the protected head (100), removes nothing, saves a cursor.
+    expect((await reserve(s, 'a1', begin())).status).toBe('ok');
+    let meta = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) => state.storage.get<OpMeta>(OP_META_KEY));
+    expect(meta!.count).toBe(105);
+    expect(meta!.pruneCursor).toEqual(expect.any(String));
+    for (const id of prunable) expect(await opGet(s, id)).not.toBeNull();
+
+    // Second admission: the pass resumes BEHIND the head and removes the three aged ones only.
+    expect((await reserve(s, 'a2', begin())).status).toBe('ok');
+    meta = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) => state.storage.get<OpMeta>(OP_META_KEY));
+    expect(meta!.count).toBe(103); // 106 − 3
+    for (const id of prunable) expect(await opGet(s, id)).toBeNull();
+    for (const id of front.slice(0, 5)) expect(await opGet(s, id)).toMatchObject({ status: 'begun' });
+    // The index entries of the removed records are gone too, the others intact.
+    const keys = await runInDurableObject(s, async (_i: RateLimiter, state: DurableObjectState) =>
+      [...(await state.storage.list({ prefix: 'opidx:' })).keys()]);
+    expect(keys).toHaveLength(103);
+    // End of index reached → the cursor wraps (absent), so the next pass starts over.
+    expect(meta!.pruneCursor).toBeUndefined();
   });
 
   it('/ops lists by time with a cursor and never the token; /op-get answers null for unknown ids', async () => {
