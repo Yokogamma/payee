@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyAnswer, classifyThrow, quarantines, joinBooks, resolutionApplies, processingWait,
-  validatePolicy, verdict, CRITERIA, RED, WAIT_STABLE_MS, WAIT_CAP_MS, UPLOAD_CODES,
+  validatePolicy, verdict, checkWindow, compareResults, CRITERIA, RED, WAIT_STABLE_MS, WAIT_CAP_MS, UPLOAD_CODES, UPLOAD_OUTCOMES,
 } from './soak-reconcile.mjs';
 
 // Plan «soak D2 operation journal» v6.1 — tests 12, 13, 17, 18, 19 and the
@@ -92,7 +92,11 @@ function server(over = {}) {
   };
 }
 function driver(s, over = {}) {
-  return { id: s.id, at: s.beganAt, noteId: s.noteId, pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: s.httpStatus, code: s.code, txId: s.txId, ...over };
+  const dedupe = s.outcome === 'deduped' || s.outcome === 'recovery_reconciled';
+  return {
+    id: s.id, at: s.beganAt, noteId: s.noteId, pass: 'dedupe', outcome: 'answered', cls: 'admitted',
+    http: s.httpStatus, code: s.code, txId: s.txId, ...(s.httpStatus === 200 ? { deduped: dedupe, committed: true } : {}), ...over,
+  };
 }
 
 describe('§6.2 joinBooks — one row per case (test 13)', () => {
@@ -164,6 +168,24 @@ describe('§6.2 joinBooks — one row per case (test 13)', () => {
       serverOps: [s], windowVersionId: VER,
     }).rows;
     expect(rows[0]).toMatchObject({ cls: 'mismatch', red: true });
+  });
+
+  it('matched requires the SAME note, a txId wherever the answer carries one, and the dedupe flag (P1-3)', () => {
+    const s = server(); // deduped, 200, TX
+    expect(compareResults(driver(s), s)).toEqual([]);
+    expect(compareResults(driver(s, { noteId: 'other-note' }), s)).toEqual([expect.stringMatching(/noteId/)]);
+    expect(compareResults(driver(s, { txId: undefined }), s)).toEqual([expect.stringMatching(/no txId/)]);
+    expect(compareResults(driver(s, { deduped: false }), s)).toEqual([expect.stringMatching(/deduped:true/)]);
+    expect(compareResults(driver(s, { http: undefined }), s)).toEqual([expect.stringMatching(/no HTTP status/)]);
+    const acc = server({ outcome: 'accepted', paidResult: 'accepted', decision: 'new', postingAt: tick(), attests: [] });
+    expect(compareResults(driver(acc), acc)).toEqual([]);
+    expect(compareResults(driver(acc, { deduped: true }), acc)).toEqual([expect.stringMatching(/accepted \(new\)/)]);
+    // The reviewer's reproduction: another note, no txId → red, not matched.
+    const rows = joinBooks({ driverOps: [driver(acc, { noteId: 'x', txId: undefined })], serverOps: [acc], windowVersionId: VER }).rows;
+    expect(rows[0]).toMatchObject({ cls: 'mismatch', red: true });
+    // A 503 answer carries no txId on either side: still matched.
+    const deferred = server({ outcome: 'deferred', httpStatus: 503, code: 'recheck_deferred', txId: undefined, attests: [] });
+    expect(compareResults(driver(deferred, { txId: undefined }), deferred)).toEqual([]);
   });
 
   it('aborted_before_post is an infrastructure incident, not red', () => {
@@ -331,6 +353,48 @@ describe('§7.3 verdict (tests 17, 18)', () => {
     const capped = judge(rows, { wait: { outcome: 'capped', unfinished: [p.id] }, resolutions });
     expect(capped.green).toBe(false);
     expect(capped.failures.join('\n')).toMatch(/capped/);
+  });
+
+  it('P1-2: a 72-hour interval that meets every VOLUME criterion is not a verdict', () => {
+    const rows = greenFixture(); // its records lie within the first 4 days
+    const short = verdict({
+      rows: joinBooks({ driverOps: rows.map(r => r.d), serverOps: rows.map(r => r.s), windowVersionId: VER }).rows,
+      wait: { outcome: 'settled_empty', unfinished: [] }, policy, window: { t0, t1: t0 + 72 * 3_600_000 }, now: t1 + 1000,
+    });
+    expect(short.green).toBe(false);
+    expect(short.failures.join('\n')).toMatch(/window 72\.0 h is shorter than 168 h/);
+    const notOver = verdict({
+      rows: joinBooks({ driverOps: rows.map(r => r.d), serverOps: rows.map(r => r.s), windowVersionId: VER }).rows,
+      wait: { outcome: 'settled_empty', unfinished: [] }, policy, window: { t0, t1 }, now: t1 - 1,
+    });
+    expect(notOver.failures.join('\n')).toMatch(/has not ended/);
+
+    expect(checkWindow({ from: t0, to: t1, ledgerStart: t0, now: t1 + 1 })).toEqual({ ok: true, problems: [] });
+    expect(checkWindow({ from: t0, to: t0 + 72 * 3_600_000, ledgerStart: t0, now: t1 }).problems).toEqual([expect.stringMatching(/72\.0 h/)]); // ended (to < now), only too short
+    expect(checkWindow({ from: t0 + 1, to: t1 + 1, ledgerStart: t0, now: t1 + 2 }).problems).toEqual([expect.stringMatching(/not the ledger's window start/)]);
+    expect(checkWindow({ from: t0, to: t1, ledgerStart: undefined, now: t1 + 1 }).problems).toEqual([expect.stringMatching(/no window start/)]);
+    expect(checkWindow({ from: t0, to: t1, ledgerStart: t0, now: t1 - 1 }).problems).toEqual([expect.stringMatching(/not ended/)]);
+  });
+
+  it('P1-5: the paid denominator is the upload_outcome total — anchor/price failures count, aborts do not', () => {
+    expect([...UPLOAD_OUTCOMES].sort()).toEqual(['accepted', 'arweave_error', 'arweave_throw', 'gateway_unavailable_pre_post', 'post_unknown']);
+    const rows = greenFixture();
+    for (let i = 0; i < 2; i++) {
+      const at = t0 + 2 * 24 * 3_600_000 + i * 1000;
+      const s = server({ beganAt: at, finishedAt: at + 5, outcome: 'gateway_unavailable_pre_post', httpStatus: 502, code: 'arweave_gateway_unavailable', txId: undefined, attests: [] });
+      rows.push({ s, d: driver(s) });
+    }
+    const v = judge(rows, { policy: { ...policy, allowances: { infrastructure: 5, resolvedManually: 1 } } });
+    expect(v.figures).toMatchObject({ paid: 22, accepted: 20, infra: 2 });
+    expect(v.failures.join('\n')).toMatch(/paid success rate 90\.9 % < 95 %/);
+    // An abort is not an upload_outcome: neither in the denominator nor in the numerator.
+    const rows2 = greenFixture();
+    const at = t0 + 2 * 24 * 3_600_000;
+    const a = server({ beganAt: at, finishedAt: at + 5, outcome: 'audit_aborted', httpStatus: 503, code: 'audit_unconfirmed', postingAt: at + 2, decision: 'new', attests: [] });
+    rows2.push({ s: a, d: driver(a) });
+    const v2 = judge(rows2);
+    expect(v2.figures).toMatchObject({ paid: 20, accepted: 20, infra: 1 }); // P2: one abort = ONE incident
+    expect(v2.failures).toEqual([]);
   });
 
   it('a resolution without evidence is itself a failure; RED lists what a red class is', () => {

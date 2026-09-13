@@ -177,13 +177,37 @@ function classifyPair(d, s, res, now) {
   }
   if (d.cls === 'delivery_unknown') return row('resolved_by_server', d, s, `driver lost the answer; journal says ${s.outcome}`);
   if (s.outcome === 'audit_aborted') return row('aborted_before_post', d, s, s.code ?? 'audit_aborted');
-  // admitted on both sides: the answers must agree
-  const disagree = [];
-  if (d.http !== undefined && s.httpStatus !== undefined && d.http !== s.httpStatus) disagree.push(`http ${d.http}≠${s.httpStatus}`);
-  if ((d.code ?? null) !== (s.code ?? null)) disagree.push(`code ${d.code ?? '-'}≠${s.code ?? '-'}`);
-  if (d.txId && s.txId && d.txId !== s.txId) disagree.push(`txId ${d.txId}≠${s.txId}`);
+  // admitted on both sides: the RESULTS must agree, field by field
+  const disagree = compareResults(d, s);
   if (disagree.length) return row('mismatch', d, s, disagree.join(', '));
   return row('matched', d, s, s.outcome);
+}
+
+/** Outcomes whose answer carries the transaction id and says whether it was a dedupe. */
+const CARRIES_TX = new Set(['accepted', 'deduped', 'recovery_reconciled', 'conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict', 'post_unknown', 'arweave_error']);
+const DEDUPE_ANSWERS = new Set(['deduped', 'recovery_reconciled']);
+
+/**
+ * `matched` means the driver's normalized result and the journal record
+ * describe the SAME operation and the SAME answer: the note, the HTTP status,
+ * the code, the transaction (REQUIRED on the driver's side wherever the answer
+ * carries one — a missing id is a disagreement, not a pass) and the dedupe
+ * flag (a dedupe answered as a new publication, or the reverse, is a
+ * disagreement even with the txId equal).
+ */
+export function compareResults(d, s) {
+  const out = [];
+  if (d.noteId !== s.noteId) out.push(`noteId ${d.noteId}≠${s.noteId}`);
+  if (d.http === undefined) out.push('driver recorded no HTTP status');
+  else if (s.httpStatus !== undefined && d.http !== s.httpStatus) out.push(`http ${d.http}≠${s.httpStatus}`);
+  if ((d.code ?? null) !== (s.code ?? null)) out.push(`code ${d.code ?? '-'}≠${s.code ?? '-'}`);
+  if (CARRIES_TX.has(s.outcome) && s.txId) {
+    if (!d.txId) out.push(`driver recorded no txId for ${s.outcome}`);
+    else if (d.txId !== s.txId) out.push(`txId ${d.txId}≠${s.txId}`);
+  }
+  if (DEDUPE_ANSWERS.has(s.outcome) && d.deduped !== true) out.push(`journal says ${s.outcome}, driver did not record deduped:true`);
+  if (s.outcome === 'accepted' && d.deduped === true) out.push('journal says accepted (new), driver recorded deduped:true');
+  return out;
 }
 
 // ── §7.1 Processing wait ──────────────────────────────────────────────
@@ -248,7 +272,36 @@ export function validatePolicy(policy) {
 export const CRITERIA = Object.freeze({
   decisions: 30, distinctDays: 3, deduped: 10, legacyBackfilled: 3,
   paidOutcomes: 20, successRate: 0.95, unprovenMax: 1, finalHoursQuiet: 48,
+  /** «168 continuous hours on ONE worker version id» (docs/ROLLBACK.md). */
+  windowMs: 168 * 3_600_000,
 });
+
+/**
+ * The window is the ledger's, not the caller's: T0 is when the driver first
+ * saw the version under soak, T1 is at least 168 h later and already in the
+ * past. Anything else is a DIAGNOSTIC read — the join and the classes are
+ * still useful, the verdict is not issued.
+ */
+export function checkWindow({ from, to, ledgerStart, now = Date.now() }) {
+  const problems = [];
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) problems.push('window bounds are not a range');
+  if (typeof ledgerStart !== 'number') problems.push('the ledger holds no window start (release.firstSeenAt) — no `day` run on this version yet');
+  else if (from !== ledgerStart) problems.push(`--from ${new Date(from).toISOString()} is not the ledger's window start ${new Date(ledgerStart).toISOString()}`);
+  if (Number.isFinite(from) && Number.isFinite(to) && to - from < CRITERIA.windowMs) {
+    problems.push(`window is ${((to - from) / 3_600_000).toFixed(1)} h, a soak window is ${CRITERIA.windowMs / 3_600_000} h`);
+  }
+  if (Number.isFinite(to) && to > now) problems.push('the window has not ended yet');
+  return { ok: problems.length === 0, problems };
+}
+
+/**
+ * The journal outcomes that ARE an `upload_outcome` emission (docs/METRICS.md):
+ * one per terminal return of the paid path. `audit_aborted` and
+ * `audit_unavailable` are NOT in it — no POST was attempted and the worker
+ * emits nothing for them — exactly as before the journal existed. This keeps
+ * «accepted ÷ all upload_outcome» the criterion it always was.
+ */
+export const UPLOAD_OUTCOMES = new Set(['accepted', 'arweave_error', 'arweave_throw', 'gateway_unavailable_pre_post', 'post_unknown']);
 
 const STRICT_ZERO = ['conflict', 'redrop_conflict', 'legacy_not_ours', 'recovery_conflict', 'arweave_throw'];
 const INFRA = new Set(['gateway_unavailable_pre_post', 'audit_aborted']);
@@ -269,6 +322,10 @@ function outcomesOf(s) {
 export function verdict({ rows, wait, policy, window, resolutions = {}, now = Date.now() }) {
   const failures = [];
   const { t0, t1 } = window;
+  // Defence in depth: reconcileWindow refuses a non-soak window before calling
+  // this, and this refuses it again — a verdict over 72 h is not a verdict.
+  if (!(t1 - t0 >= CRITERIA.windowMs)) failures.push(`window ${((t1 - t0) / 3_600_000).toFixed(1)} h is shorter than ${CRITERIA.windowMs / 3_600_000} h`);
+  if (t1 > now) failures.push('the window has not ended yet');
   if (wait.outcome === 'capped') failures.push('processing wait capped: records still changing 2 h after T1');
   if (wait.outcome === 'waiting') failures.push(`processing wait not settled: ${wait.reason}`);
 
@@ -298,18 +355,23 @@ export function verdict({ rows, wait, policy, window, resolutions = {}, now = Da
   if (deduped < CRITERIA.deduped) failures.push(`deduped ${deduped} < ${CRITERIA.deduped}`);
   if (legacyBackfilled < CRITERIA.legacyBackfilled) failures.push(`legacy_backfilled (distinct) ${legacyBackfilled} < ${CRITERIA.legacyBackfilled}`);
 
-  // Paid outcomes: every record that entered the paid path (a decision was
-  // journaled before the send). Success = accepted, or an unknown POST the
-  // operator confirmed on the pool.
-  const paid = rows.filter(r => r.server && r.server.decision);
-  const accepted = paid.filter(r => r.server.paidResult === 'accepted' || r.cls === 'resolved_manually').length;
-  if (paid.length < CRITERIA.paidOutcomes) failures.push(`paid outcomes ${paid.length} < ${CRITERIA.paidOutcomes}`);
-  if (paid.length > 0 && accepted / paid.length < CRITERIA.successRate) {
-    failures.push(`paid success rate ${(100 * accepted / paid.length).toFixed(1)} % < ${100 * CRITERIA.successRate} %`);
+  // Paid outcomes = the `upload_outcome` total, read from the journal: every
+  // finished record whose outcome is one the paid path emits (UPLOAD_OUTCOMES).
+  // Success = `accepted`, plus an unknown POST the operator confirmed on the
+  // pool (an unconfirmed one is red on its own row). Same criterion as
+  // docs/ROLLBACK.md «accepted ÷ all upload_outcome», same denominator.
+  const paidRows = rows.filter(r => r.server && r.server.status === 'finished' && UPLOAD_OUTCOMES.has(r.server.outcome));
+  const paid = paidRows.length;
+  const accepted = paidRows.filter(r => r.server.outcome === 'accepted' || r.cls === 'resolved_manually').length;
+  if (paid < CRITERIA.paidOutcomes) failures.push(`paid outcomes ${paid} < ${CRITERIA.paidOutcomes}`);
+  if (paid > 0 && accepted / paid < CRITERIA.successRate) {
+    failures.push(`paid success rate ${(100 * accepted / paid).toFixed(1)} % < ${100 * CRITERIA.successRate} %`);
   }
 
-  // Allowances — the owner's numbers, never defaults.
-  const infra = finished.filter(s => INFRA.has(s.outcome)).length + rows.filter(r => r.cls === 'aborted_before_post').length;
+  // Allowances — the owner's numbers, never defaults. Incidents are counted
+  // ONCE per operation (an aborted record is both `audit_aborted` and the
+  // row class `aborted_before_post`; it is one incident).
+  const infra = new Set(rows.filter(r => r.server && (INFRA.has(r.server.outcome) || r.cls === 'aborted_before_post')).map(r => r.operationId)).size;
   const resolved = rows.filter(r => r.cls === 'resolved_manually').length;
   if (infra > policy.allowances.infrastructure) failures.push(`infrastructure incidents ${infra} > allowance ${policy.allowances.infrastructure}`);
   if (resolved > policy.allowances.resolvedManually) failures.push(`resolved_manually ${resolved} > allowance ${policy.allowances.resolvedManually}`);
@@ -319,7 +381,7 @@ export function verdict({ rows, wait, policy, window, resolutions = {}, now = Da
     if (typeof res.evidence !== 'string' || res.evidence.trim() === '') failures.push(`resolution ${id} without evidence`);
   }
   void now;
-  return { green: failures.length === 0, failures, figures: { decisions, days: days.size, deduped, legacyBackfilled, paid: paid.length, accepted, infra, resolved } };
+  return { green: failures.length === 0, failures, figures: { decisions, days: days.size, deduped, legacyBackfilled, paid, accepted, infra, resolved } };
 }
 
 /** The `semantic_idempotency` outcomes that count as decisions (docs/METRICS.md). */

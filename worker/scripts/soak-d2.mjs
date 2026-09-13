@@ -97,7 +97,7 @@ import * as ed from '@noble/ed25519';
 import { classifySmokeTarget, AUTO_ALLOWED_WORKER_ORIGINS } from './smoke-target.mjs';
 import {
   classifyAnswer, classifyThrow, quarantines, joinBooks, processingWait, validatePolicy, verdict as decideVerdict,
-  isValidOperationId, isValidTxId,
+  checkWindow, isValidOperationId, isValidTxId,
 } from './soak-reconcile.mjs';
 
 /** The worker that must be live for `seed-legacy`: PR-3a, before D2. */
@@ -216,9 +216,35 @@ export function recordAnswer(op, answer) {
   op.cls = c.cls;
   if (c.code) op.code = c.code;
   if (c.detail) op.detail = c.detail;
+  // The normalized RESULT the join compares field by field: the transaction
+  // and the dedupe/commit flags exactly as the answer carried them.
   const body = answer.body;
-  if (body && typeof body === 'object' && typeof body.txId === 'string') op.txId = body.txId;
+  if (body && typeof body === 'object') {
+    if (typeof body.txId === 'string') op.txId = body.txId;
+    if (typeof body.deduped === 'boolean') op.deduped = body.deduped;
+    if (typeof body.committed === 'boolean') op.committed = body.committed;
+  }
   return c;
+}
+
+/**
+ * A record left `pending` means the process died between the send and the
+ * answer — in ANY pass, not only a paid publication. It becomes `unknown`
+ * and the note goes into quarantine BEFORE anything is planned: a recheck or
+ * a legacy send with an unknown outcome may have re-posted, and planning it
+ * again would be the double payment the journal exists to make visible.
+ * Idempotent; the next save persists it.
+ */
+export function reconcilePendingOperations(state, at) {
+  const stranded = (state.operations ?? []).filter(o => o.outcome === 'pending');
+  for (const o of stranded) {
+    o.outcome = 'unknown';
+    o.cls = 'delivery_unknown';
+    o.detail = 'interrupted before the answer was recorded';
+    o.reconciledAt = at;
+    quarantineNote(state, o, 'interrupted send');
+  }
+  return stranded;
 }
 
 /** The send threw: nothing arrived, the outcome is unknown forever. */
@@ -925,6 +951,9 @@ export async function seedLegacy({ origin, signer, state, count, dryRun, opts, p
 
   // …and CHARGED is not the same as BOUNDED: `--count` alone would happily walk
   // past SOAK_MAX_PAID_TOTAL, so the remainder is what actually caps the pass.
+  for (const o of reconcilePendingOperations(state, Date.now())) {
+    log(`  UNKNOWN ${o.pass} ${o.noteId} from an earlier run — interrupted before the answer was recorded; the note is quarantined`);
+  }
   const spent = attemptsSpent(state);
   const planned = Math.max(0, Math.min(count, opts.maxPaidTotal - spent));
   if (planned < count) {
@@ -1029,6 +1058,9 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
   // re-driven. The end-of-run save persists this; repeating it is harmless.
   for (const s of reconcilePendingAttempts(state, now)) {
     log(`  UNKNOWN paid ${s.noteId} from an earlier run — interrupted before the outcome was recorded; NOT retried`);
+  }
+  for (const o of reconcilePendingOperations(state, now)) {
+    log(`  UNKNOWN ${o.pass} ${o.noteId} from an earlier run — interrupted before the answer was recorded; the note is quarantined`);
   }
   const plan = planRun(state, opts, now);
   const price = await getJson(`${opts.probeOrigin}/price/${opts.priceBytes}`);
@@ -1367,19 +1399,80 @@ async function adminOps(origin, secret, payload) {
 }
 
 /** The whole slice, page by page, plus the worker identity it was read under. */
+const OP_STATUSES = new Set(['begun', 'posting', 'finished']);
+const PAID_RESULTS = new Set(['none', 'accepted', 'rejected', 'unknown']);
+
+/** A journal record as /admin/ops projects it — anything else is a broken read. */
+export function assertJournalRecord(r) {
+  if (!r || typeof r !== 'object' || Array.isArray(r)) throw new Error('journal record is not an object');
+  const bad = [];
+  if (!isValidOperationId(r.id)) bad.push('id');
+  if (typeof r.noteId !== 'string') bad.push('noteId');
+  if (!OP_STATUSES.has(r.status)) bad.push('status');
+  if (!PAID_RESULTS.has(r.paidResult)) bad.push('paidResult');
+  if (!Number.isFinite(r.beganAt)) bad.push('beganAt');
+  if (typeof r.checkVerdict !== 'string') bad.push('checkVerdict');
+  if (!(r.workerVersionId === null || typeof r.workerVersionId === 'string')) bad.push('workerVersionId');
+  if (!(r.idOrigin === 'client' || r.idOrigin === 'server')) bad.push('idOrigin');
+  if ('token' in r) bad.push('token (must never leave the DO)');
+  if (bad.length) throw new Error(`journal record ${r.id ?? '?'} malformed: ${bad.join(', ')}`);
+  return r;
+}
+
+/** The identity every /admin/ops answer must carry. */
+function assertIdentity(page) {
+  if (!page || typeof page !== 'object' || Array.isArray(page)) throw new Error('/admin/ops answer is not an object');
+  if (!('workerVersionId' in page) || !(page.workerVersionId === null || typeof page.workerVersionId === 'string')) throw new Error('/admin/ops answer lacks workerVersionId');
+  if (!('releaseSha' in page) || !(page.releaseSha === null || typeof page.releaseSha === 'string')) throw new Error('/admin/ops answer lacks releaseSha');
+  return { workerVersionId: page.workerVersionId, releaseSha: page.releaseSha };
+}
+
+/**
+ * The whole slice, page by page, under a STRICT envelope: an answer without
+ * `ops` (an array) or without `cursor` (a string or null) is a broken read,
+ * never an empty journal or its end; a cursor that does not advance is a
+ * loop, not a page; every record is checked; the identity must not change.
+ */
 export async function fetchJournalSlice(fetchOps, ownerPk, from, to) {
   const ops = [];
-  let cursor;
+  const seen = new Set();
+  let cursor = null;
   let identity = null;
-  for (;;) {
-    const page = await fetchOps({ ownerPk, from, to, limit: 500, ...(cursor ? { cursor } : {}) });
-    identity ??= { workerVersionId: page.workerVersionId ?? null, releaseSha: page.releaseSha ?? null };
-    if (page.workerVersionId !== identity.workerVersionId) throw new Error('worker version changed while reading the journal — read again');
-    ops.push(...(page.ops ?? []));
-    if (!page.cursor) break;
+  for (let pages = 0; ; pages++) {
+    if (pages > 10_000) throw new Error('journal read did not terminate');
+    const page = await fetchOps({ ownerPk, from, to, limit: 500, ...(cursor !== null ? { cursor } : {}) });
+    const id = assertIdentity(page);
+    identity ??= id;
+    if (id.workerVersionId !== identity.workerVersionId || id.releaseSha !== identity.releaseSha) {
+      throw new Error('worker version changed while reading the journal — read again');
+    }
+    if (!Array.isArray(page.ops)) throw new Error('/admin/ops answer lacks `ops`');
+    if (!('cursor' in page) || !(page.cursor === null || (typeof page.cursor === 'string' && page.cursor.length > 0))) {
+      throw new Error('/admin/ops answer lacks a valid `cursor`');
+    }
+    for (const r of page.ops) {
+      assertJournalRecord(r);
+      if (seen.has(r.id)) throw new Error(`journal read repeated record ${r.id}`);
+      seen.add(r.id);
+      ops.push(r);
+    }
+    if (page.cursor === null) break;
+    if (page.cursor === cursor) throw new Error('journal cursor did not advance');
+    if (page.ops.length === 0) throw new Error('journal answered a cursor with an empty page');
     cursor = page.cursor;
   }
   return { ops, identity };
+}
+
+/** One record by id: `op` must be present — an object (checked) or an explicit null. */
+export async function fetchJournalRecord(fetchOps, ownerPk, operationId) {
+  const one = await fetchOps({ ownerPk, operationId });
+  assertIdentity(one);
+  if (!('op' in one)) throw new Error(`/admin/ops point read of ${operationId} lacks \`op\``);
+  if (one.op === null) return null;
+  const r = assertJournalRecord(one.op);
+  if (r.id !== operationId) throw new Error(`point read of ${operationId} answered ${r.id}`);
+  return r;
 }
 
 /**
@@ -1397,8 +1490,8 @@ export async function reconcileWindow({ state, fetchOps, ownerPk, from, to, poli
   for (const d of driverOps) {
     if (byId.has(d.id)) continue;
     if (d.cls !== 'refused' && d.cls !== 'delivery_unknown' && d.outcome !== 'unknown') continue;
-    const one = await fetchOps({ ownerPk, operationId: d.id });
-    if (one?.op) byId.set(d.id, one.op);
+    const r = await fetchJournalRecord(fetchOps, ownerPk, d.id);
+    if (r) byId.set(d.id, r);
   }
   // Only operations BEGUN inside the window are the window's; the wider read
   // exists so a late finish or a foreign operation is not missed.
@@ -1416,9 +1509,15 @@ export async function reconcileWindow({ state, fetchOps, ownerPk, from, to, poli
   const { rows, versionMismatch } = joinBooks({ driverOps, serverOps, resolutions: state.resolutions ?? {}, windowVersionId, now });
 
   const policyCheck = validatePolicy(policy);
+  const windowCheck = checkWindow({ from, to, ledgerStart: state.release?.firstSeenAt, now });
   let verdictName;
   let failures = [];
-  if (versionMismatch) {
+  if (!windowCheck.ok) {
+    // Not a soak window: the join is still reported (it is how an operator
+    // looks at a day), the verdict is not issued.
+    verdictName = 'diagnostic';
+    failures = windowCheck.problems.map(x => `not a soak window: ${x}`);
+  } else if (versionMismatch) {
     verdictName = 'red';
     failures = [`version_mismatch: journal record ${versionMismatch.operationId} carries ${versionMismatch.seen}, window is ${versionMismatch.expected}`];
   } else if (!policyCheck.ok) {
@@ -1533,12 +1632,15 @@ export async function main(argv) {
   if (mode === 'reconcile') {
     const secret = process.env.METRICS_ADMIN_SECRET;
     if (!secret) { console.error('✗ METRICS_ADMIN_SECRET is required for reconcile'); return 2; }
-    if (!(cli.from >= 0) || !(cli.to >= cli.from)) { console.error('✗ reconcile needs --from and --to (ISO or epoch ms), to >= from'); return 2; }
+    // `--from` defaults to the ledger's window start: the window is the
+    // ledger's, and a caller-chosen start is checked against it anyway.
+    const from = cli.from ?? state.release?.firstSeenAt;
+    if (!(from >= 0) || !(cli.to >= from)) { console.error('✗ reconcile needs --to (ISO or epoch ms) at or after the window start, and --from only if it equals release.firstSeenAt'); return 2; }
     const ownerPk = state.ownerPk ?? (process.env.SMOKE_PRIVATE_KEY ? (await makeSigner(process.env.SMOKE_PRIVATE_KEY)).pkB64 : null);
     if (!ownerPk) { console.error('✗ the ledger holds no ownerPk yet and SMOKE_PRIVATE_KEY is unset — nothing to address the journal by'); return 2; }
     const policy = await loadPolicy(dirname(statePath));
     const report = await reconcileWindow({
-      state, ownerPk, from: cli.from, to: cli.to, policy,
+      state, ownerPk, from, to: cli.to, policy,
       fetchOps: (payload) => adminOps(origin, secret, payload),
     });
     await saveState(statePath, state);
@@ -1550,9 +1652,9 @@ export async function main(argv) {
     log(`  wait: ${report.wait.outcome}${report.wait.reason ? ` (${report.wait.reason})` : ''}; unfinished journal records: ${report.unfinished.length}`);
     log(`  classes: ${Object.entries(report.classes).map(([k, v]) => `${k}=${v}`).join(' ') || 'none'}`);
     for (const r of report.rows.filter(r => r.red)) log(`  RED ${r.cls} ${r.operationId} — ${r.detail}`);
-    for (const f of report.failures) log(`  ${report.verdict === 'withheld' ? 'WITHHELD' : 'FAIL'} ${f}`);
+    for (const f of report.failures) log(`  ${report.verdict === 'red' ? 'FAIL' : report.verdict.toUpperCase()} ${f}`);
     log(`  verdict: ${report.verdict.toUpperCase()}; report kept: ${file}`);
-    return report.verdict === 'green' ? 0 : report.verdict === 'red' ? 1 : 3;
+    return report.verdict === 'green' ? 0 : report.verdict === 'red' ? 1 : 3; // withheld / diagnostic
   }
   const gate = checkReleaseGate(health, mode, state, process.env.SOAK_RELEASE_SHA);
   if (!gate.ok) { console.error('✗ release gate:'); for (const p of gate.problems) console.error(`  - ${p}`); return 2; }

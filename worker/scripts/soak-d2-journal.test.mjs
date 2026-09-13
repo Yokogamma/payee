@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
-  DEFAULTS, emptyState, planRun, dayRun, randomUuidV8,
-  newOperation, recordAnswer, recordThrow, quarantineNote, quarantinedNoteIds, applyResolve,
-  reconcileWindow, fetchJournalSlice, parseArgs, parseWhen, makeSigner,
+  DEFAULTS, emptyState, planRun, dayRun, seedLegacy, randomUuidV8,
+  newOperation, recordAnswer, recordThrow, quarantineNote, quarantinedNoteIds, applyResolve, reconcilePendingOperations,
+  reconcileWindow, fetchJournalSlice, fetchJournalRecord, assertJournalRecord, parseArgs, parseWhen, makeSigner,
 } from './soak-d2.mjs';
 
 // The driver's half of the two books (plan v6.1 §5; tests 14, 15, 16 and the
@@ -85,6 +85,44 @@ describe('14: the quarantine excludes a note from every pass', () => {
     const plan = planRun(state, { ...DEFAULTS, paidPerRun: 0 }, Date.now());
     expect(plan.dedupe).toEqual([]);
     expect(plan.legacyCandidates).toEqual([]);
+  });
+});
+
+describe('P1-1: a ledger reloaded after an interrupted send quarantines the note BEFORE planning', () => {
+  it.each(['publish', 'dedupe', 'recheck', 'legacy', 'seed-legacy'])('a pending %s operation becomes unknown and quarantined', (pass) => {
+    const state = { ...emptyState(), notes: [note({ noteId: 'cut', confirmedAt: 1 })] };
+    const op = newOperation(state, 'cut', pass, 1000); // still pending: the process died here
+    const stranded = reconcilePendingOperations(state, 2000);
+    expect(stranded).toEqual([op]);
+    expect(op).toMatchObject({ outcome: 'unknown', cls: 'delivery_unknown', reconciledAt: 2000 });
+    expect(state.quarantine).toEqual([expect.objectContaining({ noteId: 'cut', operationId: op.id, reason: 'interrupted send' })]);
+    // Idempotent; a second call changes nothing.
+    expect(reconcilePendingOperations(state, 3000)).toEqual([]);
+    expect(state.quarantine).toHaveLength(1);
+    const plan = planRun(state, { ...DEFAULTS, paidPerRun: 0 }, Date.now());
+    expect(plan.dedupe).toEqual([]);
+    expect(plan.recheck).toEqual([]);
+  });
+
+  it("dayRun recovers the pending recheck first and never sends the note again (the reviewer's reproduction)", async () => {
+    stubPrice();
+    const state = { ...emptyState(), notes: [note({ noteId: 'cut', confirmedAt: 1, createdAt: 0 }), note({ noteId: 'fine', confirmedAt: 1, createdAt: 0 })] };
+    newOperation(state, 'cut', 'recheck', 1000); // pending from a dead run
+    const signer = scriptedSigner([{}, {}, {}]);
+    await dayRun({ origin: 'https://worker.test', signer, state, opts: { ...DEFAULTS, paidPerRun: 0, noLegacy: true }, persist: null });
+    expect(signer.sent.map(x => x.noteId)).toEqual(['fine']);
+    expect(state.quarantine[0]).toMatchObject({ noteId: 'cut' });
+    expect(state.operations[0]).toMatchObject({ pass: 'recheck', outcome: 'unknown' });
+  });
+
+  it('seedLegacy recovers pending operations too', async () => {
+    vi.stubGlobal('fetch', async () => new Response('3371193814', { status: 200 }));
+    const state = emptyState();
+    newOperation(state, 'cut', 'seed-legacy', 1000);
+    const signer = scriptedSigner([{ body: { txId: TX, status: 'accepted', committed: true } }]);
+    await seedLegacy({ origin: 'https://worker.test', signer, state, count: 0, opts: DEFAULTS, persist: null });
+    expect(state.operations[0]).toMatchObject({ outcome: 'unknown' });
+    expect(state.quarantine[0]).toMatchObject({ noteId: 'cut' });
   });
 });
 
@@ -210,7 +248,7 @@ describe('15: resolve is validated against the last reconcile only, never the wo
 
 describe('reconcile wiring: slice + point reads + observation + policy', () => {
   const t0 = Date.parse('2026-09-20T00:00:00Z');
-  const t1 = t0 + 3_600_000;
+  const t1 = t0 + 168 * 3_600_000;
   const journal = (records) => async (payload) => {
     if (payload.operationId) return { workerVersionId: VER, releaseSha: 'r', op: records.find(r => r.id === payload.operationId) ?? null };
     const inRange = records.filter(r => r.beganAt >= payload.from && r.beganAt <= payload.to);
@@ -223,10 +261,10 @@ describe('reconcile wiring: slice + point reads + observation + policy', () => {
   it('pages through the slice, point-reads unknown deliveries, records an observation, withholds without a policy', async () => {
     const seen = rec({}); const seen2 = rec({ beganAt: t0 + 2000 }); const seen3 = rec({ beganAt: t0 + 3000 });
     const lost = rec({ beganAt: t0 + 4000, status: 'begun', checkVerdict: 'ok', outcome: undefined, finishedAt: undefined, txId: undefined, attests: undefined });
-    const state = { ...emptyState(), release: { workerVersionId: VER }, operations: [
-      { id: seen.id, at: seen.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX },
-      { id: seen2.id, at: seen2.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX },
-      { id: seen3.id, at: seen3.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX },
+    const state = { ...emptyState(), release: { workerVersionId: VER, firstSeenAt: t0 }, operations: [
+      { id: seen.id, at: seen.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX, deduped: true },
+      { id: seen2.id, at: seen2.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX, deduped: true },
+      { id: seen3.id, at: seen3.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX, deduped: true },
       { id: lost.id, at: lost.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'unknown', cls: 'delivery_unknown' },
     ] };
     // The list read hides `lost` (a far-future beganAt would be outside; we
@@ -246,26 +284,59 @@ describe('reconcile wiring: slice + point reads + observation + policy', () => {
   it('with a policy but an unsettled wait: withheld; version mismatch: red', async () => {
     const policy = { allowances: { infrastructure: 2, resolvedManually: 1 }, approvedAt: '2026-09-13T00:00:00Z', approvedBy: 'owner' };
     const p = rec({ status: 'posting', paidResult: 'unknown', postingAt: t0 + 1200, decision: 'new', outcome: undefined, finishedAt: undefined });
-    const state = { ...emptyState(), release: { workerVersionId: VER }, operations: [
-      { id: p.id, at: p.beganAt, noteId: 'n', pass: 'publish', outcome: 'answered', cls: 'admitted', http: 200, txId: TX },
+    const state = { ...emptyState(), release: { workerVersionId: VER, firstSeenAt: t0 }, operations: [
+      { id: p.id, at: p.beganAt, noteId: 'n', pass: 'publish', outcome: 'answered', cls: 'admitted', http: 200, txId: TX, deduped: false },
     ] };
     const r1 = await reconcileWindow({ state, fetchOps: journal([p]), ownerPk: 'pk', from: t0, to: t1, policy, now: t1 + 10 });
     expect(r1.verdict).toBe('withheld');
     expect(r1.wait.outcome).toBe('waiting');
 
     const other = rec({ workerVersionId: 'someone-else' });
-    const state2 = { ...emptyState(), release: { workerVersionId: VER }, operations: [
-      { id: other.id, at: other.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX },
+    const state2 = { ...emptyState(), release: { workerVersionId: VER, firstSeenAt: t0 }, operations: [
+      { id: other.id, at: other.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX, deduped: true },
     ] };
     const r2 = await reconcileWindow({ state: state2, fetchOps: journal([other]), ownerPk: 'pk', from: t0, to: t1, policy, now: t1 + 10 });
     expect(r2.verdict).toBe('red');
     expect(r2.failures[0]).toMatch(/version_mismatch/);
   });
 
-  it('fetchJournalSlice refuses a version change mid-read', async () => {
-    let n = 0;
-    const flapping = async () => ({ workerVersionId: n++ === 0 ? 'a' : 'b', ops: [rec({})], cursor: n === 1 ? '2' : null });
+  it('P1-4: the journal read is strict — missing fields, a stuck cursor, a repeated record, a bad point read all throw', async () => {
+    const good = rec({});
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v' }), 'pk', 0, 10)).rejects.toThrow(/lacks releaseSha/);
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r' }), 'pk', 0, 10)).rejects.toThrow(/lacks `ops`/);
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r', ops: [] }), 'pk', 0, 10)).rejects.toThrow(/cursor/);
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r', ops: [good], cursor: 'same' }), 'pk', 0, 10)).rejects.toThrow(/repeated record|did not advance/);
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r', ops: [rec({})], cursor: 'c' }), 'pk', 0, 10)).rejects.toThrow(/did not advance/);
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r', ops: [{ ...good, token: 'leak' }], cursor: null }), 'pk', 0, 10)).rejects.toThrow(/token/);
+    await expect(fetchJournalSlice(async () => ({ workerVersionId: 'v', releaseSha: 'r', ops: [{ ...good, status: 'weird' }], cursor: null }), 'pk', 0, 10)).rejects.toThrow(/malformed: status/);
+    let m = 0;
+    const flapping = async () => ({ workerVersionId: m++ === 0 ? 'a' : 'b', releaseSha: 'r', ops: [rec({})], cursor: m === 1 ? '2' : null });
     await expect(fetchJournalSlice(flapping, 'pk', 0, 10)).rejects.toThrow(/version changed/);
+    // A valid two-page read.
+    let k = 0;
+    const paged = async () => (k++ === 0 ? { workerVersionId: 'v', releaseSha: 'r', ops: [good], cursor: 'p2' } : { workerVersionId: 'v', releaseSha: 'r', ops: [rec({})], cursor: null });
+    expect((await fetchJournalSlice(paged, 'pk', 0, 10)).ops).toHaveLength(2);
+    // Point reads: `op` must be present; null is an answer, absence is not.
+    await expect(fetchJournalRecord(async () => ({ workerVersionId: 'v', releaseSha: 'r' }), 'pk', good.id)).rejects.toThrow(/lacks `op`/);
+    expect(await fetchJournalRecord(async () => ({ workerVersionId: 'v', releaseSha: 'r', op: null }), 'pk', good.id)).toBeNull();
+    await expect(fetchJournalRecord(async () => ({ workerVersionId: 'v', releaseSha: 'r', op: rec({}) }), 'pk', good.id)).rejects.toThrow(/answered/);
+    expect(await fetchJournalRecord(async () => ({ workerVersionId: 'v', releaseSha: 'r', op: good }), 'pk', good.id)).toEqual(good);
+    expect(() => assertJournalRecord({ ...good, beganAt: 'x' })).toThrow(/beganAt/);
+  });
+
+  it('a short or wrong window is a DIAGNOSTIC report, never a verdict (P1-2)', async () => {
+    const policy = { allowances: { infrastructure: 2, resolvedManually: 1 }, approvedAt: '2026-09-13T00:00:00Z', approvedBy: 'owner' };
+    const s = rec({});
+    const state = { ...emptyState(), release: { workerVersionId: VER, firstSeenAt: t0 }, operations: [
+      { id: s.id, at: s.beganAt, noteId: 'n', pass: 'dedupe', outcome: 'answered', cls: 'admitted', http: 200, txId: TX, deduped: true },
+    ] };
+    const r = await reconcileWindow({ state, fetchOps: journal([s]), ownerPk: 'pk', from: t0, to: t0 + 72 * 3_600_000, policy, now: t1 + 10 });
+    expect(r.verdict).toBe('diagnostic');
+    expect(r.failures.join(' ')).toMatch(/72\.0 h/);
+    expect(r.classes).toEqual({ matched: 1 }); // the join is still reported
+    const r2 = await reconcileWindow({ state, fetchOps: journal([s]), ownerPk: 'pk', from: t0 + 5, to: t1 + 5, policy, now: t1 + 10 });
+    expect(r2.verdict).toBe('diagnostic');
+    expect(r2.failures.join(' ')).toMatch(/window start/);
   });
 
   it('parseArgs: reconcile window and resolve arguments', () => {
