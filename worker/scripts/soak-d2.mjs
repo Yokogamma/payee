@@ -37,8 +37,27 @@
  *                           METRICS_ADMIN_SECRET; `day` runs it automatically
  *                           when the secret is present.
  *   status                  progress against the volume criteria, from the
- *                           script's own ledger (the metrics are the truth —
- *                           this is the plan, not the verdict).
+ *                           script's own ledger (this is the plan, not the
+ *                           verdict) — and the unknown sends and quarantined
+ *                           notes that make a verdict impossible until
+ *                           `reconcile`.
+ *   reconcile --from T --to T
+ *                           the verdict (plan «soak D2 operation journal»
+ *                           v6.1 §6–§7): reads the worker's operation journal
+ *                           (POST /admin/ops, METRICS_ADMIN_SECRET) for the
+ *                           window, joins it with this ledger on operationId,
+ *                           records one observation of the unfinished records,
+ *                           and — once the wait has settled and the acceptance
+ *                           policy file exists — answers green or red with the
+ *                           reasons. Exit 0 green, 1 red, 3 withheld (waiting,
+ *                           or `acceptance-policy.json` missing/incomplete).
+ *   resolve <operationId> --txid T --evidence "…"
+ *                           the operator's decision that the SIGNED transaction
+ *                           of one unknown POST exists on the pool. Written to
+ *                           this ledger only; the journal is never changed; the
+ *                           note stays quarantined. Refused unless the journal
+ *                           record (from the last reconcile) carries an intent
+ *                           to POST, an unknown paid result and that very txId.
  *
  * Environment:
  *   SMOKE_URL             worker origin (default: the dev worker)
@@ -49,7 +68,14 @@
  *   SOAK_REDROP_RECHECK_TOTAL  window cap on recheck SENDS (default 12)
  *   SOAK_REDROP_LEGACY_TOTAL   window cap on legacy SENDS (default 8, a reserve)
  *   SOAK_PROBE_ORIGIN     gateway used to confirm a transaction (arweave.net)
- *   METRICS_ADMIN_SECRET  optional; enables `snapshot`
+ *   METRICS_ADMIN_SECRET  optional; enables `snapshot`, required by `reconcile`
+ *
+ * Acceptance policy (plan v6.1 §11): `<state dir>/acceptance-policy.json` —
+ *   { "allowances": { "infrastructure": N, "resolvedManually": N },
+ *     "approvedAt": "<ISO date>", "approvedBy": "<owner>" }
+ * The numbers are the OWNER's decision and have NO defaults in code: without
+ * the file, or with any field missing, `reconcile` answers «policy undefined»
+ * and issues no verdict at all (exit 3).
  *   ADMIN_SECRET          optional; lets `register` seed its own invite
  *
  * ⚠️ НЕ ДОБАВЛЯТЬ СЮДА SHEBANG. Файл импортируется soak-d2.test.mjs, а vite-node
@@ -69,6 +95,10 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import * as ed from '@noble/ed25519';
 import { classifySmokeTarget, AUTO_ALLOWED_WORKER_ORIGINS } from './smoke-target.mjs';
+import {
+  classifyAnswer, classifyThrow, quarantines, joinBooks, processingWait, validatePolicy, verdict as decideVerdict,
+  isValidOperationId, isValidTxId,
+} from './soak-reconcile.mjs';
 
 /** The worker that must be live for `seed-legacy`: PR-3a, before D2. */
 export const LEGACY_RELEASE_SHA = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
@@ -145,7 +175,97 @@ export function emptyState() {
      *  Written BEFORE the request leaves; paidPosts above counts only the
      *  successes and therefore cannot bound money. See the attempt ledger. */
     paidAttempts: { records: [], priorEra: null },
+    /** EVERY request this driver sent, of every pass, written `pending` before
+     *  it leaves and closed with the classified answer (soak-reconcile.mjs
+     *  §6.1) — the driver's half of the two books the verdict is read from. */
+    operations: [],
+    /** Notes with an unknown send: excluded from every pass until the window
+     *  ends. Nothing lifts a quarantine; a new ledger is a new window. */
+    quarantine: [],
+    /** The operator's resolutions of unknown POSTs, by operationId. */
+    resolutions: {},
+    /** Reconcile reports and the per-window observations of unfinished
+     *  journal records the processing wait is decided from. */
+    reconcile: [],
+    reconcileObservations: {},
+    /** The canonical public key the journal is addressed by (set by `day`). */
+    ownerPk: null,
   };
+}
+
+// ── The operations ledger (the driver's book) ─────────────────────────
+
+/**
+ * One record per request, of ANY pass, created BEFORE the request leaves —
+ * the id goes into the signed body as `operationId`, and is what the
+ * worker's journal is joined on. A paid publication's attempt record shares
+ * this id.
+ */
+export function newOperation(state, noteId, pass, at) {
+  state.operations ??= [];
+  const op = { id: crypto.randomUUID(), at, noteId, pass, outcome: 'pending' };
+  state.operations.push(op);
+  return op;
+}
+
+/** The answer, classified at receipt (§6.1) — never re-derived later. */
+export function recordAnswer(op, answer) {
+  const c = classifyAnswer(answer, op.id);
+  op.outcome = 'answered';
+  op.http = answer.status;
+  op.cls = c.cls;
+  if (c.code) op.code = c.code;
+  if (c.detail) op.detail = c.detail;
+  const body = answer.body;
+  if (body && typeof body === 'object' && typeof body.txId === 'string') op.txId = body.txId;
+  return c;
+}
+
+/** The send threw: nothing arrived, the outcome is unknown forever. */
+export function recordThrow(op, error) {
+  const c = classifyThrow(error);
+  op.outcome = 'unknown';
+  op.cls = c.cls;
+  op.detail = c.detail;
+  return c;
+}
+
+/** Quarantine the note behind an unknown send; idempotent per note. */
+export function quarantineNote(state, op, reason) {
+  state.quarantine ??= [];
+  if (state.quarantine.some(q => q.noteId === op.noteId)) return false;
+  state.quarantine.push({ noteId: op.noteId, operationId: op.id, reason, since: Date.now() });
+  return true;
+}
+
+export function quarantinedNoteIds(state) {
+  return new Set((state.quarantine ?? []).map(q => q.noteId));
+}
+
+/** Driver records inside a window, by `at`. */
+export function operationsIn(state, from, to) {
+  return (state.operations ?? []).filter(o => o.at >= from && o.at <= to);
+}
+
+/**
+ * The operator's resolution of ONE unknown POST — validated against the
+ * journal record the last `reconcile` fetched, never against the worker.
+ * Confirms the publication of the journaled txId; nothing else.
+ */
+export function applyResolve(state, operationId, { txId, evidence }, at) {
+  if (!isValidOperationId(operationId)) return { ok: false, reason: 'operationId must be a UUIDv4' };
+  if (typeof evidence !== 'string' || evidence.trim() === '') return { ok: false, reason: '--evidence is required (what was checked, where, when)' };
+  if (!isValidTxId(txId)) return { ok: false, reason: '--txid must be a 43-char transaction id' };
+  const report = (state.reconcile ?? []).at(-1);
+  if (!report) return { ok: false, reason: 'no reconcile report yet — run `reconcile` first' };
+  const record = report.records?.[operationId];
+  if (!record) return { ok: false, reason: 'the last reconcile holds no journal record for this operationId' };
+  if (typeof record.postingAt !== 'number') return { ok: false, reason: 'the record carries no intent to POST (no postingAt): nothing to confirm' };
+  if (record.paidResult !== 'unknown') return { ok: false, reason: `paidResult is ${record.paidResult}, not unknown: nothing to resolve` };
+  if (record.txId !== txId) return { ok: false, reason: `--txid ${txId} is not the journaled transaction ${record.txId}` };
+  state.resolutions ??= {};
+  state.resolutions[operationId] = { txId, evidence: evidence.trim(), at };
+  return { ok: true };
 }
 
 /**
@@ -182,8 +302,8 @@ export function redropSends(state) {
 // automatically is exactly the double-paid publication D2 exists to prevent.
 
 /** An attempt record, created before the request leaves. */
-export function newAttempt(noteId, at, mode) {
-  return { id: crypto.randomUUID(), at, noteId, mode, outcome: 'pending' };
+export function newAttempt(noteId, at, mode, id = crypto.randomUUID()) {
+  return { id, at, noteId, mode, outcome: 'pending' };
 }
 
 /**
@@ -328,9 +448,13 @@ export function planRun(state, opts, now) {
   // or one whose answer never arrived, spent the same AR. See attemptsSpent.
   const paidLeft = Math.max(0, opts.maxPaidTotal - attemptsSpent(state));
   const paid = Math.max(0, Math.min(opts.paidPerRun, paidLeft));
+  // A note behind an unknown send is out of EVERY pass for the rest of the
+  // window (§5): any of them can reach a paid POST, and a second send would be
+  // the double payment the journal exists to make visible, not to cause.
+  const quarantined = quarantinedNoteIds(state);
 
   const comparable = state.notes.filter(n => n.kind === 'paid' || n.backfilledAt);
-  const dedupe = [...comparable]
+  const dedupe = [...comparable].filter(n => !quarantined.has(n.noteId))
     .sort((a, b) => (a.dedupes ?? 0) - (b.dedupes ?? 0) || a.createdAt - b.createdAt)
     .slice(0, opts.dedupePerRun);
   // ── Redrop budget: two quotas, and the legacy half is a RESERVE ──
@@ -358,7 +482,7 @@ export function planRun(state, opts, now) {
   }
 
   const legacyReady = state.notes
-    .filter(n => n.kind === 'legacy' && !n.backfilledAt)
+    .filter(n => n.kind === 'legacy' && !n.backfilledAt && !quarantined.has(n.noteId))
     .sort((a, b) => a.createdAt - b.createdAt)
     .map(n => n.noteId);
   let legacyCandidates;
@@ -537,6 +661,10 @@ export function parseArgs(argv) {
     const a = rest[i];
     if (a === '--paid' || a === '--count') { opts[a.slice(2)] = Number(rest[++i]); continue; }
     if (a === '--invite') { opts.invite = String(rest[++i] ?? ''); continue; }
+    if (a === '--from' || a === '--to') { opts[a.slice(2)] = parseWhen(rest[++i]); continue; }
+    if (a === '--txid') { opts.txid = String(rest[++i] ?? ''); continue; }
+    if (a === '--evidence') { opts.evidence = String(rest[++i] ?? ''); continue; }
+    if (mode === 'resolve' && i === 0 && !a.startsWith('--')) { opts.operationId = a; continue; }
     if (a === '--dry-run') { opts.dryRun = true; continue; }
     // The two passes that can reach a paid redrop, switchable off explicitly.
     // A verification run against the soak wallet has no other way to promise
@@ -548,7 +676,17 @@ export function parseArgs(argv) {
   for (const k of ['paid', 'count']) {
     if (k in opts && !(Number.isInteger(opts[k]) && opts[k] >= 0)) throw new Error(`--${k} must be a non-negative integer`);
   }
+  for (const k of ['from', 'to']) {
+    if (k in opts && !Number.isFinite(opts[k])) throw new Error(`--${k} must be an ISO date or epoch milliseconds`);
+  }
   return { mode, opts };
+}
+
+/** `--from`/`--to`: ISO-8601 or epoch milliseconds → ms. */
+export function parseWhen(raw) {
+  if (raw === undefined) return NaN;
+  if (/^\d{10,}$/.test(raw)) return Number(raw);
+  return Date.parse(raw);
 }
 
 // ── IO ────────────────────────────────────────────────────────────────
@@ -575,7 +713,8 @@ export function v3Tags(ownerHash, noteId) {
   ];
 }
 
-async function makeSigner(privB64) {
+/** Exported for the transport test: one send, `redirect: 'error'`, the echo. */
+export async function makeSigner(privB64) {
   const priv = new Uint8Array(Buffer.from(privB64, 'base64'));
   if (priv.length !== 32) throw new Error('SMOKE_PRIVATE_KEY must be a base64 32-byte seed');
   const pub = await ed.getPublicKeyAsync(priv);
@@ -584,15 +723,20 @@ async function makeSigner(privB64) {
   async function signedPost(origin, path, payload) {
     const body = JSON.stringify(payload);
     const sig = b64(await ed.signAsync(await sha256(new TextEncoder().encode(body)), priv));
+    // ONE send, no retry, no redirect: a redirect would re-sign nothing and
+    // could re-deliver a paid request; an automatic retry would be the double
+    // send the ledger exists to prevent. `redirect: 'error'` makes a 3xx a
+    // thrown send — an unknown outcome, like any other lost answer.
     const resp = await fetch(new URL(path, origin), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Public-Key': pkB64, 'X-Signature': sig },
       body,
+      redirect: 'error',
     });
     const text = await resp.text();
     let parsed = text;
     try { parsed = JSON.parse(text); } catch { /* keep text */ }
-    return { status: resp.status, body: parsed };
+    return { status: resp.status, body: parsed, echo: resp.headers.get('X-Operation-Id') };
   }
   return {
     ownerHash,
@@ -806,7 +950,8 @@ export async function seedLegacy({ origin, signer, state, count, dryRun, opts, p
   let seeded = 0;
   for (let i = 0; i < planned; i++) {
     const note = { noteId: randomUuidV8(), c: b64(crypto.getRandomValues(new Uint8Array(64))), iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
-    const attempt = newAttempt(note.noteId, Date.now(), 'seed-legacy');
+    const op = newOperation(state, note.noteId, 'seed-legacy', Date.now());
+    const attempt = newAttempt(note.noteId, op.at, 'seed-legacy', op.id);
     try {
       await chargeAttempt(state, attempt, persist);
     } catch (e) {
@@ -815,12 +960,25 @@ export async function seedLegacy({ origin, signer, state, count, dryRun, opts, p
       break;
     }
 
-    let status, body;
+    let answer;
     try {
-      ({ status, body } = await signer.upload(origin, note));
+      answer = await signer.upload(origin, note, { operationId: op.id });
     } catch (e) {
+      recordThrow(op, e);
+      quarantineNote(state, op, 'send threw');
       attempt.outcome = 'unknown';
       attempt.detail = String(e?.message ?? e);
+      failures++;
+      log(`  UNKNOWN legacy ${note.noteId}: ${attempt.detail} — may be published; never retried automatically`);
+      await settle(attempt);
+      break;
+    }
+    const { status, body } = answer;
+    recordAnswer(op, answer);
+    if (quarantines(op)) {
+      quarantineNote(state, op, op.code ?? op.cls);
+      attempt.outcome = 'unknown';
+      attempt.detail = `${op.cls}${op.code ? ` (${op.code})` : ''} — ${op.detail ?? ''}`;
       failures++;
       log(`  UNKNOWN legacy ${note.noteId}: ${attempt.detail} — may be published; never retried automatically`);
       await settle(attempt);
@@ -920,12 +1078,28 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
     }
   };
 
+  /** Make an operation record durable BEFORE its request leaves — for the
+   *  passes that charge no attempt. A record that cannot be written is a
+   *  request nobody could join to the journal: refuse to send. */
+  const persistOp = async (op) => {
+    try {
+      if (persist) await persist();
+      return true;
+    } catch (e) {
+      stop(`ledger write failed before a ${op.pass} send (${e?.message ?? e}) — nothing was sent`);
+      return false;
+    }
+  };
+
   // 1. New paid publications.
   for (let i = 0; i < plan.paid; i++) {
     const note = { noteId: randomUuidV8(), c: b64(crypto.getRandomValues(new Uint8Array(64))), iv: b64(crypto.getRandomValues(new Uint8Array(12))) };
     // Durable BEFORE the request leaves: a ledger that will not take the
-    // attempt is a budget that bounds nothing, so refuse to send.
-    const attempt = newAttempt(note.noteId, Date.now(), 'day');
+    // attempt is a budget that bounds nothing, so refuse to send. The
+    // operation record and the attempt share one id — the one the worker's
+    // journal will hold.
+    const op = newOperation(state, note.noteId, 'publish', Date.now());
+    const attempt = newAttempt(note.noteId, op.at, 'day', op.id);
     try {
       await chargeAttempt(state, attempt, persist);
     } catch (e) {
@@ -933,9 +1107,9 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
       return finish(state, run);
     }
 
-    let status, body;
+    let answer;
     try {
-      ({ status, body } = await signer.upload(origin, note));
+      answer = await signer.upload(origin, note, { operationId: op.id });
     } catch (e) {
       // The answer never arrived. The POST may or may not have happened, so
       // the money may or may not be spent — and NOTHING may re-send this
@@ -943,12 +1117,28 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
       //
       // This is a STOP, not a note: a scheduler that sees exit 0 here would
       // record a healthy run over a publication nobody can account for.
+      recordThrow(op, e);
+      quarantineNote(state, op, 'send threw');
       attempt.outcome = 'unknown';
       attempt.detail = String(e?.message ?? e);
       stop(`paid ${note.noteId}: UNKNOWN outcome (${attempt.detail}) — the publication may exist; it is never retried automatically and needs a human`);
       await settle(attempt);
       // Stop the pass too: the next send would be planned from a ledger that
       // does not know what the last one did.
+      return finish(state, run);
+    }
+    const { status, body } = answer;
+    recordAnswer(op, answer);
+    if (quarantines(op)) {
+      // An answer that leaves the send unknown — `arweave_post_unknown` (the
+      // POST threw on the worker), `audit_unconfirmed` (a lost begin), an
+      // unclassifiable body — is treated exactly like no answer: unknown,
+      // quarantined, STOP. Never `error`: an error is a KNOWN failure.
+      quarantineNote(state, op, op.code ?? op.cls);
+      attempt.outcome = 'unknown';
+      attempt.detail = `${op.cls}${op.code ? ` (${op.code})` : ''} — ${op.detail ?? ''}`;
+      stop(`paid ${note.noteId}: UNKNOWN outcome (${attempt.detail}) — the publication may exist; it is never retried automatically and needs a human`);
+      await settle(attempt);
       return finish(state, run);
     }
 
@@ -979,9 +1169,27 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
     const note = byId.get(noteId);
     const wantsRecheck = plan.recheck.includes(noteId);
     // A plain dedupe answers from the DO and cannot reach the redrop path; a
-    // recheck asks the quorum and can. Only the latter is charged.
+    // recheck asks the quorum and can. Only the latter is charged — but BOTH
+    // are journaled before they leave: the verdict joins every send.
     if (wantsRecheck && !(await charge('recheck'))) return finish(state, run);
-    const { status, body } = await signer.upload(origin, note, wantsRecheck ? { recheck: true } : {});
+    const op = newOperation(state, noteId, wantsRecheck ? 'recheck' : 'dedupe', Date.now());
+    if (!(await persistOp(op))) return finish(state, run);
+    let answer;
+    try {
+      answer = await signer.upload(origin, note, { ...(wantsRecheck ? { recheck: true } : {}), operationId: op.id });
+    } catch (e) {
+      recordThrow(op, e);
+      quarantineNote(state, op, 'send threw');
+      stop(`${op.pass} ${noteId}: UNKNOWN outcome (${op.detail}) — the note is quarantined for the window`);
+      return finish(state, run);
+    }
+    const { status, body } = answer;
+    recordAnswer(op, answer);
+    if (quarantines(op)) {
+      quarantineNote(state, op, op.code ?? op.cls);
+      stop(`${op.pass} ${noteId}: UNKNOWN outcome (${op.cls}${op.code ? ` ${op.code}` : ''}) — the note is quarantined for the window`);
+      return finish(state, run);
+    }
     const verdict = classifyUpload(status, body, note.txId);
     if (verdict.kind === 'deduped') {
       note.dedupes = (note.dedupes ?? 0) + 1; run.deduped += 1;
@@ -1013,7 +1221,24 @@ export async function dayRun({ origin, signer, state, opts, dryRun, persist }) {
     // Charged even though no `recheck` flag is involved: an unproven D9 whose
     // quorum reads `dead` reaches the paid re-post by its own path.
     if (!(await charge('legacy'))) return finish(state, run);
-    const { status, body } = await signer.upload(origin, note);
+    const op = newOperation(state, noteId, 'legacy', Date.now());
+    if (!(await persistOp(op))) return finish(state, run);
+    let answer;
+    try {
+      answer = await signer.upload(origin, note, { operationId: op.id });
+    } catch (e) {
+      recordThrow(op, e);
+      quarantineNote(state, op, 'send threw');
+      stop(`legacy ${noteId}: UNKNOWN outcome (${op.detail}) — the note is quarantined for the window`);
+      return finish(state, run);
+    }
+    const { status, body } = answer;
+    recordAnswer(op, answer);
+    if (quarantines(op)) {
+      quarantineNote(state, op, op.code ?? op.cls);
+      stop(`legacy ${noteId}: UNKNOWN outcome (${op.cls}${op.code ? ` ${op.code}` : ''}) — the note is quarantined for the window`);
+      return finish(state, run);
+    }
     const verdict = classifyUpload(status, body, note.txId);
     if (verdict.kind === 'deduped') {
       note.backfilledAt = Date.now(); note.dedupes = (note.dedupes ?? 0) + 1;
@@ -1107,6 +1332,132 @@ function printStatus(state) {
   for (const row of summarize(state)) log(`  ${row.ok ? 'OK  ' : '    '} ${row.name}: ${row.have}/${row.need}`);
   const stops = state.runs.flatMap(r => (r.problems ?? []).filter(p => p.startsWith('STOP')));
   if (stops.length) { log('STOP markers in the ledger — the soak is NOT green:'); for (const s of stops) log(`  ${s}`); }
+  // The driver's book: unknown sends by pass, and the quarantine. Either one
+  // makes a verdict impossible until `reconcile` has read the journal.
+  const ops = state.operations ?? [];
+  const unknownByPass = {};
+  for (const o of ops) {
+    if (o.outcome === 'unknown' || o.outcome === 'pending' || o.cls === 'delivery_unknown') unknownByPass[o.pass] = (unknownByPass[o.pass] ?? 0) + 1;
+  }
+  const unknownTotal = Object.values(unknownByPass).reduce((a, b) => a + b, 0);
+  log(`operations: ${ops.length} sent; unknown ${unknownTotal}${unknownTotal ? ` (${Object.entries(unknownByPass).map(([k, v]) => `${k} ${v}`).join(', ')})` : ''}`);
+  const q = state.quarantine ?? [];
+  if (q.length) { log(`quarantine: ${q.length} note(s) out of every pass for the window:`); for (const e of q) log(`  ${e.noteId} since ${new Date(e.since).toISOString()} — ${e.reason}`); }
+  if (unknownTotal || q.length) log('  ! a verdict is IMPOSSIBLE from this ledger alone — run `reconcile` against the journal');
+  const last = (state.reconcile ?? []).at(-1);
+  if (last) log(`last reconcile: ${new Date(last.at).toISOString()} window ${new Date(last.window.t0).toISOString()}…${new Date(last.window.t1).toISOString()} → ${last.verdict}`);
+}
+
+// ── reconcile / resolve ───────────────────────────────────────────────
+
+async function adminOps(origin, secret, payload) {
+  const resp = await fetch(new URL('/admin/ops', origin), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${secret}` },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const text = await resp.text();
+  let body = text;
+  try { body = JSON.parse(text); } catch { /* keep text */ }
+  if (resp.status !== 200 || !body || typeof body !== 'object') {
+    throw new Error(`/admin/ops HTTP ${resp.status} ${String(text).slice(0, 160)}`);
+  }
+  return body;
+}
+
+/** The whole slice, page by page, plus the worker identity it was read under. */
+export async function fetchJournalSlice(fetchOps, ownerPk, from, to) {
+  const ops = [];
+  let cursor;
+  let identity = null;
+  for (;;) {
+    const page = await fetchOps({ ownerPk, from, to, limit: 500, ...(cursor ? { cursor } : {}) });
+    identity ??= { workerVersionId: page.workerVersionId ?? null, releaseSha: page.releaseSha ?? null };
+    if (page.workerVersionId !== identity.workerVersionId) throw new Error('worker version changed while reading the journal — read again');
+    ops.push(...(page.ops ?? []));
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  return { ops, identity };
+}
+
+/**
+ * One reconcile pass (§6–§7), IO-free apart from `fetchOps`: reads the slice
+ * and the point reads, records the observation, joins, decides the wait and
+ * — when the policy is defined and the wait settled — the verdict.
+ */
+export async function reconcileWindow({ state, fetchOps, ownerPk, from, to, policy, now = Date.now() }) {
+  const readUntil = now;
+  const { ops: slice, identity } = await fetchJournalSlice(fetchOps, ownerPk, Math.max(0, from - 5 * 60_000), readUntil);
+  const byId = new Map(slice.map(s => [s.id, s]));
+  const driverOps = operationsIn(state, from, to);
+  // Point reads for every driver record the slice does not show: a refused
+  // send must be absent, an unknown delivery may have a record.
+  for (const d of driverOps) {
+    if (byId.has(d.id)) continue;
+    if (d.cls !== 'refused' && d.cls !== 'delivery_unknown' && d.outcome !== 'unknown') continue;
+    const one = await fetchOps({ ownerPk, operationId: d.id });
+    if (one?.op) byId.set(d.id, one.op);
+  }
+  // Only operations BEGUN inside the window are the window's; the wider read
+  // exists so a late finish or a foreign operation is not missed.
+  const serverOps = [...byId.values()].filter(s => s.beganAt >= from - 5 * 60_000 && s.beganAt <= readUntil);
+
+  const key = `${from}-${to}`;
+  state.reconcileObservations ??= {};
+  const observations = state.reconcileObservations[key] ??= [];
+  const unfinished = serverOps.filter(s => s.status !== 'finished').map(s => s.id).sort();
+  observations.push({ at: now, unfinished });
+  const driverTerminal = driverOps.every(o => o.outcome === 'answered' || o.outcome === 'unknown');
+  const wait = processingWait({ t1: to, observations, driverTerminal, now });
+
+  const windowVersionId = state.release?.workerVersionId ?? identity.workerVersionId;
+  const { rows, versionMismatch } = joinBooks({ driverOps, serverOps, resolutions: state.resolutions ?? {}, windowVersionId, now });
+
+  const policyCheck = validatePolicy(policy);
+  let verdictName;
+  let failures = [];
+  if (versionMismatch) {
+    verdictName = 'red';
+    failures = [`version_mismatch: journal record ${versionMismatch.operationId} carries ${versionMismatch.seen}, window is ${versionMismatch.expected}`];
+  } else if (!policyCheck.ok) {
+    verdictName = 'withheld';
+    failures = [`acceptance policy undefined — missing: ${policyCheck.missing.join(', ')}`];
+  } else if (wait.outcome === 'waiting') {
+    verdictName = 'withheld';
+    failures = [`processing wait: ${wait.reason}`];
+  } else {
+    const v = decideVerdict({ rows, wait, policy, window: { t0: from, t1: to }, resolutions: state.resolutions ?? {}, now });
+    verdictName = v.green ? 'green' : 'red';
+    failures = v.failures;
+  }
+  const records = Object.fromEntries(serverOps.map(s => [s.id, s]));
+  const report = {
+    at: now, window: { t0: from, t1: to }, identity, windowVersionId, wait, verdict: verdictName, failures,
+    classes: countBy(rows.map(r => r.cls)),
+    rows: rows.map(r => ({ operationId: r.operationId, cls: r.cls, red: r.red, detail: r.detail })),
+    unfinished,
+    records,
+  };
+  state.reconcile ??= [];
+  state.reconcile.push(report);
+  return report;
+}
+
+function countBy(values) {
+  const out = {};
+  for (const v of values) out[v] = (out[v] ?? 0) + 1;
+  return out;
+}
+
+async function loadPolicy(stateDir) {
+  try {
+    return JSON.parse(await readFile(join(stateDir, 'acceptance-policy.json'), 'utf8'));
+  } catch (e) {
+    if (e?.code === 'ENOENT') return null;
+    throw e;
+  }
 }
 
 export async function main(argv) {
@@ -1151,8 +1502,15 @@ export async function main(argv) {
     printStatus(state);
     return 0;
   }
-  if (!['register', 'seed-legacy', 'day', 'snapshot'].includes(mode)) {
-    console.error('usage: soak-d2.mjs <register [--invite CODE] | seed-legacy --count N | day [--paid N] | snapshot | status | migrate-attempts> [--dry-run]');
+  if (mode === 'resolve') {
+    const res = applyResolve(state, cli.operationId, { txId: cli.txid, evidence: cli.evidence }, Date.now());
+    if (!res.ok) { console.error(`✗ resolve: ${res.reason}`); return 2; }
+    await saveState(statePath, state);
+    log(`resolved ${cli.operationId}: publication ${cli.txid} confirmed by the operator — journal unchanged, note stays quarantined; re-run reconcile`);
+    return 0;
+  }
+  if (!['register', 'seed-legacy', 'day', 'snapshot', 'reconcile'].includes(mode)) {
+    console.error('usage: soak-d2.mjs <register [--invite CODE] | seed-legacy --count N | day [--paid N] | snapshot | status | migrate-attempts | reconcile --from T --to T | resolve <operationId> --txid T --evidence "…"> [--dry-run]');
     return 2;
   }
 
@@ -1170,6 +1528,32 @@ export async function main(argv) {
     log(`register: ${signer.pkB64} on ${origin}`);
     return registerKey({ origin, signer, inviteCode: cli.invite, adminSecret: process.env.ADMIN_SECRET });
   }
+  // `reconcile` reads; it must work with the kill switches OFF (that is when
+  // a window is most likely being judged), so it goes before the gate.
+  if (mode === 'reconcile') {
+    const secret = process.env.METRICS_ADMIN_SECRET;
+    if (!secret) { console.error('✗ METRICS_ADMIN_SECRET is required for reconcile'); return 2; }
+    if (!(cli.from >= 0) || !(cli.to >= cli.from)) { console.error('✗ reconcile needs --from and --to (ISO or epoch ms), to >= from'); return 2; }
+    const ownerPk = state.ownerPk ?? (process.env.SMOKE_PRIVATE_KEY ? (await makeSigner(process.env.SMOKE_PRIVATE_KEY)).pkB64 : null);
+    if (!ownerPk) { console.error('✗ the ledger holds no ownerPk yet and SMOKE_PRIVATE_KEY is unset — nothing to address the journal by'); return 2; }
+    const policy = await loadPolicy(dirname(statePath));
+    const report = await reconcileWindow({
+      state, ownerPk, from: cli.from, to: cli.to, policy,
+      fetchOps: (payload) => adminOps(origin, secret, payload),
+    });
+    await saveState(statePath, state);
+    const dir = join(dirname(statePath), 'snapshots');
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `reconcile-${new Date(report.at).toISOString().replace(/[:.]/g, '-')}.json`);
+    await writeFile(file, JSON.stringify(report, null, 2) + '\n');
+    log(`reconcile: window ${new Date(report.window.t0).toISOString()} … ${new Date(report.window.t1).toISOString()} on ${report.identity.workerVersionId ?? '?'}`);
+    log(`  wait: ${report.wait.outcome}${report.wait.reason ? ` (${report.wait.reason})` : ''}; unfinished journal records: ${report.unfinished.length}`);
+    log(`  classes: ${Object.entries(report.classes).map(([k, v]) => `${k}=${v}`).join(' ') || 'none'}`);
+    for (const r of report.rows.filter(r => r.red)) log(`  RED ${r.cls} ${r.operationId} — ${r.detail}`);
+    for (const f of report.failures) log(`  ${report.verdict === 'withheld' ? 'WITHHELD' : 'FAIL'} ${f}`);
+    log(`  verdict: ${report.verdict.toUpperCase()}; report kept: ${file}`);
+    return report.verdict === 'green' ? 0 : report.verdict === 'red' ? 1 : 3;
+  }
   const gate = checkReleaseGate(health, mode, state, process.env.SOAK_RELEASE_SHA);
   if (!gate.ok) { console.error('✗ release gate:'); for (const p of gate.problems) console.error(`  - ${p}`); return 2; }
 
@@ -1186,6 +1570,7 @@ export async function main(argv) {
   if (state.ownerHash && state.ownerHash !== signer.ownerHash) { console.error('✗ state file belongs to another smoke identity'); return 2; }
   state.origin = origin;
   state.ownerHash = signer.ownerHash;
+  state.ownerPk = signer.pkB64;
 
   let failures;
   if (mode === 'seed-legacy') {
