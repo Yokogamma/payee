@@ -16,7 +16,22 @@
  * count; release frees a reserved slot (no quota spent, no attempt refunded).
  * Records carry a window `gen` for fixed-window isolation, and a `token` for
  * compare-and-swap on mark-posted/commit/release/redrop.
+ *
+ * Operation journal (plan «soak D2 operation journal» v6.1): NEXT TO the note
+ * records, never instead of them. `op:<operationId>` is written in the SAME
+ * storage transaction as the /check-and-reserve decision — the DO never awaits
+ * anything but its own storage between the read and the writes, so the SQLite
+ * implicit transaction covers both (a response lost on the way back to the
+ * worker leaves a `begun` record with the verdict, never a decision without a
+ * record). `note:*` transitions are UNCHANGED by the journal; it only observes.
  */
+
+import {
+  type OpBegin, type OpRecord, type OpAbortRequest, type OpFinishRequest, type OpPostingRequest,
+  applyAbort, applyFinish, applyPosting, newOpRecord, projectOp, isValidOpBegin, isPrunable,
+  opKey, opIndexKey, opIndexLowerBound, opIndexUpperBound, OP_INDEX_PREFIX, OP_META_KEY, type OpMeta,
+  OP_PRUNE_MIN_COUNT, OP_PRUNE_BATCH, DO_TERMINAL_VERDICTS,
+} from './op-journal';
 
 const WINDOW_MS = 3_600_000;        // 1 hour
 const RESERVE_TTL_MS = 600_000;     // 10 min — a reservation older than this is stale
@@ -58,7 +73,7 @@ interface Window { count: number; inFlight: number; attempts: number; resetAt: n
  *  is what a stored `fp` is compared against, and what a fresh reservation
  *  records. Optional so a caller that has not computed one still functions:
  *  the record is then written legacy-shaped, exactly as before D2. */
-interface CheckAndReserveRequest { noteId: string; limit: number; fp?: string }
+interface CheckAndReserveRequest { noteId: string; limit: number; fp?: string; op?: OpBegin }
 interface MarkPostedRequest { noteId: string; txId: string; token: string }
 interface CommitRequest { noteId: string; txId: string; token: string }
 interface ReleaseRequest { noteId: string; token: string }
@@ -113,6 +128,11 @@ export class RateLimiter implements DurableObject {
     if (url.pathname === '/release') return this.handleRelease(request);
     if (url.pathname === '/redrop') return this.handleRedrop(request);
     if (url.pathname === '/backfill-fp') return this.handleBackfillFp(request);
+    if (url.pathname === '/op-posting') return this.handleOpPosting(request);
+    if (url.pathname === '/op-abort') return this.handleOpAbort(request);
+    if (url.pathname === '/op-finish') return this.handleOpFinish(request);
+    if (url.pathname === '/op-get') return this.handleOpGet(request);
+    if (url.pathname === '/ops') return this.handleOps(request);
     return new Response('Not found', { status: 404 });
   }
 
@@ -131,10 +151,73 @@ export class RateLimiter implements DurableObject {
     return { count, inFlight, attempts, resetAt };
   }
 
+  /**
+   * /check-and-reserve = the unchanged decision (`decide`) plus the journal.
+   *
+   * Order matters and is the whole contract:
+   *   1. an `op.id` that already exists answers `op_reused` and touches NOTHING
+   *      — not the note record, not the journal (a repeated request can never
+   *      alter the operation of the call still running it);
+   *   2. the decision runs exactly as before the journal existed;
+   *   3. the `begun` record (or, for verdicts the DO decides terminally, the
+   *      `finished` one) is written with the verdict, in the same implicit
+   *      transaction as the reservation the decision may have made;
+   *   4. `opAccepted: true` rides on the answer — the worker treats an answer
+   *      without it as «the journal did not take this operation».
+   * A caller without `op` (older worker code, the DO tests of the note
+   * lifecycle) gets the bare decision, journal untouched.
+   */
   private async handleCheckAndReserve(request: Request): Promise<Response> {
-    const { noteId, limit, fp: requestedFp } = await request.json<CheckAndReserveRequest>();
+    const { noteId, limit, fp: requestedFp, op } = await request.json<CheckAndReserveRequest>();
     const now = Date.now();
 
+    if (op === undefined) {
+      const bare = await this.decide(noteId, limit, requestedFp, now);
+      return Response.json(bare.body, { status: bare.http });
+    }
+    if (!isValidOpBegin(op)) return Response.json({ status: 'op_invalid' });
+
+    const existing = await this.state.storage.get<OpRecord>(opKey(op.id));
+    if (op.retry === true) {
+      // The legacy path's second ask: same operation, continued.
+      if (!existing || existing.status !== 'begun' || existing.noteId !== noteId) {
+        return Response.json({ status: 'op_invalid' });
+      }
+      const decided = await this.decide(noteId, limit, requestedFp, now);
+      const verdict = String(decided.body.status);
+      await this.state.storage.put<OpRecord>(opKey(op.id), {
+        ...existing, checkVerdict: verdict, checkVerdicts: [...existing.checkVerdicts, verdict],
+      });
+      return Response.json({ ...decided.body, opAccepted: true }, { status: decided.http });
+    }
+    if (existing) return Response.json({ status: 'op_reused' });
+
+    const decided = await this.decide(noteId, limit, requestedFp, now);
+    const verdict = String(decided.body.status);
+    let record = newOpRecord(op, noteId, requestedFp, verdict, now);
+    const terminal = DO_TERMINAL_VERDICTS[verdict];
+    if (terminal) {
+      record = {
+        ...record, status: 'finished', finishedAt: now,
+        outcome: terminal.outcome, httpStatus: terminal.httpStatus, code: terminal.code,
+      };
+    }
+    await this.state.storage.put<OpRecord>(opKey(op.id), record);
+    await this.state.storage.put(opIndexKey(now, op.id), op.id);
+    const meta = (await this.state.storage.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
+    await this.state.storage.put<OpMeta>(OP_META_KEY, { count: meta.count + 1 });
+    if (meta.count + 1 > OP_PRUNE_MIN_COUNT) await this.pruneOps(now);
+    return Response.json({ ...decided.body, opAccepted: true }, { status: decided.http });
+  }
+
+  /**
+   * The decision as it was before the journal: every `return Response.json`
+   * became `return { http, body }` and nothing else moved. Reviewed CAS
+   * semantics (fp comparison, legacy snapshot, stale reservation) unchanged.
+   */
+  private async decide(
+    noteId: string, limit: number, requestedFp: string | undefined, now: number,
+  ): Promise<{ http: number; body: Record<string, unknown> }> {
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
 
     // ── The fingerprint comparison, in EVERY state that has a txId ──
@@ -159,7 +242,7 @@ export class RateLimiter implements DurableObject {
         // needs network I/O, and a Durable Object must not hold its input gate
         // across an external GET. So it hands out the snapshot and the
         // top-level worker comes back through /backfill-fp.
-        return Response.json({
+        return { http: 200, body: {
           status: 'legacy',
           snapshot: {
             status: record.status, txId: record.txId, token: record.token, gen: record.gen,
@@ -171,26 +254,26 @@ export class RateLimiter implements DurableObject {
           // would answer 503 forever.
           committedAt: record.committedAt ?? record.reservedAt ?? 0,
           postedAt: record.postedAt ?? record.reservedAt ?? 0,
-        });
+        } };
       }
       if (requestedFp !== undefined && record.fp !== requestedFp) {
         // The same id under DIFFERENT bytes. A typed conflict, never a silent
         // replay of the historical txId — that pair is exactly what the two
         // irreversible floors exist to make impossible.
-        return Response.json({
+        return { http: 200, body: {
           status: 'id_payload_conflict', txId: record.txId, state: record.status,
-        });
+        } };
       }
     }
 
     if (record?.status === 'committed') {
       // Matching fp (or a caller that computed none): the genuine dedupe.
-      return Response.json({
+      return { http: 200, body: {
         status: 'exists',
         txId: record.txId,
         committedAt: record.committedAt ?? record.reservedAt ?? now,
         deduped: true,
-      });
+      } };
     }
     if (record?.status === 'posted') {
       // Server-authoritative anchor for reconciling a lost commit.
@@ -200,15 +283,15 @@ export class RateLimiter implements DurableObject {
       // commit / 503 / redrop. Answering `committed: true` here would skip that
       // check, leave the DO unfinalized, and could pin a txId that has since
       // dropped out. `deduped` is reported only once the state is resolved.
-      return Response.json({
+      return { http: 200, body: {
         status: 'posted', txId: record.txId, postedAt: record.postedAt ?? now, token: record.token,
-      });
+      } };
     }
     if (record?.status === 'reserved' && now - (record.reservedAt ?? 0) < RESERVE_TTL_MS) {
       // A fresh reservation has no txId, so there is nothing to compare and
       // nothing to backfill — and no GET is performed. `in_progress` is the
       // whole answer.
-      return Response.json({ status: 'reserved' });
+      return { http: 200, body: { status: 'reserved' } };
     }
 
     // No record or a STALE reservation we replace — reuse its own inFlight slot.
@@ -216,8 +299,8 @@ export class RateLimiter implements DurableObject {
     const staleOwnSlot = record?.status === 'reserved' && record.gen === w.resetAt ? 1 : 0;
     const effectiveInFlight = Math.max(0, w.inFlight - staleOwnSlot);
 
-    if (w.count + effectiveInFlight >= limit) return Response.json({ status: 'rate_limited' }, { status: 429 });
-    if (w.attempts >= limit * ATTEMPT_FACTOR) return Response.json({ status: 'rate_limited' }, { status: 429 });
+    if (w.count + effectiveInFlight >= limit) return { http: 429, body: { status: 'rate_limited' } };
+    if (w.attempts >= limit * ATTEMPT_FACTOR) return { http: 429, body: { status: 'rate_limited' } };
 
     const token = crypto.randomUUID();
     await this.state.storage.put('inFlight', effectiveInFlight + 1);
@@ -227,7 +310,106 @@ export class RateLimiter implements DurableObject {
     await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
     }, requestedFp));
-    return Response.json({ status: 'ok', token });
+    return { http: 200, body: { status: 'ok', token } };
+  }
+
+  // ─── Operation journal ────────────────────────────────────────────
+
+  /** begun → posting: the signed txId and the decision, BEFORE the POST. The
+   *  note record must still be `reserved` under the caller's token — the
+   *  journal binds itself to a reservation the caller provably holds. */
+  private async handleOpPosting(request: Request): Promise<Response> {
+    const req = await request.json<OpPostingRequest>();
+    const record = await this.state.storage.get<OpRecord>(opKey(req.id));
+    let reservationOk = false;
+    if (record) {
+      const note = await this.state.storage.get<NoteRecord>(`note:${record.noteId}`);
+      reservationOk = !!note && note.status === 'reserved' && note.token === req.token;
+    }
+    const t = applyPosting(record, req, reservationOk, Date.now());
+    if (!t.ok) return Response.json({ ok: false, reason: t.reason });
+    await this.state.storage.put<OpRecord>(opKey(req.id), t.record);
+    return Response.json({ ok: true });
+  }
+
+  /** posting → finished(audit_aborted). Token-CAS only; see applyAbort. */
+  private async handleOpAbort(request: Request): Promise<Response> {
+    const req = await request.json<OpAbortRequest>();
+    const record = await this.state.storage.get<OpRecord>(opKey(req.id));
+    const t = applyAbort(record, req, Date.now());
+    if (!t.ok) return Response.json({ ok: false, reason: t.reason });
+    await this.state.storage.put<OpRecord>(opKey(req.id), t.record);
+    return Response.json({ ok: true });
+  }
+
+  /** begun|posting → finished. Idempotent; a different result is refused. */
+  private async handleOpFinish(request: Request): Promise<Response> {
+    const req = await request.json<OpFinishRequest>();
+    const record = await this.state.storage.get<OpRecord>(opKey(req.id));
+    const t = applyFinish(record, req, Date.now());
+    if (!t.ok) return Response.json({ ok: false, reason: t.reason });
+    if (t.record !== record) await this.state.storage.put<OpRecord>(opKey(req.id), t.record);
+    return Response.json({ ok: true });
+  }
+
+  private async handleOpGet(request: Request): Promise<Response> {
+    const { id } = await request.json<{ id: string }>();
+    if (typeof id !== 'string') return Response.json({ op: null });
+    const record = await this.state.storage.get<OpRecord>(opKey(id));
+    return Response.json({ op: record ? projectOp(record) : null });
+  }
+
+  /**
+   * Time-ordered slice of the journal, `from..to` by `beganAt` (ms, inclusive
+   * both ends), paged by `cursor` (the last index key of the previous page).
+   * Never the token. `limit` is capped here as well as in the worker.
+   */
+  private async handleOps(request: Request): Promise<Response> {
+    const { from, to, cursor, limit } = await request.json<{
+      from: number; to: number; cursor?: string; limit?: number;
+    }>();
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) {
+      return Response.json({ ops: [], cursor: null, error: 'bad_range' });
+    }
+    const pageSize = Math.min(500, Math.max(1, Number.isInteger(limit) ? (limit as number) : 100));
+    const lower = opIndexLowerBound(from);
+    const upper = opIndexUpperBound(to);
+    const start = typeof cursor === 'string' && cursor > lower && cursor.startsWith(OP_INDEX_PREFIX)
+      ? cursor : lower;
+    // A cursor is the last key of the previous page: resume strictly AFTER it.
+    const page = await this.state.storage.list<string>({
+      ...(start !== lower ? { startAfter: start } : { start }), end: upper, limit: pageSize + 1,
+    });
+    const entries = [...page.entries()];
+    const hasMore = entries.length > pageSize;
+    const slice = hasMore ? entries.slice(0, pageSize) : entries;
+    const ops = [];
+    for (const [, id] of slice) {
+      const record = await this.state.storage.get<OpRecord>(opKey(id));
+      if (record) ops.push(projectOp(record));
+    }
+    const nextCursor = hasMore && slice.length > 0 ? slice[slice.length - 1][0] : null;
+    return Response.json({ ops, cursor: nextCursor });
+  }
+
+  /** Oldest FINISHED, non-unknown, aged records go; everything unresolved
+   *  stays. Bounded work per call (one batch) — the journal is small on the
+   *  dev contour and this only has to keep it from growing without bound. */
+  private async pruneOps(now: number): Promise<void> {
+    const page = await this.state.storage.list<string>({ prefix: OP_INDEX_PREFIX, limit: OP_PRUNE_BATCH });
+    let removed = 0;
+    for (const [indexKey, id] of page.entries()) {
+      const record = await this.state.storage.get<OpRecord>(opKey(id));
+      if (!record) { await this.state.storage.delete(indexKey); continue; }
+      if (!isPrunable(record, now)) continue;
+      await this.state.storage.delete(opKey(id));
+      await this.state.storage.delete(indexKey);
+      removed += 1;
+    }
+    if (removed > 0) {
+      const meta = (await this.state.storage.get<OpMeta>(OP_META_KEY)) ?? { count: 0 };
+      await this.state.storage.put<OpMeta>(OP_META_KEY, { count: Math.max(0, meta.count - removed) });
+    }
   }
 
   /** Record a successful Arweave POST BEFORE commit, so a lost commit stays

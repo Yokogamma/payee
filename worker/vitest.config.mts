@@ -54,6 +54,8 @@ export default defineConfig({
       'test/admin-metrics.test.ts',
       'test/trusted-owners.test.ts',
       'test/legacy-backfill-e2e.test.ts',
+      'test/op-journal-e2e.test.ts',
+      'test/admin-ops.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that
