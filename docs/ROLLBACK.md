@@ -1871,45 +1871,139 @@ deploy. Neither is an Environment variable, so there is nothing to click:
    unmerged and Pages undeployed throughout. See «Soak criteria» below.
 5. Record the release row below with the real SHA, run id and version id.
 
-### Soak criteria (CONFIRMED by review, 2026-09-02)
+### Soak criteria — v2, judged from the operation journal (DRAFT, PR-C)
 
-The instrument is the `semantic_idempotency` event (docs/METRICS.md), read as
-`POST /admin/metrics {"report":"semantic_idempotency","hours":24}` — **daily,
-as a 24-hour snapshot, kept**. The report is an aggregate capped at 168 hours;
-it cannot show a trend, and several criteria below are trends. A soak without
-the daily snapshots is a calendar, not a measurement.
+> **Статус этого раздела.** Принят после PR #166/#167 и живой проверки
+> 2026-09-13. Смысл требований не изменён; изменён **источник доказательства**.
+> Начало окна `T0` и численные допуски **утверждены владельцем 2026-09-14**
+> («соглашаюсь с твоими предложениями» по рекомендации ревьюера от
+> 2026-09-13). Прежняя редакция (2026-09-02, вердикт из Analytics Engine) ниже
+> сохранена как «v1» для истории.
 
-This is a COVERAGE gate: it proves the release's paths were exercised and
-none refused wrongly. It is not a statistical bound on the error rate — a
-claim like «< 5 %» would need on the order of 60 relevant decisions with no
-refusal, which this window does not promise.
+**Почему не телеметрия.** Analytics Engine — взвешенная выборка по индексу,
+Workers Logs — тоже выборка по признанию самого хранилища (недостача 2 из 260
+контрольных инвокаций, взвешенные строки `sampleInterval`; docs/METRICS.md
+«Sampling», «Проверка доставки»). Отсутствие строки в них не доказывает
+отсутствие события, а критерии ниже — утверждения именно об отсутствии.
+Поэтому вердикт читается из **двух книг** (план «soak D2 operation journal»
+v6.1, `worker/src/op-journal.ts`, `worker/scripts/soak-reconcile.mjs`):
 
-**Window:** **168 continuous hours on ONE worker version id.** A redeploy, or
-any change to `TRUSTED_OWNERS` / `PAYLOAD_GATEWAYS` / the upload switches,
-resets the window to zero.
+1. **журнал операций воркера** — запись каждой допущенной операции `/upload`
+   в Durable Object владельца, `begun` в той же транзакции, что и решение по
+   резервации, до любого платного действия; `posting` с подписанным txId и
+   решением до POST; `finished` до ответа. Что не закрыто — остаётся видимым.
+   Читается через `POST /admin/ops` (docs/METRICS.md «The operation journal»);
+2. **ledger драйвера** — каждая отправка любого прохода записана `pending`
+   до ухода запроса, с тем же `operationId`, что уходит в подписанном теле,
+   и закрыта классифицированным ответом (§6.1 плана).
 
-**Volume:** at least **30** `semantic_idempotency` decisions spread over at
-least **3 distinct days**; within them at least **10** `deduped`, **3**
-`legacy_backfilled` for **distinct** legacy records, **1**
-`recovery_reconciled`; and at least **20** paid outcomes
-(`upload_outcome` total).
+Analytics Engine и Workers Logs остаются **диагностикой**: распределения,
+задержки, расследование причин. В вердикте они не участвуют.
 
-**Exit — ALL of the following over the whole window:**
+**Три факта, которые приёмка не смешивает:**
+
+- *публикация подтверждена* — только подписанным txId из журнала, найденным
+  на пуле шлюзов (для неизвестного POST — решением оператора `resolve` с
+  уликой);
+- *решение обработчика подтверждено* — записью `finished` с исходом либо
+  вердиктом DO (`checkVerdict`), сохранённым в транзакции `begin`;
+- *отправки не было* — **ни одним автоматическим правилом** не
+  устанавливается. Неизвестная доставка без записи — красное; выход только
+  новым окном (протокол закрытия допуска — §8 плана, не реализован).
+
+**Область приёмки O.** Все операции `/upload` владельца соака (один
+публичный ключ), допущенные за аутентификацию и валидацию до
+`/check-and-reserve`, на воркере с одним `workerVersionId`, начатые в
+`[T0, T1]`. Ответы из закрытого перечня до допуска
+(`worker/src/upload-codes.json`, без эха `X-Operation-Id`) — вне O.
+Запросы других владельцев — вне O; про них AE за 168 ч даёт только выборочное
+подтверждение. Это **сужение** области относительно «всех событий воркера»,
+принятое явно.
+
+**Окно.** 168 непрерывных часов на ОДНОМ `workerVersionId`. `T0` — момент,
+когда драйвер впервые увидел эту версию (`release.firstSeenAt` в ledger);
+`reconcile` принимает `--from` только равным ему. `T1` не раньше `T0 + 168 ч`
+и уже в прошлом. Редеплой или смена `TRUSTED_OWNERS` / `PAYLOAD_GATEWAYS` /
+выключателей — новое окно и новый ledger.
+
+**УТВЕРЖДЕНО владельцем 2026-09-14.** Для версии
+`7502b47a-32b4-44b0-8409-bdba0e064774` (кандидат `11cc3f71…`) первый
+`day`-прогон — живая проверка 2026-09-13 — зафиксировал
+`T0 = 2026-09-13T19:28:19Z`; минимальные 168 ч истекают
+2026-09-20T19:28:19Z. Текущий ledger сохраняется, две проверочные операции
+(одна платная публикация и её дедуп) входят в окно.
+
+**Объём** — те же числа, читаются из журнала (`finished`-записи окна и их
+`attests`), не из плана драйвера: не менее **30** решений
+`semantic_idempotency` за не менее **3** календарных дней; среди них не менее
+**10** `deduped` и **3** `legacy_backfilled` по РАЗНЫМ заметкам;
+`recovery_reconciled` — отменён владельцем 2026-09-07 (не достижим ни одним
+клиентом); не менее **20** платных исходов (`UPLOAD_OUTCOMES`, см. ниже).
+
+**Exit — ВСЕ условия одновременно, вычисляются `soak-d2.mjs reconcile`:**
+
+| Проверяемое свойство | Источник | Критерий |
+|---|---|---|
+| одни и те же байты и `noteId` не дают другой txId; нет неожиданных конфликтов | `finished` с исходом или attest `conflict`, `redrop_conflict`, `legacy_not_ours`, `recovery_conflict`; незавершённая `begun` с `checkVerdict = id_payload_conflict` | **строго 0** |
+| дефект собственной подготовки платного пути | исход `arweave_throw` (throw в JWK / createTransaction / sign — фаза `prepare`) | **строго 0** |
+| отказы шлюза до POST | исход `gateway_unavailable_pre_post` (anchor/price) | инфраструктурный инцидент — допуск владельца: **≤ 2 суммарно с `audit_aborted`**, каждый расследован, **0 в последние 48 ч** |
+| отмена до POST при потерянном подтверждении журнала | исход `audit_aborted` (`/op-abort` с токеном, только из `posting`) | инфраструктурный инцидент — тот же допуск |
+| неизвестность POST | исход `post_unknown` / запись `posting` | красное, пока оператор не разрешил `resolve` с уликой; разрешённых — **≤ 1** за окно |
+| нет неучтённых результатов | ни одной записи `begun`/`posting`/`paidResult: unknown` без разрешения; ни одной отправки драйвера без записи при полученном ответе; ни одной чужой операции | **0**, без допуска |
+| `legacy_unproven`, `recovery_unproven` | attest/исход в журнале | **≤ 1 каждый** за окно, каждый расследован, **0 в последние 48 ч** |
+| доля успешных публикаций | `accepted` (+ разрешённые вручную) ÷ `UPLOAD_OUTCOMES` = {`accepted`, `arweave_error`, `arweave_throw`, `gateway_unavailable_pre_post`, `post_unknown`} — эквивалент прежнего `upload_outcome` | **≥ 95 %**; оговорка о базовой линии остаётся: 7-дневной базы нет, абсолютный порог |
+| скорость и качество шлюзов; причины ошибок | Analytics Engine; Workers Logs | диагностика, в вердикт не входят |
+
+Все допуски живут в **`<state dir>/acceptance-policy.json`**
+(`{ "allowances": { "infrastructure": N, "resolvedManually": N },
+"approvedAt", "approvedBy" }`) и **не имеют значений по умолчанию в коде**:
+без файла или без любого поля `reconcile` отвечает «политика приёмки не
+определена» и вердикта не выдаёт. **Утверждено владельцем 2026-09-14, до
+возобновления прогонов:** `infrastructure ≤ 2` (суммарно, каждый
+расследован, 0 в последние 48 ч), `resolvedManually ≤ 1`; неразрешённые
+исходы и строгие нули — 0 (это правило зашито в сверке, не число политики).
+Файл создан оператором в тот же день с этими значениями.
+
+**Закрытие окна (§7 плана):**
+
+1. `T1` объявлен, драйвер больше не отправляет.
+2. `soak-d2.mjs reconcile --to <T1>` читает срез журнала `[T0 − 5 мин, now]`
+   и точечные записи, сохраняет **наблюдение** незавершённых записей,
+   соединяет книги по `operationId` (§6.2: `matched`, `resolved_by_server`,
+   `refused_before_admission`, `aborted_before_post`, `resolved_manually` —
+   зачёт; всё остальное — красное) и решает **ожидание обработки**:
+   `settled_empty`, `settled_with_unfinished` (множество не менялось 60 мин),
+   `capped` (меняется спустя 2 ч — красное), `waiting` (повторить позже).
+3. Незавершённые серверные записи перечисляются как факты; `posting` с txId
+   оператор может разрешить `soak-d2.mjs resolve <id> --txid <txId>
+   --evidence "…"` — только по записи последнего `reconcile`, только при
+   `postingAt` и `paidResult: unknown`, только с тем же txId; запись в
+   журнале не меняется, заметка остаётся в карантине.
+4. Вердикт: `green` (exit 0) только при всех условиях таблицы, соблюдённых
+   допусках и уликах у каждого разрешения; `red` (1) с перечнем причин;
+   `withheld` (3) — политика не определена или ожидание не завершено;
+   `diagnostic` (3) — окно не соака (короче 168 ч, не с `T0` ledger, не
+   завершено). Отчёт — `snapshots/reconcile-<ts>.json`, прикладывается к
+   строке релиза вместе с подписью оператора.
+
+Красный критерий расследуется, а не пережидается: флор НЕ поднимается и стек
+бэкапа не мержится, пока причина не названа. Исправление воркера — новое
+окно.
+
+#### Soak criteria — v1 (2026-09-02, superseded by v2 above, kept for history)
+
+Инструмент v1 — событие `semantic_idempotency` в Analytics Engine, читаемое
+как `POST /admin/metrics {"report":"semantic_idempotency","hours":24}`
+ежедневно; вердикт из AE. Это построение опровергнуто замерами 2026-09-08 …
+2026-09-12 (docs/METRICS.md «Sampling», «Проверка доставки»): выборочный канал
+не подтверждает строгий ноль. Таблица v1 для справки:
 
 | outcome | criterion | why |
 |---|---|---|
 | `conflict`, `redrop_conflict`, `legacy_not_ours`, `recovery_conflict` | **strictly 0** | no released client can change bytes under a reused id; each is a protocol defect, a mismatched pointer or an attack, and needs a human |
-| `arweave_throw` (`upload_outcomes`) | **strictly 0** | a throw on the paid path is a bug in the release, never weather |
+| `arweave_throw` (`upload_outcomes`) | **strictly 0** | v1 said «never weather»; in fact one `catch` covered anchor/price GETs too — split in v2 into `arweave_throw` (own preparation) and `gateway_unavailable_pre_post` |
 | `legacy_unproven`, `recovery_unproven` | **≤ 1 each** over the window, each one investigated, and **0 in the final 48 hours** | transport failures happen; a second one, or one near the end, means the pool or the verifier is broken |
-| paid success rate (`accepted` ÷ all `upload_outcome`) | **≥ 95 %**, and **no worse than the saved pre-release 7-day baseline by more than 5 p.p.** | the release did not change how paid publications end — save the baseline BEFORE deploying, it cannot be reconstructed after |
-
-`legacy_backfill_stale` and `legacy_dead_deferred` are informational: they say
-a race or a transient happened and was handled, not that something is wrong.
-
-A red criterion is investigated, not waited out: the floor is NOT raised and
-the backup stack stays unmerged until the cause is named. A fix to the worker
-restarts the window — which is why telemetry defects are fixed BEFORE the
-first deploy, never after.
+| paid success rate (`accepted` ÷ all `upload_outcome`) | **≥ 95 %**, and **no worse than the saved pre-release 7-day baseline by more than 5 p.p.** | the release did not change how paid publications end |
 
 ### Producing the volume — `worker/scripts/soak-d2.mjs`
 
@@ -1941,7 +2035,14 @@ Order, and the reason each step sits where it does:
    `SOAK_RELEASE_SHA=<candidate>` set: the script gates on the live
    `releaseSha`, on the marker, and on ONE `workerVersionId` for the whole
    ledger (a redeploy is a new window, and the script says so instead of
-   continuing). Each run publishes new notes, re-sends every earlier note with
+   continuing). Since #167 every send of every pass is written to the ledger
+   `pending` BEFORE it leaves and carries `operationId` in the signed body;
+   an unknown send (exception, unclassifiable answer, `arweave_post_unknown`,
+   a lost `begin`) quarantines the note for the rest of the window and STOPs
+   the run — nothing lifts a quarantine. Run the driver ONLY through a
+   wrapper that pins the reviewed driver commit (the operator's
+   `run-from-worktree.sh` refuses unless the worktree HEAD equals
+   `SOAK_DRIVER_SHA` and `worker/scripts`, `worker/src` are clean). Each run publishes new notes, re-sends every earlier note with
    its EXACT bytes (that is the only thing it ever re-sends — a conflict is a
    STOP, never a retry), asks `recheck` on confirmed notes older than 24 h,
    and re-sends a seeded legacy note only once `/tx/<id>/status` shows ≥ 2
@@ -1951,8 +2052,10 @@ Order, and the reason each step sits where it does:
    on the limit — at `--paid 3` × 7 it is one spare attempt and zero spare
    days; see «Бюджет перезапускаемого окна» below and choose deliberately.
    The dedupe pass grows with the ledger and clears 10 by day 2.
-4. `status` at any time: progress against the volume, from the ledger. The
-   metrics are the verdict; the ledger is the plan.
+4. `status` at any time: progress against the volume from the ledger, plus
+   the unknown sends by pass and the quarantine — either one means «no
+   verdict from this ledger alone». The verdict is `reconcile` (v2 above);
+   the ledger is the plan.
 
 #### Бюджет перезапускаемого окна — зафиксирован 2026-09-10
 
@@ -2034,8 +2137,13 @@ redrop-способных отправок = **до 50**. В деньгах эт
 
 Строка «confirmed paid publications in the window (plan; criterion =
 upload_outcome in AE)» в `soak-d2.mjs status` считает подтверждённые успехи
-драйвера — это ПЛАН, а не вердикт. Вердикт даёт Analytics Engine, и там и
-знаменатель другой, и полнота не гарантирована.
+драйвера — это ПЛАН, а не вердикт. **С v2 критериев вердикт даёт `reconcile`
+по журналу**: знаменатель — записи с исходом из `UPLOAD_OUTCOMES`, числитель —
+`accepted` плюс разрешённые вручную; AE больше не источник вердикта, но
+рассуждение «объём ≠ здоровье» остаётся в силе — окно, добравшее объём за
+счёт `arweave_throw`, провалит строгий ноль. И ещё раз о словах: «N left
+under SOAK_MAX_PAID_TOTAL» — это оставшиеся слоты ПОПЫТОК, не запас сверх
+цели; после первой подтверждённой публикации до 20 остаётся 19.
 
 #### Подтверждение посева — до открытия окна
 
@@ -2180,6 +2288,7 @@ gh workflow run deploy-worker.yml --ref main \
 | tag | SHA | run id | worker version id | smoked |
 |---|---|---|---|---|
 | _(none — tags are labels, the gate reads SHAs)_ | `d65e352da5b1314c08e56e4045cab2d6e655713b` | [34125361606](https://github.com/Yokogamma/payee/actions/runs/34125361606) | `a2ea9d8a-c03e-4cd9-a4eb-80f7d5e53400` | green, `normal` profile, `semanticIdempotency: 1` proven, 2026-09-07 13:05 UTC |
+| _(none)_ | `11cc3f7120befec282e8228806dbe9e491e8fd68` — main after #166 (journal, PR-A) + #167 (driver, PR-B); driver commit `a843143e0db51be2e691a5f06e8f09fe97a7e81e` | [34777152412](https://github.com/Yokogamma/payee/actions/runs/34777152412) | `7502b47a-32b4-44b0-8409-bdba0e064774` | green, `normal` profile, 2026-09-13 19:16 UTC. Negative check passed the same evening (free dedupe under a fresh `operationId` → journal `finished/deduped/none` with the ledger's txId and no POST intent; the same id again → `409 operation_id_reused`, record byte-identical; evidence `snapshots/negative-check-11cc3f7-2026-09-13.txt`). Live check passed (owner-sanctioned): one paid publication `H6OTYy_AAqKtLfD_jy8zo29WCu18wi3MhIF8VPiF0Dw` + its dedupe → `reconcile`: `matched = 2`, wait `settled_empty`, verdict `DIAGNOSTIC` (window 0 h, policy undefined) — exit 3, as expected. `/admin/metrics` reads unavailable (HTTP 502) since 2026-09-10 — a diagnostics fault, not an empty dataset. **Soak window v2 opened at `T0 = 2026-09-13T19:28:19Z` (recorded by the first `day` run); T0, the current ledger and the allowances approved by the owner 2026-09-14; `acceptance-policy.json` created the same day; daily `day --paid 3` runs resumed 2026-09-14.** |
 
 The candidate is `d65e352` and not `5881da2` (the #136 merge): the first
 dispatch of `5881da2` ([run 34124396448](https://github.com/Yokogamma/payee/actions/runs/34124396448))
