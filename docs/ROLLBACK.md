@@ -1864,7 +1864,11 @@ deploy. Neither is an Environment variable, so there is nothing to click:
 
 1. Merge the PR to `main` (branch protection; the gate runs on the candidate).
 2. Dispatch **Deploy Worker (proxy) — dev** with the merged SHA as `candidate`.
-   `WORKER_FLOOR_SHA` is NOT raised yet — see below.
+   `WORKER_FLOOR_SHA` is NOT raised yet — see below. Secrets listed in the
+   co-deploy registry (docs/SECRETS.md «Co-deployed secrets») ride in the SAME
+   activation from the `dev` Environment — a secret that must change together
+   with the code is set there BEFORE the dispatch, never with `wrangler secret
+   put` (that is an activation of its own and resets a soak window).
 3. Watch the post-deploy smoke: it now fails a build that does not advertise
    `semanticIdempotency`, so a green smoke is the proof the capability shipped.
 4. **Soak** — measurable, or it is not a soak. The backup stack stays

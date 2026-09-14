@@ -32,6 +32,20 @@
  *   NEIGHBOURING step, the gate saw an empty variable and refused a correct
  *   pool — a red deploy for a config that was right.
  *
+ * Invariant D — every `${{ secrets.* }}` reference lives in a job that runs
+ *   under an `environment:` (where the platform's deployment-branch policy
+ *   applies) and only as `with.apiToken` or as an `env:` value of a `run:`
+ *   step. The tokenless test-candidate job must never carry a secret, and a
+ *   secret must never be an argument (`with.command`, `run:`).
+ *
+ * Invariant E — co-deployed secrets (`--secrets-file`) leave nothing behind.
+ *   Wherever a `with.command` carries `--secrets-file <path>`: the path is
+ *   under `${{ runner.temp }}` (outside the checkout, never an artifact),
+ *   the SAME job has a `run:` step preparing it whose `env:` carries the
+ *   secrets and whose text never echoes them, and a LATER `if: always()`
+ *   step in the same job removes that file. A file that survived a failed
+ *   deploy on a runner is the leak this guards against.
+ *
  * HONEST LIMIT (do not oversell this check): it catches syntax variation,
  * not deliberate obfuscation — e.g. an identifier assembled via format().
  * That class is caught in review, not statically. It also lives in the
@@ -48,6 +62,10 @@ import { load } from 'js-yaml';
 const TOKEN_IDENTIFIER = 'CLOUDFLARE_API_TOKEN';
 const WRANGLER_ACTION_SHA_RE = /^cloudflare\/wrangler-action@[0-9a-f]{40}$/;
 const EXPRESSION_RE = /\$\{\{[\s\S]*?\}\}/;
+/** Any `${{ secrets.X }}` / `${{ secrets['X'] }}` reference (invariant D). */
+const SECRETS_REF_RE = /\$\{\{[^}]*\bsecrets\s*[.[]/;
+/** The path may begin with an expression containing spaces: `${{ runner.temp }}/x`. */
+const SECRETS_FILE_RE = /--secrets-file\s+((?:\$\{\{[^}]*\}\})?\S*)/;
 
 /** Invariant C: gate script → the variable it reads (skipped under --repo-only). */
 const GATE_ENV = Object.freeze({
@@ -125,6 +143,55 @@ export function checkWorkflowInvariants(files) {
       });
     }
 
+    // Invariant D: secrets only under an environment, only in the two shapes.
+    walkScalars(doc, [], (value, path) => {
+      if (typeof value !== 'string' || !SECRETS_REF_RE.test(value)) return;
+      const jobName = path[0] === 'jobs' ? path[1] : undefined;
+      const job = jobName !== undefined ? doc.jobs?.[jobName] : undefined;
+      const where = path.join('.');
+      if (!job || job.environment === undefined) {
+        violations.push(`${name}: secrets reference outside an environment-bound job — at ${where}`);
+        return;
+      }
+      const step = path[2] === 'steps' && typeof path[3] === 'number' ? job.steps?.[path[3]] : undefined;
+      const asApiToken = path.length === 6 && path[4] === 'with' && path[5] === 'apiToken';
+      const asRunEnv = path.length === 6 && path[4] === 'env' && typeof step?.run === 'string';
+      if (!asApiToken && !asRunEnv) {
+        violations.push(
+          `${name}: secrets reference must be with.apiToken or env: of a run: step — at ${where}`,
+        );
+      }
+    });
+
+    // Invariant E: --secrets-file is prepared in the job, kept in runner.temp, and removed always.
+    for (const [jobName, job] of Object.entries(doc.jobs ?? {})) {
+      (job?.steps ?? []).forEach((step, i) => {
+        const command = typeof step?.with?.command === 'string' ? step.with.command : '';
+        const m = SECRETS_FILE_RE.exec(command);
+        if (!m) return;
+        const file = m[1];
+        const at = `${name}: jobs.${jobName}.steps.${i}`;
+        if (!file.startsWith('${{ runner.temp }}/')) {
+          violations.push(`${at}: --secrets-file must point under \${{ runner.temp }}, got ${file}`);
+        }
+        const basename = file.slice(file.lastIndexOf('/') + 1);
+        const before = (job.steps ?? []).slice(0, i);
+        const prep = before.find((s) => typeof s?.run === 'string' && s.run.includes(basename) && s.env && Object.keys(s.env).length > 0);
+        if (!prep) {
+          violations.push(`${at}: no earlier run: step in this job prepares ${basename} with secrets in env:`);
+        } else if (/echo\s+"?\$CO_DEPLOY|cat\s+"?\$FILE|cat\s+"?\$RUNNER_TEMP/.test(prep.run)) {
+          violations.push(`${at}: the preparing step prints the secrets file or a secret`);
+        } else if (!/umask 077/.test(prep.run)) {
+          violations.push(`${at}: the preparing step must set umask 077 before writing ${basename}`);
+        }
+        const after = (job.steps ?? []).slice(i + 1);
+        const cleanup = after.find((s) => typeof s?.run === 'string' && s.run.includes(basename) && /\brm\s+-f\b/.test(s.run) && String(s.if ?? '').replace(/\s/g, '') === 'always()');
+        if (!cleanup) {
+          violations.push(`${at}: no later step with \`if: always()\` removes ${basename}`);
+        }
+      });
+    }
+
     // Invariant A shape check for carriers found in THIS file.
     for (const carrier of carriers.filter((c) => c.file === name)) {
       const p = carrier.path;
@@ -180,5 +247,5 @@ if (process.argv[1]?.endsWith('check-workflow-invariants.mjs')) {
     for (const v of violations) console.error(`  - ${v}`);
     process.exit(1);
   }
-  console.log('✓ workflow invariants: 2 token carriers at with.apiToken, no ${{ }} in run:, gates carry their env');
+  console.log('✓ workflow invariants: 2 token carriers at with.apiToken, no ${{ }} in run:, gates carry their env, secrets only under environments, --secrets-file prepared/cleaned');
 }

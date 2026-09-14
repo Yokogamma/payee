@@ -279,6 +279,57 @@ jobs:
       # candidate's suite already ran — in the tokenless job.
       - run: npm --prefix worker ci --ignore-scripts
         working-directory: candidate
+      # ── Co-deployed secrets: code and secret in ONE activation ──
+      #
+      # `wrangler secret put` creates and activates a new version by itself
+      # (docs: configuration/secrets). A secret rotated that way and a code
+      # deploy are therefore TWO activations — two worker version ids, and a
+      # soak window (docs/ROLLBACK.md «Soak criteria — v2») is one version id
+      # for 168 hours. `wrangler deploy --secrets-file` uploads the secrets
+      # WITH the version instead, and it is ADDITIVE: secrets omitted from the
+      # file are kept, none is ever deleted by a deploy.
+      #
+      # The file is built here, in the trusted deploy job ONLY (the tokenless
+      # test-candidate job never sees a secret), from Environment secrets
+      # passed through env: — never `${{ }}` inside run: (invariant B). It
+      # lives OUTSIDE the checkout under $RUNNER_TEMP with mode 0600, is never
+      # printed, never uploaded as an artifact, and is removed by the
+      # `if: always()` step below whatever the deploy did. Only its ENTRY COUNT
+      # reaches the log. An Environment secret that is unset simply is not in
+      # the file — a deploy with `{}` changes no secret at all, which is what
+      # every deploy did before this step existed.
+      #
+      # Registry of co-deployed secrets (docs/SECRETS.md «Co-deployed
+      # secrets»): CF_ANALYTICS_TOKEN. Adding one = one more `env:` line and
+      # one more `--arg` here, plus its row in the registry.
+      - name: Prepare the co-deployed secrets file
+        id: cosecrets
+        run: |
+          set +x
+          umask 077
+          FILE="$RUNNER_TEMP/co-deploy-secrets.json"
+          jq -n --arg cf_analytics_token "$CO_DEPLOY_CF_ANALYTICS_TOKEN" '
+            {}
+            | if ($cf_analytics_token | length) > 0 then . + { CF_ANALYTICS_TOKEN: $cf_analytics_token } else . end
+          ' > "$FILE"
+          COUNT=$(jq 'length' "$FILE")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "co-deployed secrets in this activation: $COUNT (names only: $(jq -r 'keys | join(",")' "$FILE"))"
+        env:
+          CO_DEPLOY_CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+      # A candidate whose own wrangler does not know the flag would fail AFTER
+      # the previous version was already replaced? No — it would fail at
+      # argument parsing, before any upload; but a historical rollback must not
+      # be refused by an argument it cannot parse either. So the exact binary
+      # that will deploy is asked first, and the job stops here if it cannot.
+      # (Every registered historical candidate pins wrangler 4.125.0, which
+      # has the flag; this step is what keeps that true tomorrow.)
+      - name: Refuse a candidate whose wrangler lacks --secrets-file
+        run: |
+          if ! candidate/worker/node_modules/.bin/wrangler deploy --help 2>/dev/null | grep -q -- '--secrets-file'; then
+            echo "the candidate's wrangler does not support --secrets-file; co-deploying secrets is impossible with this build" >&2
+            exit 1
+          fi
       # ── Deploy ──
       # RELEASE_SHA is injected from the VERIFIED candidate input, never from
       # github.sha — that one is the SHA of this workflow's own trusted head,
@@ -293,9 +344,14 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: candidate/worker
-          command: deploy --var RELEASE_SHA:${{ inputs.candidate }}
+          command: deploy --var RELEASE_SHA:${{ inputs.candidate }} --secrets-file ${{ runner.temp }}/co-deploy-secrets.json
         env:
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+      # The secrets file outlives nothing: removed whether the deploy passed,
+      # failed or was cancelled.
+      - name: Remove the co-deployed secrets file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/co-deploy-secrets.json"
       # ── Read the ACTIVATED version id from the structured output ──
       # A self-declared SHA cannot distinguish a re-deploy of the same commit
       # from the original; the version id can. Parsed from the TRUSTED checkout.
