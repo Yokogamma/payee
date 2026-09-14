@@ -4,7 +4,7 @@ import * as ed from '@noble/ed25519';
 import worker from '../src/index';
 import { addressOfJwk } from '../test-stubs/wallet-address';
 import { computePublicationFp } from '../src/publication-fp';
-import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
+import { setupOutboundMock, deferred, b64, sha256, type OutboundRoute } from './helpers/outbound-mock';
 import type { OpProjection } from '../src/op-journal';
 import uploadCodes from '../src/upload-codes.json';
 
@@ -96,12 +96,28 @@ const mkEnv = (extra: Record<string, unknown> = {}): WorkerEnv => ({
   RELEASE_SHA: RELEASE, CF_VERSION_METADATA: { id: VERSION_ID }, ...extra,
 }) as WorkerEnv;
 
-function mockPaidLegs(opts: { anchorDelayMs?: number; post?: false | number } = {}) {
-  const anchor = mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, ANCHOR, 1, { delayMs: opts.anchorDelayMs });
+/**
+ * `holdAnchor` parks the paid path at its first gateway leg — AFTER the begin
+ * transaction, BEFORE /op-posting — until the test releases it; `anchor.reached`
+ * tells the test the request is there. The two concurrency tests are built on
+ * that barrier and on nothing timed: a fixed anchor delay plus a sleep was a
+ * bet against the runner, and a starved CI box lost it in both directions (A
+ * not yet begun when the sleep ended; B still in flight when A moved on).
+ */
+function mockPaidLegs(opts: { holdAnchor?: Promise<unknown>; post?: false | number } = {}) {
+  const anchor = mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, ANCHOR, 1, { hold: opts.holdAnchor });
   const price = mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/price\/\d+$/, 200, '3049039377');
   const post = opts.post === false ? null
     : mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, opts.post ?? 200, opts.post && opts.post !== 200 ? 'nope' : 'OK');
   return { anchor, price, post };
+}
+
+/** Resolves once the in-flight request has reached `route`; fails with the
+ *  request's answer if it finished without ever getting there — sooner and
+ *  clearer than the test timeout would. */
+async function untilReached(route: OutboundRoute, inflight: Promise<Response>): Promise<void> {
+  const first = await Promise.race([route.reached.then(() => null), inflight]);
+  if (first !== null) throw new Error(`answered ${first.status} without reaching the mocked leg`);
 }
 
 /** The live journal, read through the real DO — never through the worker. */
@@ -275,10 +291,14 @@ describe('journal: begin (tests 1, 2, 2b, 2c, 2d)', () => {
       return forward();
     });
     const envB = mkEnv({ RATE_LIMITER: limiter });
-    mockPaidLegs({ anchorDelayMs: 300 }); // A pauses AFTER begin, BEFORE /op-posting
+    // A parks AFTER begin, BEFORE /op-posting, until released: while it is
+    // parked it makes no DO call, so everything `callsInB` collects is B's own,
+    // and the record it left behind is `begun` for as long as the test looks.
+    const anchorGate = deferred();
+    const { anchor } = mockPaidLegs({ holdAnchor: anchorGate.promise });
 
     const a = worker.fetch(await uploadRequest(id, noteId, { operationId: opId }), envB);
-    await new Promise(res => setTimeout(res, 60));
+    await untilReached(anchor, a); // A has begun and is parked
     expect(await opGet(id.pkB64, opId)).toMatchObject({ status: 'begun' });
 
     bWindow = true;
@@ -290,6 +310,9 @@ describe('journal: begin (tests 1, 2, 2b, 2c, 2d)', () => {
     expect(callsInB).toEqual(['/check-and-reserve']);
     expect(await opGet(id.pkB64, opId)).toMatchObject({ status: 'begun' }); // untouched by B
 
+    // Released only now — a failed assertion above leaves A parked, never in
+    // flight into the next test's mocks.
+    anchorGate.resolve();
     const ra = await a;
     expect(ra.status).toBe(200);
     expect(ra.headers.get('X-Operation-Id')).toBe(opId);
@@ -304,13 +327,17 @@ describe('journal: begin (tests 1, 2, 2b, 2c, 2d)', () => {
     const noteId = crypto.randomUUID();
     const opA = crypto.randomUUID();
     const opB = crypto.randomUUID();
-    mockPaidLegs({ anchorDelayMs: 200 }); // A holds the reservation while B arrives
+    // A holds the reservation, parked at the anchor, until B has been answered
+    // — so it is always A that reserves and B that meets the reservation.
+    const anchorGate = deferred();
+    const { anchor } = mockPaidLegs({ holdAnchor: anchorGate.promise });
     const a = worker.fetch(await uploadRequest(id, noteId, { operationId: opA }), mkEnv());
-    await new Promise(res => setTimeout(res, 40));
+    await untilReached(anchor, a); // A has reserved and is parked
     const rb = await worker.fetch(await uploadRequest(id, noteId, { operationId: opB }), mkEnv());
     expect(rb.status).toBe(409);
     expect(rb.headers.get('X-Operation-Id')).toBe(opB);
     expect(await rb.json()).toMatchObject({ code: 'upload_in_progress', operationId: opB });
+    anchorGate.resolve();
     const ra = await a;
     expect(ra.status).toBe(200);
     const recA = await opGet(id.pkB64, opA);
