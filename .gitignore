@@ -26,8 +26,7 @@ dist-ssr
 # TypeScript incremental build artifacts
 *.tsbuildinfo
 
-# Local documentation; existing tracked operational docs remain versioned.
-# Working documents (audits, plans, session reports) live here but never reach
-# the public repository. Publishing a NEW doc is a deliberate `git add -f`.
-# Note: `git clean -x` deletes ignored files — keep a backup of private docs.
-/docs/
+# Scratch: throwaway notes and intermediate results. Losing them is acceptable.
+# Maintained project documentation lives in docs/ and IS versioned; internal
+# plans, audits and research live in the private repository payee-private-docs.
+/.scratch/
