@@ -54,6 +54,14 @@ describe('реестр co-deploy = env: шага подготовки', () => {
     expect(fromEnv).toEqual([...CO_DEPLOY_REGISTRY].sort());
     expect(prep.run).toMatch(/node scripts\/require-co-deploy-secrets\.mjs/);
     expect(prep.run).not.toMatch(/read -ra/);
+    // Every CO_DEPLOY_* env of the step is stripped from the Node process that parses the input.
+    for (const k of Object.keys(prep.env).filter(k => k.startsWith('CO_DEPLOY_'))) {
+      const call = prep.run.split(String.fromCharCode(10)).find(l => l.includes('node scripts/require-co-deploy-secrets.mjs'));
+      expect(call).toBeTruthy();
+      expect(call).toContain('env -u');
+      expect(call.indexOf('env -u')).toBeLessThan(call.indexOf('node scripts/'));
+      expect(call).toContain(k);
+    }
   });
 });
 

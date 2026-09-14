@@ -328,9 +328,12 @@ jobs:
           # «Secret required» mode: every name in the input must be in the
           # file, or this rotation is not the rotation it claims to be. Parsed
           # by TRUSTED code (scripts/require-co-deploy-secrets.mjs, tested),
-          # not by a shell `read` that sees one line; the script gets the
-          # NAMES of the present keys only, never a value.
-          if ! PRESENT_SECRET_NAMES="$(jq -c 'keys' "$FILE")" node scripts/require-co-deploy-secrets.mjs; then
+          # not by a shell `read` that sees one line. The Node process gets
+          # the NAMES of the present keys and nothing else: every CO_DEPLOY_*
+          # variable is removed from its environment (`env -u`), so the value
+          # is not merely unread but absent from that process.
+          PRESENT_SECRET_NAMES="$(jq -c 'keys' "$FILE")"
+          if ! env -u CO_DEPLOY_CF_ANALYTICS_TOKEN PRESENT_SECRET_NAMES="$PRESENT_SECRET_NAMES" node scripts/require-co-deploy-secrets.mjs; then
             rm -f "$FILE"
             exit 1
           fi

@@ -12,7 +12,9 @@
  * registered names is a refusal BEFORE anything is uploaded.
  *
  * This script never sees a secret value: the workflow hands it the NAMES of
- * the keys present in the file (`jq -c 'keys'`), nothing else.
+ * the keys present in the file (`jq -c 'keys'`) and starts it with every
+ * CO_DEPLOY_* variable removed from the environment (`env -u`), so the value
+ * is absent from this process, not merely unread by it.
  */
 
 /** The co-deploy registry — one entry per `CO_DEPLOY_<NAME>` env in the
