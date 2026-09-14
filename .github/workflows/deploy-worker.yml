@@ -325,18 +325,15 @@ jobs:
           COUNT=$(jq 'length' "$FILE")
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "co-deployed secrets in this activation: $COUNT (names only: $(jq -r 'keys | join(",")' "$FILE"))"
-          # «Secret required» mode: every name listed in the input must be in
-          # the file, or this rotation is not the rotation it claims to be.
-          IFS=',' read -ra REQUIRED <<< "$REQUIRED_SECRETS"
-          for NAME in "${REQUIRED[@]}"; do
-            NAME="${NAME// /}"
-            [ -z "$NAME" ] && continue
-            if ! jq -e --arg n "$NAME" 'has($n)' "$FILE" > /dev/null; then
-              echo "required co-deploy secret $NAME is not set in the Environment — refusing to deploy a rotation without it" >&2
-              rm -f "$FILE"
-              exit 1
-            fi
-          done
+          # «Secret required» mode: every name in the input must be in the
+          # file, or this rotation is not the rotation it claims to be. Parsed
+          # by TRUSTED code (scripts/require-co-deploy-secrets.mjs, tested),
+          # not by a shell `read` that sees one line; the script gets the
+          # NAMES of the present keys only, never a value.
+          if ! PRESENT_SECRET_NAMES="$(jq -c 'keys' "$FILE")" node scripts/require-co-deploy-secrets.mjs; then
+            rm -f "$FILE"
+            exit 1
+          fi
         env:
           CO_DEPLOY_CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
           REQUIRED_SECRETS: ${{ inputs.required_secrets }}

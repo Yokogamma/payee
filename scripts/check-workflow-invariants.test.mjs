@@ -42,6 +42,21 @@ describe('интеграция: реальные воркфлоу репозит
   });
 });
 
+describe('реестр co-deploy = env: шага подготовки', () => {
+  it('каждый CO_DEPLOY_<NAME> в deploy-worker.yml есть в CO_DEPLOY_REGISTRY, и наоборот', async () => {
+    const { CO_DEPLOY_REGISTRY } = await import('./require-co-deploy-secrets.mjs');
+    const { load } = await import('js-yaml');
+    const { readFileSync } = await import('node:fs');
+    const doc = load(readFileSync(new URL('../.github/workflows/deploy-worker.yml', import.meta.url), 'utf8'));
+    const prep = (doc.jobs['deploy-worker'].steps ?? []).find(s => typeof s?.run === 'string' && s.run.includes('co-deploy-secrets.json') && s.env);
+    expect(prep).toBeTruthy();
+    const fromEnv = Object.keys(prep.env).filter(k => k.startsWith('CO_DEPLOY_')).map(k => k.slice('CO_DEPLOY_'.length)).sort();
+    expect(fromEnv).toEqual([...CO_DEPLOY_REGISTRY].sort());
+    expect(prep.run).toMatch(/node scripts\/require-co-deploy-secrets\.mjs/);
+    expect(prep.run).not.toMatch(/read -ra/);
+  });
+});
+
 describe('инвариант A: носители токена', () => {
   it('ровно два корректных носителя — ок', () => {
     expect(run([
