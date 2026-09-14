@@ -168,7 +168,19 @@ sees a secret; invariants D/E in `scripts/check-workflow-invariants.mjs`):
    by an argument it cannot parse, and must never silently ignore it;
 3. `wrangler deploy … --secrets-file <that file>` uploads code and secrets as
    one version;
-4. an `if: always()` step removes the file whatever the deploy did.
+4. an `if: always()` step removes the file whatever the deploy did;
+5. a planned rotation dispatches the workflow with `required_secrets` naming
+   the secrets that MUST be in the file (e.g. `CF_ANALYTICS_TOKEN`): an unset
+   one then stops the job before any upload. Without the input an ordinary
+   deploy ships `{}` when nothing is set — compatibility, not a rotation.
+
+**Named limits (do not oversell the invariants).** Invariant E forbids an
+`actions/upload-artifact` step whose `path` names the file, its directory or
+`runner.temp`; it cannot see a `run:` step that copies the file elsewhere
+first — that is caught in review. Invariant F pins the tokenless job by
+NAME (`test-candidate` in `deploy-worker.yml`): no `environment:` and no
+`secrets.*` reference in it, whatever D would allow; a job renamed out of that
+list is a review question, not a static failure.
 
 **Registry of co-deployed secrets** (one Environment secret per row; adding one
 = an `env:` line + a `--arg` in the preparing step + a row here):
@@ -267,9 +279,14 @@ provisioned); update the operator's stored value; verify with a
 Cloudflare dashboard (scope: `Account → Account Analytics → Read`, this one
 account, nothing else; a token used by the worker ONLY — never the operator's
 local one), putting its value into the `dev` Environment secret
-`CF_ANALYTICS_TOKEN`, and letting the next trusted deploy co-deploy it
-(«Co-deployed secrets» above) — NOT `wrangler secret put`, which would
-activate a version of its own. Revoke the old token after the deploy's smoke
-is green. Never during a soak window: any new version id resets it. While the
-secret is missing or invalid `/admin/metrics` answers 503 or 502 and metric
-WRITES are unaffected — the rotation window costs only report availability.
+`CF_ANALYTICS_TOKEN`, and dispatching the trusted deploy with
+`required_secrets: CF_ANALYTICS_TOKEN` so it co-deploys it («Co-deployed
+secrets» above) — NOT `wrangler secret put`, which would activate a version
+of its own. **Revoke the old token only after the NEW one is proven through
+the deployed worker**: the post-deploy smoke checks `/health`, not
+`/admin/metrics`, so a green smoke says nothing about the token. Run all four
+`POST /admin/metrics` reports at 24 h and 168 h against the live worker and
+require 200 with the `{rows}` shape from each; only then revoke. Never during
+a soak window: any new version id resets it. While the secret is missing or
+invalid `/admin/metrics` answers 503 or 502 and metric WRITES are unaffected —
+the rotation window costs only report availability.

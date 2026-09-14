@@ -359,4 +359,67 @@ describe('инвариант E: --secrets-file под runner.temp, подгот�
     const r = run([{ name: 'a.yml', content: coDeploy({ path: 'candidate/secrets.json' }) }, { name: 'b.yml', content: CANONICAL }]);
     expect(r.violations.join('\n')).toMatch(/must point under \$\{\{ runner.temp \}\}/);
   });
+
+  it('артефакт, который может унести файл секретов (сам файл, его каталог, runner.temp) — нарушение', () => {
+    for (const path of ['${{ runner.temp }}/co-deploy-secrets.json', '${{ runner.temp }}', '$RUNNER_TEMP/']) {
+      const content = coDeploy() + `      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: leak
+          path: ${path}
+`;
+      const r = run([{ name: 'a.yml', content }, { name: 'b.yml', content: CANONICAL }]);
+      expect(r.violations.join('\n')).toMatch(/uploads an artifact that could carry co-deploy-secrets.json/);
+    }
+    // An artifact of something else in the same job is fine.
+    const ok = coDeploy() + `      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-identity
+          path: release-identity.txt
+`;
+    expect(run([{ name: 'a.yml', content: ok }, { name: 'b.yml', content: CANONICAL }]).violations).toEqual([]);
+  });
+});
+
+// ── Инвариант F: tokenless-джоба остаётся tokenless (проверяется по имени файла deploy-worker.yml) ──
+
+const tokenless = ({ environment = false, secret = false, present = true } = {}) => `
+name: t
+on: workflow_dispatch
+jobs:
+${present ? `  test-candidate:
+    runs-on: ubuntu-latest
+${environment ? '    environment: dev\n' : ''}    steps:
+      - run: npm test
+${secret ? '        env:\n          X: \${{ secrets.CF_ANALYTICS_TOKEN }}\n' : ''}` : ''}  deploy-worker:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: cloudflare/wrangler-action@${SHA2}
+        with:
+          apiToken: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+`;
+
+describe('инвариант F: test-candidate без environment и без секретов', () => {
+  it('чистая tokenless-джоба — ок', () => {
+    expect(run([{ name: 'deploy-worker.yml', content: tokenless() }, { name: 'b.yml', content: CANONICAL }]).violations).toEqual([]);
+  });
+
+  it('environment у test-candidate — нарушение, даже если инвариант D доволен', () => {
+    const r = run([{ name: 'deploy-worker.yml', content: tokenless({ environment: true }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/tokenless job test-candidate must not have an environment/);
+  });
+
+  it('секрет через env: в test-candidate под environment — нарушение F (D его пропустил бы)', () => {
+    const r = run([{ name: 'deploy-worker.yml', content: tokenless({ environment: true, secret: true }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/tokenless job test-candidate references a secret/);
+  });
+
+  it('удалённая tokenless-джоба — нарушение (инвариант не может держаться над несуществующей джобой)', () => {
+    const r = run([{ name: 'deploy-worker.yml', content: tokenless({ present: false }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/tokenless job test-candidate is missing/);
+  });
+
+  it('другой файл с джобой test-candidate под environment — инвариант F не применяется (только deploy-worker.yml)', () => {
+    expect(run([{ name: 'other.yml', content: tokenless({ environment: true }) }, { name: 'b.yml', content: CANONICAL }]).violations).toEqual([]);
+  });
 });
