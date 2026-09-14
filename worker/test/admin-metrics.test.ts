@@ -1,5 +1,6 @@
 import { env } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { metricsErrorCodes, metricsRay } from '../src/metrics-diagnostics';
 import worker from '../src/index';
 import { buildMetricsReportSql, METRICS_REPORTS } from '../src/metrics';
 import { setupOutboundMock } from './helpers/outbound-mock';
@@ -174,6 +175,83 @@ describe('upstream contract: bearer, SQL text, {rows} shape, no proxying', () =>
     const r = await worker.fetch(req({ report: 'gateway_health' }), configuredEnv());
     expect(r.status).toBe(503);
     expect(r.headers.get('Cache-Control')).toBe('no-store');
+  });
+});
+
+describe('safe metrics failure diagnostics', () => {
+  it('keeps only bounded numeric error codes and structurally valid rays', () => {
+    expect(metricsErrorCodes(JSON.stringify({ errors: [null, { code: 'secret' }, { code: -1 }, { code: 10000 }, { code: 10000 }, { message: 'secret' }] }))).toEqual([10000]);
+    expect(metricsErrorCodes(JSON.stringify({ errors: Array.from({ length: 20 }, (_, code) => ({ code })) }))).toHaveLength(8);
+    for (const body of [null, 'private text', 'null', '{}']) expect(metricsErrorCodes(body)).toEqual([]);
+    expect(metricsRay('a3ae44731ad3c2a0-VIE')).toBe('a3ae44731ad3c2a0-VIE');
+    for (const ray of [null, 'secret', 'a3ae44731ad3c2a0-VIE\nsecret']) expect(metricsRay(ray)).toBeUndefined();
+  });
+
+  it('logs status and code without upstream messages, credentials or raw request data', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      mockRoute('POST', SQL_URL, 403, JSON.stringify({ errors: [{ code: 10000, message: 'analytics-token-test' }], private: METRICS_SECRET }));
+      const request = req({ report: 'upload_outcomes', hours: 24 });
+      request.headers.set('CF-Ray', 'a3ae44731ad3c2a0-VIE');
+      const response = await worker.fetch(request, configuredEnv());
+      expect(response.status).toBe(502);
+      expect(await response.text()).toBe('Metrics upstream error');
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(spy.mock.calls[0][0] as string)).toEqual({
+        diagnostic: 'metrics_upstream_failure', stage: 'http_status', report: 'upload_outcomes', hours: 24,
+        requestRay: 'a3ae44731ad3c2a0-VIE', upstreamStatus: 403, errorCodes: [10000],
+      });
+      const output = JSON.stringify(spy.mock.calls);
+      for (const secret of ['analytics-token-test', METRICS_SECRET, 'Authorization', 'SELECT', 'acct-123']) expect(output).not.toContain(secret);
+    } finally { spy.mockRestore(); }
+  });
+
+  it.each([
+    ['invalid_json', 200, 'private text', 502],
+    ['invalid_shape', 200, '{"data":{}}', 502],
+    ['body_too_large', 200, 'x'.repeat(300 * 1024), 502],
+  ] as const)('identifies %s without logging the body', async (stage, status, body, expected) => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      mockRoute('POST', SQL_URL, status, body);
+      const response = await worker.fetch(req({ report: 'gateway_health' }), configuredEnv());
+      expect(response.status).toBe(expected);
+      expect(JSON.parse(spy.mock.calls[0][0] as string)).toMatchObject({ stage, upstreamStatus: status });
+    } finally { spy.mockRestore(); }
+  });
+
+  it.each([200, 403])('retains HTTP status %i when reading the body fails', async status => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      mockRoute('POST', SQL_URL, status, '', 1, { makeBody: () => new ReadableStream({ start(controller) { controller.error(new Error('secret-stream-error')); } }) });
+      const response = await worker.fetch(req({ report: 'gateway_health' }), configuredEnv());
+      expect(response.status).toBe(status === 200 ? 503 : 502);
+      expect(JSON.parse(spy.mock.calls[0][0] as string)).toMatchObject({ stage: status === 200 ? 'body_read_failed' : 'http_status', upstreamStatus: status });
+      expect(JSON.stringify(spy.mock.calls)).not.toContain('secret-stream-error');
+    } finally { spy.mockRestore(); }
+  });
+
+  it('distinguishes fetch failure and does not log successful queries', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const failed = await worker.fetch(req({ report: 'gateway_health' }), configuredEnv());
+      expect(failed.status).toBe(503);
+      expect(JSON.parse(spy.mock.calls[0][0] as string)).toMatchObject({ stage: 'fetch_failed' });
+      spy.mockClear();
+      mockRoute('POST', SQL_URL, 200, UPSTREAM_OK);
+      expect((await worker.fetch(req({ report: 'gateway_health' }), configuredEnv())).status).toBe(200);
+      expect(spy).not.toHaveBeenCalled();
+    } finally { spy.mockRestore(); }
+  });
+
+  it('a failed logger cannot change the generic upstream response', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => { throw new Error('logger failed'); });
+    try {
+      mockRoute('POST', SQL_URL, 403, '{}');
+      const response = await worker.fetch(req({ report: 'gateway_health' }), configuredEnv());
+      expect(response.status).toBe(502);
+      expect(await response.text()).toBe('Metrics upstream error');
+    } finally { spy.mockRestore(); }
   });
 });
 
