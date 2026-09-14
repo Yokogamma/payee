@@ -17,6 +17,7 @@ import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-
 import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
 import { parseTrustedOwners } from '../../src/lib/trusted-owners';
 import { authenticatePublication, type ReadStage } from './publication-auth';
+import { metricsErrorCodes, metricsRay } from './metrics-diagnostics';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -551,6 +552,17 @@ async function handleAdminMetrics(request: Request, env: Env): Promise<Response>
   }
 
   const sql = buildMetricsReportSql(report as MetricsReport, env.METRICS_DATASET, effectiveHours);
+  // Diagnostics only: API responses stay generic, and no upstream messages,
+  // credentials, SQL text or arbitrary headers enter the log.
+  const diagnose = (stage: string, response?: Response, codes: number[] = []) => {
+    logStructured({
+      diagnostic: 'metrics_upstream_failure', stage, report, hours: effectiveHours,
+      requestRay: metricsRay(request.headers.get('CF-Ray')),
+      upstreamStatus: response?.status,
+      upstreamRay: response ? metricsRay(response.headers.get('CF-Ray')) : undefined,
+      errorCodes: codes,
+    });
+  };
   let upstream: Response;
   try {
     upstream = await fetch(
@@ -563,28 +575,45 @@ async function handleAdminMetrics(request: Request, env: Env): Promise<Response>
       },
     );
   } catch {
+    diagnose('fetch_failed');
     return error('Metrics upstream unavailable', 503); // timeout / network
   }
   // Upstream body is NEVER proxied to the client — only the class and our own
   // strings. Non-2xx → 502; oversized/malformed 2xx → 502.
-  if (!upstream.ok) return error('Metrics upstream error', 502);
+  if (!upstream.ok) {
+    // The fetch deadline also bounds the error-body read. Failure to read it
+    // must still retain the original HTTP status and correlation id.
+    let failureBody: string | null = null;
+    try { failureBody = await readCappedText(upstream, METRICS_UPSTREAM_BODY_CAP_BYTES); }
+    catch { /* status and ray remain useful even without a readable body */ }
+    diagnose('http_status', upstream, metricsErrorCodes(failureBody));
+    return error('Metrics upstream error', 502);
+  }
   let text: string | null;
   try {
     text = await readCappedText(upstream, METRICS_UPSTREAM_BODY_CAP_BYTES);
   } catch {
+    diagnose('body_read_failed', upstream);
     return error('Metrics upstream unavailable', 503); // aborted mid-body = timeout
   }
-  if (text === null) return error('Metrics upstream error', 502); // over the cap
+  if (text === null) {
+    diagnose('body_too_large', upstream);
+    return error('Metrics upstream error', 502);
+  }
   // Every template ends in FORMAT JSON; the standard upstream document is
   // {meta, data, rows} (L r17). ONE response shape — ours: {rows: data}.
   let doc: unknown;
   try {
     doc = JSON.parse(text);
   } catch {
+    diagnose('invalid_json', upstream);
     return error('Metrics upstream error', 502);
   }
   const data = (typeof doc === 'object' && doc !== null) ? (doc as { data?: unknown }).data : undefined;
-  if (!Array.isArray(data)) return error('Metrics upstream error', 502);
+  if (!Array.isArray(data)) {
+    diagnose('invalid_shape', upstream);
+    return error('Metrics upstream error', 502);
+  }
   return json({ rows: data });
 }
 
