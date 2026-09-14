@@ -1873,13 +1873,12 @@ deploy. Neither is an Environment variable, so there is nothing to click:
 
 ### Soak criteria — v2, judged from the operation journal (DRAFT, PR-C)
 
-> **Статус этого раздела.** Черновик после PR #166/#167 и живой проверки
+> **Статус этого раздела.** Принят после PR #166/#167 и живой проверки
 > 2026-09-13. Смысл требований не изменён; изменён **источник доказательства**.
-> Два места ждут явного утверждения владельца и помечены так: **[НЕ
-> УТВЕРЖДЕНО]** — начало окна `T0` и численные допуски. До утверждения
-> `reconcile` отвечает `withheld`/`diagnostic` и зачёта не даёт. Прежняя
-> редакция (2026-09-02, вердикт из Analytics Engine) ниже сохранена как
-> «v1» для истории.
+> Начало окна `T0` и численные допуски **утверждены владельцем 2026-09-14**
+> («соглашаюсь с твоими предложениями» по рекомендации ревьюера от
+> 2026-09-13). Прежняя редакция (2026-09-02, вердикт из Analytics Engine) ниже
+> сохранена как «v1» для истории.
 
 **Почему не телеметрия.** Analytics Engine — взвешенная выборка по индексу,
 Workers Logs — тоже выборка по признанию самого хранилища (недостача 2 из 260
@@ -1927,12 +1926,12 @@ Analytics Engine и Workers Logs остаются **диагностикой**: 
 и уже в прошлом. Редеплой или смена `TRUSTED_OWNERS` / `PAYLOAD_GATEWAYS` /
 выключателей — новое окно и новый ledger.
 
-**[НЕ УТВЕРЖДЕНО]** Для версии `7502b47a-32b4-44b0-8409-bdba0e064774`
-(кандидат `11cc3f71…`) первый `day`-прогон — живая проверка 2026-09-13 —
-зафиксировал `T0 = 2026-09-13T19:28:19Z`; минимальные 168 ч истекают
-2026-09-20T19:28:19Z. Рекомендация ревьюера: принять этот `T0` и текущий
-ledger, две проверочные операции учитывать в окне. Решение — за владельцем;
-альтернатива — новый ledger с переносом пяти легаси-фикстур.
+**УТВЕРЖДЕНО владельцем 2026-09-14.** Для версии
+`7502b47a-32b4-44b0-8409-bdba0e064774` (кандидат `11cc3f71…`) первый
+`day`-прогон — живая проверка 2026-09-13 — зафиксировал
+`T0 = 2026-09-13T19:28:19Z`; минимальные 168 ч истекают
+2026-09-20T19:28:19Z. Текущий ledger сохраняется, две проверочные операции
+(одна платная публикация и её дедуп) входят в окно.
 
 **Объём** — те же числа, читаются из журнала (`finished`-записи окна и их
 `attests`), не из плана драйвера: не менее **30** решений
@@ -1947,9 +1946,9 @@ ledger, две проверочные операции учитывать в о�
 |---|---|---|
 | одни и те же байты и `noteId` не дают другой txId; нет неожиданных конфликтов | `finished` с исходом или attest `conflict`, `redrop_conflict`, `legacy_not_ours`, `recovery_conflict`; незавершённая `begun` с `checkVerdict = id_payload_conflict` | **строго 0** |
 | дефект собственной подготовки платного пути | исход `arweave_throw` (throw в JWK / createTransaction / sign — фаза `prepare`) | **строго 0** |
-| отказы шлюза до POST | исход `gateway_unavailable_pre_post` (anchor/price) | инфраструктурный инцидент — допуск владельца **[НЕ УТВЕРЖДЕНО]** |
+| отказы шлюза до POST | исход `gateway_unavailable_pre_post` (anchor/price) | инфраструктурный инцидент — допуск владельца: **≤ 2 суммарно с `audit_aborted`**, каждый расследован, **0 в последние 48 ч** |
 | отмена до POST при потерянном подтверждении журнала | исход `audit_aborted` (`/op-abort` с токеном, только из `posting`) | инфраструктурный инцидент — тот же допуск |
-| неизвестность POST | исход `post_unknown` / запись `posting` | красное, пока оператор не разрешил `resolve` с уликой; разрешённых — допуск владельца **[НЕ УТВЕРЖДЕНО]** |
+| неизвестность POST | исход `post_unknown` / запись `posting` | красное, пока оператор не разрешил `resolve` с уликой; разрешённых — **≤ 1** за окно |
 | нет неучтённых результатов | ни одной записи `begun`/`posting`/`paidResult: unknown` без разрешения; ни одной отправки драйвера без записи при полученном ответе; ни одной чужой операции | **0**, без допуска |
 | `legacy_unproven`, `recovery_unproven` | attest/исход в журнале | **≤ 1 каждый** за окно, каждый расследован, **0 в последние 48 ч** |
 | доля успешных публикаций | `accepted` (+ разрешённые вручную) ÷ `UPLOAD_OUTCOMES` = {`accepted`, `arweave_error`, `arweave_throw`, `gateway_unavailable_pre_post`, `post_unknown`} — эквивалент прежнего `upload_outcome` | **≥ 95 %**; оговорка о базовой линии остаётся: 7-дневной базы нет, абсолютный порог |
@@ -1959,11 +1958,11 @@ ledger, две проверочные операции учитывать в о�
 (`{ "allowances": { "infrastructure": N, "resolvedManually": N },
 "approvedAt", "approvedBy" }`) и **не имеют значений по умолчанию в коде**:
 без файла или без любого поля `reconcile` отвечает «политика приёмки не
-определена» и вердикта не выдаёт. **[НЕ УТВЕРЖДЕНО]** Рекомендация ревьюера
-2026-09-13: `infrastructure ≤ 2` (суммарно, каждый расследован, 0 в последние
-48 ч), `resolvedManually ≤ 1`; неразрешённые исходы и строгие нули — 0 (это
-правило зашито в сверке, не число политики). Утвердить **до** продолжения
-прогонов, чтобы не подбирать допуски под результаты недели.
+определена» и вердикта не выдаёт. **Утверждено владельцем 2026-09-14, до
+возобновления прогонов:** `infrastructure ≤ 2` (суммарно, каждый
+расследован, 0 в последние 48 ч), `resolvedManually ≤ 1`; неразрешённые
+исходы и строгие нули — 0 (это правило зашито в сверке, не число политики).
+Файл создан оператором в тот же день с этими значениями.
 
 **Закрытие окна (§7 плана):**
 
@@ -2289,7 +2288,7 @@ gh workflow run deploy-worker.yml --ref main \
 | tag | SHA | run id | worker version id | smoked |
 |---|---|---|---|---|
 | _(none — tags are labels, the gate reads SHAs)_ | `d65e352da5b1314c08e56e4045cab2d6e655713b` | [34125361606](https://github.com/Yokogamma/payee/actions/runs/34125361606) | `a2ea9d8a-c03e-4cd9-a4eb-80f7d5e53400` | green, `normal` profile, `semanticIdempotency: 1` proven, 2026-09-07 13:05 UTC |
-| _(none)_ | `11cc3f7120befec282e8228806dbe9e491e8fd68` — main after #166 (journal, PR-A) + #167 (driver, PR-B); driver commit `a843143e0db51be2e691a5f06e8f09fe97a7e81e` | [34777152412](https://github.com/Yokogamma/payee/actions/runs/34777152412) | `7502b47a-32b4-44b0-8409-bdba0e064774` | green, `normal` profile, 2026-09-13 19:16 UTC. Negative check passed the same evening (free dedupe under a fresh `operationId` → journal `finished/deduped/none` with the ledger's txId and no POST intent; the same id again → `409 operation_id_reused`, record byte-identical; evidence `snapshots/negative-check-11cc3f7-2026-09-13.txt`). Live check passed (owner-sanctioned): one paid publication `H6OTYy_AAqKtLfD_jy8zo29WCu18wi3MhIF8VPiF0Dw` + its dedupe → `reconcile`: `matched = 2`, wait `settled_empty`, verdict `DIAGNOSTIC` (window 0 h, policy undefined) — exit 3, as expected. `/admin/metrics` reads unavailable (HTTP 502) since 2026-09-10 — a diagnostics fault, not an empty dataset. **`T0 = 2026-09-13T19:28:19Z` recorded by the first `day` run — [НЕ УТВЕРЖДЕНО]; acceptance policy not created; paid runs paused pending the owner's decision.** |
+| _(none)_ | `11cc3f7120befec282e8228806dbe9e491e8fd68` — main after #166 (journal, PR-A) + #167 (driver, PR-B); driver commit `a843143e0db51be2e691a5f06e8f09fe97a7e81e` | [34777152412](https://github.com/Yokogamma/payee/actions/runs/34777152412) | `7502b47a-32b4-44b0-8409-bdba0e064774` | green, `normal` profile, 2026-09-13 19:16 UTC. Negative check passed the same evening (free dedupe under a fresh `operationId` → journal `finished/deduped/none` with the ledger's txId and no POST intent; the same id again → `409 operation_id_reused`, record byte-identical; evidence `snapshots/negative-check-11cc3f7-2026-09-13.txt`). Live check passed (owner-sanctioned): one paid publication `H6OTYy_AAqKtLfD_jy8zo29WCu18wi3MhIF8VPiF0Dw` + its dedupe → `reconcile`: `matched = 2`, wait `settled_empty`, verdict `DIAGNOSTIC` (window 0 h, policy undefined) — exit 3, as expected. `/admin/metrics` reads unavailable (HTTP 502) since 2026-09-10 — a diagnostics fault, not an empty dataset. **Soak window v2 opened at `T0 = 2026-09-13T19:28:19Z` (recorded by the first `day` run); T0, the current ledger and the allowances approved by the owner 2026-09-14; `acceptance-policy.json` created the same day; daily `day --paid 3` runs resumed 2026-09-14.** |
 
 The candidate is `d65e352` and not `5881da2` (the #136 merge): the first
 dispatch of `5881da2` ([run 34124396448](https://github.com/Yokogamma/payee/actions/runs/34124396448))
