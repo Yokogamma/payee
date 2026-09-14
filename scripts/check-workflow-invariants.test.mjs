@@ -19,6 +19,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - uses: ${uses}
         with:
@@ -37,6 +38,29 @@ describe('интеграция: реальные воркфлоу репозит
     for (const c of result.carriers) {
       expect(c.path[4]).toBe('with');
       expect(c.path[5]).toBe('apiToken');
+    }
+  });
+});
+
+describe('реестр co-deploy = env: шага подготовки', () => {
+  it('каждый CO_DEPLOY_<NAME> в deploy-worker.yml есть в CO_DEPLOY_REGISTRY, и наоборот', async () => {
+    const { CO_DEPLOY_REGISTRY } = await import('./require-co-deploy-secrets.mjs');
+    const { load } = await import('js-yaml');
+    const { readFileSync } = await import('node:fs');
+    const doc = load(readFileSync(new URL('../.github/workflows/deploy-worker.yml', import.meta.url), 'utf8'));
+    const prep = (doc.jobs['deploy-worker'].steps ?? []).find(s => typeof s?.run === 'string' && s.run.includes('co-deploy-secrets.json') && s.env);
+    expect(prep).toBeTruthy();
+    const fromEnv = Object.keys(prep.env).filter(k => k.startsWith('CO_DEPLOY_')).map(k => k.slice('CO_DEPLOY_'.length)).sort();
+    expect(fromEnv).toEqual([...CO_DEPLOY_REGISTRY].sort());
+    expect(prep.run).toMatch(/node scripts\/require-co-deploy-secrets\.mjs/);
+    expect(prep.run).not.toMatch(/read -ra/);
+    // Every CO_DEPLOY_* env of the step is stripped from the Node process that parses the input.
+    for (const k of Object.keys(prep.env).filter(k => k.startsWith('CO_DEPLOY_'))) {
+      const call = prep.run.split(String.fromCharCode(10)).find(l => l.includes('node scripts/require-co-deploy-secrets.mjs'));
+      expect(call).toBeTruthy();
+      expect(call).toContain('env -u');
+      expect(call.indexOf('env -u')).toBeLessThan(call.indexOf('node scripts/'));
+      expect(call).toContain(k);
     }
   });
 });
@@ -68,6 +92,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - uses: cloudflare/wrangler-action@${SHA}
         env:
@@ -103,6 +128,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - run: deploy --token \${{ secrets.CLOUDFLARE_API_TOKEN }}
 `;
@@ -119,6 +145,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - uses: cloudflare/wrangler-action@${SHA}
         with:
@@ -137,6 +164,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - uses: cloudflare/wrangler-action@${SHA}
         with:
@@ -176,6 +204,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - id: d
         uses: cloudflare/wrangler-action@${SHA}
@@ -195,6 +224,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - id: d
         uses: cloudflare/wrangler-action@${SHA}
@@ -215,6 +245,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - run: |
           echo start
@@ -236,6 +267,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - run: ${runLine}${env}
       - uses: cloudflare/wrangler-action@${SHA}
@@ -277,5 +309,140 @@ jobs:
       { name: 'b.yml', content: CANONICAL },
     ]);
     expect(violations.join(' ')).toMatch(/check-trusted-owners\.mjs without VITE_TRUSTED_OWNERS/);
+  });
+});
+
+// ── Инварианты D и E: секреты только под environment; --secrets-file готовится и удаляется ──
+
+const SHA2 = 'ebbaa1584979971c8614a24965b4405ff95890e0';
+/** Deploy-джоба с совместной активацией секретов; `mutate` меняет части фикстуры. */
+const coDeploy = ({ environment = 'dev', prep = true, umask = true, cleanup = 'always()', path = '${{ runner.temp }}/co-deploy-secrets.json', leak = false, secretIn = 'env' } = {}) => `
+name: t
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo tokenless
+  deploy:
+    runs-on: ubuntu-latest
+${environment ? `    environment: ${environment}\n` : ''}    steps:
+${prep ? `      - name: prep
+        run: |
+          set +x
+          ${umask ? 'umask 077' : ''}
+          FILE="$RUNNER_TEMP/co-deploy-secrets.json"
+          jq -n --arg t "$CO_DEPLOY_CF_ANALYTICS_TOKEN" '{}' > "$FILE"
+          ${leak ? 'cat "$FILE"' : 'echo "count=$(jq length "$FILE")"'}
+        env:
+          CO_DEPLOY_CF_ANALYTICS_TOKEN: \${{ secrets.CF_ANALYTICS_TOKEN }}
+` : ''}      - uses: cloudflare/wrangler-action@${SHA2}
+        with:
+          apiToken: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: deploy --var X:y --secrets-file ${path}${secretIn === 'command' ? ' --secret ${{ secrets.CF_ANALYTICS_TOKEN }}' : ''}
+${cleanup ? `      - name: cleanup
+        if: ${cleanup}
+        run: rm -f "$RUNNER_TEMP/co-deploy-secrets.json"
+` : ''}`;
+
+describe('инвариант D: секреты только под environment и только в with.apiToken / env: run-шага', () => {
+  it('каноническая совместная активация — ок', () => {
+    const r = run([{ name: 'a.yml', content: coDeploy() }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations).toEqual([]);
+  });
+
+  it('секрет в джобе без environment — нарушение', () => {
+    const r = run([{ name: 'a.yml', content: coDeploy({ environment: '' }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/outside an environment-bound job/);
+  });
+
+  it('секрет аргументом команды — нарушение', () => {
+    const r = run([{ name: 'a.yml', content: coDeploy({ secretIn: 'command' }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/must be with.apiToken or env: of a run: step/);
+  });
+});
+
+describe('инвариант E: --secrets-file под runner.temp, подготовлен в той же джобе, удалён всегда', () => {
+  it('без шага подготовки — нарушение', () => {
+    const r = run([{ name: 'a.yml', content: coDeploy({ prep: false }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/no earlier run: step in this job prepares co-deploy-secrets.json/);
+  });
+
+  it('без umask 077 — нарушение; печать файла — нарушение', () => {
+    expect(run([{ name: 'a.yml', content: coDeploy({ umask: false }) }, { name: 'b.yml', content: CANONICAL }]).violations.join('\n')).toMatch(/umask 077/);
+    expect(run([{ name: 'a.yml', content: coDeploy({ leak: true }) }, { name: 'b.yml', content: CANONICAL }]).violations.join('\n')).toMatch(/prints the secrets file/);
+  });
+
+  it('без очистки, или очистка не под if: always() — нарушение', () => {
+    expect(run([{ name: 'a.yml', content: coDeploy({ cleanup: '' }) }, { name: 'b.yml', content: CANONICAL }]).violations.join('\n')).toMatch(/if: always\(\)/);
+    expect(run([{ name: 'a.yml', content: coDeploy({ cleanup: 'success()' }) }, { name: 'b.yml', content: CANONICAL }]).violations.join('\n')).toMatch(/if: always\(\)/);
+  });
+
+  it('файл вне runner.temp — нарушение', () => {
+    const r = run([{ name: 'a.yml', content: coDeploy({ path: 'candidate/secrets.json' }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/must point under \$\{\{ runner.temp \}\}/);
+  });
+
+  it('артефакт, который может унести файл секретов (сам файл, его каталог, runner.temp) — нарушение', () => {
+    for (const path of ['${{ runner.temp }}/co-deploy-secrets.json', '${{ runner.temp }}', '$RUNNER_TEMP/']) {
+      const content = coDeploy() + `      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: leak
+          path: ${path}
+`;
+      const r = run([{ name: 'a.yml', content }, { name: 'b.yml', content: CANONICAL }]);
+      expect(r.violations.join('\n')).toMatch(/uploads an artifact that could carry co-deploy-secrets.json/);
+    }
+    // An artifact of something else in the same job is fine.
+    const ok = coDeploy() + `      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-identity
+          path: release-identity.txt
+`;
+    expect(run([{ name: 'a.yml', content: ok }, { name: 'b.yml', content: CANONICAL }]).violations).toEqual([]);
+  });
+});
+
+// ── Инвариант F: tokenless-джоба остаётся tokenless (проверяется по имени файла deploy-worker.yml) ──
+
+const tokenless = ({ environment = false, secret = false, present = true } = {}) => `
+name: t
+on: workflow_dispatch
+jobs:
+${present ? `  test-candidate:
+    runs-on: ubuntu-latest
+${environment ? '    environment: dev\n' : ''}    steps:
+      - run: npm test
+${secret ? '        env:\n          X: \${{ secrets.CF_ANALYTICS_TOKEN }}\n' : ''}` : ''}  deploy-worker:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: cloudflare/wrangler-action@${SHA2}
+        with:
+          apiToken: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+`;
+
+describe('инвариант F: test-candidate без environment и без секретов', () => {
+  it('чистая tokenless-джоба — ок', () => {
+    expect(run([{ name: 'deploy-worker.yml', content: tokenless() }, { name: 'b.yml', content: CANONICAL }]).violations).toEqual([]);
+  });
+
+  it('environment у test-candidate — нарушение, даже если инвариант D доволен', () => {
+    const r = run([{ name: 'deploy-worker.yml', content: tokenless({ environment: true }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/tokenless job test-candidate must not have an environment/);
+  });
+
+  it('секрет через env: в test-candidate под environment — нарушение F (D его пропустил бы)', () => {
+    const r = run([{ name: 'deploy-worker.yml', content: tokenless({ environment: true, secret: true }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/tokenless job test-candidate references a secret/);
+  });
+
+  it('удалённая tokenless-джоба — нарушение (инвариант не может держаться над несуществующей джобой)', () => {
+    const r = run([{ name: 'deploy-worker.yml', content: tokenless({ present: false }) }, { name: 'b.yml', content: CANONICAL }]);
+    expect(r.violations.join('\n')).toMatch(/tokenless job test-candidate is missing/);
+  });
+
+  it('другой файл с джобой test-candidate под environment — инвариант F не применяется (только deploy-worker.yml)', () => {
+    expect(run([{ name: 'other.yml', content: tokenless({ environment: true }) }, { name: 'b.yml', content: CANONICAL }]).violations).toEqual([]);
   });
 });
