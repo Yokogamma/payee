@@ -1110,6 +1110,77 @@ export type BackupSnapshotResult =
  * JSON length plus a separator), because being wrong in the other direction
  * means producing a file the import then refuses.
  */
+/**
+ * What ONE record costs the container, in the units the cap is charged in.
+ *
+ * The bytes the container will actually carry: the CANONICAL serialization,
+ * measured in UTF-8. `JSON.stringify(...).length` is neither — it counts
+ * UTF-16 code units, so any non-ASCII text undercounts (an emoji costs one or
+ * two units but four bytes), and it silently renders values IndexedDB accepts
+ * but JSON cannot carry (`Blob`, `ArrayBuffer`) as `{}` or drops them. Both
+ * errors point the same way: a store well past the cap would measure as
+ * fitting, which is exactly the memory blow-up the early stop exists to
+ * prevent. `canonicalJson` refuses such a value outright, and that refusal
+ * propagates — the export must fail loudly rather than write a file with a
+ * record quietly flattened to nothing.
+ *
+ * Defined once because the reader and the estimator MUST agree: an estimate
+ * measured differently from the refusal would tell the user a file will fit
+ * and then refuse to produce it.
+ */
+const PLAINTEXT_ENCODER = new TextEncoder();
+
+function recordPlaintextBytes(record: unknown): number {
+  return PLAINTEXT_ENCODER.encode(canonicalJson(record)).length + 1; // +1 separator
+}
+
+export interface BackupSizeEstimate {
+  /** Canonical plaintext bytes, stopping at the budget. */
+  plaintextBytes: number;
+  /** The budget ran out — the true total is larger than the number above. */
+  overCap: boolean;
+}
+
+/**
+ * How big an export would be, WITHOUT building one.
+ *
+ * The settings block shows this before the user presses anything (D17): the
+ * volume only grows — nothing in this app deletes records — so a refusal must
+ * never be the first time the ceiling is mentioned. It reads with cursors and
+ * retains NOTHING: the snapshot reader holds every record it measures, which
+ * is the right trade when a container is about to be built out of them and the
+ * wrong one when the answer is a single number on a settings screen.
+ */
+export async function estimateBackupPlaintextBytes(
+  maxPlaintextBytes: number,
+): Promise<BackupSizeEstimate> {
+  const tx = getDB().transaction(['notes', 'safebox'], 'readonly');
+  try {
+    let plaintextBytes = 0;
+    for (const store of ['notes', 'safebox'] as const) {
+      let cursor = await tx.objectStore(store).openCursor();
+      while (cursor) {
+        plaintextBytes += recordPlaintextBytes(cursor.value);
+        if (plaintextBytes > maxPlaintextBytes) {
+          // Stop at the budget rather than at the end: past this point the
+          // exact figure changes no decision, and reading on would spend the
+          // whole store's worth of work to say «too large» more precisely.
+          // The abandoned transaction still settles on its own; its promise is
+          // claimed so an early exit never surfaces as an unhandled rejection.
+          tx.done.catch(() => {});
+          return { plaintextBytes, overCap: true };
+        }
+        cursor = await cursor.continue();
+      }
+    }
+    await tx.done;
+    return { plaintextBytes, overCap: false };
+  } catch (e) {
+    tx.done.catch(() => {});
+    throw e;
+  }
+}
+
 export async function readBackupSnapshot(maxPlaintextBytes: number): Promise<BackupSnapshotResult> {
   const tx = getDB().transaction(['notes', 'safebox', 'meta'], 'readonly');
   try {
@@ -1124,19 +1195,8 @@ export async function readBackupSnapshot(maxPlaintextBytes: number): Promise<Bac
   let readBytes = 0;
   let overCap = false;
 
-  const encoder = new TextEncoder();
   const collect = (record: unknown): boolean => {
-    // The bytes the container will actually carry: the CANONICAL serialization,
-    // measured in UTF-8. `JSON.stringify(...).length` was neither — it counts
-    // UTF-16 code units, so any non-ASCII text undercounts (an emoji costs one
-    // or two units but four bytes), and it silently renders values IndexedDB
-    // accepts but JSON cannot carry (`Blob`, `ArrayBuffer`) as `{}` or drops
-    // them. Both errors point the same way: a store well past the cap would
-    // measure as fitting, which is exactly the memory blow-up this early stop
-    // exists to prevent. `canonicalJson` refuses such a value outright, and
-    // that refusal propagates — the export must fail loudly rather than write
-    // a file with a record quietly flattened to nothing.
-    readBytes += encoder.encode(canonicalJson(record)).length + 1; // +1 separator
+    readBytes += recordPlaintextBytes(record);
     if (readBytes > maxPlaintextBytes) {
       overCap = true;
       return false;

@@ -925,6 +925,20 @@ export async function decryptSafeboxSecret(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+/**
+ * SHA-256 of a string, lowercase hex.
+ *
+ * Used for the two integrity claims this app makes about FILES rather than
+ * about records: which backup container an artifact marker is about (D21), and
+ * whether the downloaded viewer is the one this build was compiled against
+ * (D19). Neither is a secret operation — it lives here because this is where
+ * hashing lives, not because it needs a key.
+ */
+export async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+
 export function bufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let binary = '';

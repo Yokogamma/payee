@@ -1,0 +1,186 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Backup near-cap — main-thread probe</title>
+<style>
+  body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 24px; max-width: 860px; }
+  pre { white-space: pre-wrap; background: #f6f6f6; padding: 12px; }
+  h1 { font-size: 18px; }
+</style>
+
+<h1>Near-cap backup — main-thread probe</h1>
+
+<p>
+  Answers the one question <code>scripts/measure-backup-near-cap.mjs</code> cannot:
+  <b>does the interface actually freeze, and for how long?</b> Node times the
+  same chain and reports its cost, but a browser might run WebCrypto off the
+  main thread — «seconds of work» and «seconds of a dead UI» are different
+  claims, and only a browser can tell them apart.
+</p>
+
+<p>
+  <b>Open it from disk</b> — double-click the file, or serve it from any static
+  server. It is a plain script with no imports on purpose: it must run without a
+  build, and Vite's dev server refuses to serve files from outside its root.
+</p>
+
+<p>
+  It reproduces the export/verify chain at container scale with plain Web APIs:
+  the same operations on the same volumes as <code>backup.ts</code> — canonical
+  serialization, one AES-GCM pass over the whole body, base64, SHA-256, then the
+  reverse plus a per-record decrypt. It deliberately does not import the app;
+  the subject is the platform, and a bundle would only add its own noise.
+</p>
+
+<p><button id="run">Run</button> <span id="status"></span></p>
+<pre id="out">idle</pre>
+
+<script>
+const RECORDS = 731;
+const RECORD_BYTES = 24 * 1024;
+
+const out = document.getElementById('out');
+const status = document.getElementById('status');
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+const b64 = (bytes) => {
+  let s = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(s);
+};
+const unb64 = (text) => {
+  const bin = atob(text);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) a[i] = bin.charCodeAt(i);
+  return a;
+};
+const mb = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+
+/**
+ * The heartbeat, and why it is a MessageChannel rather than requestAnimationFrame.
+ *
+ * rAF does not fire at all in a hidden tab, which makes «no frame gaps» and «no
+ * frames» indistinguishable — a probe that reports a perfectly responsive page
+ * precisely when it cannot see anything. A message task is not throttled by
+ * visibility, so a tick that does not arrive means the main thread genuinely
+ * had no room for it.
+ *
+ * Reposted through `setTimeout(0)` rather than immediately: a tight repost loop
+ * saturates the task queue and slows down the very work being measured.
+ */
+function heartbeat() {
+  const mc = new MessageChannel();
+  const state = { ticks: 0, running: true };
+  mc.port1.onmessage = () => {
+    state.ticks += 1;
+    if (state.running) setTimeout(() => mc.port2.postMessage(0), 0);
+  };
+  setTimeout(() => mc.port2.postMessage(0), 0);
+  return state;
+}
+
+/**
+ * Two controls, run first, that decide whether the instrument may be believed.
+ * Without them a zero-tick reading is ambiguous — blocked thread, or broken
+ * probe? Awaiting a timer MUST tick; a synchronous loop MUST NOT.
+ */
+async function controls() {
+  const hb = heartbeat();
+  await new Promise(r => setTimeout(r, 300));
+  const idle = hb.ticks;
+
+  const before = hb.ticks;
+  const end = performance.now() + 300;
+  while (performance.now() < end) { /* block the main thread on purpose */ }
+  const during = hb.ticks - before;
+
+  hb.running = false;
+  return { idleTicks: idle, ticksWhileBlocked: during, trustworthy: idle > 10 && during === 0 };
+}
+
+document.getElementById('run').addEventListener('click', async () => {
+  out.textContent = '';
+  status.textContent = 'validating the instrument…';
+
+  const control = await controls();
+  if (!control.trustworthy) {
+    out.textContent = `INSTRUMENT NOT TRUSTWORTHY: idle ticks ${control.idleTicks}, `
+      + `ticks while deliberately blocked ${control.ticksWhileBlocked}.\n`
+      + 'A reading of «nothing blocked» would be meaningless here — fix the probe, not the app.';
+    status.textContent = '';
+    return;
+  }
+
+  status.textContent = 'building the fixture…';
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const records = [];
+  for (let i = 0; i < RECORDS; i += 1) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const body = enc.encode(`${i}:${'note '.repeat(Math.floor(RECORD_BYTES / 5))}`);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, body));
+    records.push({ noteId: `id-${i}`, ciphertext: b64(ct), iv: b64(iv), createdAt: 1756000000000 + i });
+  }
+
+  status.textContent = 'measuring…';
+  let peak = 0;
+  const sampleHeap = () => {
+    if (performance.memory) peak = Math.max(peak, performance.memory.usedJSHeapSize);
+  };
+
+  const steps = [];
+  const hb = heartbeat();
+  const step = async (name, fn) => {
+    sampleHeap();
+    const before = hb.ticks;
+    const t = performance.now();
+    const value = await fn();
+    const ms = Math.round(performance.now() - t);
+    steps.push({ name, ms, blocked: hb.ticks - before === 0 });
+    sampleHeap();
+    return value;
+  };
+
+  const plaintext = await step('stringify', async () =>
+    JSON.stringify({ notes: records, safebox: [], incompleteRestore: false }));
+  const bytes = await step('encode utf-8', async () => enc.encode(plaintext));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const sealed = await step('AES-GCM encrypt', async () =>
+    new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes)));
+  const file = await step('base64 + wrap', async () =>
+    JSON.stringify({ format: 'eternal-notes-backup', v: 1, iv: b64(iv), body: b64(sealed) }));
+  await step('SHA-256', async () => crypto.subtle.digest('SHA-256', enc.encode(file)));
+
+  const parsed = await step('parse file', async () => JSON.parse(file));
+  const opened = await step('unbase64 + decrypt', async () => new Uint8Array(
+    await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(parsed.iv) }, key, unb64(parsed.body))));
+  const body = await step('parse body', async () => JSON.parse(dec.decode(opened)));
+  await step(`decrypt ${RECORDS} records`, async () => {
+    for (const r of body.notes) {
+      await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(r.iv) }, key, unb64(r.ciphertext));
+    }
+  });
+  hb.running = false;
+
+  const exportMs = steps.slice(0, 5).reduce((a, s) => a + s.ms, 0);
+  const verifyMs = steps.slice(5).reduce((a, s) => a + s.ms, 0);
+  const worst = steps.reduce((a, s) => (s.ms > a.ms ? s : a));
+
+  out.textContent = [
+    `instrument:      idle ticks ${control.idleTicks}, ticks while blocked ${control.ticksWhileBlocked} → trustworthy`,
+    `file produced:   ${mb(enc.encode(file).byteLength)}`,
+    '',
+    ...steps.map(s => `  ${s.name.padEnd(22)} ${String(s.ms).padStart(5)} ms  ${s.blocked ? 'BLOCKED' : 'yielded'}`),
+    '',
+    `export:          ${exportMs} ms`,
+    `verify:          ${verifyMs} ms`,
+    `longest freeze:  ${worst.ms} ms  (${worst.name})`,
+    performance.memory
+      ? `peak JS heap:    ${mb(peak)} of ${mb(performance.memory.jsHeapSizeLimit)} limit`
+      : 'peak JS heap:    not exposed by this browser',
+  ].join('\n');
+  status.textContent = '';
+});
+</script>

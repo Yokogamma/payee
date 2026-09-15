@@ -1,9 +1,11 @@
-import { useState, useEffect, type ReactNode } from 'react';
+import { useState, useEffect } from 'react';
 import { useNotes } from '../lib/store';
 import type { AutoLockTimeout } from '../lib/auto-lock';
 import type { ThemePref } from '../lib/theme';
 import { SECRET_PASSWORD_FIELD_PROPS, SAFEBOX_SECRET_FIELD_CLASS } from '../components/secretFieldProps';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { SettingsBlock } from '../components/SettingsBlock';
+import { BackupSettings } from './BackupSettings';
 import { navigate } from '../lib/route';
 import { QUARANTINE_EXPLANATION, RECOVERY_INVALIDATED_EXPLANATION } from '../lib/syncCounters';
 import { QUICK_UNLOCK_ENABLED } from '../lib/flags';
@@ -40,51 +42,6 @@ const THEME_LABELS: Record<ThemePref, string> = {
 };
 
 // ─── Inline SVG icons (self-hosted — the CSP forbids external icon fonts) ───
-function Svg({ children }: { children: ReactNode }) {
-  return (
-    <svg
-      viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
-      strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
-    >
-      {children}
-    </svg>
-  );
-}
-const IconChevron = () => <Svg><path d="m6 9 6 6 6 -6" /></Svg>;
-
-/** One settings row. Collapsed by default; the header stays a button so the
- *  keyboard treats it as one stop.
- *
- *  NO LEADING ICON, deliberately. Each row used to carry a 20px accent glyph,
- *  which is 31px of the row's width spent on decoration that repeats the label
- *  it sits next to. The approved mockup has none, and on a 360px phone that
- *  width is the difference between «Авто-блокировка · Через 5 мин» fitting and
- *  wrapping. Icons stay where they disambiguate — the three nav items. */
-function SettingsBlock({ title, chip, chipClass, danger, children }: {
-  title: string;
-  chip?: string;
-  chipClass?: string;
-  danger?: boolean;
-  children: ReactNode;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className={`settings-block${danger ? ' settings-block--danger' : ''}${open ? ' is-open' : ''}`}>
-      <button
-        type="button"
-        className="settings-block-header"
-        aria-expanded={open}
-        onClick={() => setOpen(o => !o)}
-      >
-        <span className="settings-block-title">{title}</span>
-        {chip && <span className={`settings-block-chip${chipClass ? ' ' + chipClass : ''}`}>{chip}</span>}
-        <span className="settings-block-chev"><IconChevron /></span>
-      </button>
-      {open && <div className="settings-block-body">{children}</div>}
-    </div>
-  );
-}
-
 export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) {
   const {
     notes,
@@ -457,6 +414,10 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               </div>
             )}
           </SettingsBlock>
+
+          {/* Release-gated INSIDE the block, not here: with both flags off it
+              renders nothing at all, instruction included (§7, D16). */}
+          <BackupSettings />
 
           </div>
           </div>

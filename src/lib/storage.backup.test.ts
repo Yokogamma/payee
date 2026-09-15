@@ -10,8 +10,10 @@ import {
   getSyncRecord,
   getNoteById,
   getAllNotes,
+  getMeta,
   getSafeboxEntryById,
   readBackupSnapshot,
+  estimateBackupPlaintextBytes,
   mergeBackupRecord,
   mergeRestoredSafeboxEntry,
   getDbGeneration,
@@ -67,6 +69,79 @@ describe('readBackupSnapshot', () => {
     expect(result.snapshot.notes).toHaveLength(1);
     expect(result.snapshot.safebox).toHaveLength(1);
     expect(result.snapshot.incompleteRestore).toBe(false);
+  });
+
+  it('a write racing the snapshot lands wholly outside it — the marker cannot disagree with the data', async () => {
+    /*
+     * The test above shows the three values arriving in ONE RESULT, which a
+     * reader opening one transaction per store would satisfy just as happily.
+     * What the single `transaction(['notes', 'safebox', 'meta'])` actually buys
+     * is a snapshot, and a snapshot is only observable against a concurrent
+     * write: an import running at the same time (export is deliberately left
+     * outside the import lock) must be either wholly inside the picture or
+     * wholly outside it — never half of each.
+     *
+     * The failure this catches is the torn read. Stage B of an import writes
+     * records AND raises `incompleteRestore`. A reader that takes the marker in
+     * one transaction and the records in another can catch the records WITHOUT
+     * the marker and export them under `incompleteRestore: false` — a file
+     * that declares itself complete while the import behind its contents never
+     * finished. The user is told the copy is good, deletes the source file, and
+     * the records stage B never reached are gone with it.
+     *
+     * Behavioural rather than a source-text guard, because the property is
+     * reachable: IndexedDB starts transactions in creation order and
+     * `readBackupSnapshot` creates its transaction synchronously on entry, so
+     * every write queued after the call is ordered behind it. Phase 2 replays
+     * the identical race against a two-transaction reader assembled from the
+     * same public API — without that control this test could go green for
+     * the boring reason that nothing interleaved at all.
+     */
+    const SECOND_ID = '22222222-2222-4333-8444-555555555555';
+    await saveNote(note());
+
+    // Deliberately not awaited: the snapshot's transaction is already open, and
+    // these are the two writes stage B makes to the stores it is reading.
+    const snapshot = readBackupSnapshot(BIG_BUDGET);
+    const racingWrites = Promise.all([
+      saveNote(note({ noteId: SECOND_ID })),
+      setMeta(INCOMPLETE_RESTORE_META_KEY, true),
+    ]);
+    const result = await snapshot;
+    await racingWrites;
+
+    expect(result.ok && result.snapshot.notes.map((n) => n.noteId)).toEqual([ID]);
+    expect(result.ok && result.snapshot.incompleteRestore).toBe(false);
+
+    // The writes did land — the race was live, merely invisible to a
+    // transaction that had already started.
+    const after = await readBackupSnapshot(BIG_BUDGET);
+    expect(after.ok && after.snapshot.notes).toHaveLength(2);
+    expect(after.ok && after.snapshot.incompleteRestore).toBe(true);
+
+    // Phase 2 — the control: the same race and the same writes, with the
+    // marker and the records read in two transactions instead of one.
+    await resetAll();
+    await saveNote(note());
+    const twoTransactionRead = (async () => {
+      const rawMarker = await getMeta(INCOMPLETE_RESTORE_META_KEY);
+      return {
+        notes: (await getAllNotes()).length,
+        incompleteRestore: rawMarker !== undefined && rawMarker !== false,
+      };
+    })();
+    const sameWrites = Promise.all([
+      saveNote(note({ noteId: SECOND_ID })),
+      setMeta(INCOMPLETE_RESTORE_META_KEY, true),
+    ]);
+    const torn = await twoTransactionRead;
+    await sameWrites;
+
+    // Should this ever equal the snapshot above, the race stopped interleaving
+    // and the assertions before it prove nothing: repair the race, never relax
+    // them.
+    expect(torn, 'two transactions must NOT survive the race a single one does')
+      .not.toEqual({ notes: 1, incompleteRestore: false });
   });
 
   it('an absent marker means complete', async () => {
@@ -331,6 +406,52 @@ describe('readBackupSnapshot — the size measure is an upper bound in BYTES', (
     await saveNote({ ...note(), extra: new ArrayBuffer(8) } as unknown as EncryptedNote);
 
     await expect(readBackupSnapshot(BIG_BUDGET)).rejects.toMatchObject({ code: 'unsupported_value' });
+  });
+});
+
+describe('estimateBackupPlaintextBytes — the same measure, without the records', () => {
+  it('agrees with the reader byte for byte', async () => {
+    // Two measures that could disagree would mean the settings block promises
+    // a file the export then refuses to produce. They share one function, and
+    // this is the assertion that keeps it that way.
+    await saveNote(note());
+    await saveNote(other);
+
+    const estimate = await estimateBackupPlaintextBytes(BIG_BUDGET);
+    const snapshot = await readBackupSnapshot(estimate.plaintextBytes - 1);
+
+    expect(estimate.overCap).toBe(false);
+    // One byte under the measured total is not enough — which is only true if
+    // both sides counted the same bytes.
+    expect(snapshot.ok).toBe(false);
+    expect(await readBackupSnapshot(estimate.plaintextBytes)).toMatchObject({ ok: true });
+  });
+
+  it('counts safebox entries as well as notes', async () => {
+    await saveNote(note());
+    const notesOnly = await estimateBackupPlaintextBytes(BIG_BUDGET);
+
+    await mergeRestoredSafeboxEntry({
+      entryId: '88888888-9999-8aaa-baaa-cccccccccccc',
+      metaCiphertext: 'QUFBQUFBQUFBQUFBQUFBQQ==', metaIv: IV,
+      secretCiphertext: 'QkJCQkJCQkJCQkJCQkJCQg==', secretIv: IV,
+      createdAt: NOW, v: 4,
+    }, 'tx-A', NOW, getDbGeneration());
+
+    expect((await estimateBackupPlaintextBytes(BIG_BUDGET)).plaintextBytes)
+      .toBeGreaterThan(notesOnly.plaintextBytes);
+  });
+
+  it('stops at the budget and SAYS it stopped', async () => {
+    // The figure it returns is small by construction once it stops, so a
+    // consumer reading the number alone would call an unexportable store
+    // comfortable. The flag is the answer, not the number.
+    await saveNote(note());
+
+    const estimate = await estimateBackupPlaintextBytes(4);
+
+    expect(estimate.overCap).toBe(true);
+    expect(estimate.plaintextBytes).toBeGreaterThan(4);
   });
 });
 

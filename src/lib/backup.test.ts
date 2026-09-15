@@ -4,6 +4,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   BACKUP_CAP_BYTES,
+  BACKUP_PLAINTEXT_BUDGET_BYTES,
+  expectedContainerBytes,
   BackupError,
   type EncodeBackupInput,
   backupFileName,
@@ -535,5 +537,25 @@ describe('the documented container vector (docs/BACKUP_FORMAT_V1.md §2.8)', () 
     expect(doc).toContain(CONTAINER);
     expect(doc).toContain(BODY_JSON);
     expect(doc).toContain(MNEMONIC);
+  });
+});
+
+describe('the cap is one number, stated in one unit (D17)', () => {
+  it('a plaintext at the budget produces a file at or under the cap', () => {
+    // The two are inverses of each other, and the direction matters: the
+    // estimate must never say «fits» about a store the export then refuses.
+    expect(expectedContainerBytes(BACKUP_PLAINTEXT_BUDGET_BYTES))
+      .toBeLessThanOrEqual(BACKUP_CAP_BYTES);
+  });
+
+  it('one byte past the budget is over the cap', () => {
+    // The other direction: an estimate so conservative that nothing ever
+    // reaches the ceiling would make the warning unreachable.
+    expect(expectedContainerBytes(BACKUP_PLAINTEXT_BUDGET_BYTES + 4096))
+      .toBeGreaterThan(BACKUP_CAP_BYTES);
+  });
+
+  it('charges base64 and the wrapper, not the raw bytes', () => {
+    expect(expectedContainerBytes(3000)).toBeGreaterThan(4000);
   });
 });
