@@ -138,13 +138,6 @@ afford.
 Not a wire format, documented here because it is the client-side counterpart of
 §1 and the two are easy to confuse.
 
-> **Ships one release later than §1.** The server fingerprint of §1 is part of
-> the worker release that introduces `semanticIdempotency`; the client function
-> described here lands with the backup release. The section is specified here
-> anyway, and deliberately: the two notions of «the same publication» have to
-> be written down together or they drift, and the differences listed at the end
-> of this section are the whole reason the second one exists.
-
 `publicationEquivalent(a, b)` (`src/lib/publication-equivalent.ts`) answers
 «would these two LOCAL records go on-chain as the same publication?» by
 comparing the `(data, tags)` pair from the real upload builders with fixed
