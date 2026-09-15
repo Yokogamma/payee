@@ -21,8 +21,19 @@ export interface OutboundRoute {
   body: string;
   times: number;
   calls: number;
-  /** Optional artificial latency before the mocked response resolves. */
+  /** Optional artificial latency before the mocked response resolves — for
+   *  MEASURING (a stopwatch must see ≥ N ms), never for ordering: a request
+   *  that has to stay parked while the test does something else is parked
+   *  with `hold`, not with a number of milliseconds a slow runner can outlast. */
   delayMs?: number;
+  /** Optional barrier: the mocked response is withheld until this promise
+   *  settles. The TEST holds the resolver, so the caller stays parked at this
+   *  leg for exactly as long as the test says. */
+  hold?: Promise<unknown>;
+  /** Resolves when the first matching request ARRIVES — before `delayMs` and
+   *  before `hold` — so a test can wait for the caller to reach this leg
+   *  instead of sleeping and hoping it did. */
+  reached: Promise<void>;
   /** Optional body factory overriding `body` — lets a test hand out a
    *  streaming/erroring body (e.g. a truncated connection). */
   makeBody?: () => BodyInit;
@@ -36,6 +47,34 @@ export interface OutboundRoute {
   gotSignal?: boolean;
   /** Authorization header of the LAST matching request, if any. */
   lastAuthorization?: string;
+  /** Redirect mode of the LAST matching request — `undefined` when the caller
+   *  left it at the default. Lets a suite assert the mode a call site passes,
+   *  not merely that it passed something the runtime tolerates. */
+  lastRedirect?: RequestRedirect;
+}
+
+/**
+ * workerd accepts ONLY `follow` and `manual`; `'error'` is refused with a
+ * TypeError while init is parsed — before any I/O, on every call, forever.
+ *
+ * A mock that quietly accepts anything is how that shipped: the suites were
+ * green while production could not read a single gateway. So the mock refuses
+ * exactly what the runtime refuses, with the runtime's own message.
+ *
+ * `init` WINS over the Request's own field, as the Fetch standard requires —
+ * and a bare `new Request(url)` already carries `redirect: 'follow'`, so the
+ * opposite order would mask precisely the call this exists to catch.
+ */
+export function assertSupportedRedirect(input: RequestInfo | URL, init?: RequestInit): RequestRedirect | undefined {
+  const redirect = init?.redirect ?? (input instanceof Request ? input.redirect : undefined);
+  if (redirect !== undefined && redirect !== 'follow' && redirect !== 'manual') {
+    throw new TypeError(
+      'Invalid redirect value, must be one of "follow" or "manual" ' +
+      '("error" won\'t be implemented since it does not make sense at the edge; ' +
+      'use "manual" and check the response status code)',
+    );
+  }
+  return redirect;
 }
 
 /** Status origins configured for the test isolates (vitest*.config.mts). */
@@ -46,28 +85,43 @@ export function statusUrlRe(origin: string, txId: string): RegExp {
   return new RegExp('^' + origin.replace(/\./g, '\\.') + '/tx/' + txId + '/status$');
 }
 
+/** A promise with its resolver in hand — the barrier a test releases. */
+export function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(res => { resolve = res; });
+  return { promise, resolve };
+}
+
 export function setupOutboundMock() {
   const outboundRoutes: OutboundRoute[] = [];
+  const markReached = new WeakMap<OutboundRoute, () => void>();
 
   function mockRoute(
     method: string, url: RegExp, status: number, body: string, times = 1,
-    opts: { delayMs?: number; makeBody?: () => BodyInit } = {},
+    opts: { delayMs?: number; hold?: Promise<unknown>; makeBody?: () => BodyInit } = {},
   ): OutboundRoute {
+    const reached = deferred();
     const route: OutboundRoute = {
       method, url, status, body, times, calls: 0,
-      delayMs: opts.delayMs, makeBody: opts.makeBody,
+      delayMs: opts.delayMs, hold: opts.hold, reached: reached.promise, makeBody: opts.makeBody,
     };
+    markReached.set(route, reached.resolve);
     outboundRoutes.push(route);
     return route;
   }
 
   beforeAll(() => {
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      // BEFORE routing: an init the runtime would refuse must fail here too,
+      // whether or not this suite happens to mock the URL.
+      const redirect = assertSupportedRedirect(input, init);
       const url = input instanceof Request ? input.url : String(input);
       const method = ((input instanceof Request ? input.method : init?.method) ?? 'GET').toUpperCase();
       const route = outboundRoutes.find(r => r.method === method && r.url.test(url) && r.calls < r.times);
       if (!route) throw new Error(`unmocked or exhausted outbound fetch: ${method} ${url}`);
       route.calls++;
+      markReached.get(route)?.();
+      route.lastRedirect = redirect;
       route.lastUrl = url;
       if (!(input instanceof Request)) route.gotSignal = init?.signal != null;
       if (typeof init?.body === 'string') route.lastBody = init.body;
@@ -77,6 +131,7 @@ export function setupOutboundMock() {
       const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
       route.lastAuthorization = headers.get('Authorization') ?? undefined;
       if (route.delayMs) await new Promise(r => setTimeout(r, route.delayMs));
+      if (route.hold) await route.hold;
       return new Response(route.makeBody ? route.makeBody() : route.body, { status: route.status });
     });
   });

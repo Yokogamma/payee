@@ -25,7 +25,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseOriginList } from './gateways-parse.mjs';
 import { readTomlString } from './toml-scan.mjs';
-import { EXPECTED_STATUS_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { candidateLacksVar } from './historical-candidates.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -50,6 +51,10 @@ export function readTomlVar(toml, blockPrefix, key) {
 
 export function readWorkerStatusGateways(toml, blockPrefix = '') {
   return readTomlVar(toml, blockPrefix, 'STATUS_GATEWAYS');
+}
+
+export function readWorkerPayloadGateways(toml, blockPrefix = '') {
+  return readTomlVar(toml, blockPrefix, 'PAYLOAD_GATEWAYS');
 }
 
 /**
@@ -78,7 +83,7 @@ export function checkUploadSwitchesOff(toml, blockPrefix = '') {
  * Returns `{ ok, problems }`; problems name variables and expectations but
  * never echo secrets (there are none here — gateway lists are public).
  */
-export function checkGateways(clientCsv, toml, { repoOnly = false } = {}) {
+export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = null } = {}) {
   const problems = [];
 
   const pinned = parseOriginList(EXPECTED_STATUS_CSV);
@@ -132,7 +137,41 @@ export function checkGateways(clientCsv, toml, { repoOnly = false } = {}) {
     }
   }
 
-  return { ok: problems.length === 0, problems };
+  // ── The PAYLOAD pool (D2/D9) ──
+  //
+  // A separate pin from the status pool, and compared with its ORDER: the pool
+  // is tried in sequence, and the sequence is the approved one (§2.1). Order is
+  // meaningless for status probes — they run in parallel — which is why the
+  // comparison above is set-only and this one is not.
+  //
+  // Checked per BLOCK, like everything else here: a named environment inherits
+  // nothing, so a correct production table says nothing about staging.
+  //
+  // Skipped for ONE registered historical candidate and nothing else: a build
+  // that predates D9 has no code that reads PAYLOAD_GATEWAYS, so the check is
+  // vacuous there — while the STATUS pool above is still checked in full,
+  // because that build does have a quorum. The exception is keyed by the full
+  // SHA in scripts/historical-candidates.mjs; nothing here can widen it.
+  const skipPayload = candidateLacksVar(candidate, 'PAYLOAD_GATEWAYS');
+  const pinnedPayload = parseOriginList(EXPECTED_PAYLOAD_CSV);
+  for (const [label, prefix] of skipPayload ? [] : [['production', ''], ['staging', 'env.staging.']]) {
+    const read = readWorkerPayloadGateways(toml, prefix);
+    if (read.error) { problems.push(`${label}: ${read.error}`); continue; }
+    const worker = parseOriginList(read.value);
+    if (worker.length === 0) {
+      problems.push(`${label}: PAYLOAD_GATEWAYS is empty or fully unparseable`);
+      continue;
+    }
+    if (worker.join(',') !== pinnedPayload.join(',')) {
+      problems.push(
+        `${label}: worker PAYLOAD_GATEWAYS does not match the repo-pinned list in order ` +
+          `(${EXPECTED_PAYLOAD_CSV}). The order is part of the pin: the pool is tried in ` +
+          'sequence, and a reordered list silently changes which gateway is asked first.',
+      );
+    }
+  }
+
+  return { ok: problems.length === 0, problems, skippedPayloadPool: skipPayload };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -144,7 +183,8 @@ if (process.argv[1]?.endsWith('check-gateways-vs-worker.mjs')) {
   // an unapproved pool and only fail the post-deploy smoke.
   const configArg = process.argv.find(a => a.startsWith('--config='))?.split('=')[1];
   const toml = readFileSync(configArg ?? join(ROOT, 'worker', 'wrangler.toml'), 'utf8');
-  const { ok, problems } = checkGateways(process.env.VITE_STATUS_GATEWAYS, toml, { repoOnly });
+  const candidate = process.env.WORKER_CANDIDATE_SHA ?? null;
+  const { ok, problems, skippedPayloadPool } = checkGateways(process.env.VITE_STATUS_GATEWAYS, toml, { repoOnly, candidate });
   if (!ok) {
     console.error('✗ gateway config gate failed:');
     for (const p of problems) console.error(`  - ${p}`);
@@ -155,7 +195,10 @@ if (process.argv[1]?.endsWith('check-gateways-vs-worker.mjs')) {
     process.exit(1);
   }
   console.log(
-    `✓ gateway config gate: client and worker agree on the pinned status pool` +
+    `✓ gateway config gate: client and worker agree on the pinned status pool, ` +
+      (skippedPayloadPool
+        ? `and the payload-pool check was SKIPPED for historical candidate ${candidate.slice(0, 7)} (no D9 in that build)`
+        : `and the worker's payload pool matches the pin in order`) +
       `${repoOnly ? ' (repo-only mode)' : ''}`,
   );
 }

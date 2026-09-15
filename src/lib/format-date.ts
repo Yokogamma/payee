@@ -39,6 +39,52 @@ const DAY = 24 * HOUR;
  *  «август», so the day has to be in the same format call to inflect it. */
 const dayMonth = new Intl.DateTimeFormat('ru', { day: 'numeric', month: 'long' });
 
+/**
+ * The same date, ALWAYS absolute — «19 августа», «19 августа 2025».
+ *
+ * For places that need a date rather than a relative bearing: the accessible
+ * name of the feed's open control reads «Открыть заметку от …», and «Открыть
+ * заметку от только что» is not a sentence. It is also time-dependent, so the
+ * name of a control would change while the user is on the page.
+ *
+ * No relative branch at all, which is why a FUTURE timestamp prints its date
+ * here instead of clamping to «только что» as the relative formatter does.
+ */
+export function formatNoteDateFull(ts: number, now: number = Date.now()): string {
+  const d = new Date(ts);
+  const text = dayMonth.format(d);
+  return d.getFullYear() === new Date(now).getFullYear() ? text : `${text} ${d.getFullYear()}`;
+}
+
+/** «14:22». `hourCycle: 'h23'`, NOT `hour12: false`.
+ *
+ *  They are not synonyms: `hour12: false` selects the h24 cycle in several ICU
+ *  builds, which prints midnight as «24:00» — a time that does not exist and
+ *  that sorts after every other hour of the day it belongs to. `h23` is the
+ *  cycle Russian actually uses. Pinned by a test at exactly midnight, because
+ *  this is invisible at every other hour. */
+const hourMinute = new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+/**
+ * The stamp of ONE version — «13 августа, 14:22», «13 августа 2025, 14:22».
+ *
+ * The version index needs a moment, not a bearing. Three versions written
+ * within an hour of each other print «40 мин назад / 41 мин назад / 42 мин
+ * назад» under the relative formatter: ordered, but placed nowhere — and the
+ * order is already carried by the list. The clock time is what tells them
+ * apart, so this formatter has no relative branch at all.
+ *
+ * No relative branch also means a FUTURE timestamp prints its own date here
+ * rather than clamping to «только что», the same way `formatNoteDateFull`
+ * behaves and for the same reason.
+ */
+export function formatVersionStamp(ts: number, now: number = Date.now()): string {
+  const d = new Date(ts);
+  const date = dayMonth.format(d);
+  const dated = d.getFullYear() === new Date(now).getFullYear() ? date : `${date} ${d.getFullYear()}`;
+  return `${dated}, ${hourMinute.format(d)}`;
+}
+
 export function formatNoteDate(ts: number, now: number = Date.now()): string {
   const diff = now - ts;
 

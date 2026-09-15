@@ -16,6 +16,7 @@
 import Arweave from 'arweave';
 import type { JWKInterface } from 'arweave/node/lib/wallet';
 import type { Emit } from './metrics';
+import { classifyStatus, classifyThrow } from './gateway-class';
 
 export const ARWEAVE_HOST = 'arweave.net';
 
@@ -82,19 +83,10 @@ export function assertStructurallyCompleteJwk(raw: string): JWKInterface {
 /** Thrown on any gateway-leg failure; the caller's existing catch keeps the 502 path. */
 export class GatewayLegError extends Error {}
 
-export function classifyStatus(status: number): '2xx' | '404' | '4xx' | '5xx' | 'network' {
-  if (status >= 200 && status < 300) return '2xx';
-  if (status === 404) return '404';
-  if (status >= 400 && status < 500) return '4xx';
-  if (status >= 500 && status < 600) return '5xx';
-  return 'network'; // 1xx/3xx leftovers are not a valid gateway answer here
-}
-
-export function classifyThrow(e: unknown): 'timeout' | 'network' {
-  return e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')
-    ? 'timeout'
-    : 'network';
-}
+// The label vocabulary lives in `gateway-class.ts` so the D9 reader can share
+// it without importing this module (and `arweave` with it). Re-exported here
+// because every existing call site imports these two from the transport.
+export { classifyStatus, classifyThrow, type GatewayClass } from './gateway-class';
 
 /**
  * Read a response body under a hard cap without materialising the excess.

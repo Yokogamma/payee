@@ -18,6 +18,10 @@
  *
  * Anything it cannot understand is a REFUSAL, never a guess: a gate that
  * silently skips what it fails to parse is a gate that can be talked past.
+ * In particular the QUOTED and DOTTED spellings TOML allows for the same
+ * tables and keys — `["vars"]`, `[env."staging".vars]`, `"KEY" = …`,
+ * `a.b = …` — are refused outright: wrangler would read them, the bare-name
+ * scanner would not, and the two would then judge different files.
  */
 
 /** Thrown on syntax this scanner refuses to interpret. */
@@ -28,16 +32,72 @@ export class TomlScanError extends Error {
   }
 }
 
-const TABLE_RE = /^\[\[?([A-Za-z0-9_.\-"' ]+)\]\]?\s*(#.*)?$/;
+// BARE names only — no quotes, no spaces inside a segment. TOML also allows
+// `["vars"]`, `[env."staging".vars]`, `"KEY" = …` and `a.b = …`; wrangler
+// reads all of those as the same tables and keys this scanner spells bare. A
+// scanner that recognised the bare form and silently ignored the others would
+// let a candidate declare the value wrangler ACTUALLY uses in a spelling the
+// gate never looks at. So the quoted and dotted forms are not «unsupported» —
+// they are REFUSED, and the gate fails closed on the whole file.
+const TABLE_RE = /^\[\[?([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)\]\]?\s*(#.*)?$/;
 const KEY_RE = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/;
 
+const DQ3 = '"'.repeat(3);
+const SQ3 = "'".repeat(3);
+
 /**
- * Split `text` into table sections, ignoring anything inside multi-line
- * strings. Returns `[{ table, lines }]`; the root section has `table: ''`.
+ * Walk one line outside a multi-line string and report the net change in
+ * bracket depth (`[`/`{` minus `]`/`}`) OUTSIDE strings and comments — the
+ * only way to tell a continuation line of a multi-line array from a line the
+ * scanner does not understand. Also reports whether a multi-line string opens
+ * on this line without closing.
+ */
+function scanLine(line, depth) {
+  let i = 0;
+  let opensMultiline = null;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === '#') break;
+    if (ch === '"' || ch === "'") {
+      const triple = line.slice(i, i + 3);
+      if (triple === DQ3 || triple === SQ3) {
+        const close = line.indexOf(triple, i + 3);
+        if (close < 0) { opensMultiline = triple; break; }
+        i = close + 3;
+        continue;
+      }
+      // single-line string: skip to its close, honouring escapes in basic strings
+      let j = i + 1;
+      while (j < line.length && line[j] !== ch) {
+        if (ch === '"' && line[j] === '\\') j++;
+        j++;
+      }
+      if (j >= line.length) throw new TomlScanError(`unterminated string: ${line.trim()}`);
+      i = j + 1;
+      continue;
+    }
+    if (ch === '[' || ch === '{') depth++;
+    else if (ch === ']' || ch === '}') depth--;
+    i++;
+  }
+  return { depth, opensMultiline };
+}
+
+/**
+ * Split `text` into table sections.
+ *
+ * Every line is classified, and a line that fits NONE of the shapes below is a
+ * refusal — never skipped:
+ *   - blank, or a comment;
+ *   - a bare table header `[a.b]` / `[[a.b]]`;
+ *   - a bare-key assignment `key = value`;
+ *   - a continuation line of a multi-line array/inline-table value;
+ *   - a line inside a multi-line string, which is inert.
  */
 function sections(text) {
   const out = [{ table: '', lines: [] }];
   let inMultiline = null; // the delimiter that opened it
+  let depth = 0;          // bracket depth of an unfinished value
 
   for (const rawLine of String(text ?? '').split('\n')) {
     const line = rawLine.replace(/\r$/, '');
@@ -52,25 +112,38 @@ function sections(text) {
     const trimmed = line.trim();
     if (trimmed === '' || trimmed.startsWith('#')) continue;
 
-    // A line that OPENS a multi-line string without closing it on the same line.
-    for (const delim of ['"""', "'''"]) {
-      const first = line.indexOf(delim);
-      if (first >= 0 && line.indexOf(delim, first + 3) < 0) {
-        inMultiline = delim;
-        break;
-      }
+    if (depth > 0) {
+      // Continuation of a multi-line array. Only the bracket bookkeeping
+      // matters here; the value itself is never one the gates read.
+      const r = scanLine(line, depth);
+      depth = r.depth;
+      if (r.opensMultiline) inMultiline = r.opensMultiline;
+      if (depth < 0) throw new TomlScanError(`unbalanced brackets: ${trimmed}`);
+      continue;
     }
-    if (inMultiline !== null) continue;
 
     const table = TABLE_RE.exec(trimmed);
     if (table) {
-      out.push({ table: table[1].trim(), lines: [] });
+      out.push({ table: table[1], lines: [] });
       continue;
     }
+    if (trimmed.startsWith('[')) {
+      throw new TomlScanError(`table header in a form this scanner refuses (quoted or malformed): ${trimmed}`);
+    }
+
+    const key = KEY_RE.exec(trimmed);
+    if (!key) {
+      throw new TomlScanError(`line is neither a bare table header nor a bare-key assignment: ${trimmed}`);
+    }
+    const r = scanLine(key[2], 0);
+    depth = r.depth;
+    if (r.opensMultiline) inMultiline = r.opensMultiline;
+    if (depth < 0) throw new TomlScanError(`unbalanced brackets: ${trimmed}`);
     out[out.length - 1].lines.push(trimmed);
   }
 
   if (inMultiline !== null) throw new TomlScanError('unterminated multi-line string');
+  if (depth !== 0) throw new TomlScanError('unterminated array or inline table');
   return out;
 }
 

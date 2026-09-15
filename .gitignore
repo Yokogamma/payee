@@ -30,3 +30,8 @@ dist-ssr
 # The SHA-256 constant it produces IS committed (as a placeholder stub) so a
 # clean checkout compiles; the artifact itself is rebuilt deterministically.
 public/backup-viewer.html
+
+# Scratch: throwaway notes and intermediate results. Losing them is acceptable.
+# Maintained project documentation lives in docs/ and IS versioned; internal
+# plans, audits and research live in the private repository payee-private-docs.
+/.scratch/
