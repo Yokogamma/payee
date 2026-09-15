@@ -28,14 +28,21 @@
  *               stays where it is.
  *
  * Why the mode is read from `src/lib/flags.ts` of the checkout that gets
- * built, and only from there: the flags are source-controlled literals (the
- * strict `readFlag` of check-backup-flags.mjs refuses anything computed), the
- * Pages workflow builds the very checkout this script runs in, and the
- * workflow itself lives on the protected default branch. A workflow input or
- * an operator switch could be set to «relax» for a build that has import on;
- * a literal in the released source cannot. Equality therefore comes back
- * automatically with the first build that turns import on — nobody has to
- * remember to flip the gate.
+ * built, and only from there: the flags are source-controlled literals; the
+ * Pages workflow builds the very checkout this script runs in; and the job
+ * runs under the `dev` Environment, whose deployment-branch policy admits only
+ * `main` — so the checkout whose flags are read is a protected-branch state,
+ * and the mode inherits exactly the strength of that policy (docs/SECRETS.md).
+ * A workflow input or an operator switch could be set to «relax» for a build
+ * that has import on; a literal in the released source cannot. Equality
+ * therefore comes back automatically with the first build that turns import
+ * on — nobody has to remember to flip the gate.
+ *
+ * The flag is read STRICTLY: exactly one declaration, at the start of a line,
+ * with a literal `true` or `false`. Zero matches, two matches (a comment or a
+ * string that spells the declaration ahead of the real one) or a computed
+ * value are refusals — a gate that guessed the mode would be a gate that can
+ * be talked into the wrong one.
  *
  * In BOTH modes the Environment floor must equal the repo-pinned
  * `MINIMUM_FLOOR`: the two stages of a floor raise (the variable, then the
@@ -48,20 +55,36 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { readFlag } from './check-backup-flags.mjs';
 import { checkFloorInputs, gitIn, MINIMUM_FLOOR } from './check-worker-floor.mjs';
 
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const FLAGS_PATH = fileURLToPath(new URL('../src/lib/flags.ts', import.meta.url));
 
 /**
- * Which mode the released source demands.
+ * The one declaration of a flag, or a throw.
  *
- * Throws (via `readFlag`) when the flag is not a literal boolean — a computed
- * flag would make the artifact's behavior differ from its source, and a gate
- * that guessed would be a gate that can be talked into the wrong mode.
+ * Anchored at the start of a line (`m`), and it must match EXACTLY ONCE: the
+ * first-match reader of check-backup-flags.mjs is right for the pair check,
+ * but here a second spelling of the declaration — in a comment, a string, a
+ * doc example — could shadow the real one and pick the other mode. Exported
+ * for the test; not a general utility.
  */
+export function readFlagExactlyOnce(source, name) {
+  const re = new RegExp(`^export const ${name}\\s*:\\s*boolean\\s*=\\s*(true|false)\\s*;`, 'gm');
+  const matches = [...String(source ?? '').matchAll(re)];
+  if (matches.length !== 1) {
+    throw new Error(
+      `check-client-floor-gate: expected exactly one line-anchored declaration ` +
+      `\`export const ${name}: boolean = true|false;\` in src/lib/flags.ts, found ${matches.length}. ` +
+      'A missing, computed or duplicated declaration cannot decide the gate mode.',
+    );
+  }
+  return matches[0][1] === 'true';
+}
+
+/** Which mode the released source demands. Throws when it cannot tell. */
 export function gateModeFor(flagsSource) {
-  return readFlag(flagsSource, 'BACKUP_IMPORT_ENABLED') ? 'equality' : 'ancestry';
+  return readFlagExactlyOnce(flagsSource, 'BACKUP_IMPORT_ENABLED') ? 'equality' : 'ancestry';
 }
 
 /**
@@ -70,7 +93,8 @@ export function gateModeFor(flagsSource) {
  *     yes nor a no — an undecided gate must never read as a pass.
  *
  * Returns `{ ok, mode?, reason }`. `reason` explains the verdict either way,
- * so the run log carries the evidence of WHICH mode judged the release and why.
+ * naming the mode, what was compared and the floor/pin agreement, so the run
+ * log carries the evidence of WHICH rule judged the release and why.
  */
 export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_FLOOR, flagsSource, git }) {
   const inputs = checkFloorInputs({ floor, candidate });
@@ -81,13 +105,13 @@ export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_
   if (floorSha !== pin) {
     return {
       ok: false,
-      reason: `WORKER_FLOOR_SHA is ${floorSha} but MINIMUM_FLOOR (scripts/check-worker-floor.mjs) is ${pin}. `
+      reason: `WORKER_FLOOR_SHA (${floorSha}) ≠ MINIMUM_FLOOR (${pin}, scripts/check-worker-floor.mjs). `
         + 'The two stages of a floor raise must agree before a client ships: raise the Environment '
-        + 'variable AND land the protected commit raising MINIMUM_FLOOR (docs/ROLLBACK.md «Release '
-        + 'order — and the two-stage floor raise»). A variable below the pin is a lowered floor; a '
-        + 'variable above it is a raise that is only half done.',
+        + 'variable AND land the protected commit raising MINIMUM_FLOOR to the same SHA (docs/ROLLBACK.md '
+        + '«Release order — and the two-stage floor raise»).',
     };
   }
+  const agreed = `WORKER_FLOOR_SHA == MINIMUM_FLOOR == ${floorSha}`;
 
   let mode;
   try {
@@ -102,16 +126,16 @@ export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_
         ok: false,
         mode,
         reason: `client floor gate: equality mode — BACKUP_IMPORT_ENABLED=true in src/lib/flags.ts, so the `
-          + `floor must BE the release this client ships on. WORKER_FLOOR_SHA is ${floorSha} but this client `
-          + `ships against ${candidateSha}. Raise the Environment floor (and MINIMUM_FLOOR) to the smoked `
-          + 'release before publishing a client with import on (D2a).',
+          + `floor must BE the release this client ships on. ${agreed}, but this client ships against `
+          + `${candidateSha}. Raise the Environment floor and MINIMUM_FLOOR to the smoked release before `
+          + 'publishing a client with import on (D2a).',
       };
     }
     return {
       ok: true,
       mode,
       reason: `client floor gate: equality mode — BACKUP_IMPORT_ENABLED=true in src/lib/flags.ts; `
-        + `WORKER_FLOOR_SHA == MINIMUM_FLOOR == candidate ${candidateSha}.`,
+        + `${agreed} == candidate.`,
     };
   }
 
@@ -121,7 +145,7 @@ export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_
       ok: true,
       mode,
       reason: `client floor gate: ancestry mode — BACKUP_IMPORT_ENABLED=false in src/lib/flags.ts; `
-        + `candidate ${candidateSha} is the floor itself.`,
+        + `${agreed}; candidate ${candidateSha} is the floor itself.`,
     };
   }
   let descends;
@@ -148,14 +172,18 @@ export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_
   return {
     ok: true,
     mode,
-    reason: `client floor gate: ancestry mode — BACKUP_IMPORT_ENABLED=false in src/lib/flags.ts; the floor `
-      + `stays at ${floorSha} (it rises immediately before the import flip, D2a) and candidate `
+    reason: `client floor gate: ancestry mode — BACKUP_IMPORT_ENABLED=false in src/lib/flags.ts; `
+      + `${agreed}; the floor stays (it rises immediately before the import flip, D2a) and candidate `
       + `${candidateSha} descends from it.`,
   };
 }
 
-/** The real repository: flags of THIS checkout, the pin of THIS checkout, git of THIS checkout. */
-export function checkClientFloorGateHere({ floor, candidate, cwd = process.cwd() }) {
+/**
+ * The real repository: flags of THIS checkout, the pin of THIS checkout, git
+ * of THIS checkout — all three resolved from the script's own location, so
+ * they are provably the same tree whatever the process cwd is.
+ */
+export function checkClientFloorGateHere({ floor, candidate, cwd = REPO_ROOT }) {
   return checkClientFloorGate({
     floor,
     candidate,
@@ -169,7 +197,7 @@ export function checkClientFloorGateHere({ floor, candidate, cwd = process.cwd()
 if (process.argv[1] && process.argv[1].endsWith('check-client-floor-gate.mjs')) {
   const verdict = checkClientFloorGateHere({
     floor: process.env.WORKER_FLOOR_SHA,
-    candidate: process.env.WORKER_CANDIDATE_SHA ?? process.argv[2],
+    candidate: process.env.WORKER_CANDIDATE_SHA,
   });
   if (verdict.ok) {
     console.log(`✓ ${verdict.reason}`);

@@ -502,8 +502,10 @@ reverted by accident.
    `BACKUP_IMPORT_ENABLED = false` in the released source the gate runs in
    ancestry mode (the live worker must be the floor or its descendant) — see
    «Which order applies» under «Release order — and the two-stage floor raise».
-3. **Raise `WORKER_FLOOR_SHA`**, verify the gate now refuses the ancestor, then
-   flip `BACKUP_IMPORT_ENABLED`.
+3. **Raise `WORKER_FLOOR_SHA` AND land the protected commit raising
+   `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
+   modes while the two differ), verify the worker gate now refuses the
+   ancestor, then flip `BACKUP_IMPORT_ENABLED`.
 4. Flip `BACKUP_EXPORT_ENABLED`.
 
 The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
@@ -2022,7 +2024,8 @@ The floor is raised in TWO steps, and skipping the second leaves it lowerable:
    value can be edited back down to the previous repo pin, and the «absolute»
    floor is only as absolute as its lower bound.
 5. Dispatch **Deploy client to Cloudflare Pages — dev** with
-   `worker_candidate` and `worker_version_id` from step 2. It re-checks the
+   `worker_candidate` and `worker_run_id` (the run of step 1; the version id
+   is taken from that run's `release-identity` artifact). It re-checks the
    live `/health` immediately before publishing, and then runs the client
    floor gate (`scripts/check-client-floor-gate.mjs`) in the mode the released
    source demands — see «Which order applies» below. For a client whose
@@ -2031,15 +2034,22 @@ The floor is raised in TWO steps, and skipping the second leaves it lowerable:
 
 #### Which order applies: steps 3–4 before step 5, or after it
 
-The sequence above (raise, pin, then ship the client) is the order of the
-PR-3a release, and it stays the rule for every client that STORES txIds under
-semantic idempotency — i.e. whose source has `BACKUP_IMPORT_ENABLED = true`.
-The backup track's own order (§«Order» above, and «The floor is NOT raised by
-this release» below) is different on purpose: the DB3 client floor
-`client-b1` ships with both backup flags `false`, nothing in it depends on
-semantic idempotency, and D2a keeps the worker's rollback window OPEN until
-the import flip — the floor is raised immediately BEFORE that flip (steps 3–4
-happen then), not before `client-b1`.
+The sequence above (raise, pin, then ship the client) was written for the
+PR-3a release, where the floor had to move to the quorum-reading worker before
+any client could rely on it. The Pages gate enforces that equality ONLY for a
+build whose source has `BACKUP_IMPORT_ENABLED = true` — a client that stores
+txIds under semantic idempotency and therefore must never meet a worker below
+the release that introduced it. The backup track's own order (§«Order» above,
+and «The floor is NOT raised by this release» below) is different on purpose:
+the DB3 client floor `client-b1` ships with both backup flags `false`, nothing
+in it depends on semantic idempotency, and D2a keeps the worker's rollback
+window OPEN until the import flip — the floor is raised immediately BEFORE that
+flip (steps 3–4 happen then), not before `client-b1`.
+
+A future client that depends on some OTHER new worker capability while import
+is still off is not covered by this rule: the gate would admit it in ancestry
+mode. Such a release needs its own decision — either turn the dependency into a
+flag the gate reads, or raise the floor first and record why.
 
 The Pages gate encodes both orders, and picks one from a PROPERTY OF THE
 BUILD, never from an input or an operator switch
@@ -2056,12 +2066,16 @@ the checkout being built through the strict literal reader of
   stages of a raise must agree); the floor itself stays where it is.
 
 Equality therefore returns automatically with the first build that turns
-import on — nobody has to remember to flip the gate. Every other check of the
-Pages run is the same in both modes: the release identity comes from the
-worker run's artifact, the live `/health` must be that release under the
-`normal` profile, the candidate must be admissible, the floor must be a full
-SHA. Recorded 2026-09-15 (owner decision: the plan's order is normative for
-backup releases; the gate changed by a reviewed PR rather than being bypassed).
+import on — nobody has to remember to flip the gate. The checkout whose flags
+decide the mode is the one the run builds and publishes, and the job runs under
+the `dev` Environment whose deployment-branch policy admits only `main` (the
+run also refuses any other ref itself), so the mode inherits the strength of
+that policy — no more, no less. Every other check of the Pages run is the same
+in both modes: the release identity comes from the worker run's artifact, the
+live `/health` must be that release under the `normal` profile, the candidate
+must be admissible, the floor must be a full SHA and equal to `MINIMUM_FLOOR`.
+Recorded 2026-09-15; decision record: payee-private-docs
+`decisions/2026-09-15-client-floor-release-order.md` (its status is kept there).
 
 Both workflows share the `release-dev` concurrency group, so a worker deploy
 cannot land between the client's live check and its publish. Serialization is

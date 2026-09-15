@@ -69,12 +69,27 @@ jobs:
       # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The floor check below is ancestry, and ancestry cannot be computed
-          # from a shallow clone.
+          # The floor gate below runs in ancestry mode for a build with
+          # BACKUP_IMPORT_ENABLED=false, and ancestry cannot be computed from a
+          # shallow clone.
           fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
+      # The floor gate reads its MODE from src/lib/flags.ts of this checkout, so
+      # the checkout must be the protected default branch — the `dev`
+      # Environment's deployment-branch policy already says so, and this step
+      # says it again from inside the run (defense in depth, mirrors the worker
+      # deploy). No `${{ }}` in run: — the values arrive through env.
+      - name: Refuse to deploy from anything but the default branch
+        run: |
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "This workflow publishes the client of the checked-out source and must be dispatched from the $DEFAULT branch (was: $REF)." >&2
+            exit 1
+          fi
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
       # Early config gate: presence + repo-pinned expectations for the four
       # NON-SECRET variables (the build reads only the VITE_* pair; the other
       # two would otherwise ride into the deploy action empty and surface
@@ -164,9 +179,10 @@ jobs:
       #   * /health must report the release named in `worker_candidate` AND the
       #     version id that deploy actually activated — a re-deploy of the same
       #     commit is a DIFFERENT version, and only the id can tell;
-      #   * that candidate must be an ancestor of (or equal to) the floor
-      #     recorded in WORKER_FLOOR_SHA, which catches «forgot to raise the
-      #     floor» before the client goes out rather than after.
+      #   * that candidate must stand in the right relation to the floor recorded
+      #     in WORKER_FLOOR_SHA — equality for a build with import on, «the floor
+      #     is an ancestor of the candidate» for a build with import off — as the
+      #     released source demands (see the floor gate step below).
       # ── Take the release identity from the WORKER RUN, not from the form ──
       - name: Fetch the release identity from the worker run
         id: identity
