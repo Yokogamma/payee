@@ -14,7 +14,7 @@ function baseStore() {
     arweave: {
       enabled: true, online: true, syncing: false, registered: true,
       countsReady: true, confirmedCount: 0, acceptedCount: 0, unsyncedCount: 0,
-      errorCount: 0, quarantinedCount: 0, recoveryInvalidatedCount: 0, lastError: null,
+      errorCount: 0, quarantinedCount: 0, recoveryInvalidatedCount: 0, publicationConflictCount: 0, lastError: null,
     },
     restoring: false, restoreProgress: null, restoreError: null,
     restoredCount: null, restoredUpdatedCount: null,

@@ -7,7 +7,7 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SettingsBlock } from '../components/SettingsBlock';
 import { BackupSettings } from './BackupSettings';
 import { navigate } from '../lib/route';
-import { QUARANTINE_EXPLANATION, RECOVERY_INVALIDATED_EXPLANATION } from '../lib/syncCounters';
+import { PUBLICATION_CONFLICT_EXPLANATION, QUARANTINE_EXPLANATION, RECOVERY_INVALIDATED_EXPLANATION } from '../lib/syncCounters';
 import { QUICK_UNLOCK_ENABLED } from '../lib/flags';
 import type { QuickUnlockCapability } from '../lib/quick-unlock-core';
 
@@ -369,11 +369,18 @@ export function SettingsSection({ theme, onThemeChange }: SettingsSectionProps) 
               {arweave.errorCount > 0 && (
                 <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>
               )}
-              {arweave.quarantinedCount > arweave.recoveryInvalidatedCount && (
+              {arweave.quarantinedCount - arweave.recoveryInvalidatedCount - arweave.publicationConflictCount > 0 && (
                 // Permanent by design — deliberately NOT lumped into «Ошибки»:
                 // no «Повторить» can ever fix a quarantined record.
                 <div>
-                  Отложено записей: <strong>{arweave.quarantinedCount - arweave.recoveryInvalidatedCount}</strong> — {QUARANTINE_EXPLANATION}
+                  Отложено записей: <strong>{arweave.quarantinedCount - arweave.recoveryInvalidatedCount - arweave.publicationConflictCount}</strong> — {QUARANTINE_EXPLANATION}
+                </div>
+              )}
+              {arweave.publicationConflictCount > 0 && (
+                // Its own sentence: the generic one would tell the owner of a
+                // perfectly readable note to update the app.
+                <div>
+                  Отложено записей: <strong>{arweave.publicationConflictCount}</strong> — {PUBLICATION_CONFLICT_EXPLANATION}
                 </div>
               )}
               {arweave.recoveryInvalidatedCount > 0 && (

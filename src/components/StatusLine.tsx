@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useNotes } from '../lib/store';
-import { computeSyncCounters, QUARANTINE_EXPLANATION, RECOVERY_INVALIDATED_EXPLANATION } from '../lib/syncCounters';
+import { computeSyncCounters, PUBLICATION_CONFLICT_EXPLANATION, QUARANTINE_EXPLANATION, RECOVERY_INVALIDATED_EXPLANATION } from '../lib/syncCounters';
 import { InfinityMark, IconRefresh, IconChevron, IconClose } from './icons';
 
 /**
@@ -269,14 +269,19 @@ export function StatusLine() {
           )}
           {arweave.unsyncedCount > 0 && <div>Ожидают загрузки версий: <strong>{arweave.unsyncedCount}</strong></div>}
           {arweave.errorCount > 0 && <div className="text-red">Ошибки: <strong>{arweave.errorCount}</strong></div>}
-          {arweave.quarantinedCount > arweave.recoveryInvalidatedCount && (
+          {arweave.quarantinedCount - arweave.recoveryInvalidatedCount - arweave.publicationConflictCount > 0 && (
             <div className="status-hint">
-              Отложено: {arweave.quarantinedCount - arweave.recoveryInvalidatedCount} — {QUARANTINE_EXPLANATION}
+              Отложено: {arweave.quarantinedCount - arweave.recoveryInvalidatedCount - arweave.publicationConflictCount} — {QUARANTINE_EXPLANATION}
             </div>
           )}
           {arweave.recoveryInvalidatedCount > 0 && (
             <div className="status-hint">
               Отложено: {arweave.recoveryInvalidatedCount} — {RECOVERY_INVALIDATED_EXPLANATION}
+            </div>
+          )}
+          {arweave.publicationConflictCount > 0 && (
+            <div className="status-hint">
+              Отложено: {arweave.publicationConflictCount} — {PUBLICATION_CONFLICT_EXPLANATION}
             </div>
           )}
         </div>
