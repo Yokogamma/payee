@@ -28,7 +28,7 @@ function show(statuses: Record<string, NoteSyncInfo>, syncActive = true) {
       syncStatuses={statuses}
       syncActive={syncActive}
       onClose={vi.fn()}
-      onRequestRestore={vi.fn()}
+      onOpenVersion={vi.fn()}
     />,
   );
 }
@@ -94,5 +94,62 @@ describe('VersionHistoryModal — ∞ рядом с «навечно»', () => {
     show({ r: { status: 'queued' }, v2: { status: 'queued' } });
     expect(document.querySelector('.sync-state--queued svg')).toBeNull();
     expect(screen.getAllByText('в очереди').length).toBe(2);
+  });
+});
+
+describe('VersionHistoryModal — указатель, а не читалка', () => {
+  const notes = [
+    version('r', { createdAt: new Date(2026, 7, 13, 9, 5).getTime() }),
+    version('v2', { rev: 2, prev: 'r', createdAt: new Date(2026, 7, 13, 14, 22).getTime() }),
+  ];
+
+  function index(onOpenVersion = vi.fn()) {
+    render(
+      <VersionHistoryModal
+        open
+        chain={groupChains(notes)[0]}
+        syncStatuses={{}}
+        syncActive={false}
+        onClose={vi.fn()}
+        onOpenVersion={onOpenVersion}
+      />,
+    );
+    return onOpenVersion;
+  }
+
+  it('строка ведёт наружу, а не раскрывается на месте', () => {
+    const onOpenVersion = index();
+    // Раскрывать в указателе нечего — версия открывается страницей.
+    expect(document.querySelector('.history-row-body')).toBeNull();
+    screen.getByText(/Версия 1 из 2/).click();
+    expect(onOpenVersion).toHaveBeenCalledWith(1);
+  });
+
+  it('текущую называет слово, а не рамка', () => {
+    index();
+    expect(screen.getByText(/· текущая/)).toBeTruthy();
+    expect(document.querySelector('.history-row--current')).toBeNull();
+  });
+
+  it('штамп абсолютный и со временем — «40 / 41 мин назад» ничего не расставляет', () => {
+    index();
+    expect(screen.getByText('13 августа, 14:22')).toBeTruthy();
+    expect(screen.getByText('13 августа, 09:05')).toBeTruthy();
+    expect(document.body.textContent).not.toContain('назад');
+  });
+
+  it('доступное имя строки говорит, что она открывает и что именно', () => {
+    index();
+    expect(screen.getByRole('button', { name: 'Открыть версию 1 из 2 от 13 августа, 09:05' })).toBeTruthy();
+  });
+
+  it('при открытии фокус уходит на первую строку, а не остаётся на body', async () => {
+    // useModalA11y начальный фокус не ставит — это дело вызывающего, и без
+    // него вход «из ленты» оставлял бы фокус на исчезнувшем пункте меню.
+    index();
+    await vi.waitFor(() => {
+      expect(document.activeElement?.getAttribute('aria-label'))
+        .toBe('Открыть версию 2 из 2 от 13 августа, 14:22');
+    });
   });
 });
