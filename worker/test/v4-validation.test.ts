@@ -151,6 +151,19 @@ describe('upload validation: App-Version=4 (safebox split envelope)', () => {
     }
   });
 
+  it('rejects a NON-CANONICAL base64 spelling — BOTH halves', async () => {
+    // Unpadded spellings of the same 16 bytes as MC / SC: decodable, right
+    // length, wrong spelling. Each half is held to the canonical rule
+    // independently, exactly like the single-envelope path.
+    const meta = await upload(v4Tags(), { ...v4Data(), mc: MC.replace(/=+$/, '') }, nextIp());
+    expect(meta.status).toBe(400);
+    expect(await meta.text()).toMatch(/canonical base64/);
+
+    const secret = await upload(v4Tags(), { ...v4Data(), sc: SC.replace(/=+$/, '') }, nextIp());
+    expect(secret.status).toBe(400);
+    expect(await secret.text()).toMatch(/canonical base64/);
+  });
+
   it('rejects a non-string secret ciphertext', async () => {
     const r = await upload(v4Tags(), { ...v4Data(), sc: 42 } as unknown, nextIp());
     expect(r.status).toBe(400);

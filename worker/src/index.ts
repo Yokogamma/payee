@@ -1003,9 +1003,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     }
     // CANONICAL base64, not merely decodable: `atob` accepts missing padding,
     // embedded whitespace and non-zero trailing bits, so one byte string has
-    // many accepted spellings. The spelling is what goes on chain — `data` is a
-    // JSON string — so accepting a variant would publish a different record for
-    // the same bytes, permanently, under the same idempotent id.
+    // many accepted spellings. The c/iv strings go on chain verbatim inside the
+    // `data` JSON, so accepting a variant spelling would publish a different
+    // record for the same bytes, permanently, under the same idempotent id.
+    // (This pins the base64 fragments only; the JSON spelling of `data` itself
+    // — key order, escapes — is not canonicalized here.)
     if (bytesToBase64(cipherBytes) !== cVal || bytesToBase64(bytes) !== ivVal) {
       return uploadError(400, 'validation_failed', `Invalid data: ${cName} and ${ivName} must be canonical base64`);
     }
