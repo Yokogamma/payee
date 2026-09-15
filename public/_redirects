@@ -1,1 +1,16 @@
+# The standalone viewer is served at an EXTENSIONLESS canonical URL, and
+# BOTH rules below must stay ABOVE the splat: the SPA fallback matches
+# everything, so a viewer request would otherwise be answered with the
+# app shell — a page that cannot open a backup file and gives no hint why.
+#
+# The `.html` rule is not decoration. Cloudflare states that «redirects are
+# always followed, regardless of whether or not an asset matches the incoming
+# request», so the file sitting in `dist` does NOT shield that path from the
+# splat: someone who typed the name they saw in a folder would be handed the
+# app shell. One canonical URL, and everything else points at it.
+#
+# No loop: a 200 rewrite serves the asset at its destination, it does not
+# re-enter this table. The live smoke checks that too, on every deploy.
+/backup-viewer.html /backup-viewer 301
+/backup-viewer /backup-viewer.html 200
 /* /index.html 200
