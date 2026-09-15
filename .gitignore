@@ -39,3 +39,8 @@ public/backup-viewer.html
 .playwright-cli/
 output/
 tmp/
+
+# Scratch: throwaway notes and intermediate results. Losing them is acceptable.
+# Maintained project documentation lives in docs/ and IS versioned; internal
+# plans, audits and research live in the private repository payee-private-docs.
+/.scratch/
