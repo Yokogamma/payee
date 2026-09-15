@@ -40,7 +40,11 @@ for (const [name, pattern] of Object.entries(required)) {
 
 // ── The standalone viewer ────────────────────────────────────────────
 
-const viewerUrl = new URL('/backup-viewer', url).toString();
+// Keep the caller's query (`?v=<ts>` cache-busting) on every route, not only
+// on the app shell: an edge that still serves yesterday's viewer would pass a
+// bare `/backup-viewer` and fail only the operator's expectations.
+const withQuery = path => { const u = new URL(path, url); u.search = new URL(url).search; return u; };
+const viewerUrl = withQuery('/backup-viewer').toString();
 const viewer = await fetch(viewerUrl, { redirect: 'manual' });
 
 // `redirect: 'manual'` on purpose: a 3xx here means the rewrite became a real
@@ -95,7 +99,7 @@ if (/https?:\/\//i.test(body)) fail('viewer: the served artifact references an h
 // failure mode this route exists to prevent, and «some redirect somewhere» is
 // not an answer either — a 301 to `/`, to another origin, or back to itself
 // would each look like success at the status-code level.
-const altUrl = new URL('/backup-viewer.html', url);
+const altUrl = withQuery('/backup-viewer.html');
 const alt = await fetch(altUrl.toString(), { redirect: 'manual' });
 if ([301, 302, 307, 308].includes(alt.status)) {
   const location = alt.headers.get('location') ?? '';
