@@ -23,15 +23,24 @@ interface FabProps {
    * nothing to focus» for free.
    */
   ref?: React.Ref<HTMLButtonElement>;
+  /**
+   * Overrides the «+». The reading view puts EDIT in this corner — the same
+   * place, the same thumb, a different verb — so the glyph has to vary while
+   * everything else about the control stays identical. Defaults to the plus,
+   * so the two existing callers are untouched.
+   */
+  icon?: React.ReactNode;
 }
 
-export function Fab({ onClick, label, marked, ref }: FabProps) {
+export function Fab({ onClick, label, marked, ref, icon }: FabProps) {
   return (
     <div className="fab-slot">
       <button ref={ref} type="button" className="fab" onClick={onClick} aria-label={label} title={label}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-          <path d="M12 5v14M5 12h14" />
-        </svg>
+        {icon ?? (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+        )}
         {marked && <span className="fab-mark" aria-hidden="true" />}
       </button>
     </div>

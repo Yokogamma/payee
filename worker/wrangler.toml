@@ -61,6 +61,24 @@ V3_UPLOADS_ENABLED = "true"
 # Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
 V4_UPLOADS_ENABLED = "true"
+# ── Trusted Arweave owners (D2/D9) ──
+# EVERY wallet address this project has ever posted under, comma separated.
+# The worker authenticates a publication before binding its txId to a payload
+# fingerprint, and `address in TRUSTED_OWNERS` is one of the D9 steps.
+#
+# NOT the current ARWEAVE_JWK: after a rotation that address cannot confirm the
+# project's OWN older transactions, and every one of them would stop
+# authenticating. This is a HISTORICAL list and entries are never removed.
+#
+# Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
+# deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
+# of it, and refuses a set that disagrees with the client's
+# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+#
+# Rotation order, and it is not symmetric: add the new address HERE and to the
+# client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker
+# refuses /upload while its own wallet is outside this set.
+TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # ── Status gateways (PR-3a) ──
 # Bare https origins, comma separated. MUST equal the client's
 # VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
@@ -71,6 +89,21 @@ V4_UPLOADS_ENABLED = "true"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# ── Payload gateways (D2/D9) ──
+# Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
+# tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
+# first, the slower community mirrors after).
+#
+# Used ONLY to authenticate an existing publication before binding its txId to a
+# payload fingerprint: the worker fetches /tx/<id> and /raw/<id> and runs D9 over
+# them. Lying is not a threat model here — the protocol is cryptographic, so a
+# wrong answer costs a retry against the next origin, never a wrong verdict.
+#
+# permagate.io is deliberately ABSENT while it is a STATUS origin: its cold /raw
+# timed out past 25 s in the acceptance probes, and only the HTTP code matters
+# for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
+# the deploy gate compares them.
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
 # ── Metrics (PR-2) ── Telemetry is fail-closed, the request path fail-open:
 # writes happen STRICTLY when METRICS_ENABLED = "true" AND the METRICS binding
 # exists; ANY other value (missing, garbage, no binding) disables writes
@@ -91,6 +124,35 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 [[analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "eternal_notes_metrics"
+
+# ── Workers Logs (observability) ──
+# Checked in the Cloudflare API on 2026-09-09 and found ABSENT, with `logpush`
+# false and ZERO log events in the account for the whole soak. So the
+# `console.error` diagnostics next to the critical outcomes were writing to
+# nothing at all.
+#
+# This gives the criteria a SECOND, INDEPENDENT channel — not a guaranteed one.
+# Analytics Engine samples PER INDEX, so an absent row cannot be told from an
+# event that never happened, and two exit criteria in docs/ROLLBACK.md must
+# read STRICTLY ZERO. One estimating channel cannot establish a zero; two
+# channels that must both lose the same event make it far less likely.
+#
+# `head_sampling_rate = 1` asks for FULL COLLECTION. It is NOT a promise of
+# lossless storage, and this config alone proves nothing about delivery —
+# delivery is verified after the deploy (docs/METRICS.md, «Проверка доставки»).
+#
+# RETENTION IS THE TRAP: Workers Logs keeps at most SEVEN DAYS. A 168-hour soak
+# is exactly seven days, so the beginning of the window can age out on the very
+# day the window is being judged. Daily archival is therefore mandatory, not
+# optional — `soak-d2.mjs snapshot` writes the dated evidence files.
+#
+# NOTE: enabling this changes the deployed script, so it takes a deploy — and a
+# deploy RESETS the 168-hour soak window (soak-d2.mjs asserts one
+# workerVersionId for the whole window). Land it together with the other
+# telemetry fixes, never on its own mid-window.
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 # The Worker's own ACTIVE version id, reported by /health. A self-declared
 # release SHA cannot tell a re-deploy of the same commit from the original;
@@ -125,15 +187,52 @@ binding = "CF_VERSION_METADATA"
 # OPERATOR PREREQUISITES (once, before first `npm run deploy:staging`):
 #   1. wrangler kv namespace create ALLOWLIST --env staging
 #      → paste the returned id below (placeholder deploys will fail until then).
-#   2. wrangler secret put ARWEAVE_JWK --env staging        (DEDICATED test JWK,
-#      minimal AR balance — never the production wallet)
+#   2. wrangler secret put ARWEAVE_JWK --env staging
+#      TWO legitimate choices; pick deliberately, the config permits only one
+#      of them out of the box.
+#
+#      (a) THE SAME wallet as dev — what this config is already written for.
+#          `env.staging.TRUSTED_OWNERS` names exactly one address, the dev one,
+#          and `/upload` answers 503 while the signing wallet is outside that
+#          set (walletTrust). Nothing else to do. The older wording asked for a
+#          dedicated JWK «never the production wallet», but there IS no
+#          production wallet yet (production comes later, from scratch, on
+#          .app), and the dev wallet is already a test wallet with a minimal
+#          balance.
+#      (b) A SEPARATE staging wallet — legitimate and sometimes right: it
+#          isolates the AR balance from the soak budget and keeps one key out
+#          of two workers' secrets. It is NOT ruled out by anything here; it
+#          simply costs an extra step — its address MUST be added to
+#          `env.staging.TRUSTED_OWNERS` below, or staging refuses every upload
+#          — plus real AR to fund it.
+#
+#      The trade-off, stated rather than hidden: (a) shares a key and a balance
+#      across contours; (b) buys isolation for funding and an edit. Revisit
+#      when a real production contour exists.
 #   3. wrangler secret put ADMIN_SECRET --env staging       (staging-only value)
 #   4. wrangler secret put RECOVERY_HMAC_SECRET --env staging (staging-only)
 #   5. Register the smoke test key via an invite seeded through
 #      /admin/seed-invite + /register (InviteManager is the source of truth —
 #      never hand-write pk: entries into KV).
+#   6. wrangler secret put METRICS_ADMIN_SECRET --env staging  (staging-only)
+#   7. wrangler secret put CF_ANALYTICS_TOKEN --env staging     (Account →
+#      Account Analytics → Read)
+#      6 and 7 are needed ONLY if telemetry is exercised on staging at all.
+#      The delivery check of docs/METRICS.md no longer requires staging: it runs
+#      in dev, through POST /admin/telemetry-probe, which needs no second wallet
+#      and provokes no control `conflict`. Keep these two for a staging that is
+#      set up for isolation — without them staging /admin/metrics and the probe
+#      both answer 503.
+#
+# NONE of this exists yet. Checked against the account on 2026-09-10: it holds
+# exactly ONE worker (`eternal-notes-proxy`) and ONE KV namespace
+# (`ALLOWLIST`) — so staging is unprovisioned, not merely unconfigured, and the
+# placeholder below is only the first thing that would fail.
+#
 # Config gate before any real staging deploy:
 #   npm run deploy:staging:check   (wrangler deploy --env staging --dry-run)
+#   — passes on the placeholder: it proves the config BUILDS, not that staging
+#     is ready.
 #
 # NOTE on origins: the workers.dev URL below is the API ENDPOINT, not a client
 # origin. CLI smoke sends no Origin header (CORS is not exercised); a browser
@@ -168,6 +267,25 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
+# ── Trusted Arweave owners (D2/D9) ──
+# EVERY wallet address this project has ever posted under, comma separated.
+# The worker authenticates a publication before binding its txId to a payload
+# fingerprint, and `address in TRUSTED_OWNERS` is one of the D9 steps.
+#
+# NOT the current ARWEAVE_JWK: after a rotation that address cannot confirm the
+# project's OWN older transactions, and every one of them would stop
+# authenticating. This is a HISTORICAL list and entries are never removed.
+#
+# Declared explicitly for staging too: a named environment inherits NOTHING.
+# Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
+# deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
+# of it, and refuses a set that disagrees with the client's
+# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+#
+# Rotation order, and it is not symmetric: add the new address HERE and to the
+# client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker
+# refuses /upload while its own wallet is outside this set.
+TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # ── Status gateways (PR-3a) ──
 # Bare https origins, comma separated. MUST equal the client's
 # VITE_STATUS_GATEWAYS: the dead formula is ONE formula for both halves, and
@@ -178,6 +296,21 @@ V4_UPLOADS_ENABLED = "true"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# ── Payload gateways (D2/D9) ──
+# Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
+# tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
+# first, the slower community mirrors after).
+#
+# Used ONLY to authenticate an existing publication before binding its txId to a
+# payload fingerprint: the worker fetches /tx/<id> and /raw/<id> and runs D9 over
+# them. Lying is not a threat model here — the protocol is cryptographic, so a
+# wrong answer costs a retry against the next origin, never a wrong verdict.
+#
+# permagate.io is deliberately ABSENT while it is a STATUS origin: its cold /raw
+# timed out past 25 s in the acceptance probes, and only the HTTP code matters
+# for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
+# the deploy gate compares them.
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
 # Metrics (PR-2) — same contract as production vars above; staging writes go
 # to its OWN dataset (explicit different name, M6 r14).
 METRICS_ENABLED = "true"
@@ -190,6 +323,13 @@ CF_ACCOUNT_ID = "88cd072a3c0a9b861d52dcc126b9d57e"
 [[env.staging.analytics_engine_datasets]]
 binding = "METRICS"
 dataset = "eternal_notes_metrics_staging"
+
+# Declared explicitly for staging too: a named environment inherits NOTHING,
+# so omitting this would leave staging without logs and make its smoke
+# structurally different from production's.
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
 
 # Declared explicitly for staging too: a named environment inherits NOTHING,
 # so omitting this would leave staging without the binding and make its smoke
