@@ -18,15 +18,22 @@ import {
   getDbGeneration,
   type SyncRecord,
 } from './storage';
+import { assertUploadableItem, isUploadableItem, MalformedRecordError } from './upload-flow';
+import { buildUploadPayload } from './arweave';
+import { UnsupportedNoteVersionError } from './crypto';
 
 /**
  * THE `client-b1` COMPOSITION GATE.
  *
  * `client-b1` is declared the minimum safe rollback target once DB_VERSION 3
  * ships, and that declaration is only true if the tag actually contains all
- * four parts. A release cut without one of them would still open the v3
- * database — and quietly reintroduce the defect the floor exists to prevent,
- * with nothing to notice it.
+ * FIVE parts the plan names — D12, D14, D14a, D14b and DB_VERSION 3. A release
+ * cut without one of them would still open the v3 database — and quietly
+ * reintroduce the defect the floor exists to prevent, with nothing to notice
+ * it. D14b is in the list for a reason of its own: without it a rollback to
+ * an «almost the same» build brings back either an endless retry of a generic
+ * 400 through the shared IP limit, or a paid publication of ciphertext nobody
+ * can ever decrypt under a permanent noteId.
  *
  * So each part is asserted here, minimally and behaviourally, in one place a
  * release check can point at. The exhaustive suites live next door
@@ -116,5 +123,51 @@ describe('client-b1 — part 4: D14a, the attempt-CAS', () => {
 
     expect(began.ok).toBe(true);
     expect((await getSyncRecord('cb1'))?.attemptId).toEqual(expect.any(String));
+  });
+});
+
+describe('client-b1 — part 5: D14b, the form barriers close BEFORE anything is signed', () => {
+  // Canonical 16-byte ciphertext (exactly the GCM tag), canonical 12-byte IV.
+  const C16 = 'AAAAAAAAAAAAAAAAAAAAAA==';
+  const ID_V4 = '11111111-2222-4333-8444-555555555555';
+  const ID_V8 = '11111111-2222-8333-8444-555555555555';
+  const v2 = (over: Partial<Parameters<typeof buildUploadPayload>[0]> = {}) =>
+    ({ kind: 'note' as const, record: { noteId: ID_V4, ciphertext: C16, iv: IV, createdAt: NOW, v: 2 as const, ...over } });
+  const v3 = (over: Partial<Parameters<typeof buildUploadPayload>[0]> = {}) =>
+    ({ kind: 'note' as const, record: { noteId: ID_V8, ciphertext: C16, iv: IV, createdAt: NOW, v: 3 as const, ...over } });
+
+  it('a well-formed record of each namespace passes', () => {
+    expect(() => assertUploadableItem(v2())).not.toThrow();
+    expect(() => assertUploadableItem(v3())).not.toThrow();
+  });
+
+  it('the id namespace: UUIDv8 on a v1/v2 note and UUIDv4 on a v3 note are refused, as are any other string and an empty id', () => {
+    for (const bad of [v2({ noteId: ID_V8 }), v3({ noteId: ID_V4 }), v2({ noteId: 'not-a-uuid' }), v2({ noteId: '' })]) {
+      expect(() => assertUploadableItem(bad)).toThrow(MalformedRecordError);
+      expect(isUploadableItem(bad)).toBe(false);
+    }
+  });
+
+  it('the envelope: a ciphertext of 0–15 bytes, a non-canonical base64 spelling, and an IV that is not 12 bytes are refused', () => {
+    for (const bad of [
+      v2({ ciphertext: '' }),
+      v2({ ciphertext: 'AAAA' }),                     // 3 bytes
+      v2({ ciphertext: 'AAAAAAAAAAAAAAAAAAAA' }),     // 15 bytes
+      v2({ ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA' }),   // 16 bytes, unpadded spelling
+      v2({ iv: 'AAAAAAAAAAAAAAAAAAAAAA==' }),         // 16-byte IV
+      v2({ iv: 'AAAAAAAAAAAAAAAA==' }),               // padded spelling of 12 bytes
+    ]) {
+      expect(() => assertUploadableItem(bad)).toThrow(MalformedRecordError);
+    }
+    expect(() => assertUploadableItem(v2({ ciphertext: C16 }))).not.toThrow(); // exactly 16 bytes passes
+  });
+
+  it('an unknown version is UNSUPPORTED, not malformed — the barrier must not seal a newer build\'s record as broken', () => {
+    // D5a: an opaque record (one a newer build wrote) may never be replaced from
+    // a backup; a malformed one may be repaired. The barrier leaves the version
+    // to the payload builder, which raises the typed error before signing.
+    const opaque = v3({ v: 99 as unknown as 3 });
+    expect(isUploadableItem(opaque)).toBe(true);
+    expect(() => buildUploadPayload(opaque.record, 'owner-hash', NOW)).toThrow(UnsupportedNoteVersionError);
   });
 });
