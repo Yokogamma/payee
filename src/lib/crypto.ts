@@ -104,6 +104,27 @@ export function isValidMnemonic(mnemonic: string): boolean {
   return validateMnemonic(mnemonic, wordlist);
 }
 
+/**
+ * The canonical form of a phrase before any key is derived from it: lower-case
+ * words, single spaces, nothing at the ends.
+ *
+ * Every key in this app is derived from a phrase in exactly this shape,
+ * because the seed grid produces it at the input boundary
+ * (`SeedEntryGrid.tsx` lower-cases each word and re-joins a pasted phrase).
+ * The derivation functions themselves do NOT normalize — they hash what they
+ * are given — so any surface that accepts free text must apply this first.
+ *
+ * Both halves matter and fail differently. Wrong CASE («Abandon», as wallets
+ * and printed cards spell it) derives a different key in silence, and the
+ * result is indistinguishable from a wrong phrase. Wrong WHITESPACE (a phrase
+ * wrapped over several lines, a double space) makes BIP-39's own word count
+ * fail and throws — which a caller then has to be careful not to report as a
+ * verdict about the file.
+ */
+export function normalizeMnemonic(input: string): string {
+  return input.trim().split(/\s+/).filter(Boolean).map(word => word.toLowerCase()).join(' ');
+}
+
 // ─── Key Derivation ──────────────────────────────────────────────────
 
 /**

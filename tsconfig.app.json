@@ -24,6 +24,9 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"],
-  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+  // `viewer` is included deliberately: esbuild STRIPS types without checking
+  // them, so a viewer left out of `tsc -b` would ship whatever type errors it
+  // contains — in the one artifact nobody can patch after the fact.
+  "include": ["src", "viewer"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "viewer/**/*.test.ts"]
 }

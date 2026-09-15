@@ -586,6 +586,23 @@ client floor in force is still `client-r4`.
   «payload B ↔ txId A» locally. **Once the first v3 client is deployed, rolling
   the client below it is forbidden** — the floor line above must be updated to
   `client-b1` at that point, and `client-r4` stays recorded as history.
+- **Backup viewer — a REGISTRY of released hashes, not a single line.** The
+  standalone `backup-viewer.html` is built first on every release and its
+  SHA-256 is compiled into the app, which checks the file it hands the user
+  against that constant. That closes the DELIVERY channel and nothing else:
+  anyone able to rewrite the saved file can rewrite a checksum stored beside
+  it just as easily. Authenticity rests on the user keeping the value
+  somewhere independent — a password manager, or the printed recovery kit next
+  to the seed phrase — and the UI says exactly that.
+  Every released artifact is listed here FOREVER, because a user may be
+  holding any of them: a viewer saved three years ago must still be
+  verifiable. Rows are appended by the operator at release time; none is ever
+  removed or edited.
+
+  | Release tag | Date | SHA-256 of `backup-viewer.html` |
+  |---|---|---|
+  | _(none released yet)_ | — | — |
+
 - **CORS:** if the Pages origin changes, update `ALLOWED_ORIGINS` in
   `worker/wrangler.toml` and redeploy the worker **before** the client, and verify
   the new origin is allowed while a stranger origin is rejected.

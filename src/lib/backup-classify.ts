@@ -41,6 +41,7 @@
  * not leave this function, not that it is scrubbed after it does.
  */
 
+import { isOpaqueEntry, isOpaqueNote } from './backup';
 import {
   decryptNote,
   decryptSafeboxMeta,
@@ -82,15 +83,6 @@ export interface BackupRecordKeys {
   safeboxMeta: CryptoKey;
   safeboxSecret: CryptoKey;
 }
-
-/** A note version this build cannot serialize. `v` absent means v1 (crypto.ts
- *  «Absent/1 = v1»), which is legal and must not read as unknown. */
-export const isOpaqueNote = (n: EncryptedNote): boolean =>
-  n.v !== undefined && n.v !== 1 && n.v !== 2 && n.v !== 3;
-
-/** Safebox entries have always carried a version, so an absent one is unknown
- *  just like a wrong one. */
-export const isOpaqueEntry = (e: EncryptedSafeboxEntry): boolean => e.v !== 4;
 
 export async function classifyBackupRecord(
   keys: BackupRecordKeys,

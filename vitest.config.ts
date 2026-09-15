@@ -16,9 +16,14 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
+    // `viewer/` is included deliberately: the standalone artifact used to be
+    // covered only by checks on its BUILT TEXT, which cannot see what the page
+    // does when someone opens it — and its riskiest behaviour (what stays in
+    // the DOM after the tab is left) is runtime behaviour.
     include: [
       'src/**/*.test.ts',
       'src/**/*.test.tsx',
+      'viewer/**/*.test.ts',
       'scripts/**/*.test.mjs',
       // The worker's own SCRIPTS are plain Node, not workerd: both worker
       // vitest configs run in the workers pool, where `node:fs` does not

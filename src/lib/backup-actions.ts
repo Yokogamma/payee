@@ -29,15 +29,12 @@ import {
   backupFileName,
   decodeBackup,
   encodeBackup,
+  isOpaqueEntry,
+  isOpaqueNote,
   type BackupHeader,
 } from './backup';
 import { validateChains, type ChainIssue, type ChainNode } from './backup-chains';
-import {
-  classifyBackupRecord,
-  isOpaqueEntry,
-  isOpaqueNote,
-  type BackupRecordState,
-} from './backup-classify';
+import { classifyBackupRecord, type BackupRecordState } from './backup-classify';
 import type { EncryptedNote, EncryptedSafeboxEntry } from './crypto';
 import type { BackupSnapshotResult } from './storage';
 
