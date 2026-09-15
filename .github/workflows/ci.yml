@@ -42,6 +42,10 @@ jobs:
       # The deploys get it for free inside the build; CI cannot run the build
       # (see below), so the gate is invoked directly — it needs no secrets.
       - run: npm run typecheck
+      # The one forbidden pair of backup flags (D16): export ON while import is
+      # OFF would ship a release producing files the same build can neither
+      # verify nor restore. Source-only check, so it runs before any build.
+      - run: node scripts/check-backup-flags.mjs
       # ── Worker ──
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck

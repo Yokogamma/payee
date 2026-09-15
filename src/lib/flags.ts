@@ -61,3 +61,42 @@ export const SAFEBOX_WRITER_ENABLED: boolean = true;
  * branch into unreachable dead code under TS narrowing.
  */
 export const QUICK_UNLOCK_ENABLED: boolean = true;
+
+/**
+ * Backup EXPORT gate — «Скачать резервную копию» and «Скачать просмотрщик».
+ *
+ * Two flags rather than one, and three releases rather than two, because the
+ * first DB3 release is irreversible. Raising `DB_VERSION` to 3 (D2b) forbids
+ * rolling back to the proven DBv2 client; if import — the riskiest mutating
+ * operation there is — were already on at that moment, no safe DB3 artifact
+ * without import would exist, and a defect in import could only be cured by an
+ * urgent forward fix.
+ *
+ * So: release 1 is the client floor with BOTH flags off (this is the tag
+ * declared as the minimum safe rollback target on DB3), release 2 turns import
+ * and file verification on, release 3 turns export on.
+ *
+ * Contract (enforced in the store, not just hidden UI): with the flag off the
+ * export action refuses with a typed error rather than producing a file.
+ *
+ * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
+ * branch into unreachable dead code under TS narrowing.
+ */
+export const BACKUP_EXPORT_ENABLED: boolean = false;
+
+/**
+ * Backup IMPORT gate — «Импортировать из файла» AND «Проверить файл копии».
+ *
+ * Verification is gated together with import even though it is a pure dry-run
+ * that mutates nothing: release 1 exists to be the smallest possible surface
+ * on DB3, and a file picker plus a full decrypt pass is surface.
+ *
+ * EXPORT ON while IMPORT is OFF is FORBIDDEN and rejected by a build-time
+ * check (`scripts/check-backup-flags.mjs`). That combination would hand users
+ * copies they can neither verify nor restore — a backup they have no way to
+ * find out is worthless until the day they need it.
+ *
+ * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
+ * branch into unreachable dead code under TS narrowing.
+ */
+export const BACKUP_IMPORT_ENABLED: boolean = false;

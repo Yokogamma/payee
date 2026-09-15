@@ -96,6 +96,9 @@ jobs:
       - run: node scripts/check-gateways-vs-worker.mjs
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      # Same source-only gate as CI: the forbidden backup-flag pair must not
+      # reach a release artifact (D16).
+      - run: node scripts/check-backup-flags.mjs
       # Both halves authenticate the SAME on-chain history, so their trusted
       # owner sets must agree — and both must contain every wallet the project
       # has ever posted under (scripts/owner-pins.mjs). A narrowed set does not
