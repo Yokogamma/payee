@@ -37,8 +37,13 @@ on:
 
 # Least privilege for GITHUB_TOKEN (repo defaults may be write-all); the
 # Cloudflare deploy uses its own scoped API token, not this one.
+# `actions: read` is what `gh run view` / `gh run download` need to fetch the
+# worker run's release-identity artifact below. Without it the identity step
+# failed at runtime — and a workflow that cannot read the attestation cannot
+# make the check it exists for.
 permissions:
   contents: read
+  actions: read
 
 # Serialization, NOT ordering — the same correction made in deploy-worker.yml,
 # and for the same reason: `concurrency` keeps two runs of this workflow from
@@ -91,6 +96,13 @@ jobs:
       - run: node scripts/check-gateways-vs-worker.mjs
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
+      # Both halves authenticate the SAME on-chain history, so their trusted
+      # owner sets must agree — and both must contain every wallet the project
+      # has ever posted under (scripts/owner-pins.mjs). A narrowed set does not
+      # fail loudly: it makes healthy old publications unverifiable.
+      - run: node scripts/check-trusted-owners.mjs
+        env:
+          VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}
       # ── Quality gates ──
       - run: npm ci
       - run: npm run lint
@@ -150,17 +162,35 @@ jobs:
       # ── Take the release identity from the WORKER RUN, not from the form ──
       - name: Fetch the release identity from the worker run
         id: identity
+        # The run is identified by what CANNOT be renamed or re-pointed: the
+        # workflow's file PATH in this repository (a display name is a free-form
+        # string any workflow may claim), its trigger EVENT (only a manual
+        # dispatch goes through the Environment's branch policy) and its HEAD
+        # BRANCH (the default branch, where the gates live). Read through the
+        # REST API from THIS repository's namespace, so a run id from elsewhere
+        # is simply not found.
         run: |
-          CONCLUSION=$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)
-          WORKFLOW=$(gh run view "$RUN_ID" --json workflowName --jq .workflowName)
+          RUN=$(gh api "repos/$REPO/actions/runs/$RUN_ID")
+          CONCLUSION=$(printf '%s' "$RUN" | jq -r .conclusion)
+          WF_PATH=$(printf '%s' "$RUN" | jq -r .path)
+          EVENT=$(printf '%s' "$RUN" | jq -r .event)
+          HEAD_BRANCH=$(printf '%s' "$RUN" | jq -r .head_branch)
           if [ "$CONCLUSION" != "success" ]; then
             echo "worker run $RUN_ID did not succeed (conclusion: $CONCLUSION)" >&2
             exit 1
           fi
-          case "$WORKFLOW" in
-            "Deploy Worker (proxy) — dev") ;;
-            *) echo "run $RUN_ID belongs to \"$WORKFLOW\", not the worker deploy" >&2; exit 1 ;;
-          esac
+          if [ "$WF_PATH" != ".github/workflows/deploy-worker.yml" ]; then
+            echo "run $RUN_ID is from workflow file '$WF_PATH', not the worker deploy" >&2
+            exit 1
+          fi
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "run $RUN_ID was triggered by '$EVENT', not a manual dispatch" >&2
+            exit 1
+          fi
+          if [ "$HEAD_BRANCH" != "$DEFAULT" ]; then
+            echo "run $RUN_ID ran from '$HEAD_BRANCH', not the default branch '$DEFAULT'" >&2
+            exit 1
+          fi
           gh run download "$RUN_ID" -n release-identity -D identity
           SHA=$(sed -n '1p' identity/release-identity.txt)
           VERSION=$(sed -n '2p' identity/release-identity.txt)
@@ -173,6 +203,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ inputs.worker_run_id }}
           CANDIDATE: ${{ inputs.worker_candidate }}
+          REPO: ${{ github.repository }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
       - name: Verify the live worker is the gated release
         run: node worker/scripts/smoke-gateways.mjs --profile=normal
         env:
