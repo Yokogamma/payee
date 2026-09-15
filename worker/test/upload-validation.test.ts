@@ -243,9 +243,12 @@ describe('upload validation: version contract (v1/v2)', () => {
     }
   });
 
-  it('accepts exactly 16 bytes — an empty plaintext still carries the tag', async () => {
+  it('accepts exactly 16 bytes — an empty plaintext still carries the tag (502 at Arweave stage)', async () => {
+    // Same convention as the well-formed uploads above: the envelope passes
+    // validation AND auth and reaches the Arweave stub, which fails with 502.
+    // `not.toBe(400)` would also pass on a 401/429/500 that never got there.
     const r = await upload(v2Tags(), { id: NOTE_ID, c: 'AAAAAAAAAAAAAAAAAAAAAA==', iv: IV }, nextIp());
-    expect(r.status).not.toBe(400);
+    expect(r.status).toBe(502);
   });
 
   it('rejects a NON-CANONICAL base64 spelling of otherwise valid bytes', async () => {
