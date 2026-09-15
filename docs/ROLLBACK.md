@@ -384,10 +384,11 @@ flip is a **raise** rather than a first filling:
    branch~~ — **done** (verified 2026-08-28: policy is branch-only, `main`).
    That policy, not the guard step inside the workflow, is the real boundary:
    a branch that wanted to remove the guard would simply remove it;
-3. **forbid administrative bypass** on the Environment — **still open**
-   (verified 2026-08-28: `can_admins_bypass = true`). By default admins may
-   bypass protection rules, and a «hard floor» an admin can wave through is a
-   soft one;
+3. ~~**forbid administrative bypass** on the Environment~~ — **done**
+   (verified 2026-08-28: `can_admins_bypass = true`; re-verified through the
+   API 2026-09-15: `can_admins_bypass = false`). By default admins may bypass
+   protection rules, and a «hard floor» an admin can wave through is a soft
+   one — which is why the setting is part of the floor, not a nicety;
 4. keep to the operational ban above: no dashboard rollback, no bare
    `wrangler rollback`;
 5. **do not dispatch the next worker deploy until the previous run has

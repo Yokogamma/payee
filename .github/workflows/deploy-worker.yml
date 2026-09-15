@@ -420,11 +420,13 @@ jobs:
           name: release-identity
           path: release-identity.txt
           retention-days: 30
-      - name: Remind the operator to raise the floor
+      - name: Remind the operator about the floor
         if: ${{ inputs.profile == 'normal' }}
         run: |
-          echo "::notice::Smoke green for $CANDIDATE. Raise WORKER_FLOOR_SHA to it" \
-            "BEFORE releasing the client — the control plane keeps applying the" \
-            "OLD floor until the Environment variable is updated."
+          echo "::notice::Smoke green for $CANDIDATE. The floor is NOT raised automatically:" \
+            "the control plane keeps applying the OLD WORKER_FLOOR_SHA until the Environment" \
+            "variable is updated AND the protected MINIMUM_FLOOR commit lands. Raise it only when" \
+            "docs/ROLLBACK.md says so — before a client with BACKUP_IMPORT_ENABLED=true, not" \
+            "before every client (see «Which order applies»)."
         env:
           CANDIDATE: ${{ inputs.candidate }}
