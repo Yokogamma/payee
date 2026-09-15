@@ -12,6 +12,7 @@ import {
   readFlagExactlyOnce,
 } from './check-client-floor-gate.mjs';
 import { gitIn, MINIMUM_FLOOR, SHA_RE } from './check-worker-floor.mjs';
+import { readFlag } from './check-backup-flags.mjs';
 
 /**
  * The client floor gate (D2a) in its two modes.
@@ -19,9 +20,11 @@ import { gitIn, MINIMUM_FLOOR, SHA_RE } from './check-worker-floor.mjs';
  * Three things are worth a failing build, and they are separate:
  *   1. the RULES — equality once import is on, ancestry while it is off, and
  *      «could not tell» is a refusal in both;
- *   2. that the MODE comes from the released source and from nowhere else —
- *      a computed, missing or DUPLICATED flag is a refusal, never a guess, and
- *      the path the workflow executes really reads the real src/lib/flags.ts;
+ *   2. that the MODE comes from the released source's DECLARATION and from
+ *      nowhere else — text in comments or strings is not a declaration; a
+ *      computed, missing, duplicated, non-exported or non-const flag is a
+ *      refusal, never a guess; and the path the workflow executes really reads
+ *      the real src/lib/flags.ts (checked against an independent reader);
  *   3. the WORKFLOW's shape — the step carries the floor variable, reads the
  *      candidate from the input, sits between the identity smoke and the
  *      deploy, and no inline equality gate is left behind to disagree.
@@ -61,7 +64,7 @@ describe('the mode is a property of the released source', () => {
     // artifact behave differently from its source, and a gate that guessed the
     // mode could be talked into ancestry for a build that has import on.
     const computed = 'export const BACKUP_IMPORT_ENABLED: boolean = process.env.X === "1";\n';
-    expect(() => gateModeFor(computed)).toThrow(/exactly one line-anchored declaration/);
+    expect(() => gateModeFor(computed)).toThrow(/literal initializer/);
     const verdict = decide({ flagsSource: computed });
     expect(verdict.ok).toBe(false);
     expect(verdict.reason).toMatch(/cannot decide the gate mode/);
@@ -73,25 +76,41 @@ describe('the mode is a property of the released source', () => {
     expect(verdict.reason).toMatch(/BACKUP_IMPORT_ENABLED/);
   });
 
-  it('a declaration spelled in a comment or a string cannot shadow the real one', () => {
-    // A first-match reader would pick the `= false` inside the doc comment and
-    // put an import-ON build into ancestry mode. The reader is line-anchored
-    // and demands exactly one match, so the shadowed source is a refusal — and
-    // an indented (commented-out) copy does not count as a declaration.
-    const shadowedAhead = `/** example: export const BACKUP_IMPORT_ENABLED: boolean = false; */\n${IMPORT_ON}`;
-    expect(() => gateModeFor(shadowedAhead)).not.toThrow();
-    expect(gateModeFor(shadowedAhead)).toBe('equality');
-    const duplicated = `export const BACKUP_IMPORT_ENABLED: boolean = false;\n${IMPORT_ON}`;
-    expect(() => gateModeFor(duplicated)).toThrow(/found 2/);
-    expect(decide({ flagsSource: duplicated }).ok).toBe(false);
-    const stringLiteral = `const doc = "export const BACKUP_IMPORT_ENABLED: boolean = false;";\n${IMPORT_ON}`;
-    expect(gateModeFor(stringLiteral)).toBe('equality');
+  it('a declaration spelled in a comment cannot shadow the real one — even an INDENTED real one', () => {
+    // The reviewer's reproduction against the text reader: a block comment
+    // spells the declaration at the start of a line, the real export is
+    // indented by one space. A line-anchored regex picked the comment (false)
+    // and skipped the export (true) — ancestry mode for a build with import
+    // ON. The AST reader sees one statement, exported, const, literal true.
+    const reviewersCase = '/* Example:\nexport const BACKUP_IMPORT_ENABLED: boolean = false;\n*/\n export const BACKUP_IMPORT_ENABLED: boolean = true;\n';
+    expect(readFlagExactlyOnce(reviewersCase, 'BACKUP_IMPORT_ENABLED')).toBe(true);
+    expect(gateModeFor(reviewersCase)).toBe('equality');
+    expect(decide({ flagsSource: reviewersCase, candidate: DESCENDANT }).ok).toBe(false);
   });
 
-  it('readFlagExactlyOnce is anchored at line start', () => {
-    expect(readFlagExactlyOnce(IMPORT_ON, 'BACKUP_IMPORT_ENABLED')).toBe(true);
-    expect(readFlagExactlyOnce(IMPORT_OFF, 'BACKUP_IMPORT_ENABLED')).toBe(false);
-    expect(() => readFlagExactlyOnce('  export const BACKUP_IMPORT_ENABLED: boolean = true;\n', 'BACKUP_IMPORT_ENABLED')).toThrow(/found 0/);
+  it('a declaration spelled inside a multi-line string is not a declaration either', () => {
+    const inTemplate = 'const doc = `\nexport const BACKUP_IMPORT_ENABLED: boolean = false;\n`;\nexport const BACKUP_IMPORT_ENABLED: boolean = true;\n';
+    expect(gateModeFor(inTemplate)).toBe('equality');
+    const inString = 'const doc = "export const BACKUP_IMPORT_ENABLED: boolean = false;";\n' + IMPORT_ON;
+    expect(gateModeFor(inString)).toBe('equality');
+    const inLineComment = '// export const BACKUP_IMPORT_ENABLED: boolean = false;\n' + IMPORT_ON;
+    expect(gateModeFor(inLineComment)).toBe('equality');
+  });
+
+  it('two real declarations, a nested one, a non-exported or non-const one, or a negated initializer are refusals', () => {
+    const duplicated = 'export const BACKUP_IMPORT_ENABLED: boolean = false;\n' + IMPORT_ON;
+    expect(() => gateModeFor(duplicated)).toThrow(/found 2/);
+    expect(decide({ flagsSource: duplicated }).ok).toBe(false);
+    expect(() => gateModeFor('if (x) { export const BACKUP_IMPORT_ENABLED: boolean = true; }\n')).toThrow(/found 0/);
+    expect(() => gateModeFor('const BACKUP_IMPORT_ENABLED: boolean = true;\n')).toThrow(/literal initializer/);
+    expect(() => gateModeFor('export let BACKUP_IMPORT_ENABLED: boolean = true;\n')).toThrow(/literal initializer/);
+    expect(() => gateModeFor('export const BACKUP_IMPORT_ENABLED: boolean = !false;\n')).toThrow(/literal initializer/);
+    expect(() => gateModeFor('export const BACKUP_IMPORT_ENABLED = Boolean(1);\n')).toThrow(/literal initializer/);
+  });
+
+  it('an indented, un-annotated or trailing-comment declaration still counts — the AST does not care about layout', () => {
+    expect(readFlagExactlyOnce('  export const BACKUP_IMPORT_ENABLED = true; // flipped 2026-10-01\n', 'BACKUP_IMPORT_ENABLED')).toBe(true);
+    expect(readFlagExactlyOnce('export const BACKUP_IMPORT_ENABLED:boolean=false\n', 'BACKUP_IMPORT_ENABLED')).toBe(false);
   });
 });
 
@@ -240,10 +259,13 @@ describe('against a real repository', () => {
 describe('this repository — the path the workflow executes', () => {
   const repoRoot = fileURLToPath(new URL('..', import.meta.url));
   const realFlags = readFileSync(join(repoRoot, 'src', 'lib', 'flags.ts'), 'utf8');
-  // Derived independently of the wiring under test, from the same file the
+  // Derived by an INDEPENDENT reader (the regex of check-backup-flags.mjs,
+  // which is right for the real, unshadowed file) from the same file the
   // workflow builds: a wiring that silently hard-coded import=false (ancestry
-  // for a build with import ON) would disagree with this the day import flips.
-  const expectedMode = readFlagExactlyOnce(realFlags, 'BACKUP_IMPORT_ENABLED') ? 'equality' : 'ancestry';
+  // for a build with import ON) would disagree with this the day import flips,
+  // and so would an AST reader that started reading the wrong declaration.
+  const expectedMode = readFlag(realFlags, 'BACKUP_IMPORT_ENABLED') ? 'equality' : 'ancestry';
+  expect(readFlagExactlyOnce(realFlags, 'BACKUP_IMPORT_ENABLED')).toBe(readFlag(realFlags, 'BACKUP_IMPORT_ENABLED'));
 
   it('checkClientFloorGateHere reads the real src/lib/flags.ts and the real pin', () => {
     const verdict = checkClientFloorGateHere({ floor: MINIMUM_FLOOR, candidate: MINIMUM_FLOOR });

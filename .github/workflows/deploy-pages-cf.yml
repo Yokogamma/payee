@@ -249,8 +249,10 @@ jobs:
       #     candidate must be the floor or a descendant of it; the floor stays.
       #
       # The mode is read from src/lib/flags.ts of THIS checkout — the one that
-      # was built above — through the strict literal reader of
-      # check-backup-flags.mjs. It is deliberately not an input and not a
+      # was built above — from the TypeScript AST: exactly one top-level
+      # `export const BACKUP_IMPORT_ENABLED` with a literal initializer (text in
+      # comments or strings is not a declaration; anything else refuses). It is
+      # deliberately not an input and not a
       # switch: equality returns automatically with the first build that turns
       # import on. In both modes the Environment floor must equal the
       # repo-pinned MINIMUM_FLOOR (the two stages of a raise must agree).

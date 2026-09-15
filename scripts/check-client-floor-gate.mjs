@@ -38,11 +38,12 @@
  * therefore comes back automatically with the first build that turns import
  * on — nobody has to remember to flip the gate.
  *
- * The flag is read STRICTLY: exactly one declaration, at the start of a line,
- * with a literal `true` or `false`. Zero matches, two matches (a comment or a
- * string that spells the declaration ahead of the real one) or a computed
- * value are refusals — a gate that guessed the mode would be a gate that can
- * be talked into the wrong one.
+ * The flag is read from the TypeScript AST, not from the text: exactly one
+ * top-level `export const BACKUP_IMPORT_ENABLED` whose initializer is the
+ * literal `true` or `false`. Text inside comments and strings is not a
+ * declaration, so it cannot shadow the real one; a missing, duplicated,
+ * non-exported, non-const or computed declaration is a refusal — a gate that
+ * guessed the mode would be a gate that can be talked into the wrong one.
  *
  * In BOTH modes the Environment floor must equal the repo-pinned
  * `MINIMUM_FLOOR`: the two stages of a floor raise (the variable, then the
@@ -55,31 +56,56 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { checkFloorInputs, gitIn, MINIMUM_FLOOR } from './check-worker-floor.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const FLAGS_PATH = fileURLToPath(new URL('../src/lib/flags.ts', import.meta.url));
 
 /**
- * The one declaration of a flag, or a throw.
+ * The one declaration of a flag, or a throw — read from the AST.
  *
- * Anchored at the start of a line (`m`), and it must match EXACTLY ONCE: the
- * first-match reader of check-backup-flags.mjs is right for the pair check,
- * but here a second spelling of the declaration — in a comment, a string, a
- * doc example — could shadow the real one and pick the other mode. Exported
- * for the test; not a general utility.
+ * Why not a regex: a line that LOOKS like the declaration inside a block
+ * comment or a template string is not a declaration, and the real one may be
+ * indented; a text reader was shown to pick the comment and skip the export.
+ * The TypeScript parser sees statements, not lines. Accepted shape, and only
+ * this shape: a top-level `export const NAME = true|false` (a type annotation
+ * is fine), exactly once in the file. Anything else — no declaration, two of
+ * them, `let`/`var`, no `export`, a computed or negated initializer, a
+ * declaration nested in a block — throws. Exported for the test; not a general
+ * utility.
  */
 export function readFlagExactlyOnce(source, name) {
-  const re = new RegExp(`^export const ${name}\\s*:\\s*boolean\\s*=\\s*(true|false)\\s*;`, 'gm');
-  const matches = [...String(source ?? '').matchAll(re)];
-  if (matches.length !== 1) {
+  const file = ts.createSourceFile('flags.ts', String(source ?? ''), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const found = [];
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declarator of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declarator.name) || declarator.name.text !== name) continue;
+      const exported = (ts.getModifiers(statement) ?? []).some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+      const isConst = (statement.declarationList.flags & ts.NodeFlags.Const) !== 0;
+      const init = declarator.initializer;
+      const literal = init && init.kind === ts.SyntaxKind.TrueKeyword ? true
+        : init && init.kind === ts.SyntaxKind.FalseKeyword ? false
+        : null;
+      found.push({ exported, isConst, literal });
+    }
+  }
+  if (found.length !== 1) {
     throw new Error(
-      `check-client-floor-gate: expected exactly one line-anchored declaration ` +
-      `\`export const ${name}: boolean = true|false;\` in src/lib/flags.ts, found ${matches.length}. ` +
-      'A missing, computed or duplicated declaration cannot decide the gate mode.',
+      `check-client-floor-gate: expected exactly one top-level declaration of ${name} ` +
+      `in src/lib/flags.ts, found ${found.length}. A missing or duplicated declaration cannot decide the gate mode.`,
     );
   }
-  return matches[0][1] === 'true';
+  const [decl] = found;
+  if (!decl.exported || !decl.isConst || decl.literal === null) {
+    throw new Error(
+      `check-client-floor-gate: ${name} must be declared as \`export const ${name}: boolean = true|false;\` ` +
+      'with a literal initializer — a non-exported, non-const, computed or negated value would make the ' +
+      'release artifact behave differently from what the gate reads.',
+    );
+  }
+  return decl.literal;
 }
 
 /** Which mode the released source demands. Throws when it cannot tell. */

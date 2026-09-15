@@ -2054,8 +2054,9 @@ flag the gate reads, or raise the floor first and record why.
 The Pages gate encodes both orders, and picks one from a PROPERTY OF THE
 BUILD, never from an input or an operator switch
 (`scripts/check-client-floor-gate.mjs`, mode read from `src/lib/flags.ts` of
-the checkout being built through the strict literal reader of
-`check-backup-flags.mjs`):
+the checkout being built, from the TypeScript AST — exactly one top-level
+`export const BACKUP_IMPORT_ENABLED` with a literal initializer; text in
+comments or strings is not a declaration, and anything else is a refusal):
 
 - `BACKUP_IMPORT_ENABLED = true` → **equality**: `WORKER_FLOOR_SHA ==
   MINIMUM_FLOOR == worker_candidate`. «Candidate descends from the floor» is
