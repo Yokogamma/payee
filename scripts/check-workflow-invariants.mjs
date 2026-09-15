@@ -80,10 +80,13 @@ const TOKENLESS_JOBS = Object.freeze({ 'deploy-worker.yml': ['test-candidate'] }
 /** The path may begin with an expression containing spaces: `${{ runner.temp }}/x`. */
 const SECRETS_FILE_RE = /--secrets-file\s+((?:\$\{\{[^}]*\}\})?\S*)/;
 
-/** Invariant C: gate script → the variable it reads (skipped under --repo-only). */
+/** Invariant C: gate script → the variables it reads. `repoOnly` names the
+ *  gates that have a `--repo-only` mode (no Environment read, so no env: needed
+ *  then); a gate without that mode is checked whatever flags its run: carries. */
 const GATE_ENV = Object.freeze({
-  'check-gateways-vs-worker.mjs': 'VITE_STATUS_GATEWAYS',
-  'check-trusted-owners.mjs': 'VITE_TRUSTED_OWNERS',
+  'check-gateways-vs-worker.mjs': { variables: ['VITE_STATUS_GATEWAYS'], repoOnly: true },
+  'check-trusted-owners.mjs': { variables: ['VITE_TRUSTED_OWNERS'], repoOnly: true },
+  'check-client-floor-gate.mjs': { variables: ['WORKER_FLOOR_SHA', 'WORKER_CANDIDATE_SHA'], repoOnly: false },
 });
 
 /** Recursively visit every scalar with its path. */
@@ -143,14 +146,17 @@ export function checkWorkflowInvariants(files) {
     for (const [jobName, job] of Object.entries(doc.jobs ?? {})) {
       (job?.steps ?? []).forEach((step, i) => {
         const runText = typeof step?.run === 'string' ? step.run : '';
-        for (const [script, variable] of Object.entries(GATE_ENV)) {
-          if (!runText.includes(script) || runText.includes('--repo-only')) continue;
-          const carried = (step.env && variable in step.env) || (job.env && variable in job.env);
-          if (!carried) {
-            violations.push(
-              `${name}: jobs.${jobName}.steps.${i} runs ${script} without ${variable} in env: — ` +
-                'the gate would judge an empty pool and refuse a correct deploy',
-            );
+        for (const [script, { variables, repoOnly }] of Object.entries(GATE_ENV)) {
+          if (!runText.includes(script)) continue;
+          if (repoOnly && runText.includes('--repo-only')) continue;
+          for (const variable of variables) {
+            const carried = (step.env && variable in step.env) || (job.env && variable in job.env);
+            if (!carried) {
+              violations.push(
+                `${name}: jobs.${jobName}.steps.${i} runs ${script} without ${variable} in env: — ` +
+                  'the gate would judge an empty value and refuse a correct deploy',
+              );
+            }
           }
         }
       });

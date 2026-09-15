@@ -310,6 +310,34 @@ jobs:
     ]);
     expect(violations.join(' ')).toMatch(/check-trusted-owners\.mjs without VITE_TRUSTED_OWNERS/);
   });
+
+  it('check-client-floor-gate без WORKER_FLOOR_SHA — нарушение', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-client-floor-gate.mjs') },
+    ]);
+    expect(violations.join(' ')).toMatch(/check-client-floor-gate\.mjs without WORKER_FLOOR_SHA/);
+  });
+
+  it('check-client-floor-gate с одной переменной из двух — нарушение по второй', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-client-floor-gate.mjs', withEnv('WORKER_FLOOR_SHA')) },
+    ]);
+    expect(violations.join(' ')).toMatch(/check-client-floor-gate\.mjs without WORKER_CANDIDATE_SHA/);
+  });
+
+  it('check-client-floor-gate не имеет режима --repo-only: флаг не освобождает от env', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-client-floor-gate.mjs --repo-only') },
+    ]);
+    expect(violations.join(' ')).toMatch(/check-client-floor-gate\.mjs without WORKER_FLOOR_SHA/);
+  });
+
+  it('check-client-floor-gate с обеими переменными — чисто', () => {
+    const { violations } = run([
+      { name: 'a.yml', content: gate('node scripts/check-client-floor-gate.mjs', withEnv('WORKER_FLOOR_SHA') + '\n          WORKER_CANDIDATE_SHA: ${{ inputs.worker_candidate }}') },
+    ]);
+    expect(violations.filter(v => v.includes('check-client-floor-gate'))).toEqual([]);
+  });
 });
 
 // ── Инварианты D и E: секреты только под environment; --secrets-file готовится и удаляется ──

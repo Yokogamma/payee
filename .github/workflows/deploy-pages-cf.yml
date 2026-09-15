@@ -69,12 +69,27 @@ jobs:
       # Actions pinned to immutable commit SHAs — see deploy-worker.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The floor check below is ancestry, and ancestry cannot be computed
-          # from a shallow clone.
+          # The floor gate below runs in ancestry mode for a build with
+          # BACKUP_IMPORT_ENABLED=false, and ancestry cannot be computed from a
+          # shallow clone.
           fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
+      # The floor gate reads its MODE from src/lib/flags.ts of this checkout, so
+      # the checkout must be the protected default branch — the `dev`
+      # Environment's deployment-branch policy already says so, and this step
+      # says it again from inside the run (defense in depth, mirrors the worker
+      # deploy). No `${{ }}` in run: — the values arrive through env.
+      - name: Refuse to deploy from anything but the default branch
+        run: |
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "This workflow publishes the client of the checked-out source and must be dispatched from the $DEFAULT branch (was: $REF)." >&2
+            exit 1
+          fi
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
       # Early config gate: presence + repo-pinned expectations for the four
       # NON-SECRET variables (the build reads only the VITE_* pair; the other
       # two would otherwise ride into the deploy action empty and surface
@@ -164,9 +179,10 @@ jobs:
       #   * /health must report the release named in `worker_candidate` AND the
       #     version id that deploy actually activated — a re-deploy of the same
       #     commit is a DIFFERENT version, and only the id can tell;
-      #   * that candidate must be an ancestor of (or equal to) the floor
-      #     recorded in WORKER_FLOOR_SHA, which catches «forgot to raise the
-      #     floor» before the client goes out rather than after.
+      #   * that candidate must stand in the right relation to the floor recorded
+      #     in WORKER_FLOOR_SHA — equality for a build with import on, «the floor
+      #     is an ancestor of the candidate» for a build with import off — as the
+      #     released source demands (see the floor gate step below).
       # ── Take the release identity from the WORKER RUN, not from the form ──
       - name: Fetch the release identity from the worker run
         id: identity
@@ -218,37 +234,33 @@ jobs:
         env:
           EXPECT_RELEASE_SHA: ${{ inputs.worker_candidate }}
           EXPECT_WORKER_VERSION_ID: ${{ steps.identity.outputs.version_id }}
-      # EQUALITY, not ancestry.
+      # The floor gate, in the mode the RELEASED SOURCE demands
+      # (scripts/check-client-floor-gate.mjs, tested):
       #
-      # "candidate is a descendant of the floor" is satisfied by the OLD floor
-      # too, so it cannot catch the one mistake this gate exists for: shipping
-      # the client while WORKER_FLOOR_SHA still points at the previous release.
-      # The floor must BE the release this client goes out on top of.
+      #   * BACKUP_IMPORT_ENABLED = true  → EQUALITY: the floor must BE the release
+      #     this client ships on — «candidate descends from the floor» is satisfied
+      #     by the OLD floor too, which is exactly the mistake equality catches
+      #     (shipping a client with import on while WORKER_FLOOR_SHA still points
+      #     at the previous release).
+      #   * BACKUP_IMPORT_ENABLED = false → ANCESTRY: nothing in such a client
+      #     depends on semantic idempotency, and the plan (D2a) keeps the worker's
+      #     rollback window open until the import flip — the floor rises
+      #     immediately BEFORE that flip, not before the DB3 client floor. The
+      #     candidate must be the floor or a descendant of it; the floor stays.
       #
-      # Both halves of the two-stage raise are checked: the Environment
-      # variable (stage 2) and the repo-pinned MINIMUM_FLOOR (stage 3, the
-      # separate protected commit) — the Environment value alone can be lowered
-      # back to the old repo pin at any time.
-      - name: Verify the floor was raised to this release
-        run: |
-          if [ -z "$FLOOR" ]; then
-            echo "WORKER_FLOOR_SHA is not set — the floor is configuration, not an absent constraint." >&2
-            exit 1
-          fi
-          if [ "$FLOOR" != "$CANDIDATE" ]; then
-            echo "WORKER_FLOOR_SHA is $FLOOR but this client ships against $CANDIDATE." >&2
-            echo "Raise the Environment floor to the smoked release before publishing." >&2
-            exit 1
-          fi
-          MINIMUM=$(node -e "import('./scripts/check-worker-floor.mjs').then(m => console.log(m.MINIMUM_FLOOR))")
-          if [ "$MINIMUM" != "$CANDIDATE" ]; then
-            echo "MINIMUM_FLOOR is $MINIMUM but this client ships against $CANDIDATE." >&2
-            echo "Land the protected commit raising MINIMUM_FLOOR before publishing." >&2
-            exit 1
-          fi
+      # The mode is read from src/lib/flags.ts of THIS checkout — the one that
+      # was built above — from the TypeScript AST: exactly one top-level
+      # `export const BACKUP_IMPORT_ENABLED` with a literal initializer (text in
+      # comments or strings is not a declaration; anything else refuses). It is
+      # deliberately not an input and not a
+      # switch: equality returns automatically with the first build that turns
+      # import on. In both modes the Environment floor must equal the
+      # repo-pinned MINIMUM_FLOOR (the two stages of a raise must agree).
+      - name: Verify the floor stands in the right relation to this release
+        run: node scripts/check-client-floor-gate.mjs
         env:
-          FLOOR: ${{ vars.WORKER_FLOOR_SHA }}
-          CANDIDATE: ${{ inputs.worker_candidate }}
+          WORKER_FLOOR_SHA: ${{ vars.WORKER_FLOOR_SHA }}
+          WORKER_CANDIDATE_SHA: ${{ inputs.worker_candidate }}
       # ── Deploy ──
       # wrangler itself comes from the ROOT lockfile (devDependency): the
       # action prefers the locally installed CLI over downloading one at
