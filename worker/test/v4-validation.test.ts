@@ -136,6 +136,21 @@ describe('upload validation: App-Version=4 (safebox split envelope)', () => {
     expect(await r.text()).toMatch(/sc and siv must be non-empty/);
   });
 
+  it('rejects a ciphertext shorter than the GCM tag — BOTH halves', async () => {
+    // Same reasoning as the note path, applied to each half independently: a
+    // v4 record with a well-formed meta blob and a stub secret blob must never
+    // reach the chain.
+    for (const short of ['AAAA', 'AAAAAAAAAAAAAAAAAAAA']) { // 3 and 15 bytes
+      const meta = await upload(v4Tags(), { ...v4Data(), mc: short }, nextIp());
+      expect(meta.status, `mc ${short}`).toBe(400);
+      expect(await meta.text()).toMatch(/mc must be at least 16 bytes/);
+
+      const secret = await upload(v4Tags(), { ...v4Data(), sc: short }, nextIp());
+      expect(secret.status, `sc ${short}`).toBe(400);
+      expect(await secret.text()).toMatch(/sc must be at least 16 bytes/);
+    }
+  });
+
   it('rejects a non-string secret ciphertext', async () => {
     const r = await upload(v4Tags(), { ...v4Data(), sc: 42 } as unknown, nextIp());
     expect(r.status).toBe(400);
