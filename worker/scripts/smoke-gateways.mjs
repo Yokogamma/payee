@@ -95,6 +95,16 @@ export function checkHealth(body, expected) {
         `profile "${expected.profile}" requires ${JSON.stringify(profile.statusQuorumPolicy)}`,
     );
   }
+  // EXACT equality again, and it cuts both ways: a normal build that does not
+  // claim the capability has not shipped what the release is for, and an
+  // emergency build that DOES claim it is mislabelled — the client would then
+  // trust a fingerprint comparison the build never performs.
+  if (body.semanticIdempotency !== profile.semanticIdempotency) {
+    problems.push(
+      `semanticIdempotency is ${JSON.stringify(body.semanticIdempotency)}, ` +
+        `profile "${expected.profile}" requires ${JSON.stringify(profile.semanticIdempotency)}`,
+    );
+  }
   if (body.statusGatewaysHash !== expected.statusGatewaysHash) {
     problems.push('statusGatewaysHash does not match the set configured in wrangler.toml');
   }
@@ -115,6 +125,16 @@ export function checkHealth(body, expected) {
   if (profile.requireUploadsOff) {
     for (const flag of ['uploads', 'v3Uploads', 'v4Uploads']) {
       if (body[flag] !== false) problems.push(`${flag} must be false under the emergency profile`);
+    }
+  }
+  // The mirror image, and NOT implied by `requireUploadsOff: false` — that only
+  // stops demanding them off, it asserts nothing. A profile whose whole purpose
+  // is publishing (pre-d2 exists so seed-legacy can post) must say so
+  // positively, or a build with every switch off would be declared ready and
+  // the seeding would fail against a worker the smoke had just approved.
+  if (profile.requireUploadsOn) {
+    for (const flag of ['uploads', 'v3Uploads', 'v4Uploads']) {
+      if (body[flag] !== true) problems.push(`${flag} must be true under the ${expected.profile} profile`);
     }
   }
 
