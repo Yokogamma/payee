@@ -27,6 +27,7 @@ provisioned» until then.
 | `VITE_TRUSTED_OWNERS` | config, **integrity-critical** → Environment variable | client build | trusting a stranger's transactions; repo-pinned inclusion check |
 | `VITE_STATUS_GATEWAYS`, `VITE_PAYLOAD_GATEWAYS`, `VITE_INDEX_SOURCES` | config, **integrity-critical** → Environment variables | client build (PR-3a) | these decide where a stable Owner-Hash, a stable IP and every requested txId are sent — and the CSP is GENERATED from them, so a Settings edit would authorize its own egress. Pinned exactly in `scripts/gateway-pins.mjs`; the deploy gate compares normalized values, and `check-gateways-vs-worker.mjs` requires the worker's `STATUS_GATEWAYS` to be the same set |
 | `STATUS_GATEWAYS` | config in `wrangler.toml` | worker (PR-3a) | source of truth is the repository. MUST equal the client's list: the dead formula is one formula for both halves, and disagreeing halves would not mean the same thing by `dead` — which is what authorizes a paid redrop |
+| `TRUSTED_OWNERS` | **non-secret config** in `wrangler.toml`, declared in EVERY named environment | worker `/upload` (D2/D9) | not a secret — these addresses are on chain and compiled into the client bundle. What matters is that the list only ever GROWS: the worker authenticates a publication before binding its `txId` to a payload fingerprint, and a dropped address does not fail loudly — it makes the project's own older publications unverifiable, so healthy records start answering a conflict or a 503. Deliberately NOT derived from `ARWEAVE_JWK`: after a rotation the current wallet cannot confirm older transactions. What it must contain is pinned in `scripts/owner-pins.mjs` and enforced by `check-trusted-owners.mjs`, which also requires the worker and client sets to agree. Missing, empty or malformed → `/upload` 503s (fail-closed), and so does a signing wallet outside the set. **Rotation order is asymmetric:** add the new address to both sets and deploy FIRST, switch `ARWEAVE_JWK` second |
 | `RELEASE_SHA` | identifier → injected at deploy | worker `/health` (PR-3a) | not a secret. Injected by the trusted workflow from its VERIFIED `candidate` input, never from `github.sha` (that is the workflow's own head, not the deployed code). Reported back by `/health` so the smoke can refuse anything else |
 | `SMOKE_PRIVATE_KEY`, `MNEMONIC` | operator secrets | local paid smokes | access to the smoke vault |
 | `SMOKE_URL`, `SMOKE_ALLOW_ORIGIN` | **non-secret** operator setting | local paid smokes | not a secret; `SMOKE_ALLOW_ORIGIN` is a deliberate per-origin grant for a paid smoke (worker/scripts/smoke-target.mjs) |
@@ -142,6 +143,80 @@ project. Probability is lowered by: lockfiles, `allowScripts` (only `esbuild`
 and `workerd` may run install scripts), Dependabot alerts, and the repo being
 public. Recorded here as an accepted decision.
 
+## Co-deployed secrets: code and secret in ONE activation
+
+`wrangler secret put` **creates and activates a new worker version by itself**
+([Cloudflare: secrets](https://developers.cloudflare.com/workers/configuration/secrets/)).
+Rotating a secret that way and deploying code are therefore two activations —
+two `workerVersionId`s. A soak window (docs/ROLLBACK.md «Soak criteria — v2»)
+is 168 hours on ONE version id, so a mid-window `secret put` resets it exactly
+like a deploy does.
+
+The trusted deploy workflow (`deploy-worker.yml`) therefore co-deploys secrets
+with the code through `wrangler deploy --secrets-file`, which is **additive**:
+secrets omitted from the file are kept, none is ever deleted by a deploy.
+Mechanics, all inside the deploy job (the tokenless `test-candidate` job never
+sees a secret; invariants D/E in `scripts/check-workflow-invariants.mjs`):
+
+1. the job reads each co-deployed secret from the GitHub Environment `dev`
+   through `env:` (never `${{ }}` inside `run:`), builds
+   `$RUNNER_TEMP/co-deploy-secrets.json` with `umask 077`, and logs only the
+   entry COUNT and the names — never a value; an unset Environment secret is
+   simply absent from the file, so a deploy with `{}` changes nothing;
+2. the candidate's own wrangler is asked whether it knows `--secrets-file`
+   before anything is uploaded — a historical rollback must never be refused
+   by an argument it cannot parse, and must never silently ignore it;
+3. `wrangler deploy … --secrets-file <that file>` uploads code and secrets as
+   one version;
+4. an `if: always()` step removes the file whatever the deploy did;
+5. a planned rotation dispatches the workflow with `required_secrets` naming
+   the secrets that MUST be in the file (e.g. `CF_ANALYTICS_TOKEN`): an unset
+   one then stops the job before any upload. Without the input an ordinary
+   deploy ships `{}` when nothing is set — compatibility, not a rotation.
+
+**Named limits (do not oversell the invariants).** Invariant E forbids an
+`actions/upload-artifact` step whose `path` names the file, its directory or
+`runner.temp`; it cannot see a `run:` step that copies the file elsewhere
+first — that is caught in review. Invariant F pins the tokenless job by
+NAME (`test-candidate` in `deploy-worker.yml`): no `environment:` and no
+`secrets.*` reference in it, whatever D would allow; a job renamed out of that
+list is a review question, not a static failure.
+
+**Registry of co-deployed secrets** (one Environment secret per row; adding one
+= an `env:` line + a `--arg` in the preparing step + a row here):
+
+| Environment secret (`dev`) | Worker secret | Owner / consumer |
+|---|---|---|
+| `CF_ANALYTICS_TOKEN` | `CF_ANALYTICS_TOKEN` | the worker's `/admin/metrics` upstream — and NOTHING else (see the ownership rule below) |
+
+`ARWEAVE_JWK`, `ADMIN_SECRET`, `RECOVERY_HMAC_SECRET`, `METRICS_ADMIN_SECRET`
+stay on their existing procedures for now; moving one into the registry is a
+deliberate change, reviewed like a deploy.
+
+**Ownership rule — one token, one consumer.** A Cloudflare API token that is
+stored in a worker secret is used by that worker only. It is never pasted into
+an operator's local tool: rolling a token (`Roll`) invalidates its previous
+value immediately ([Cloudflare: roll a token](https://developers.cloudflare.com/fundamentals/api/how-to/roll-token/)),
+and a token shared by two consumers takes the second one down the moment the
+first one rolls it. Local tools get their own tokens with the same scope.
+
+**Incident 2026-09-09 → 2026-09-14 (`/admin/metrics` answered 502 for four
+days).** Established from the account's Audit Logs: the user token
+`eternal-notes-metrics-sql-read` was the ONE token behind every Analytics
+Engine SQL call — the worker's (empty user-agent, Workers egress) and the
+operator's local exporter (`node`) alike. It was rolled from the dashboard on
+2026-09-09 12:59:56 UTC; the worker's last successful call was 12:30:46 UTC
+that day and none followed, while the local exporter resumed with the new
+value 34 seconds after the roll. The worker kept the pre-roll value in
+`CF_ANALYTICS_TOKEN`, the SQL API refused it, and the handler mapped the
+refusal to the generic `502 Metrics upstream error` — the response the daily
+snapshots show from 2026-09-10 12:50 UTC on. Evidence: the operator's
+`snapshots/metrics-502-cause-2026-09-14.txt`; PR #169 adds the structured
+`metrics_upstream_failure` line that would have named the upstream status and
+code on day one. The fix is applied ONLY after the soak window is closed and
+archived, as one activation: the worker's own new token in the `dev`
+Environment + the code of #169 → one deploy, one version id.
+
 ## Rotation
 
 **Wallet (`ARWEAVE_JWK`)** — the rule from `src/lib/config.ts`:
@@ -200,9 +275,18 @@ afterwards.
 provisioned); update the operator's stored value; verify with a
 `POST /admin/metrics` → 200. Nothing else depends on it (read-only reports).
 
-**`CF_ANALYTICS_TOKEN` (PR-2)** — rotate by RECREATING the token in the
+**`CF_ANALYTICS_TOKEN` (PR-2)** — rotate by CREATING a new token in the
 Cloudflare dashboard (scope: `Account → Account Analytics → Read`, this one
-account, nothing else), then `wrangler secret put CF_ANALYTICS_TOKEN` (and
-`--env staging` where provisioned) and revoke the old token. While it is
-missing `/admin/metrics` answers 503 and metric WRITES are unaffected — the
-rotation window costs only report availability.
+account, nothing else; a token used by the worker ONLY — never the operator's
+local one), putting its value into the `dev` Environment secret
+`CF_ANALYTICS_TOKEN`, and dispatching the trusted deploy with
+`required_secrets: CF_ANALYTICS_TOKEN` so it co-deploys it («Co-deployed
+secrets» above) — NOT `wrangler secret put`, which would activate a version
+of its own. **Revoke the old token only after the NEW one is proven through
+the deployed worker**: the post-deploy smoke checks `/health`, not
+`/admin/metrics`, so a green smoke says nothing about the token. Run all four
+`POST /admin/metrics` reports at 24 h and 168 h against the live worker and
+require 200 with the `{rows}` shape from each; only then revoke. Never during
+a soak window: any new version id resets it. While the secret is missing or
+invalid `/admin/metrics` answers 503 or 502 and metric WRITES are unaffected —
+the rotation window costs only report availability.
