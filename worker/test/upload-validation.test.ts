@@ -56,7 +56,7 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
 
 const NOTE_ID = '11111111-2222-4333-8444-555555555555';    // valid UUIDv4 shape
 const NOTE_ID_V8 = '11111111-2222-8333-8444-555555555555'; // valid UUIDv8 shape (v3 namespace)
-const C = 'AAAA';                 // valid base64 (3 bytes)
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA';    // valid base64, exactly 12 bytes
 
 function v1Tags(): Tag[] {

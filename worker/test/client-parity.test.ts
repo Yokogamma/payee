@@ -21,7 +21,7 @@ const MNEMONIC =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
 const NOTE_ID = '77777777-2222-4333-8444-555555555555'; // valid UUIDv4 shape
-const C = 'AAAA';              // valid base64 (3 bytes)
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA'; // valid base64, exactly 12 bytes
 
 let ipCounter = 0;

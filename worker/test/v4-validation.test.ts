@@ -55,8 +55,8 @@ async function upload(tags: Tag[], dataObj: unknown, ip: string): Promise<Respon
 
 const ID_V8 = '11111111-2222-8333-8444-555555555555';  // UUIDv8 (v3/v4 namespace)
 const ID_V4 = '11111111-2222-4333-8444-555555555555';  // UUIDv4 (v1/v2 namespace)
-const MC = 'AAAAAAAA';                 // valid base64
-const SC = 'BBBBBBBB';                 // valid base64
+const MC = 'QUFBQUFBQUFBQUFBQUFBQQ=='; // 16 bytes                 // valid base64
+const SC = 'QkJCQkJCQkJCQkJCQkJCQg=='; // 16 bytes                 // valid base64
 const IV12 = 'AAAAAAAAAAAAAAAA';       // valid base64, exactly 12 bytes
 const IV3 = 'AAAA';                    // valid base64, 3 bytes
 

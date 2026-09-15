@@ -16,6 +16,11 @@
  * corrupt both sets of counters) and `terminalError` is carried over
  * explicitly (it used to be lost here; harmless only because quarantined
  * records never re-enter the queue).
+ *
+ * `attemptId` (D14a) is the deliberate exception to that rule: it is set ONLY
+ * by toUploading, from a value the caller just generated, and dropping it
+ * everywhere else is the mechanism — a record that is no longer 'uploading'
+ * has no attempt to answer, so a late response finds nothing to match.
  */
 
 import type { SyncRecord } from './storage';
@@ -25,12 +30,19 @@ export type SyncKind = SyncRecord['kind'];
 
 /** Transition into 'uploading' before a proxy attempt. Preserves the prior
  *  txId + recheck intent + recovery proof — a crash or aborted request mid-
- *  recheck must not lose the accepted TX or its only signed recovery hint. */
+ *  recheck must not lose the accepted TX or its only signed recovery hint.
+ *
+ *  `attemptId` is REQUIRED and always NEW (D14a). It is the one field that
+ *  must never be inherited from `prev`: it identifies THIS attempt, and
+ *  carrying a previous one over would let a long-dead request's answer match
+ *  and be applied. Every other transition rebuilds the record without it, so a
+ *  row that leaves 'uploading' has no owner and no late answer can claim it. */
 export function toUploading(
   noteId: string,
   kind: SyncKind,
   prev: SyncRecord | undefined,
   now: number,
+  attemptId: string,
 ): SyncRecord {
   return {
     noteId,
@@ -41,6 +53,7 @@ export function toUploading(
     updatedAt: now,
     needsRecheck: prev?.needsRecheck === true,
     recovery: prev?.recovery,
+    attemptId,
     terminalError: prev?.terminalError,
   };
 }

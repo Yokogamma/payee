@@ -28,6 +28,16 @@ afterEach(() => {
 
 type Storage = typeof import('./storage');
 
+/**
+ * ВАЖЕН ПОРЯДОК: вызывать ТОЛЬКО после stubGateway.
+ *
+ * config.ts замораживает VITE_TRUSTED_OWNERS на загрузке модуля, а storage с
+ * §1.9 тянет config транзитивно (publication-equivalent → arweave → config).
+ * Загруженный раньше, чем stubGateway прибьёт доверенным кошелёк харнеса, он
+ * заморозит ЧУЖОЙ адрес — и конвейер отбросит кандидата по владельцу. Тест,
+ * ожидающий пустую выдачу, при этом останется зелёным по НЕВЕРНОЙ причине,
+ * поэтому порядок соблюдён и там, где итог от него не меняется.
+ */
 async function loadStorage(): Promise<Storage> {
   const storage = await import('./storage');
   await storage.initStorage();
@@ -102,16 +112,16 @@ async function runMergeLoop(
 describe('restore-конвейер × карантин recovery_invalidated (заметки)', () => {
   it('повреждённый/неаутентифицированный envelope отброшен — карантин стоит', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
-    const storage = await loadStorage();
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const otherKey = await deriveKey(generateMnemonic());
     // Кандидат под ЧУЖИМ ключом: GCM-тег не сойдётся → конвейер отбросит.
     const foreign = await encryptEnvelope(otherKey, 'not yours');
-    await quarantinedRow(storage, foreign.noteId, 'note');
 
     await stubGateway([{ txId: 'TX-F', version: '2', noteId: foreign.noteId }],
       { 'TX-F': { id: foreign.noteId, c: foreign.ciphertext, iv: foreign.iv } });
+    const storage = await loadStorage();
+    await quarantinedRow(storage, foreign.noteId, 'note');
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', { note: key, safeboxMeta: key, safeboxSecret: key });
     expect(fetched.notes).toHaveLength(0); // конвейер не довёл кандидата
@@ -143,14 +153,14 @@ describe('restore-конвейер × карантин recovery_invalidated (з�
 
   it('валидный аутентифицированный кандидат доходит до писателя — карантин снят, запись confirmed', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
-    const storage = await loadStorage();
     const { deriveKey, generateMnemonic, encryptEnvelope } = await import('./crypto');
     const key = await deriveKey(generateMnemonic());
     const good = await encryptEnvelope(key, 'моя заметка');
-    await quarantinedRow(storage, good.noteId, 'note');
 
     const gw = await stubGateway([{ txId: 'TX-G', version: '2', noteId: good.noteId }],
       { 'TX-G': { id: good.noteId, c: good.ciphertext, iv: good.iv } });
+    const storage = await loadStorage();
+    await quarantinedRow(storage, good.noteId, 'note');
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', { note: key, safeboxMeta: key, safeboxSecret: key });
     expect(fetched.notes).toHaveLength(1);
@@ -180,14 +190,14 @@ describe('restore-конвейер × карантин recovery_invalidated (с�
 
   it('повреждённый envelope сейфа отброшен — карантин стоит', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
-    const storage = await loadStorage();
     const keys = await safeboxKeyring();
     const foreignKeys = await safeboxKeyring(); // другой seed → другие ключи
     const { encryptSafeboxEntry } = await import('./crypto');
     const foreign = await encryptSafeboxEntry(foreignKeys.safeboxMeta, foreignKeys.safeboxSecret, ENTRY_INPUT);
-    await quarantinedRow(storage, foreign.entryId, 'safebox');
 
     await stubGateway([{ txId: 'TX-SF', version: '4', noteId: foreign.entryId }], { 'TX-SF': wire(foreign) });
+    const storage = await loadStorage();
+    await quarantinedRow(storage, foreign.entryId, 'safebox');
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', keys);
     expect(fetched.safeboxEntries).toHaveLength(0);
@@ -200,13 +210,13 @@ describe('restore-конвейер × карантин recovery_invalidated (с�
 
   it('валидный кандидат сейфа снимает карантин', async () => {
     vi.stubEnv('VITE_TRUSTED_OWNERS', OWNER_A);
-    const storage = await loadStorage();
     const keys = await safeboxKeyring();
     const { encryptSafeboxEntry } = await import('./crypto');
     const good = await encryptSafeboxEntry(keys.safeboxMeta, keys.safeboxSecret, ENTRY_INPUT);
-    await quarantinedRow(storage, good.entryId, 'safebox');
 
     await stubGateway([{ txId: 'TX-SG', version: '4', noteId: good.entryId }], { 'TX-SG': wire(good) });
+    const storage = await loadStorage();
+    await quarantinedRow(storage, good.entryId, 'safebox');
     const { fetchAllNotes } = await import('./arweave');
     const fetched = await fetchAllNotes('oh', keys);
     expect(fetched.safeboxEntries).toHaveLength(1);

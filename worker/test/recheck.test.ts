@@ -46,7 +46,7 @@ async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
 }
 
 const NOTE_ID = '22222222-3333-4444-8555-666666666666';
-const C = 'AAAA';
+const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA';
 
 /** Exactly the outer `data` string recheckUpload publishes — the fingerprint
