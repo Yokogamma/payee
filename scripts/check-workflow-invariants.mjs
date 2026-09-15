@@ -84,6 +84,7 @@ const SECRETS_FILE_RE = /--secrets-file\s+((?:\$\{\{[^}]*\}\})?\S*)/;
 const GATE_ENV = Object.freeze({
   'check-gateways-vs-worker.mjs': 'VITE_STATUS_GATEWAYS',
   'check-trusted-owners.mjs': 'VITE_TRUSTED_OWNERS',
+  'check-client-floor-gate.mjs': 'WORKER_FLOOR_SHA',
 });
 
 /** Recursively visit every scalar with its path. */

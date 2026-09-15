@@ -498,7 +498,10 @@ reverted by accident.
 2. **`client-b1`** — the client floor: D12 + D14 + D14a + D14b + `DB_VERSION` 3,
    **both flags `false`**, plus the bundle-ceiling commit. This tag becomes the
    minimum safe rollback target on DB3 and the **new client floor after
-   `client-r4`**.
+   `client-r4`**. The Pages gate admits it on the UNRAISED floor: with
+   `BACKUP_IMPORT_ENABLED = false` in the released source the gate runs in
+   ancestry mode (the live worker must be the floor or its descendant) — see
+   «Which order applies» under «Release order — and the two-stage floor raise».
 3. **Raise `WORKER_FLOOR_SHA`**, verify the gate now refuses the ancestor, then
    flip `BACKUP_IMPORT_ENABLED`.
 4. Flip `BACKUP_EXPORT_ENABLED`.
@@ -2020,8 +2023,45 @@ The floor is raised in TWO steps, and skipping the second leaves it lowerable:
    floor is only as absolute as its lower bound.
 5. Dispatch **Deploy client to Cloudflare Pages — dev** with
    `worker_candidate` and `worker_version_id` from step 2. It re-checks the
-   live `/health` immediately before publishing and refuses unless BOTH floors
-   already equal that release.
+   live `/health` immediately before publishing, and then runs the client
+   floor gate (`scripts/check-client-floor-gate.mjs`) in the mode the released
+   source demands — see «Which order applies» below. For a client whose
+   source has `BACKUP_IMPORT_ENABLED = true` that gate refuses unless BOTH
+   floors already equal that release (steps 3–4 done).
+
+#### Which order applies: steps 3–4 before step 5, or after it
+
+The sequence above (raise, pin, then ship the client) is the order of the
+PR-3a release, and it stays the rule for every client that STORES txIds under
+semantic idempotency — i.e. whose source has `BACKUP_IMPORT_ENABLED = true`.
+The backup track's own order (§«Order» above, and «The floor is NOT raised by
+this release» below) is different on purpose: the DB3 client floor
+`client-b1` ships with both backup flags `false`, nothing in it depends on
+semantic idempotency, and D2a keeps the worker's rollback window OPEN until
+the import flip — the floor is raised immediately BEFORE that flip (steps 3–4
+happen then), not before `client-b1`.
+
+The Pages gate encodes both orders, and picks one from a PROPERTY OF THE
+BUILD, never from an input or an operator switch
+(`scripts/check-client-floor-gate.mjs`, mode read from `src/lib/flags.ts` of
+the checkout being built through the strict literal reader of
+`check-backup-flags.mjs`):
+
+- `BACKUP_IMPORT_ENABLED = true` → **equality**: `WORKER_FLOOR_SHA ==
+  MINIMUM_FLOOR == worker_candidate`. «Candidate descends from the floor» is
+  satisfied by the OLD floor too, which is exactly the mistake equality exists
+  to catch.
+- `BACKUP_IMPORT_ENABLED = false` → **ancestry**: the candidate must be the
+  floor or a descendant of it, and `WORKER_FLOOR_SHA == MINIMUM_FLOOR` (the two
+  stages of a raise must agree); the floor itself stays where it is.
+
+Equality therefore returns automatically with the first build that turns
+import on — nobody has to remember to flip the gate. Every other check of the
+Pages run is the same in both modes: the release identity comes from the
+worker run's artifact, the live `/health` must be that release under the
+`normal` profile, the candidate must be admissible, the floor must be a full
+SHA. Recorded 2026-09-15 (owner decision: the plan's order is normative for
+backup releases; the gate changed by a reviewed PR rather than being bypassed).
 
 Both workflows share the `release-dev` concurrency group, so a worker deploy
 cannot land between the client's live check and its publish. Serialization is
@@ -2524,6 +2564,13 @@ rollback window for a defect found during the very soak this release is having.
 Raising it is also a REVIEWED change to `MINIMUM_FLOOR` in
 `scripts/check-worker-floor.mjs`, not only an Environment edit — the pin is what
 stops the variable being edited back down.
+
+The Pages deploy does not contradict this: its client floor gate
+(`scripts/check-client-floor-gate.mjs`) runs in ancestry mode for a build whose
+source has `BACKUP_IMPORT_ENABLED = false`, so `client-b1` ships on top of the
+live worker with the floor unraised, and switches to equality by itself for the
+first build with import on — «Which order applies» under «Release order — and
+the two-stage floor raise».
 
 ### Rollback
 
