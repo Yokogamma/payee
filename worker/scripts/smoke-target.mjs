@@ -87,11 +87,43 @@ export const EXPECTED_VERSIONS = Object.freeze(['1', '2', '3', '4']);
 export const DEPLOY_PROFILES = Object.freeze({
   normal: Object.freeze({
     statusQuorumPolicy: 'all-configured-v1',
+    // The capability a client with import depends on (D2a): this build compares
+    // a publication fingerprint before handing back a historical txId.
+    //
+    // Asserted by the smoke for the same reason `statusQuorumPolicy` is: the
+    // release exists BECAUSE of this property, and a deploy that cannot prove it
+    // shipped proves nothing at all. `undefined` under the emergency profile is
+    // not an omission but the truthful value — an emergency build predates the
+    // capability and must not appear to carry it.
+    semanticIdempotency: 1,
     requireUploadsOff: false,
   }),
   emergency: Object.freeze({
     statusQuorumPolicy: 'legacy-single-v0',
+    semanticIdempotency: undefined,
     requireUploadsOff: true,
+  }),
+  // The PR-3a lineage, and it fits NEITHER profile above: it has the quorum
+  // (`normal` would pass that) but no fingerprinting (`normal` demands
+  // `semanticIdempotency: 1`), and its uploads must be ON — `seed-legacy`
+  // exists to publish through it — so `emergency` is wrong twice over.
+  //
+  // Exists for one build, `ff0954d`, pinned in scripts/historical-candidates.mjs
+  // with a two-way binding the workflow checks BEFORE materialization: this
+  // profile activates only that SHA, and that SHA deploys only under this
+  // profile. The exact-equality rule cuts the other way too, as it does for
+  // `emergency`: a D2 build reports `semanticIdempotency: 1`, which is NOT
+  // `undefined`, so a modern build cannot slip through under this profile even
+  // if the binding were somehow bypassed.
+  'pre-d2': Object.freeze({
+    statusQuorumPolicy: 'all-configured-v1',
+    semanticIdempotency: undefined,
+    requireUploadsOff: false,
+    // Positively required, not merely «not required off»: this profile exists so
+    // seed-legacy can PUBLISH through the build. A worker with any switch off
+    // would be declared ready by the smoke and then refuse the very seeding
+    // it was activated for.
+    requireUploadsOn: true,
   }),
 });
 

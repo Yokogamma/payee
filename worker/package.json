@@ -11,6 +11,7 @@
     "deploy:staging:check": "wrangler deploy --env staging --dry-run",
     "smoke:v3": "node scripts/smoke-v3.mjs",
     "smoke:v4": "node scripts/smoke-v4.mjs",
+    "soak:d2": "node scripts/soak-d2.mjs",
     "seed-invite": "wrangler dev --test-scheduled",
     "test": "vitest run && vitest run -c vitest.direct.config.mts",
     "test:watch": "vitest",
@@ -18,13 +19,13 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20260823.1",
+    "@cloudflare/workers-types": "^5.20260911.1",
     "typescript": "~6.0.3",
     "vitest": "^4.1.11",
-    "wrangler": "^4.125.0"
+    "wrangler": "^4.131.0"
   },
   "dependencies": {
-    "@noble/ed25519": "^3.1.0",
+    "@noble/ed25519": "^3.2.0",
     "arweave": "^1.15.5"
   },
   "overrides": {
