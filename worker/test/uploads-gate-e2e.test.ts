@@ -179,7 +179,12 @@ describe('обе ветки «Invalid recovery token» — HTTP 400 + одина
     expect(body.code).toBe('recovery_invalid');
   });
 
-  it('форма остальных ошибок API не изменилась: 401 без auth-заголовков — plain text', async () => {
+  it('остальные ошибки /upload — JSON {error, code} с прежним текстом и статусом: 401 без auth-заголовков', async () => {
+    // The operation journal (docs/METRICS.md «The operation journal») made
+    // every /upload refusal machine-readable: the human text is unchanged
+    // under `error`, the status is unchanged, and `code` comes from the closed
+    // pre-admission list in worker/src/upload-codes.json. No echo header: the
+    // request was refused before admission.
     const r = await worker.fetch(
       new Request('https://proxy.example.com/upload', {
         method: 'POST',
@@ -189,7 +194,8 @@ describe('обе ветки «Invalid recovery token» — HTTP 400 + одина
       baseEnv,
     );
     expect(r.status).toBe(401);
-    expect(r.headers.get('Content-Type')).not.toBe('application/json');
-    expect(await r.text()).toBe('Missing auth headers');
+    expect(r.headers.get('Content-Type')).toBe('application/json');
+    expect(r.headers.get('X-Operation-Id')).toBeNull();
+    expect(await r.json()).toEqual({ error: 'Missing auth headers', code: 'auth_failed' });
   });
 });

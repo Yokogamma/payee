@@ -423,6 +423,10 @@ export type UpdateCheckState =
     }
   | { status: 'error'; at: number };
 
+/** `ok` — the sweep reached everything it asked for; `partial` — it ran but
+ *  some pages or payloads were unreachable; `error` — it failed outright. */
+export type SweepOutcome = 'ok' | 'partial' | 'error';
+
 /**
  * Why a PIN offered during RESTORE is not the PIN of this device:
  *  'already-set' — another tab configured one first (first-writer-wins: its
@@ -489,6 +493,19 @@ interface NotesStore {
   restoredUpdatedCount: number | null;
   /** Outcome of the manual «Проверить обновления» run (see UpdateCheckState). */
   updateCheck: UpdateCheckState;
+  /** How the LAST sweep of either mode ended — the only honest answer to «can
+   *  this list of versions be trusted to be complete?».
+   *
+   *  It exists because the banner state cannot answer that. `restoreError` is
+   *  dismissible (`clearRestoreStatus`), a successful check never clears a
+   *  stale one, a successful restore never clears a stale `updateCheck.partial`,
+   *  and `updateCheck` only ever describes the manual check. Anything reading
+   *  those four to decide «is the snapshot whole» reads four half-answers.
+   *
+   *  NOT a gate: nothing is blocked on it. It is what a screen prints when it
+   *  wants to admit that what it shows may be missing something. `null` = no
+   *  sweep has finished in this vault session. */
+  lastSweepOutcome: SweepOutcome | null;
   vaultError: string | null;
   hasPin: boolean;
   /** Outcome of a PIN requested from the RESTORE flow, when it did NOT end up
@@ -827,6 +844,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const [restoredCount, setRestoredCount] = useState<number | null>(null);
   const [restoredUpdatedCount, setRestoredUpdatedCount] = useState<number | null>(null);
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({ status: 'idle' });
+  const [lastSweepOutcome, setLastSweepOutcome] = useState<SweepOutcome | null>(null);
   // v3 uploads paused by the worker kill switch. Authoritative state lives in
   // the shared IndexedDB marker (readV3PauseMeta) — this mirrors it for the UI.
   const [v3Paused, setV3Paused] = useState(false);
@@ -1854,13 +1872,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // with the lock/reload, but the fail-closed pause itself must never look
       // like silently-stuck sync. Malformed marker = paused (fail closed).
       try {
-        const [pause3, pause4] = await Promise.all([readV3PauseMeta(), readV4PauseMeta()]);
+        const [pause3, pause4, pauseGlobal] = await Promise.all([
+          readV3PauseMeta(), readV4PauseMeta(), readGlobalPauseMeta(),
+        ]);
         if (vaultEpochRef.current === myEpoch) {
-          setV3Paused(pause3 !== null);
-          setV4Paused(pause4 !== null);
+          // The global marker pauses every version, so it raises BOTH banners:
+          // reading only the version markers here left a global pause
+          // invisible after a reload — a silently stuck queue, which is the
+          // one state the persisted markers exist to prevent.
+          const global = pauseGlobal !== null;
+          setV3Paused(global || pause3 !== null);
+          setV4Paused(global || pause4 !== null);
         }
       } catch (err) {
-        console.error('readV3PauseMeta at unlock failed:', err);
+        console.error('pause markers at unlock failed:', err);
       }
 
       // Safebox presence (§3 hydration): the PIN-config record + the encrypted
@@ -1932,6 +1957,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // would otherwise leave 'checking' pinned forever (its own state writes are
     // gated on the epoch it no longer owns).
     setUpdateCheck({ status: 'idle' });
+    // The outcome belongs to the session that measured it. `clearRestoreStatus`
+    // deliberately does NOT touch it (a dismissed banner is not a whole
+    // snapshot), but a lock ends the session that knew — the next unlock starts
+    // with «no sweep has finished yet», and the next sweep answers again.
+    setLastSweepOutcome(null);
     // Ремонтный набор принадлежит закрываемой сессии; следующая разблокировка
     // пересоберёт его заново из фактов СВОЕЙ расшифровки (§6.4).
     undecryptableIdsRef.current = new Set();
@@ -2393,6 +2423,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // a contradicting dead control. NEVER markUnregistered.
         if (result.kind === 'v3_disabled') setV3Paused(true);
         else setV4Paused(true);
+      } else if (result.kind === 'uploads_disabled') {
+        // The GLOBAL switch answered: the marker is persisted (upload-flow),
+        // and BOTH banners go up NOW — not whenever the queue next happens to
+        // run. A pause with no banner is a silently stuck queue.
+        setV3Paused(true);
+        setV4Paused(true);
       } else {
         // L13: a clock-skew rejection looks like a permanent mystery to the
         // user — surface the actionable «проверьте время» toast.
@@ -2502,29 +2538,38 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (liftable) {
         const capability = await getWorkerCapabilities();
         let resumed = false;
+        let v3Lifted = false;
+        let v4Lifted = false;
         if (pause3 !== null && pause3 !== 'malformed' && capability.v3 === 'enabled'
             && await clearV3UploadsPaused(pause3.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
-          setV3Paused(false);
+          v3Lifted = true;
           resumed = true;
         }
         if (pause4 !== null && pause4 !== 'malformed' && capability.v4 === 'enabled'
             && await clearV4UploadsPaused(pause4.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
-          setV4Paused(false);
+          v4Lifted = true;
           resumed = true;
         }
-        // 'enabled' on ANY version already proves the GLOBAL flag is true — the
-        // capability table requires `uploads === true` before it says enabled —
-        // so no separate probe is needed to lift the global marker.
+        // The GLOBAL marker lifts on the GLOBAL verdict. It used to require
+        // «some version enabled», which is unreachable when `uploads` is back
+        // on while both version switches stay off — exactly the state in which
+        // v1/v2 are allowed again and the marker would have stood forever.
+        let globalLifted = false;
         if (pauseGlobal !== null && pauseGlobal !== 'malformed'
-            && (capability.v3 === 'enabled' || capability.v4 === 'enabled')
+            && capability.uploads === 'enabled'
             && await clearGlobalUploadsPaused(pauseGlobal.pausedAt)) {
           if (vaultEpochRef.current !== myEpoch) return;
-          setV3Paused(false);
-          setV4Paused(false);
+          globalLifted = true;
           resumed = true;
         }
+        // Banners follow the MARKERS that remain, never the lift that just
+        // happened: lifting the global marker while a version marker stands
+        // must not clear that version's banner.
+        const globalStands = pauseGlobal !== null && !globalLifted;
+        setV3Paused(globalStands || (pause3 !== null && !v3Lifted));
+        setV4Paused(globalStands || (pause4 !== null && !v4Lifted));
         if (resumed) {
           await syncPendingRecords(); // re-enqueue the backlog
           kickQueue();
@@ -2827,6 +2872,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         await refreshSafeboxPresence(myEpoch);
       }
       if (vaultEpochRef.current !== myEpoch) return;
+      // THE OUTCOME IS PUBLISHED WITH THE TERMINAL STATUS, in this same
+      // synchronous block — NOT after the `sweep-full-at` write further down.
+      // An await between the two would leave the fresh status standing beside
+      // the PREVIOUS sweep's caveat for as long as that write takes.
+      // The generation is re-checked next to the epoch: a wipe during this
+      // sweep must not publish an outcome into the database that replaced it.
+      if (getDbGeneration() === myDbGen) setLastSweepOutcome(incomplete ? 'partial' : 'ok');
       if (mode === 'restore') {
         setRestoredCount(newRoots.size);
         setRestoredUpdatedCount(updatedRoots.size);
@@ -2870,6 +2922,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // caller's signal aborted, and every state write below is epoch-gated.
       console.error(mode === 'restore' ? 'restoreFromArweave failed:' : 'checkForUpdates failed:', err);
       if (vaultEpochRef.current !== myEpoch) return;
+      if (getDbGeneration() === myDbGen) setLastSweepOutcome('error');
       if (mode === 'restore') setRestoreError('Не удалось восстановить заметки из Arweave.');
       else setUpdateCheck({ status: 'error', at: Date.now() });
     } finally {
@@ -3077,6 +3130,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    *  go through the /health-validated probe instead. */
   const resumeV3Uploads = useCallback(async () => {
     const myEpoch = vaultEpochRef.current;
+    // Manual resume is the UNCONDITIONAL path: the person clicked. Clearing
+    // only the version marker while the global one stood would let the very
+    // next queue pass re-raise the pause — a button that visibly does nothing
+    // and a stop with no end. If the worker still refuses, the pause comes
+    // back through the ordinary fail-closed path, which is the right order.
+    await clearGlobalUploadsPaused('any');
     await clearV3UploadsPaused('any');
     if (vaultEpochRef.current !== myEpoch) return;
     setV3Paused(false);
@@ -3089,6 +3148,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   /** Manual resume of the SAFEBOX queue — same unconditional contract. */
   const resumeV4Uploads = useCallback(async () => {
     const myEpoch = vaultEpochRef.current;
+    await clearGlobalUploadsPaused('any'); // same reasoning as resumeV3Uploads
     await clearV4UploadsPaused('any');
     if (vaultEpochRef.current !== myEpoch) return;
     setV4Paused(false);
@@ -4523,6 +4583,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     restoredCount,
     restoredUpdatedCount,
     updateCheck,
+    lastSweepOutcome,
     vaultError,
     hasPin,
     pinSetupNotice,
@@ -4592,7 +4653,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     safeboxUnlocked, safeboxLockGeneration, safeboxPinConfigured, safeboxEntryCount, safeboxEntries,
     safeboxChains, filteredSafeboxChains, safeboxSearchQuery, restoredSafeboxCount,
     arweaveState, syncStatuses, restoring, restoreProgress, restoreError,
-    restoredCount, restoredUpdatedCount, updateCheck, vaultError, hasPin, pinSetupNotice,
+    restoredCount, restoredUpdatedCount, updateCheck, lastSweepOutcome, vaultError, hasPin, pinSetupNotice,
     autoLockTimeout, bootError,
     storageBlocked, storageOutdated,
     createNewWallet, confirmMnemonic, restoreFromMnemonic, dismissPinSetupNotice, addNote,

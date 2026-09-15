@@ -377,7 +377,7 @@ describe('SafeboxSection — действия, уехавшие в меню', ()
     expect(screen.queryByText('Копировать логин')).toBeNull();
   });
 
-  it('история версий открывается через меню', () => {
+  it('история версий открывается через меню и раскрывает строку', () => {
     const chainEntries = [
       entry({ id: 'e1', rev: 1, root: 'e1' }),
       entry({ id: 'e2', rev: 2, root: 'e1', title: 'GitHub v2' }),
@@ -387,6 +387,19 @@ describe('SafeboxSection — действия, уехавшие в меню', ()
     openMenu();
     fireEvent.click(screen.getByText(/История версий \(2\)/));
     expect(screen.getByRole('dialog')).toBeDefined();
+
+    // Раскрытие ВНУТРИ строки остаётся только у сейфа: там короткие поля, а не
+    // длинная заметка. Это и есть тот, ради кого `.history-row { flex: none }`
+    // продолжает быть нужным после того, как история заметок стала указателем.
+    expect(document.querySelector('.history-row-body')).toBeNull();
+    fireEvent.click(screen.getByText(/Версия 1 из 2/));
+    expect(document.querySelector('.history-row-body')).toBeTruthy();
+    expect(document.querySelector('.history-restore-btn')).toBeTruthy();
+
+    // Текущую версию называет слово, а не класс: правило `history-row--current`
+    // удалено вместе с коробкой строки, и класс за ним не остался.
+    expect(screen.getByText(/· текущая/)).toBeTruthy();
+    expect(document.querySelector('.history-row--current')).toBeNull();
   });
 
   it('пункт «Изменить» открывает форму записи', () => {

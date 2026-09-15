@@ -78,6 +78,11 @@ jobs:
       # snapshotting the CSP against a single-gateway fallback would test a
       # configuration that never ships.
       - run: node scripts/check-gateways-vs-worker.mjs --repo-only
+      # The worker authenticates a publication before binding its txId to a
+      # fingerprint (D9), and `address in TRUSTED_OWNERS` is one of the steps.
+      # A set that drops a historical wallet does not fail loudly — it turns
+      # healthy old publications into conflicts.
+      - run: node scripts/check-trusted-owners.mjs --repo-only
       - run: npm run build
         env:
           VITE_BASE: /
