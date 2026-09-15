@@ -977,7 +977,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return uploadError(400, 'validation_failed', 'Invalid data structure: id (string) required');
   }
 
-  /** ciphertext+iv pair: non-empty strings, valid base64, iv exactly 12 bytes. */
+  /** ciphertext+iv pair: non-empty strings, valid base64, iv exactly 12 bytes,
+   *  ciphertext at least the 16-byte GCM tag. The last check is not cosmetic:
+   *  a shorter blob is provably not AES-GCM output, and posting it would burn a
+   *  paid, permanent transaction under this record's forever-idempotent id on
+   *  bytes nobody can ever decrypt. The client refuses the same shape
+   *  (upload-flow.ts assertCiphertext) — this side must not depend on it. */
   const checkEnvelope = (cName: string, cVal: unknown, ivName: string, ivVal: unknown): Response | null => {
     if (typeof cVal !== 'string' || typeof ivVal !== 'string') {
       return uploadError(400, 'validation_failed', `Invalid data structure: ${cName}, ${ivName} (strings) required`);
@@ -986,11 +991,25 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       return uploadError(400, 'validation_failed', `Invalid data: ${cName} and ${ivName} must be non-empty`);
     }
     let bytes: Uint8Array;
+    let cipherBytes: Uint8Array;
     try {
       bytes = base64ToBytes(ivVal);
-      base64ToBytes(cVal); // validate base64
+      cipherBytes = base64ToBytes(cVal);
     } catch {
       return uploadError(400, 'validation_failed', `Invalid data: ${cName} and ${ivName} must be base64`);
+    }
+    if (cipherBytes.length < 16) {
+      return uploadError(400, 'validation_failed', `Invalid data: ${cName} must be at least 16 bytes (GCM tag)`);
+    }
+    // CANONICAL base64, not merely decodable: `atob` accepts missing padding,
+    // embedded whitespace and non-zero trailing bits, so one byte string has
+    // many accepted spellings. The c/iv strings go on chain verbatim inside the
+    // `data` JSON, so accepting a variant spelling would publish a different
+    // record for the same bytes, permanently, under the same idempotent id.
+    // (This pins the base64 fragments only; the JSON spelling of `data` itself
+    // — key order, escapes — is not canonicalized here.)
+    if (bytesToBase64(cipherBytes) !== cVal || bytesToBase64(bytes) !== ivVal) {
+      return uploadError(400, 'validation_failed', `Invalid data: ${cName} and ${ivName} must be canonical base64`);
     }
     if (bytes.length !== 12) return uploadError(400, 'validation_failed', `Invalid data: ${ivName} must be 12 bytes`);
     return null;
