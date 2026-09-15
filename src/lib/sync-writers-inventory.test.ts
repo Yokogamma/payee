@@ -77,6 +77,18 @@ describe('инвентаризация писателей стора sync', () =
     expect(Object.keys(attemptWriter).sort()).toEqual(['lib/storage.ts', 'lib/store.tsx']);
   });
 
+  it('импорт бэкапа пишет sync ТОЛЬКО через свой транзакционный примитив', () => {
+    // mergeBackupRecord — единственный писатель на пути импорта: он
+    // перечитывает строку, сверяет снимок синхронно (D13) и применяет чистое
+    // решение из backup-merge.ts. Правила в отдельном модуле намеренно НЕ
+    // умеют писать: у них нет доступа к базе, поэтому «удобный» обход
+    // примитива потребовал бы новой транзакции, а её здесь видно.
+    const writer = countOccurrences(/mergeBackupRecord\(/g);
+    expect(Object.keys(writer)).toContain('lib/storage.ts');
+    const rules = countOccurrences(/objectStore\(|getDB\(/g);
+    expect(rules['lib/backup-merge.ts']).toBeUndefined();
+  });
+
   it('сканер жив: исходники реально обойдены', () => {
     // Пустой результат «всё чисто» без обхода — это не защита. Проверяем, что
     // дерево видит и storage.ts, и store.tsx.
