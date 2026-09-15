@@ -153,10 +153,66 @@ async function classifyEntry(
 }
 
 /**
+ * What this build makes of a record that is ALREADY IN THE STORE.
+ *
+ * A different question from the one above, and the difference is worth the
+ * second function rather than a flag on the first. For a record FROM A FILE
+ * the question is «may this be restored?», and a broken shape answers it
+ * (`malformed`) before anything is decrypted. For a record ON DISK the
+ * question is the one D5a's table asks — «can these bytes still be read?» —
+ * and a broken shape does not answer it at all: a record can violate the
+ * upload barrier and still decrypt perfectly, in which case the merge rules
+ * have things to say about it that depend on it being READABLE.
+ *
+ * So: version first (an opaque record is never replaced, whatever else is
+ * true of it), then the decryption itself.
+ */
+export async function classifyLocalPayload(
+  keys: BackupRecordKeys,
+  kind: BackupRecordKind,
+  record: EncryptedNote | EncryptedSafeboxEntry | undefined,
+  /** Checked BETWEEN the two halves of a safebox entry, not only around the
+   *  pair: the secret half is the password and the attachment bytes, and a
+   *  cancelled operation has no reason to materialize them. Throws (D15). */
+  assertAlive: () => void = () => {},
+): Promise<'absent' | 'readable' | 'corrupt' | 'opaque'> {
+  if (record === undefined) return 'absent';
+  if (kind === 'note') {
+    if (isOpaqueNote(record as EncryptedNote)) return 'opaque';
+    try {
+      await decryptNote(keys.note, record as EncryptedNote);
+      return 'readable';
+    } catch (error) {
+      if (isCancellation(error)) throw error;
+      return 'corrupt';
+    }
+  }
+  const entry = record as EncryptedSafeboxEntry;
+  if (isOpaqueEntry(entry)) return 'opaque';
+  try {
+    const meta = await decryptSafeboxMeta(keys.safeboxMeta, entry);
+    assertAlive();
+    // BOTH halves: an entry whose secret half is unreadable is not «readable»
+    // in any sense the merge rules could act on — restoring its meta alone
+    // would leave a password-shaped hole.
+    await decryptSafeboxSecret(keys.safeboxSecret, entry, meta.files);
+    return 'readable';
+  } catch (error) {
+    // A cancelled operation is not a damaged record. Swallowed here it would
+    // become a verdict about the user's data, from an event that had nothing
+    // to do with it — and the loop would carry on classifying for a page
+    // nobody is looking at.
+    if (isCancellation(error)) throw error;
+    return 'corrupt';
+  }
+}
+
+/**
  * Is this the operation being cancelled rather than a record being broken?
  *
- * Matched by NAME rather than by class: this module stays free of store
- * imports, and that is what keeps it testable without an app around it.
+ * Matched by NAME rather than by class, exactly like the quota check in the
+ * import executor: this module stays free of store imports, and that is what
+ * keeps it testable without an app around it.
  */
 function isCancellation(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
