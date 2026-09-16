@@ -35,6 +35,18 @@ export const RELEASE_ALLOWLIST = Object.freeze([
   // D2 release found broken during its soak rolls back HERE — legitimately,
   // because the floor is not raised until the import flip (D2a).
   'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1',
+
+  // The client-b1-era worker — head of main after #183, live since 2026-09-16
+  // (run 35089754710, smoked green under `normal`): the first worker carrying
+  // the server side of D14b (#180) on top of the semantic-idempotency line.
+  // It is the version the client-b1 client is released against, so a client
+  // rollback must have THIS worker to come back to while the floor is still
+  // ff0954d — and the head of main has already moved past it (a docs merge).
+  // Listed for the C10 rehearsal of docs/ROLLBACK.md «allowlist the live SHA
+  // first, then dispatch it»: a redeploy of the pinned SHA through the gate,
+  // bytes identical to what is running. It stays as the rollback target for
+  // the releases that follow; it is not a fix for a defect in itself.
+  '394156d5998dbaef5b1d273898ee8006104227f8',
 ]);
 
 const SHA_RE = /^[0-9a-f]{40}$/;
