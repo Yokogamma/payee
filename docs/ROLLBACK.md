@@ -490,8 +490,9 @@ this gate. The CLIENT floor is `DB_VERSION`: today `client-r4` (IndexedDB v2);
 when the backup track's first release ships as `client-b1` it raises
 `DB_VERSION` to 3, and rolling the client below that tag stops being possible
 rather than merely forbidden — an older build meets a newer database and shows
-the non-destructive «update the app» screen. Until `client-b1` exists, the
-client floor in force is still `client-r4`.
+the non-destructive «update the app» screen. **`client-b1` shipped on
+2026-09-16 23:01 UTC (e3bdf0a, Pages run 35160292662) — the client floor in
+force is `client-b1`; `client-r4` is history.**
 
 ## Backup v1 — `client-b1` → import flip → export flip
 
@@ -520,6 +521,36 @@ reverted by accident.
    `BACKUP_IMPORT_ENABLED = false` in the released source the gate runs in
    ancestry mode (the live worker must be the floor or its descendant) — see
    «Which order applies» under «Release order — and the two-stage floor raise».
+   **DEPLOYED 2026-09-16 23:01 UTC** (tag `client-b1` = e3bdf0a, head of
+   main after #186) on notes.matamata.dev — Pages run
+   [35160292662](https://github.com/Yokogamma/payee/actions/runs/35160292662),
+   deployment `f94e3505.eternal-notes.pages.dev` (bundle
+   `assets/index-Dt-PNCAF.js`), against the live worker
+   `394156d5998dbaef5b1d273898ee8006104227f8` / `41773298-9b1e-47aa-b33b-a353a8c381db`
+   (worker run 35151788392); `WORKER_FLOOR_SHA` = `MINIMUM_FLOOR` = `ff0954d`,
+   gate in ancestry mode. Every pre-publish gate was green, including the
+   worker identity, the live `normal` smoke and the client floor gate; the
+   root `npm test` flake did not reproduce. **Published, NOT accepted:** the
+   post-deploy `smoke-headers` FAILED on the viewer route — `/backup-viewer`
+   answers **308 to itself** and `/backup-viewer.html` 301s into that loop,
+   because the `_redirects` rule `/backup-viewer /backup-viewer.html 200`
+   rewrites to an `.html` asset that Pages itself redirects back to the
+   extensionless URL. The app shell (CSP, XFO, nosniff, Referrer-Policy) and
+   `smoke-csp-origins` (run by hand against `notes.matamata.dev`) are green;
+   the job stopped before `smoke-csp-origins` ran in the workflow. The route is
+   unreachable, nothing else is: both backup flags are `false`, so no user
+   can produce a file for the viewer yet, and the offline `file://` path is
+   untouched. **A red final step does not undo a publication** — this build
+   IS live and IS the client floor (see below); the fix is a roll-forward with
+   its own record (a preview deployment verified BEFORE the merge, then a
+   re-dispatch with the same worker inputs). Rolling Pages back to
+   `42c4e49a-169f-4f72-8978-6c4a0eea03c2` (7f18da8, DB_VERSION 2) is
+   forbidden by the floor rule further down. Previous live Pages deployment:
+   that same `42c4e49a…` (2026-08-29, run 33250686582). Release note published
+   with this release: «закройте старые вкладки Eternal Notes и обновите
+   установленные PWA». NOT verified at release time: mobile near-cap (A4 of
+   the operator checklist — to be measured before the export flip), the
+   manual mixed-version smoke, the paid conflict check (C11).
 3. **Raise `WORKER_FLOOR_SHA` AND land the protected commit raising
    `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
    modes while the two differ), verify the worker gate now refuses the
@@ -704,7 +735,11 @@ be trusted is the checksum sitting next to the file it describes.
 - **Client (Pages):** use the Cloudflare Pages dashboard "Rollback to this
   deployment" on a previous **R-or-newer** deployment. Re-run `smoke-headers`
   afterwards.
-  **Client floor since 2026-08-12: `client-r4`** (f43e503) — never below it.
+  **Client floor since 2026-09-16 23:01 UTC: `client-b1`** (e3bdf0a, Pages run
+  35160292662, deployment `f94e3505`) — never below it: every device that has
+  launched it holds IndexedDB **v3**, and the pre-`client-b1` writers are
+  unsafe on their own (D2b, «Rolling a client below client-b1 is forbidden»).
+  History — client floor 2026-08-12 → 2026-09-16: `client-r4` (f43e503).
   R4 raises IndexedDB to version 2 on first launch regardless of the writer
   flag, and any device that has run R4 gets a `VersionError` on a client with
   `DB_VERSION=1`. Rolling W4 → R4 is allowed and is the writer kill switch for
@@ -714,9 +749,9 @@ be trusted is the checksum sitting next to the file it describes.
   so they keep writing v4 locally and uploading. Observed live on the W4
   deploy: an open tab stayed on R4 until «Обновить» was clicked. The immediate
   server-side stop is `V4_UPLOADS_ENABLED=false`, not a Pages rollback.
-  **Next client floor — `client-b1`, NOT YET RELEASED (tag/SHA to be recorded
-  here by the operator when it ships).** `DB_VERSION` is already **3** in the
-  code (`src/lib/storage.ts`). v3 adds no store and no index — the only schema
+  **`client-b1` RELEASED 2026-09-16 23:01 UTC (e3bdf0a) — the floor line above
+  is it; what follows is the rationale, kept as written before the release.**
+  `DB_VERSION` is **3** in the code (`src/lib/storage.ts`). v3 adds no store and no index — the only schema
   change is the additive `attemptId` on `sync` rows — so the bump costs
   nothing to apply and everything to undo: any device that has launched a v3
   client gives a `VersionError` to a client with `DB_VERSION=2`, which lands on
@@ -743,7 +778,7 @@ be trusted is the checksum sitting next to the file it describes.
 
   | Release tag | Date | SHA-256 of `backup-viewer.html` |
   |---|---|---|
-  | _(none released yet)_ | — | — |
+  | `client-b1` (e3bdf0a) | 2026-09-16 | `be34dd60d3b591e825d6b63b9bb7704548f5ac16074cfbfb96d5a5a8b98cf936` (63978 bytes; from the build log of Pages run 35160292662) |
 
   **Verification is done by a command, not by eye (D19).** Sixty-four hex
   characters compared by a human is a check that passes when it should fail —
