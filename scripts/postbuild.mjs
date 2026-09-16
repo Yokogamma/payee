@@ -53,12 +53,13 @@ try {
  * in the exact situation it exists for.
  *
  * Both paths are listed, but only ONE is a contract. `/backup-viewer` is the
- * canonical route, served through the 200 rewrite. `/backup-viewer.html` is
- * listed defensively: Cloudflare states that «redirects are always followed,
- * regardless of whether or not an asset matches the incoming request», so the
- * catch-all may well answer that path with the app shell instead of the file.
- * The header rule costs nothing if it never matches, and the live smoke checks
- * what actually happens rather than trusting either reading of the docs.
+ * canonical route — Pages serves the HTML asset at its extensionless URL
+ * natively (no `_redirects` rule: a rewrite to the `.html` asset was a 308
+ * loop on the first real release). `/backup-viewer.html` is listed
+ * defensively: Pages redirects it to the canonical URL, but if it ever served
+ * the file directly the per-path unset must already be there. The header rule
+ * costs nothing if it never matches, and the live smoke checks what actually
+ * happens rather than trusting any reading of the docs.
  */
 const VIEWER_HEADERS = ['/backup-viewer', '/backup-viewer.html']
   .map(path => `${path}
