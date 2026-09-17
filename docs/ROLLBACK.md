@@ -1359,10 +1359,32 @@ at this measurement reported «nothing blocked» because `requestAnimationFrame`
 does not fire in a hidden tab, so «no frame gaps» and «no frames at all» looked
 identical. A heartbeat on `MessageChannel` is not throttled by visibility.
 
-**Still owed by the operator:** the same measurement on a real phone, recorded
-here as a number (§13 — no device in this contour). The desktop peak of 932 MB
-against a 4 GB limit is the reason it matters: a mobile heap limit is a
-fraction of that.
+**Measured on a phone — 2026-09-17** (the operator's OnePlus 12, Android,
+Chrome 152.0.7977.84, the same `scripts/main-thread-probe.html` served over
+HTTPS from a Pages preview; opened as a local file from the Files app it never
+ran — a `content://` document is not a secure context and `crypto.subtle` is
+absent, so the probe stayed at «idle»). The probe validated its own instrument
+(idle ticks 32163, ticks while blocked 0 → trustworthy):
+
+```
+file produced        30.6 MB
+export                493 ms      verify                391 ms
+longest single block  215 ms      (base64 + wrap)
+peak JS heap         24.8 MB      of a 3585.8 MB limit
+stringify 32 · utf-8 69 · AES-GCM 34 · base64+wrap 215 · SHA-256 143 ·
+parse 17 · unbase64+decrypt 169 · parse body 26 · decrypt 731 records 179 (ms)
+```
+
+What this is and is not: the probe's own numbers on this one device, on this
+one day — not a fleet figure, not a guarantee, and not the app itself (the
+probe reproduces the chain with plain Web APIs, deliberately without the
+bundle). The freeze is a fifth of a second, well inside the desktop
+precedent; the reported heap peak is suspiciously small next to the desktop
+343 MB (same probe, Chromium 152) and is recorded as reported — Android
+Chrome's `performance.memory` may account differently, and no second device
+or browser was measured. The desktop reading in this section (Chrome 148,
+932 MB peak) is the older, more conservative figure and stays the one the
+settings warning is written against.
 
 ## Section density — `client-nav2` (client-only)
 
