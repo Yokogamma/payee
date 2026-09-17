@@ -551,6 +551,26 @@ reverted by accident.
    установленные PWA». NOT verified at release time: mobile near-cap (A4 of
    the operator checklist — to be measured before the export flip), the
    manual mixed-version smoke, the paid conflict check (C11).
+   **ROLL-FORWARD 2026-09-17 00:33 UTC** — `23d4628` (head of main after
+   #187 + #188), Pages run
+   [35167011951](https://github.com/Yokogamma/payee/actions/runs/35167011951),
+   deployment `4661ec60.eternal-notes.pages.dev`, **green end to end**: the same
+   gates, the live worker re-verified as `394156d…` / `41773298…` (worker run
+   35151788392, unchanged), floor `ff0954d` in ancestry mode, and both
+   post-deploy smokes green in the run and again by hand against the
+   deployment URL and `notes.matamata.dev` with `?v=`: `/backup-viewer`
+   answers 200 with the viewer document (sha256 `be34dd60…`, the registry
+   row), `/backup-viewer.html` is Pages' own 308 to it, deep links get the
+   shell, static assets are served. The fix (#188) removed every rule from
+   `public/_redirects` — Pages serves the HTML asset at its extensionless URL
+   and falls back to `index.html` natively — and was proven first on a
+   preview deployment of the pinned SHA (`2889a9d0`, branch
+   `fix-viewer-route`), never on production. **The app bundle is
+   byte-identical to the first release** (`assets/index-Dt-PNCAF.js`): no
+   client code changed, so the tag `client-b1` and the client floor stay on
+   `e3bdf0a`; this deployment is the corrected edge configuration of that
+   same client. Pages rollback target from here on: `4661ec60` (never
+   `42c4e49a`, which is below the floor).
 3. **Raise `WORKER_FLOOR_SHA` AND land the protected commit raising
    `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
    modes while the two differ), verify the worker gate now refuses the
