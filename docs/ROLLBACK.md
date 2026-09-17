@@ -486,13 +486,13 @@ it first would leave nothing deployable — the live worker would already be
 below the new floor.
 
 **Two floors, and they are enforced by different things.** The worker floor is
-this gate. The CLIENT floor is `DB_VERSION`: today `client-r4` (IndexedDB v2);
-when the backup track's first release ships as `client-b1` it raises
-`DB_VERSION` to 3, and rolling the client below that tag stops being possible
-rather than merely forbidden — an older build meets a newer database and shows
-the non-destructive «update the app» screen. **`client-b1` shipped on
-2026-09-16 23:01 UTC (e3bdf0a, Pages run 35160292662) — the client floor in
-force is `client-b1`; `client-r4` is history.**
+this gate. The CLIENT floor is `DB_VERSION`: **today `client-b1` (IndexedDB
+v3, shipped 2026-09-16 23:01 UTC — e3bdf0a, Pages run 35160292662)**; before it,
+`client-r4` (IndexedDB v2, 2026-08-12 → 2026-09-16) — history now. The
+backup track's first release raised `DB_VERSION` to 3, and rolling the client
+below that tag stopped being possible rather than merely forbidden — an older
+build meets a newer database and shows the non-destructive «update the app»
+screen.
 
 ## Backup v1 — `client-b1` → import flip → export flip
 
