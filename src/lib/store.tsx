@@ -953,7 +953,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * user is actually looking at, it explains itself, and if it outlives even
    * the verdict's own deadline it offers the way out. «Ввести PIN» just calls
    * lockApp() — locking is never a privacy downgrade, and it always lands on a
-   * screen with an input.
+   * screen with a way forward: an input, or on a dead-end tab the «reload»
+   * button (lockApp keeps the storage-outdated screen).
    *
    * Reveals ONLY to a foreground tab: a gate over a backgrounded tab has no
    * audience, and pre-revealing it would flash «Проверяем…» on every ordinary
@@ -1119,9 +1120,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // state read inside an event listener would be stale).
   const hasPinRef = useRef(false);
   const autoLockTimeoutRef = useRef<AutoLockTimeout>(null);
+  // Mirror of `storageOutdated` for lockApp, which picks its target screen
+  // inside the lifecycle handlers. Only ever goes true: a dead-end tab stays
+  // one until it reloads.
+  const storageOutdatedRef = useRef(false);
 
   const applyHasPin = (v: boolean) => { hasPinRef.current = v; setHasPin(v); };
   const applyAutoLockTimeout = (t: AutoLockTimeout) => { autoLockTimeoutRef.current = t; setAutoLockTimeoutState(t); };
+  const applyStorageOutdated = (v: boolean) => { storageOutdatedRef.current = v; setStorageOutdated(v); };
   /** The ONLY setter for the quick-unlock state. `hasQuickUnlock` is computed
    *  from it at the context boundary; there is no `applyHasQuickUnlock`. */
   const applyQuickUnlockMeta = (meta: { createdAt: number } | null) => setQuickUnlockMeta(meta);
@@ -1681,7 +1687,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // the non-destructive «reload» screen instead of failing obscurely.
         onBlocking: () => {
           lockApp({ broadcast: false }); // no ping-pong: the other tab is fine
-          setStorageOutdated(true);
+          applyStorageOutdated(true);
           setScreen('error');            // AFTER lockApp — it sets its own screen
         },
       });
@@ -1783,7 +1789,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // clicks (it would delete every unsynced record).
       if (isDbVersionError(err)) {
         console.error('bootstrap: database is newer than this build', err);
-        setStorageOutdated(true);
+        // A session seed (step 4) stays where it is: this throw came before
+        // the seed could be judged, and the lifecycle's fail-closed verdict
+        // on the first return will lock it away — landing back on THIS screen
+        // (see lockApp), not on seed entry.
+        applyStorageOutdated(true);
         setScreen('error');
         return;
       }
@@ -2094,7 +2104,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     invalidateVaultLifecycle();
     clearVaultState();
     // Without a PIN there is nothing to unlock against — seed re-entry it is.
-    setScreen(hasPinRef.current ? 'pin' : 'restore');
+    // EXCEPT on a dead-end tab (A18): once a newer build owns the database,
+    // the non-destructive «reload» screen is the only truthful target. A lock
+    // still reaches this line there — a VersionError at boot leaves the
+    // session seed unjudged in sessionStorage, and the first return's config
+    // re-read then fails closed — and the lock itself is right (the seed and
+    // the gate are gone above). Only the SCREEN must stay: a seed-entry form
+    // here would answer «Неверная seed-фраза» to the correct phrase, because
+    // nothing can open the database from this build.
+    setScreen(storageOutdatedRef.current ? 'error' : hasPinRef.current ? 'pin' : 'restore');
     if (opts.broadcast !== false) postVaultMessage('lock');
     // The target screen above used possibly-stale hasPin — reconcile it
     // against the authoritative pin-seed (review round 3): a PIN wiped in
