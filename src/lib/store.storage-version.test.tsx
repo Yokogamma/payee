@@ -19,6 +19,10 @@ vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: fal
 const h = vi.hoisted(() => ({
   initBehaviour: 'ok' as 'ok' | 'version-error' | 'blocked' | 'blocking' | 'generic-error',
   fireBlocking: null as null | (() => void),
+  // Bootstrap step 3, the config snapshot. 'throw-once' fails the FIRST read
+  // and lets every later one through: a tab whose database DID open but whose
+  // boot still failed — the boot-error tab that is not a storage failure.
+  snapshotBehaviour: 'ok' as 'ok' | 'throw-once',
 }));
 
 import type { InitStorageOptions } from './storage';
@@ -44,6 +48,13 @@ vi.mock('./storage', async importOriginal => {
         h.fireBlocking = () => opts?.onBlocking?.();
       }
       return actual.initStorage();
+    }),
+    readClientConfigSnapshot: vi.fn(async () => {
+      if (h.snapshotBehaviour === 'throw-once') {
+        h.snapshotBehaviour = 'ok';
+        throw new Error('config snapshot failed');
+      }
+      return actual.readClientConfigSnapshot();
     }),
   };
 });
@@ -83,15 +94,35 @@ Object.defineProperty(globalThis, 'crypto', {
   },
 });
 
+// Fake BroadcastChannel (jsdom has none; Node's spans threads, not tabs) —
+// the instance-tracking one from store.test.tsx, not a no-op stub: the A18
+// wire test below asserts SILENCE, and silence from a stub proves nothing.
+type ChannelMessage = { data: unknown };
+
 class FakeBroadcastChannel {
-  onmessage: unknown = null;
-  postMessage(): void {}
-  close(): void {}
+  static instances: FakeBroadcastChannel[] = [];
+  name: string;
+  onmessage: ((e: ChannelMessage) => void) | null = null;
+  closed = false;
+
+  constructor(name: string) {
+    this.name = name;
+    FakeBroadcastChannel.instances.push(this);
+  }
+
+  postMessage(data: unknown): void {
+    for (const ch of FakeBroadcastChannel.instances) {
+      if (ch === this || ch.closed || ch.name !== this.name) continue;
+      queueMicrotask(() => { if (!ch.closed) ch.onmessage?.({ data }); });
+    }
+  }
+
+  close(): void { this.closed = true; }
 }
 (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel = FakeBroadcastChannel;
 
 import { NotesProvider, useNotes } from './store';
-import { closeStorage } from './storage';
+import { closeStorage, initStorage, resetAll, setMeta } from './storage';
 import App from '../App';
 
 const MN = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -112,6 +143,20 @@ function setVisibility(state: 'visible' | 'hidden') {
   document.dispatchEvent(new Event('visibilitychange'));
 }
 
+/** The healthy tab, listening on the vault channel (created AFTER the render
+ *  so the store's own channel exists too). Also proves the listener is REAL:
+ *  silence must be the store's choice, not the harness's, so the store's own
+ *  channel has to be a live instance of the same fake on the same name — a
+ *  postMessage from it would reach the listener. */
+function listenOnChannel() {
+  const channel = new FakeBroadcastChannel('eternal-notes-vault');
+  const received: Array<Record<string, unknown>> = [];
+  channel.onmessage = e => received.push(e.data as Record<string, unknown>);
+  const stores = FakeBroadcastChannel.instances.filter(ch => ch !== channel && ch.name === channel.name && !ch.closed);
+  expect(stores).toHaveLength(1);
+  return { received };
+}
+
 // ─── A dead-end tab with a session seed (shared by the two describes below) ──
 
 /** Boot the REAL App — router and ErrorScreen, not a Probe: these findings are
@@ -126,6 +171,12 @@ async function bootDeadEndWithSeed(behaviour: 'version-error' | 'generic-error',
   // An earlier case opened the real database; this build must have NONE, or
   // the config re-read on return would succeed and no lock would be at stake.
   closeStorage();
+  return bootAppWithSeed(heading);
+}
+
+/** The render half of the above, on its own for the tab whose database DID
+ *  open (the caller has already put the config it wants in there). */
+async function bootAppWithSeed(heading: string) {
   sessionStorage.setItem(SESSION_KEY, MN);
   // jsdom has no matchMedia; App's theme hook needs it to resolve «system».
   vi.stubGlobal('matchMedia', (query: string) => ({
@@ -162,7 +213,9 @@ function returnViaBfcache() {
 beforeEach(() => {
   h.initBehaviour = 'ok';
   h.fireBlocking = null;
+  h.snapshotBehaviour = 'ok';
   sessionStorage.clear();
+  FakeBroadcastChannel.instances = [];
 });
 afterEach(() => {
   cleanup();
@@ -284,6 +337,26 @@ describe('bootstrap — VersionError with a session seed still in the tab (A18)'
 
     expectReloadScreenOnly();
   });
+
+  // The same lock, seen from the OTHER tab — the one running the newer build,
+  // with the database open and its notes on screen. A 'lock' on the wire is an
+  // order («locked everywhere», §8); this lock is no such thing: a statement
+  // about THIS build's inability to read the database, not about the vault.
+  // Relayed, it would throw the healthy tab out of its notes — without a PIN,
+  // into twelve words — on the say-so of a tab that knows nothing. Same
+  // silence as the `onBlocking` route into the same dead end.
+  it('…and the other tabs hear NOTHING: the dead-end lock is not broadcast', async () => {
+    const { failClosedLocks } = await bootOutdatedWithSeed();
+    const { received } = listenOnChannel();
+
+    returnViaVisibility();
+    await waitFor(() => expect(sessionStorage.getItem(SESSION_KEY)).toBeNull());
+    expect(failClosedLocks()).toBe(1);
+    await act(async () => {}); // the fake channel delivers on a microtask
+
+    expect(received).toEqual([]);
+    expectReloadScreenOnly(); // locked, and still the reload screen
+  });
 });
 
 // The GENERIC boot failure has the same shape, one step earlier still: init
@@ -351,5 +424,48 @@ describe('bootstrap — generic init failure with a session seed still in the ta
     await act(async () => {});
 
     expectErrorScreenWithReset();
+  });
+});
+
+// The boot-error tab that is NOT a storage failure — the counterexample from
+// the review of #192, and the reason lockApp keys its silence on
+// storageOutdated rather than on `deadEnd`. The database OPENS; the boot still
+// fails one step later, at the config snapshot; the error screen is up, the
+// seed unjudged. On the first return the re-read SUCCEEDS: a PIN is set,
+// «Сразу» is on, and the verdict is the user's own policy, not a storage
+// failure. That lock keeps the error screen (a dead end is a dead end) AND
+// goes on the wire — a genuine order, «locked everywhere» (§8). Keyed on
+// `deadEnd`, the silence would have swallowed it.
+describe('bootstrap — the config snapshot fails with the database OPEN', () => {
+  it('a genuine policy verdict on the error screen locks, stays, and IS broadcast', async () => {
+    // The config the return will find: PIN set, lock on every return.
+    await initStorage();
+    await resetAll();
+    await setMeta('init', true);
+    await setMeta('pin-seed', { ciphertext: 'ct', iv: 'iv', salt: 's' });
+    await setMeta('auto-lock-timeout', 0);
+    h.snapshotBehaviour = 'throw-once';
+    const { failClosedLocks } = await bootAppWithSeed('Не удалось запустить');
+    expect(screen.getByText('config snapshot failed')).toBeTruthy(); // the bootError copy
+    expect(screen.getByRole('button', { name: 'Сбросить данные' })).toBeTruthy();
+    const { received } = listenOnChannel();
+
+    // The refs are still the defaults (step 3 never applied them), so the
+    // verdict goes to the authoritative config — readable now: PIN + «Сразу».
+    returnViaVisibility();
+    await waitFor(() => expect(sessionStorage.getItem(SESSION_KEY)).toBeNull());
+    expect(failClosedLocks()).toBe(0); // a verdict, not a failure
+    await act(async () => {}); // the fake channel delivers on a microtask
+
+    // On the wire: exactly one lock, ours.
+    expect(received.map(m => m.type)).toEqual(['lock']);
+    // On screen: still the error screen with its reset — the PIN pad the
+    // refreshed hasPin would otherwise pick cannot succeed without a boot.
+    expect(screen.getByText('Не удалось запустить')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Перезагрузить' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Сбросить данные' })).toBeTruthy();
+    expect(screen.queryByText('Eternal Notes')).toBeNull(); // no PIN pad
+    expect(screen.queryByText('Восстановление')).toBeNull();
+    expect(document.querySelector('.lock-gate')?.hasAttribute('hidden')).toBe(true);
   });
 });
