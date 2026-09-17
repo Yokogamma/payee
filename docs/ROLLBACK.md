@@ -571,6 +571,31 @@ reverted by accident.
    `e3bdf0a`; this deployment is the corrected edge configuration of that
    same client. Pages rollback target from here on: `4661ec60` (never
    `42c4e49a`, which is below the floor).
+   **HOTFIX — `client-b1-hotfix1` = 7426987, DEPLOYED 2026-09-17 12:05 UTC**
+   (Pages run
+   [35218902599](https://github.com/Yokogamma/payee/actions/runs/35218902599),
+   deployment `49e219de.eternal-notes.pages.dev`, bundle
+   `assets/index-DUU1Ugfh.js`), against the unchanged worker `394156d…` /
+   `41773298…` (run 35151788392, identity re-verified before the dispatch),
+   floor `ff0954d`, gate in ancestry mode, green end to end; both post-deploy
+   smokes green in the run and again by hand against the deployment URL and
+   `notes.matamata.dev` (`?v=`). Runtime delta against the previous deployment
+   (`23d4628`): only `src/lib/store.tsx` (+83) with its test — the A18 fix
+   chain #190/#191/#192: the «storage outdated» and generic boot-error screens
+   now survive the fail-closed auto-lock (`lockApp` keeps `screen='error'` for
+   a dead-end tab), and such a tab no longer broadcasts `lock` to its
+   siblings. Found while releasing client-b1 (an old tab holding a
+   no-PIN session, returning from the background after a newer build had
+   raised the database, landed on the seed-entry screen instead of «update the
+   app»; data were never at risk). Verified before the release on two real
+   tabs of the same origin — the original regression path (session kept,
+   incompatible build reloaded, real visibility return) and the
+   `versionchange` path (the other tab raises the database) — plus the
+   plain-DB-v3 note-survival check on both the live and the candidate build.
+   Same `DB_VERSION` 3, both backup flags `false`: the client floor stays
+   `client-b1` (e3bdf0a); this tag is a label for the fixed edge/tab
+   behaviour, not a new floor. Pages rollback target from here on: `49e219de`
+   (`4661ec60` is the same floor and remains admissible).
 3. **Raise `WORKER_FLOOR_SHA` AND land the protected commit raising
    `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
    modes while the two differ), verify the worker gate now refuses the
