@@ -83,10 +83,30 @@ Object.defineProperty(globalThis, 'crypto', {
   },
 });
 
+// Fake BroadcastChannel (jsdom has none; Node's spans threads, not tabs) —
+// the instance-tracking one from store.test.tsx, not a no-op stub: the A18
+// wire test below asserts SILENCE, and silence from a stub proves nothing.
+type ChannelMessage = { data: unknown };
+
 class FakeBroadcastChannel {
-  onmessage: unknown = null;
-  postMessage(): void {}
-  close(): void {}
+  static instances: FakeBroadcastChannel[] = [];
+  name: string;
+  onmessage: ((e: ChannelMessage) => void) | null = null;
+  closed = false;
+
+  constructor(name: string) {
+    this.name = name;
+    FakeBroadcastChannel.instances.push(this);
+  }
+
+  postMessage(data: unknown): void {
+    for (const ch of FakeBroadcastChannel.instances) {
+      if (ch === this || ch.closed || ch.name !== this.name) continue;
+      queueMicrotask(() => { if (!ch.closed) ch.onmessage?.({ data }); });
+    }
+  }
+
+  close(): void { this.closed = true; }
 }
 (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel = FakeBroadcastChannel;
 
@@ -110,6 +130,20 @@ function renderStore() {
 function setVisibility(state: 'visible' | 'hidden') {
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
   document.dispatchEvent(new Event('visibilitychange'));
+}
+
+/** The healthy tab, listening on the vault channel (created AFTER the render
+ *  so the store's own channel exists too). Also proves the listener is REAL:
+ *  silence must be the store's choice, not the harness's, so the store's own
+ *  channel has to be a live instance of the same fake on the same name — a
+ *  postMessage from it would reach the listener. */
+function listenOnChannel() {
+  const channel = new FakeBroadcastChannel('eternal-notes-vault');
+  const received: Array<Record<string, unknown>> = [];
+  channel.onmessage = e => received.push(e.data as Record<string, unknown>);
+  const stores = FakeBroadcastChannel.instances.filter(ch => ch !== channel && ch.name === channel.name && !ch.closed);
+  expect(stores).toHaveLength(1);
+  return { received };
 }
 
 // ─── A dead-end tab with a session seed (shared by the two describes below) ──
@@ -163,6 +197,7 @@ beforeEach(() => {
   h.initBehaviour = 'ok';
   h.fireBlocking = null;
   sessionStorage.clear();
+  FakeBroadcastChannel.instances = [];
 });
 afterEach(() => {
   cleanup();
@@ -283,6 +318,26 @@ describe('bootstrap — VersionError with a session seed still in the tab (A18)'
     await act(async () => {});
 
     expectReloadScreenOnly();
+  });
+
+  // The same lock, seen from the OTHER tab — the one running the newer build,
+  // with the database open and its notes on screen. A 'lock' on the wire is an
+  // order («locked everywhere», §8); this lock is no such thing: a statement
+  // about THIS build's inability to read the database, not about the vault.
+  // Relayed, it would throw the healthy tab out of its notes — without a PIN,
+  // into twelve words — on the say-so of a tab that knows nothing. Same
+  // silence as the `onBlocking` route into the same dead end.
+  it('…and the other tabs hear NOTHING: the dead-end lock is not broadcast', async () => {
+    const { failClosedLocks } = await bootOutdatedWithSeed();
+    const { received } = listenOnChannel();
+
+    returnViaVisibility();
+    await waitFor(() => expect(sessionStorage.getItem(SESSION_KEY)).toBeNull());
+    expect(failClosedLocks()).toBe(1);
+    await act(async () => {}); // the fake channel delivers on a microtask
+
+    expect(received).toEqual([]);
+    expectReloadScreenOnly(); // locked, and still the reload screen
   });
 });
 

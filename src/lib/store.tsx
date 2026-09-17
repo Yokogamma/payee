@@ -1797,7 +1797,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // A session seed (step 4) stays where it is: this throw came before
         // the seed could be judged, and the lifecycle's fail-closed verdict
         // on the first return will lock it away — landing back on THIS screen
-        // (see lockApp), not on seed entry.
+        // (see lockApp), not on seed entry, and telling no other tab.
         applyStorageOutdated(true);
         setScreen('error');
         return;
@@ -2136,7 +2136,33 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // the one recovery from a storage that will not open.
     const deadEnd = storageOutdatedRef.current || bootErrorRef.current !== null;
     setScreen(deadEnd ? 'error' : hasPinRef.current ? 'pin' : 'restore');
-    if (opts.broadcast !== false) postVaultMessage('lock');
+    // …and a storage-OUTDATED tab tells nobody — that half of the dead end,
+    // deliberately not `deadEnd` (below). A 'lock' on the wire is an ORDER —
+    // «locked everywhere» (§8) — and every lock a live tab sends is one: the
+    // user's, or a return verdict on a vault the tab could vouch for. A
+    // storage-outdated tab can send neither. Its refs never saw a config
+    // (bootstrap threw at step 1, so hasPin/timeout are the defaults and the
+    // fast path never locks; on the `onBlocking` route the vault was gone
+    // before the ref flipped), and no database will open in this build, so
+    // what reaches this line here is the fail-closed verdict — a statement
+    // about THIS build's inability to read the database, not about the vault
+    // — or the gate's «Ввести PIN» racing it: a way out from behind the gate,
+    // not an order. The tab that owns that database runs its own return
+    // verdict against a config it CAN read; a lock relayed from here would
+    // throw it out of its notes — without a PIN, into twelve words — or abort
+    // an unlock ceremony in progress, on the say-so of a tab that knows
+    // nothing. Not a privacy downgrade either way: that tab's exposure was
+    // never in this tab's hands. Same silence as `onBlocking`, which passes
+    // the flag by hand because it locks BEFORE the ref flips.
+    //
+    // A boot-error tab is NOT silenced, dead end though it is. Its database
+    // may well have opened — the snapshot at step 3 can fail on a connection
+    // that is fine — and then the return's re-read SUCCEEDS and the verdict
+    // is the user's own policy (PIN set, «Сразу»): a real order, on this
+    // screen only because the screen never changes. Keying the silence on
+    // `deadEnd` would drop that order for the sake of an earlier, unrelated
+    // failure.
+    if (opts.broadcast !== false && !storageOutdatedRef.current) postVaultMessage('lock');
     // The target screen above used possibly-stale hasPin — reconcile it
     // against the authoritative pin-seed (review round 3): a PIN wiped in
     // another tab must not dead-end the user on a seedless PIN screen.
