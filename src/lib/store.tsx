@@ -954,7 +954,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
    * the verdict's own deadline it offers the way out. «Ввести PIN» just calls
    * lockApp() — locking is never a privacy downgrade, and it always lands on a
    * screen with a way forward: an input, or on a dead-end tab the «reload»
-   * button (lockApp keeps the storage-outdated screen).
+   * button (lockApp never leaves the error screen).
    *
    * Reveals ONLY to a foreground tab: a gate over a backgrounded tab has no
    * audience, and pre-revealing it would flash «Проверяем…» on every ordinary
@@ -1124,10 +1124,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   // inside the lifecycle handlers. Only ever goes true: a dead-end tab stays
   // one until it reloads.
   const storageOutdatedRef = useRef(false);
+  // Mirror of `bootError`, for the same reader: a storage that would not open
+  // at all is the OTHER way a tab becomes a dead end. Never cleared either —
+  // the reset that recovers from it reloads the page.
+  const bootErrorRef = useRef<string | null>(null);
 
   const applyHasPin = (v: boolean) => { hasPinRef.current = v; setHasPin(v); };
   const applyAutoLockTimeout = (t: AutoLockTimeout) => { autoLockTimeoutRef.current = t; setAutoLockTimeoutState(t); };
   const applyStorageOutdated = (v: boolean) => { storageOutdatedRef.current = v; setStorageOutdated(v); };
+  const applyBootError = (msg: string) => { bootErrorRef.current = msg; setBootError(msg); };
   /** The ONLY setter for the quick-unlock state. `hasQuickUnlock` is computed
    *  from it at the context boundary; there is no `applyHasQuickUnlock`. */
   const applyQuickUnlockMeta = (meta: { createdAt: number } | null) => setQuickUnlockMeta(meta);
@@ -1799,8 +1804,21 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
       // Storage init/read failed (corrupted IndexedDB, quota, private-mode
       // restrictions). Without this catch the app would spin forever.
+      //
+      // A session seed stays where it is, as in the VersionError branch: only
+      // a bootstrap ever consumes it, and every bootstrap judges it (steps
+      // 3–5) before opening anything. The «reload» this screen offers first
+      // IS that next bootstrap — a transient failure clears there and the
+      // session resumes with no PIN or seed to re-enter; a persistent one
+      // lands back here, where the reset removes the seed itself
+      // (resetBrokenStorage). Dropping it now would only forfeit that resume:
+      // this screen paints no data either way, and the lifecycle's
+      // fail-closed verdict on the first return locks it away regardless —
+      // landing back on THIS screen (see lockApp), not on seed entry: the PIN
+      // and seed screens cannot succeed without a database either, and
+      // «Сбросить данные» lives nowhere else.
       console.error('bootstrap failed:', err);
-      setBootError(err instanceof Error ? err.message : String(err));
+      applyBootError(err instanceof Error ? err.message : String(err));
       setScreen('error');
     } finally {
       readyRef.current = true;
@@ -2104,15 +2122,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     invalidateVaultLifecycle();
     clearVaultState();
     // Without a PIN there is nothing to unlock against — seed re-entry it is.
-    // EXCEPT on a dead-end tab (A18): once a newer build owns the database,
-    // the non-destructive «reload» screen is the only truthful target. A lock
-    // still reaches this line there — a VersionError at boot leaves the
-    // session seed unjudged in sessionStorage, and the first return's config
-    // re-read then fails closed — and the lock itself is right (the seed and
-    // the gate are gone above). Only the SCREEN must stay: a seed-entry form
-    // here would answer «Неверная seed-фраза» to the correct phrase, because
-    // nothing can open the database from this build.
-    setScreen(storageOutdatedRef.current ? 'error' : hasPinRef.current ? 'pin' : 'restore');
+    // EXCEPT on a dead-end tab: a lock never leaves the error screen. That
+    // screen means no database will open in this tab again — a newer build
+    // owns the stored one (storageOutdated, A18) or it would not open at all
+    // (bootError) — and both of its roads out reload the page, while every
+    // other screen needs the database. A lock still reaches this line there:
+    // a throw at boot leaves the session seed unjudged in sessionStorage, and
+    // the first return's config re-read then fails closed — and the lock
+    // itself is right (the seed and the gate are gone above). Only the SCREEN
+    // must stay: a seed-entry form here would answer «Неверная seed-фраза» to
+    // the correct phrase, because nothing can open the database from this
+    // tab — and on the generic screen it would also hide «Сбросить данные»,
+    // the one recovery from a storage that will not open.
+    const deadEnd = storageOutdatedRef.current || bootErrorRef.current !== null;
+    setScreen(deadEnd ? 'error' : hasPinRef.current ? 'pin' : 'restore');
     if (opts.broadcast !== false) postVaultMessage('lock');
     // The target screen above used possibly-stale hasPin — reconcile it
     // against the authoritative pin-seed (review round 3): a PIN wiped in
@@ -3404,7 +3427,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // to do) instead of pretending the reset was aborted; the page reloads
       // only after the database is truly gone and re-initialized.
       await recoverStorage({
-        onBlocked: () => setBootError(
+        onBlocked: () => applyBootError(
           'Хранилище открыто в другой вкладке приложения. Закройте остальные ' +
           'вкладки — сброс продолжится и завершится автоматически.'
         ),
@@ -3413,7 +3436,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // Do NOT reload on failure — the user would land on the same error screen
       // with no idea the reset never happened. Show what to do instead.
       console.error('recoverStorage failed:', err);
-      setBootError(`Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
+      applyBootError(`Сброс не удался: ${err instanceof Error ? err.message : String(err)}. Попробуйте ещё раз или перезагрузите страницу.`);
       throw err;
     }
     // Success: clean boot from scratch. Explicit recovery destroys the draft
