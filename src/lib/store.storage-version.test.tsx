@@ -10,7 +10,9 @@ import { render, screen, cleanup, waitFor, act } from '@testing-library/react';
 //  - the stored DB is NEWER than this build → a RELOAD screen, and explicitly
 //    NOT the generic error screen whose destructive reset is two clicks away;
 //  - …and that reload screen SURVIVES the auto-lock's fail-closed verdict on
-//    the first return from the background (A18).
+//    the first return from the background (A18) — as does the generic error
+//    screen, whose destructive reset is the one recovery from a storage that
+//    will not open.
 
 vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false }));
 
@@ -110,6 +112,53 @@ function setVisibility(state: 'visible' | 'hidden') {
   document.dispatchEvent(new Event('visibilitychange'));
 }
 
+// ─── A dead-end tab with a session seed (shared by the two describes below) ──
+
+/** Boot the REAL App — router and ErrorScreen, not a Probe: these findings are
+ *  about which screen the user is looking at, and `store.screen` alone would
+ *  not notice the router or the copy changing underneath it. Resolves once
+ *  `heading` is up with the seed still in the tab (bootstrap threw before step
+ *  4 could judge it — vaultPresentInTab() stays true). Returns a counter of
+ *  fail-closed verdicts, the only footprint a lock leaves once the seed is
+ *  gone. */
+async function bootDeadEndWithSeed(behaviour: 'version-error' | 'generic-error', heading: string) {
+  h.initBehaviour = behaviour;
+  // An earlier case opened the real database; this build must have NONE, or
+  // the config re-read on return would succeed and no lock would be at stake.
+  closeStorage();
+  sessionStorage.setItem(SESSION_KEY, MN);
+  // jsdom has no matchMedia; App's theme hook needs it to resolve «system».
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: false, media: query, onchange: null,
+    addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+    addListener: vi.fn(), removeListener: vi.fn(),
+  }));
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+  render(<App />);
+  expect(await screen.findByText(heading)).toBeTruthy();
+  expect(sessionStorage.getItem(SESSION_KEY)).toBe(MN);
+  return {
+    failClosedLocks: () =>
+      errors.mock.calls.filter(c => String(c[0]).includes('locking fail-closed')).length,
+  };
+}
+
+/** Background and back on the visibility edge. The refs say «no lock» (no
+ *  PIN, no timeout), so the verdict goes to the authoritative config — which
+ *  throws → fail-closed. */
+function returnViaVisibility() {
+  act(() => { setVisibility('hidden'); });
+  act(() => { setVisibility('visible'); });
+}
+
+/** The same round trip through the BFCache: `pagehide` is the hidden edge,
+ *  a PERSISTED `pageshow` the return. */
+function returnViaBfcache() {
+  act(() => { window.dispatchEvent(new Event('pagehide')); });
+  act(() => { window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); });
+}
+
 beforeEach(() => {
   h.initBehaviour = 'ok';
   h.fireBlocking = null;
@@ -181,50 +230,7 @@ describe('bootstrap — local database problems', () => {
 // open the database from this build. The lock itself is right (the seed must
 // not sit in a dead-end tab); only the SCREEN must not move.
 describe('bootstrap — VersionError with a session seed still in the tab (A18)', () => {
-  /** Boot the REAL App — router and ErrorScreen, not a Probe: the finding is
-   *  about which screen the user is looking at, and `store.screen` alone would
-   *  not notice the router or the copy changing underneath it. Resolves once
-   *  the reload screen is up with the seed still in the tab. Returns a counter
-   *  of fail-closed verdicts, the only footprint a lock leaves once the seed
-   *  is gone. */
-  async function bootOutdatedWithSeed() {
-    h.initBehaviour = 'version-error';
-    // An earlier case opened the real database; this build must have NONE, or
-    // the config re-read below would succeed and no lock would be at stake.
-    closeStorage();
-    sessionStorage.setItem(SESSION_KEY, MN);
-    // jsdom has no matchMedia; App's theme hook needs it to resolve «system».
-    vi.stubGlobal('matchMedia', (query: string) => ({
-      matches: false, media: query, onchange: null,
-      addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
-      addListener: vi.fn(), removeListener: vi.fn(),
-    }));
-    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    render(<App />);
-    expect(await screen.findByText('Приложение обновилось')).toBeTruthy();
-    // bootstrap threw before step 4 — the seed is still here (vaultPresentInTab).
-    expect(sessionStorage.getItem(SESSION_KEY)).toBe(MN);
-    return {
-      failClosedLocks: () =>
-        errors.mock.calls.filter(c => String(c[0]).includes('locking fail-closed')).length,
-    };
-  }
-
-  /** Background and back on the visibility edge. The refs say «no lock» (no
-   *  PIN, no timeout), so the verdict goes to the authoritative config — which
-   *  throws → fail-closed. */
-  function returnViaVisibility() {
-    act(() => { setVisibility('hidden'); });
-    act(() => { setVisibility('visible'); });
-  }
-
-  /** The same round trip through the BFCache: `pagehide` is the hidden edge,
-   *  a PERSISTED `pageshow` the return. */
-  function returnViaBfcache() {
-    act(() => { window.dispatchEvent(new Event('pagehide')); });
-    act(() => { window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); });
-  }
+  const bootOutdatedWithSeed = () => bootDeadEndWithSeed('version-error', 'Приложение обновилось');
 
   /** The SAME screen: reload only, no destructive reset, no seed form, and no
    *  privacy gate left covering it. */
@@ -277,5 +283,73 @@ describe('bootstrap — VersionError with a session seed still in the tab (A18)'
     await act(async () => {});
 
     expectReloadScreenOnly();
+  });
+});
+
+// The GENERIC boot failure has the same shape, one step earlier still: init
+// itself throws (corrupted IndexedDB, quota, private mode), the seed is never
+// judged, and the first return fails closed. Here the lock used to land on
+// seed entry as well — and took «Сбросить данные» with it, the one recovery
+// from a storage that will not open, reachable from no other screen. Nothing
+// on the seed-entry or PIN screens can succeed without a database; the error
+// screen's reload and reset are the only truthful actions, so the lock must
+// keep that screen too. Same three round trips as A18.
+describe('bootstrap — generic init failure with a session seed still in the tab', () => {
+  const bootBrokenWithSeed = () => bootDeadEndWithSeed('generic-error', 'Не удалось запустить');
+
+  /** The SAME screen: the failure copy, reload AND the reset all still there;
+   *  no seed form, no PIN pad, no privacy gate left covering it. */
+  function expectErrorScreenWithReset() {
+    expect(screen.getByText('Не удалось запустить')).toBeTruthy();
+    expect(screen.getByText('quota exceeded')).toBeTruthy(); // the bootError copy
+    expect(screen.getByRole('button', { name: 'Перезагрузить' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Сбросить данные' })).toBeTruthy();
+    expect(screen.queryByText('Восстановление')).toBeNull();
+    expect(screen.queryByText('Eternal Notes')).toBeNull();
+    expect(document.querySelector('.lock-gate')?.hasAttribute('hidden')).toBe(true);
+  }
+
+  it('the fail-closed lock on the first return keeps the error screen and its reset', async () => {
+    const { failClosedLocks } = await bootBrokenWithSeed();
+    // The reset is on offer BEFORE the lock — the regression was losing it.
+    expect(screen.getByRole('button', { name: 'Сбросить данные' })).toBeTruthy();
+
+    returnViaVisibility();
+    await waitFor(() => expect(sessionStorage.getItem(SESSION_KEY)).toBeNull());
+    expect(failClosedLocks()).toBe(1);
+    // The lock set its target screen synchronously with the seed removal; let
+    // that commit before looking, so a wrong target cannot hide behind timing.
+    await act(async () => {});
+
+    expectErrorScreenWithReset();
+  });
+
+  it('a BFCache restore (pagehide → persisted pageshow) is decided the same way', async () => {
+    const { failClosedLocks } = await bootBrokenWithSeed();
+
+    returnViaBfcache();
+    await waitFor(() => expect(sessionStorage.getItem(SESSION_KEY)).toBeNull());
+    expect(failClosedLocks()).toBe(1);
+    await act(async () => {});
+
+    expectErrorScreenWithReset();
+  });
+
+  it('every later return finds nothing to lock and leaves the screen alone', async () => {
+    const { failClosedLocks } = await bootBrokenWithSeed();
+
+    returnViaVisibility();
+    await waitFor(() => expect(sessionStorage.getItem(SESSION_KEY)).toBeNull());
+    await act(async () => {});
+    expectErrorScreenWithReset();
+
+    // Second round trip: the config is still unreadable, the verdict still
+    // says «lock» — but with no seed, vaultPresentInTab() is false and lockApp
+    // takes its first exit. Screen, copy and both buttons are left alone.
+    returnViaVisibility();
+    await waitFor(() => expect(failClosedLocks()).toBe(2));
+    await act(async () => {});
+
+    expectErrorScreenWithReset();
   });
 });
