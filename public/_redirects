@@ -1,16 +1,19 @@
-# The standalone viewer is served at an EXTENSIONLESS canonical URL, and
-# BOTH rules below must stay ABOVE the splat: the SPA fallback matches
-# everything, so a viewer request would otherwise be answered with the
-# app shell — a page that cannot open a backup file and gives no hint why.
+# No rules — on purpose. Read before adding one.
 #
-# The `.html` rule is not decoration. Cloudflare states that «redirects are
-# always followed, regardless of whether or not an asset matches the incoming
-# request», so the file sitting in `dist` does NOT shield that path from the
-# splat: someone who typed the name they saw in a folder would be handed the
-# app shell. One canonical URL, and everything else points at it.
+# The standalone backup viewer is `backup-viewer.html` at the top of `dist`,
+# and its canonical URL is the EXTENSIONLESS `/backup-viewer`. Cloudflare Pages
+# serves that natively: an HTML asset answers at its extensionless path, and a
+# request for `/backup-viewer.html` is redirected (308) to `/backup-viewer`.
+# The single-page fallback is native too — with no top-level `404.html` in
+# `dist`, every unknown path gets `index.html` — so the app needs no
+# `/* /index.html 200` rule either.
 #
-# No loop: a 200 rewrite serves the asset at its destination, it does not
-# re-enter this table. The live smoke checks that too, on every deploy.
-/backup-viewer.html /backup-viewer 301
-/backup-viewer /backup-viewer.html 200
-/* /index.html 200
+# The rules that used to live here broke the route on the first real Pages
+# release (client-b1, 2026-09-16, Pages run 35160292662): a 200 rewrite
+# `/backup-viewer → /backup-viewer.html` handed Pages an `.html` path, which
+# Pages answered with its own 308 back to `/backup-viewer` — a redirect loop,
+# caught by `scripts/smoke-headers.mjs` after publication. A rewrite whose
+# target is an `.html` asset can never work here, and `_redirects` rules are
+# only ever proven on a real Pages deployment, never by a unit test — see
+# `scripts/backup-viewer-route.test.mjs` for what IS checked in the tree, and
+# the smoke for what is checked live.

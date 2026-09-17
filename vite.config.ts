@@ -78,8 +78,8 @@ export default defineConfig(({ command, mode }) => {
           // ...but never for the viewer. It is a separate document, not a
           // route of this app, and answering its URL with the app shell would
           // hand the user a page that cannot open a backup and does not say
-          // why. Belt to the `_redirects` rule's braces: that one governs the
-          // server, this one governs the service worker.
+          // why. Belt to the edge's braces: Pages serves the file at its
+          // extensionless URL on the server, this governs the service worker.
           // Anchored at the start and open at the end for a query string:
           // Workbox tests this against `pathname + search`, so a `$` here
           // would let `/backup-viewer?anything` fall through to the SPA shell

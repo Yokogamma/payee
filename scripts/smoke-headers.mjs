@@ -4,7 +4,9 @@
  * the Cloudflare Pages cutover really took effect), and that the standalone
  * backup viewer is served as its own document under exactly one policy.
  *
- * The viewer half is not a formality. Its route is a 200 rewrite living above
+ * The viewer half is not a formality. Its route is served natively by Pages
+ * (an HTML asset at its extensionless URL) — a rewrite to the `.html` asset
+ * was a 308 loop on the first real release (2026-09-16) — and it lives above
  * a catch-all SPA fallback, and its policy is a per-path UNSET of the site CSP
  * — three pieces of edge configuration that fail silently and in ways nobody
  * notices until someone opens the file offline, years later, with no way to
@@ -47,11 +49,11 @@ const withQuery = path => { const u = new URL(path, url); u.search = new URL(url
 const viewerUrl = withQuery('/backup-viewer').toString();
 const viewer = await fetch(viewerUrl, { redirect: 'manual' });
 
-// `redirect: 'manual'` on purpose: a 3xx here means the rewrite became a real
+// `redirect: 'manual'` on purpose: a 3xx here means the route became a real
 // redirect, which is one misconfiguration away from a loop and changes the
 // path the header rules match against.
 if (viewer.status !== 200) {
-  fail(`viewer: expected 200, got ${viewer.status} (a 3xx means the rewrite turned into a redirect)`);
+  fail(`viewer: expected 200, got ${viewer.status} (a 3xx means the route turned into a redirect — a loop, a rule, or the edge)`);
 }
 const contentType = viewer.headers.get('content-type') ?? '';
 if (!/text\/html/i.test(contentType)) fail(`viewer: content-type = "${contentType}"`);
@@ -89,11 +91,10 @@ if (/https?:\/\//i.test(body)) fail('viewer: the served artifact references an h
 
 // ── `/backup-viewer.html`: exactly two acceptable answers ────────────
 //
-// `_redirects` sends this path to the canonical URL with a 301, because
-// Cloudflare follows redirects «regardless of whether or not an asset matches
-// the incoming request» — the file in `dist` does not shield it from the
-// splat. If a future Pages behaviour serves the asset first instead, the
-// answer is the viewer itself, which is equally fine.
+// Pages redirects an `.html` path to its extensionless URL by itself (308),
+// so the expected answer is a redirect to `/backup-viewer`. If a future Pages
+// behaviour serves the asset directly instead, the answer is the viewer
+// itself, which is equally fine.
 //
 // Everything else fails: the app shell under a viewer-looking URL is the
 // failure mode this route exists to prevent, and «some redirect somewhere» is
