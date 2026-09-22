@@ -149,7 +149,9 @@ export const VOLUME = Object.freeze({
   decisions: 30,
   distinctDays: 3,
   deduped: 10,
-  legacyBackfilled: 3,
+  // Waived by the owner on 2026-09-22 (window v3): unseedable once the floor
+  // is a D2 version; evidence carried from window v2. Reported, not required.
+  legacyBackfilled: 0,
   recoveryReconciled: 1,
   paidOutcomes: 20,
 });
@@ -661,7 +663,10 @@ export function summarize(state) {
     row('semantic_idempotency decisions (script-side)', decisions, VOLUME.decisions),
     row('distinct days with a day run', days.size, VOLUME.distinctDays),
     row('deduped', deduped, VOLUME.deduped),
-    row('legacy_backfilled (distinct records)', legacyBackfilled, VOLUME.legacyBackfilled),
+    // Waived by the owner on 2026-09-22 (docs/ROLLBACK.md «Soak criteria»):
+    // seeding needs a worker without fingerprints, which the floor forbids
+    // forever once it stands on a D2 version. Counted, never required.
+    { name: 'legacy_backfilled (distinct records) — waived by owner 2026-09-22 (unseedable above the D2 floor; evidence carried from window v2)', have: legacyBackfilled, need: VOLUME.legacyBackfilled, ok: true },
     // Waived by the owner on 2026-09-07 (docs/ROLLBACK.md): the event needs a
     // genuine DO fault, which nothing outside the worker can stage.
     { name: 'recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)', have: 0, need: VOLUME.recoveryReconciled, ok: true },
@@ -1334,8 +1339,13 @@ async function snapshot({ origin, secret, stateDir }) {
   log(`  snapshot kept: ${file}`);
 }
 
-function printStatus(state) {
+// `opts` are the EFFECTIVE limits of this invocation (env over DEFAULTS): the
+// status line must show the budget the run would actually be charged against,
+// not the driver's built-in default — a wrapper pinning SOAK_MAX_PAID_TOTAL=21
+// would otherwise read «/30» here while `day` stops at 21.
+function printStatus(state, opts = DEFAULTS) {
   log(`state: origin=${state.origin ?? '-'} release=${state.release?.sha?.slice(0, 7) ?? '-'} versionId=${state.release?.workerVersionId ?? '-'}`);
+  log(`effective limits: SOAK_MAX_PAID_TOTAL=${opts.maxPaidTotal}, redrop recheck ${opts.redropRecheckTotal}, legacy ${opts.redropLegacyTotal}`);
   log(`notes: ${state.notes.length} (legacy ${state.notes.filter(n => n.kind === 'legacy').length}, paid ${state.notes.filter(n => n.kind === 'paid').length})`);
   // Three numbers, each counted DIRECTLY from its own source. The window and
   // seeding figures come from the durable attempt records; `paidPosts` is the
@@ -1348,14 +1358,14 @@ function printStatus(state) {
     log(`  ! ${state.paidPosts - inWindow - seeded} paid POST(s) are unattributed — records without a mode, or a counter written without one`);
   }
   const sent = redropSends(state);
-  log(`redrop-capable sends: recheck ${sent.recheck}/${DEFAULTS.redropRecheckTotal}, legacy ${sent.legacy}/${DEFAULTS.redropLegacyTotal}`);
+  log(`redrop-capable sends: recheck ${sent.recheck}/${opts.redropRecheckTotal}, legacy ${sent.legacy}/${opts.redropLegacyTotal}`);
   // An unmigrated ledger must not read as "0 attempts" — that is exactly the
   // false reassurance this counter exists to remove.
   if (needsAttemptsMigration(state)) {
     log('paid attempts: NOT TRACKED — this ledger predates the counter; `day` refuses until `soak-d2.mjs migrate-attempts` is run');
   } else {
     const at = attemptsSummary(state);
-    log(`paid attempts: ${at.total}/${DEFAULTS.maxPaidTotal} (accepted ${at.accepted}, error ${at.error}, unknown ${at.unknown}) — the budget charges ATTEMPTS, not successes`);
+    log(`paid attempts: ${at.total}/${opts.maxPaidTotal} (accepted ${at.accepted}, error ${at.error}, unknown ${at.unknown}) — the budget charges ATTEMPTS, not successes`);
     if (at.priorEra?.attemptsUnknown) {
       log(`  ! attempts before ${new Date(at.priorEra.migratedAt).toISOString()} were never recorded; the budget counts ${at.priorEra.knownSuccesses} known successes as a LOWER BOUND — the real figure may be higher`);
     }
@@ -1614,7 +1624,7 @@ export async function main(argv) {
   // hostile for no gain. Everything else takes the lock BEFORE reading the
   // ledger: planning from a snapshot another process is already spending is
   // exactly how two runs both believe the budget is theirs.
-  if (mode === 'status') { printStatus(await loadState(statePath)); return 0; }
+  if (mode === 'status') { printStatus(await loadState(statePath), opts); return 0; }
 
   const lock = await acquireLedgerLock(statePath);
   if (!lock.ok) { console.error(`✗ ${lock.reason}`); return 2; }
@@ -1635,7 +1645,7 @@ export async function main(argv) {
       log('the attempt ledger is already in place — nothing to migrate');
     }
     await saveState(statePath, state);
-    printStatus(state);
+    printStatus(state, opts);
     return 0;
   }
   if (mode === 'resolve') {
@@ -1728,7 +1738,7 @@ export async function main(argv) {
     }
   }
   if (!cli.dryRun) await saveState(statePath, state);
-  printStatus(state);
+  printStatus(state, opts);
   return failures ? 1 : 0;
   }
 }

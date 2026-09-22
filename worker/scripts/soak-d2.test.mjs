@@ -287,7 +287,8 @@ describe('summarize', () => {
     expect(rows['confirmed paid publications in the window (plan; criterion = upload_outcome in AE)']).toMatchObject({ have: 21, need: VOLUME.paidOutcomes, ok: true });
     expect(rows['deduped']).toMatchObject({ have: 14, ok: true });
     expect(rows['distinct days with a day run']).toMatchObject({ have: 2, ok: false });
-    expect(rows['legacy_backfilled (distinct records)']).toMatchObject({ have: 2, ok: false });
+    // Waived 2026-09-22: the figure is reported, a shortfall is not a failure.
+    expect(rows['legacy_backfilled (distinct records) — waived by owner 2026-09-22 (unseedable above the D2 floor; evidence carried from window v2)']).toMatchObject({ have: 2, need: 0, ok: true });
     expect(rows['recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)']).toMatchObject({ have: 0, ok: true });
   });
 });

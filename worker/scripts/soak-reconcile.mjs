@@ -275,9 +275,20 @@ export function validatePolicy(policy) {
 
 // ── §7.3 Verdict ──────────────────────────────────────────────────────
 
-/** docs/ROLLBACK.md «Soak criteria», the numbers (mirrors soak-d2.mjs VOLUME). */
+/**
+ * docs/ROLLBACK.md «Soak criteria», the numbers (mirrors soak-d2.mjs VOLUME).
+ *
+ * `legacyBackfilled` is 0 — the criterion was WAIVED by the owner on
+ * 2026-09-22 (decision E.2, window v3): a legacy record can only be seeded on
+ * a worker WITHOUT publication fingerprints, and once the floor rises to a D2
+ * version no such worker is deployable ever again, so «≥ 3 backfills in THIS
+ * window» would be unreachable for every future window. The evidence is
+ * carried from window v2 (5 distinct backfills on 11cc3f7, books matched
+ * 31/31); the backfill code did not change between 11cc3f7 and 394156d. The
+ * figure is still counted and reported — it is no longer a failure.
+ */
 export const CRITERIA = Object.freeze({
-  decisions: 30, distinctDays: 3, deduped: 10, legacyBackfilled: 3,
+  decisions: 30, distinctDays: 3, deduped: 10, legacyBackfilled: 0,
   paidOutcomes: 20, successRate: 0.95, unprovenMax: 1, finalHoursQuiet: 48,
   /** «168 continuous hours on ONE worker version id» (docs/ROLLBACK.md). */
   windowMs: 168 * 3_600_000,
