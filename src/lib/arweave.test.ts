@@ -76,7 +76,19 @@ describe('fetchAllNotes owner filter (C2)', () => {
 });
 
 describe('uploadViaProxy committed flag', () => {
-  it('passes through committed:false (server did not confirm the DO commit)', async () => {
+  // The marker-less pass-through is the LEGACY wire path, reachable only with
+  // import OFF: since release 2 the real flag is on, and a 2xx without
+  // `semanticIdempotency: 1` is refused as `unattested` (D2a). The attested
+  // path — marker present, `committed` required — is covered in
+  // `d2a-client-guard.test.ts`; these two pin the legacy shape under the flag
+  // state it belongs to (`vi.resetModules` in afterEach makes the doMock take).
+  const importOff = () => vi.doMock('./flags', async importOriginal => ({
+    ...(await importOriginal<typeof import('./flags')>()),
+    BACKUP_IMPORT_ENABLED: false,
+  }));
+
+  it('passes through committed:false (server did not confirm the DO commit) — import off', async () => {
+    importOff();
     vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify({ txId: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs', committed: false }), { status: 200 }),
@@ -85,7 +97,8 @@ describe('uploadViaProxy committed flag', () => {
     expect(await uploadViaProxy('{}', 'pk', 'sig')).toEqual({ kind: 'accepted', txId: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjs', committed: false });
   });
 
-  it('defaults committed:true when the field is absent', async () => {
+  it('defaults committed:true when the field is absent — import off', async () => {
+    importOff();
     vi.stubEnv('VITE_PROXY_URL', 'http://localhost:8787');
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify({ txId: 'w9AF3YCc9eFb5IqD8rzqXfCgmWNpBJHrAPo1VzfZfjt' }), { status: 200 }),
