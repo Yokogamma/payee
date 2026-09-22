@@ -124,8 +124,22 @@ export const SHA_RE = /^[0-9a-f]{40}$/;
  * client cannot tell the safe quorum semantics from the old single-host ones.
  * That is a money-and-integrity boundary, not a feature level, which is why it
  * belongs here and not in the Environment variable alone.
+ *
+ * RAISED AGAIN to the D2 worker (`394156d`, semantic idempotency: `fp`,
+ * `deduped`, `409 id_payload_conflict`, server-side legacy backfill,
+ * `semanticIdempotency: 1` in `/health`; live since 2026-09-16, run
+ * 35151788392, versionId 41773298-9b1e-47aa-b33b-a353a8c381db). Raised
+ * immediately BEFORE the import flip (D2a): a client with
+ * `BACKUP_IMPORT_ENABLED = true` stores a txId only under the capability
+ * marker, and below this SHA the worker cannot dedupe a re-post by payload
+ * fingerprint — a second PAID transaction for the same note. The soak that
+ * justifies the raise is window v3 (docs/ROLLBACK.md «Soak criteria — v2»,
+ * «Backup v1 … step 3»); the floor-raise record there cites the closing
+ * `reconcile` report. `ff0954d` stays in `historical-candidates.mjs` and the
+ * release allowlist as HISTORY: the profile binding runs first, this gate
+ * runs second and refuses it before anything is materialized.
  */
-export const MINIMUM_FLOOR = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
+export const MINIMUM_FLOOR = '394156d5998dbaef5b1d273898ee8006104227f8';
 
 /**
  * Everything decidable without touching git.

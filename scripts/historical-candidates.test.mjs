@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import {
   HISTORICAL_CANDIDATES, HISTORICAL_PROFILES,
   historicalCandidate, checkHistoricalBinding, candidateLacksVar,
@@ -22,10 +23,22 @@ describe('the registry', () => {
     });
   });
 
-  // The whole reason this registry exists: the floor admits this build, so the
-  // rest of the pipeline must be able to as well — consistently.
-  it('the historical build IS the pinned minimum floor', () => {
-    expect(FF).toBe(MINIMUM_FLOOR);
+  // Until the floor was raised to the D2 worker (immediately before the import
+  // flip) this build WAS the pinned minimum floor, and the registry existed so
+  // the rest of the pipeline could admit what the floor admitted. Since the
+  // raise it is HISTORY: a strict ancestor of the pin, kept on record, and no
+  // longer deployable — the profile binding still passes first, and
+  // `check-worker-floor.mjs` refuses it second, before anything is
+  // materialized. Both halves are asserted: the entry is not the floor, and it
+  // is below it (a registry entry that were NOT an ancestor would mean the
+  // floor moved to a different line of history, which is a different mistake).
+  it('the historical build is a strict ancestor of the pinned minimum floor, not the floor itself', () => {
+    expect(FF).not.toBe(MINIMUM_FLOOR);
+    const isAncestor = () => execFileSync(
+      'git', ['merge-base', '--is-ancestor', FF, MINIMUM_FLOOR],
+      { cwd: new URL('..', import.meta.url), stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    expect(isAncestor).not.toThrow();
   });
 
   it('every historical profile exists in the smoke table, and no modern profile is historical', () => {
