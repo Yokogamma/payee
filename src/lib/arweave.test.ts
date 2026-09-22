@@ -86,6 +86,11 @@ describe('uploadViaProxy committed flag', () => {
     ...(await importOriginal<typeof import('./flags')>()),
     BACKUP_IMPORT_ENABLED: false,
   }));
+  // `vi.resetModules()` (file-level afterEach) drops module instances but NOT
+  // the mock registry: without this, every later dynamic import in the file
+  // would still see import OFF. Scoped to this block — the rest of the file
+  // runs against the real flags.
+  afterEach(() => { vi.doUnmock('./flags'); });
 
   it('passes through committed:false (server did not confirm the DO commit) — import off', async () => {
     importOff();
