@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   HISTORICAL_CANDIDATES, HISTORICAL_PROFILES,
   historicalCandidate, checkHistoricalBinding, candidateLacksVar,
@@ -32,11 +33,23 @@ describe('the registry', () => {
   // materialized. Both halves are asserted: the entry is not the floor, and it
   // is below it (a registry entry that were NOT an ancestor would mean the
   // floor moved to a different line of history, which is a different mistake).
-  it('the historical build is a strict ancestor of the pinned minimum floor, not the floor itself', () => {
+  it('the historical build is NOT the pinned minimum floor', () => {
     expect(FF).not.toBe(MINIMUM_FLOOR);
+  });
+
+  // The ancestry half needs the real history. CI's checkout is shallow (no
+  // fetch-depth), so there the two SHAs are not commits at all and the check
+  // is SKIPPED, visibly — not passed. The deploy workflows fetch depth 0 and
+  // `check-worker-floor.mjs` computes exactly this ancestry before any deploy,
+  // so the property is enforced where it matters; this test pins it for a full
+  // local checkout, where a wrong pin would be caught before a PR is opened.
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const commitPresent = sha => spawnSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: repoRoot, stdio: 'ignore' }).status === 0;
+  const historyAvailable = commitPresent(FF) && commitPresent(MINIMUM_FLOOR);
+  it.skipIf(!historyAvailable)('… and is a strict ancestor of it (full history only; shallow CI checkout skips this)', () => {
     const isAncestor = () => execFileSync(
       'git', ['merge-base', '--is-ancestor', FF, MINIMUM_FLOOR],
-      { cwd: new URL('..', import.meta.url), stdio: ['ignore', 'ignore', 'pipe'] },
+      { cwd: repoRoot, stdio: ['ignore', 'ignore', 'pipe'] },
     );
     expect(isAncestor).not.toThrow();
   });
