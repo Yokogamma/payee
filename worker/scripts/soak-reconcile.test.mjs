@@ -339,7 +339,11 @@ describe('§7.3 verdict (tests 17, 18)', () => {
     const v2 = judge(thin);
     expect(v2.failures.join('\n')).toMatch(/paid outcomes 10 < 20/);
     expect(v2.failures.join('\n')).toMatch(/deduped 0 < 10/);
-    expect(v2.failures.join('\n')).toMatch(/legacy_backfilled \(distinct\) 0 < 3/);
+    // Waived by the owner 2026-09-22 (window v3): zero backfills is NOT a
+    // failure any more — the figure is still reported.
+    expect(v2.failures.join('\n')).not.toMatch(/legacy_backfilled/);
+    expect(v2.figures.legacyBackfilled).toBe(0);
+    expect(CRITERIA.legacyBackfilled).toBe(0);
   });
 
   it('17: posting → red; resolve → resolved_manually and green; capped wait stays red despite the resolve', () => {

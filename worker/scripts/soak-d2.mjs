@@ -149,7 +149,9 @@ export const VOLUME = Object.freeze({
   decisions: 30,
   distinctDays: 3,
   deduped: 10,
-  legacyBackfilled: 3,
+  // Waived by the owner on 2026-09-22 (window v3): unseedable once the floor
+  // is a D2 version; evidence carried from window v2. Reported, not required.
+  legacyBackfilled: 0,
   recoveryReconciled: 1,
   paidOutcomes: 20,
 });
@@ -661,7 +663,10 @@ export function summarize(state) {
     row('semantic_idempotency decisions (script-side)', decisions, VOLUME.decisions),
     row('distinct days with a day run', days.size, VOLUME.distinctDays),
     row('deduped', deduped, VOLUME.deduped),
-    row('legacy_backfilled (distinct records)', legacyBackfilled, VOLUME.legacyBackfilled),
+    // Waived by the owner on 2026-09-22 (docs/ROLLBACK.md «Soak criteria»):
+    // seeding needs a worker without fingerprints, which the floor forbids
+    // forever once it stands on a D2 version. Counted, never required.
+    { name: 'legacy_backfilled (distinct records) — waived by owner 2026-09-22 (unseedable above the D2 floor; evidence carried from window v2)', have: legacyBackfilled, need: VOLUME.legacyBackfilled, ok: true },
     // Waived by the owner on 2026-09-07 (docs/ROLLBACK.md): the event needs a
     // genuine DO fault, which nothing outside the worker can stage.
     { name: 'recovery_reconciled — waived by owner 2026-09-07 (not reachable by any client)', have: 0, need: VOLUME.recoveryReconciled, ok: true },
