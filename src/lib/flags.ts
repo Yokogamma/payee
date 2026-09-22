@@ -96,7 +96,14 @@ export const BACKUP_EXPORT_ENABLED: boolean = false;
  * copies they can neither verify nor restore — a backup they have no way to
  * find out is worthless until the day they need it.
  *
+ * ON since release 2 (`client-b2`): import and file verification. The Pages
+ * gate reads this literal from the built checkout and switches itself to
+ * EQUALITY mode (`WORKER_FLOOR_SHA == MINIMUM_FLOOR == worker_candidate`), so
+ * a build with this flag on cannot be published onto a worker below the
+ * semantic-idempotency floor — see docs/ROLLBACK.md «Which order applies».
+ * Export stays off until release 3.
+ *
  * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
  * branch into unreachable dead code under TS narrowing.
  */
-export const BACKUP_IMPORT_ENABLED: boolean = false;
+export const BACKUP_IMPORT_ENABLED: boolean = true;
