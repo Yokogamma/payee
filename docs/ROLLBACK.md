@@ -655,6 +655,27 @@ dispatch, as for `client-b1`. Rollback target if import misbehaves: the
 `client-b1-hotfix1` deployment (`49e219de`) — import disappears from the UI,
 imported data stays; the worker is NOT rolled back (the floor).
 
+**Export flip — release 3 (`client-b3`).** This commit sets
+`BACKUP_EXPORT_ENABLED = true` on top of the import flip, so the pair becomes
+both ON — the only direction `scripts/check-backup-flags.mjs` allows (export
+may never be on while import is off). In application code it changes ONE
+literal; alongside it: this note and `src/lib/flags.shipped.test.ts` (the one
+owner of the «build as it ships» assertion, now the release-3 pair). Nothing
+else: the export path, the size estimate and the viewer download have shipped
+dark since `client-b1` and were exercised on a `true/true` scratch build in the
+release-3 rehearsal. The Pages gate is already in equality mode (it switched on
+the import flip), so this build too is refused before publishing unless
+`WORKER_FLOOR_SHA == MINIMUM_FLOOR == worker_candidate`. Order: only after
+release 2 is dispatched AND its acceptance (R2-C, including the live import)
+is closed — the two flips are separate releases by decision E.8 (2026-09-22).
+Deploy facts are recorded by the release-lines PR after the dispatch. Rollback
+target if export misbehaves: the `client-b2` deployment — export disappears
+from the UI, nothing on the device changes (export mutates nothing); the worker
+is NOT rolled back (the floor). Acceptance of this release is the «clean
+device» protocol (export on A → clean profile B → import by seed → compare),
+and Milestone 1 «Backup v1 done» is claimed only with the operator evidence it
+lists.
+
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
 This release is not inert for existing users, and the runbook has to say so
