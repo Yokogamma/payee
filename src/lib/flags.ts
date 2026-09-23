@@ -79,10 +79,17 @@ export const QUICK_UNLOCK_ENABLED: boolean = true;
  * Contract (enforced in the store, not just hidden UI): with the flag off the
  * export action refuses with a typed error rather than producing a file.
  *
+ * ON since release 3 (`client-b3`): «Скачать резервную копию», «Скачать
+ * просмотрщик» and the size estimate. Legal only because import is already on
+ * (release 2) — `scripts/check-backup-flags.mjs` refuses the reverse pair. The
+ * Pages gate stays in EQUALITY mode (it switched on the import flip), so this
+ * build too can only be published onto the semantic-idempotency floor — see
+ * docs/ROLLBACK.md «Which order applies».
+ *
  * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
  * branch into unreachable dead code under TS narrowing.
  */
-export const BACKUP_EXPORT_ENABLED: boolean = false;
+export const BACKUP_EXPORT_ENABLED: boolean = true;
 
 /**
  * Backup IMPORT gate — «Импортировать из файла» AND «Проверить файл копии».
