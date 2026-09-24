@@ -1776,6 +1776,22 @@ Reader-релиз этим не блокируется: он не создаёт
   `settle-by-tx spent` / `dead` + age guard → `released` / backoff, выход
   только по терминальному ответу guard; (M) smoke считает исходом последний
   ответ `init` (`done`/`waiting` — успех, иначе отказ).
+- **Ревью 24.09 #3 (3 high, 1 medium) внесено:** (H1) **протокол отправки** —
+  разрешение = lease на деньги: `permit-send` записывает `sending {token,
+  since}` и возвращает `sendToken`; отправитель после POST (любой исход)
+  отчитывается `/send-done {txId, sendToken}`; `released` для резервации,
+  чьё разрешение в `sending` моложе `SEND_LEASE_MS` (30 мин), отвечает
+  `503 spend_send_in_flight` (`settle` и `settle-by-tx`); повтор
+  `permit-send` внутри lease возвращает тот же lease; фаза 2 не подписывает,
+  пока старые деньги не освобождены (`in_flight`/`unavailable` →
+  reschedule). Крах отправителя → lease истекает; POST дольше 30 мин
+  ложится на `released` и переучитывается решёткой (`spend_conflict`).
+  (H2) `settle-by-tx`: `retry` (guard не ответил, 503) сохраняет запись
+  денежного индекса; терминально только `settled`/`noop`/`unknown`/
+  `terminal_refusal` (409/400). (H3) `commit` из `reserved` (mark-posted
+  потерян трижды) атомарно заводит денежную запись. (M) элементы
+  `/open-permits` проверяются по полям, типам и состояниям
+  (`prepared`/`active`), неполный элемент держит множество открытым.
 
 **Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
 ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**

@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
-import { PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES } from '../src/spend-ledger';
+import { PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SEND_LEASE_MS, SPEND_CODES } from '../src/spend-ledger';
 
 // D10 SpendGuard DO on REAL storage (spec rev. 10 §4.0–4.4, §5–§7): the pure
 // rules of spend-ledger.ts through the DO routes, each in one storage
@@ -120,6 +120,48 @@ describe('permit-send — the single path to the network', () => {
     const again = await call(sg, '/permit-send', { txId: 'SENT', kind: 'resend', cycle: 1, now: T0 + 5 });
     expect(again.body).toMatchObject({ granted: true, existing: true });
     expect((again.body.permit as { issuedAt: number }).issuedAt).toBe(T0);
+  });
+});
+
+describe('the send lease — a permit and a release cannot both win (review 24.09 #3, high 1)', () => {
+  it('permit-send hands out a lease token; `released` is refused while it is live; /send-done clears it; an expired lease lets the release through', async () => {
+    const sg = await initialized(fresh('sendlease'));
+    await credit(sg, 'D', '1000', 2000);
+    const q = await quote(sg, 100, '10');
+    await call(sg, '/prepare', { spendKey: 'k', reward: '10', revision: 0, quoteId: q, bytes: 100, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'k', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: T0 });
+    const p = await call(sg, '/permit-send', { txId: 'SENT', kind: 'upload', cycle: 1, spendKey: 'k', now: T0 });
+    expect(p.status).toBe(200);
+    const sendToken = p.body.sendToken as string;
+    expect(typeof sendToken).toBe('string');
+    // A releaser deciding the redrop while the send is in flight is refused.
+    const rel = await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 1000 });
+    expect(rel.status).toBe(503);
+    expect(rel.body.code).toBe(SPEND_CODES.sendInFlight);
+    const byTx = await call(sg, '/settle-by-tx', { txId: 'SENT', outcome: 'released', now: T0 + 1000 });
+    expect(byTx.body.code).toBe(SPEND_CODES.sendInFlight);
+    expect((await status(sg)).ledger.pending).toBe('10');
+    // `spent` is never blocked by the lease (money that landed is money).
+    // A wrong token clears nothing; the right one does; then release passes.
+    expect((await call(sg, '/send-done', { txId: 'SENT', sendToken: 'nope' })).body.cleared).toBe(false);
+    expect((await call(sg, '/send-done', { txId: 'SENT', sendToken })).body.cleared).toBe(true);
+    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 2000 })).body).toMatchObject({ state: 'released' });
+    expect((await status(sg)).ledger.pending).toBe('0');
+  });
+
+  it('a repeat permit-send within the lease keeps the SAME lease; a crashed sender\'s lease expires after SEND_LEASE_MS and the release goes through', async () => {
+    const sg = await initialized(fresh('sendlease2'));
+    await credit(sg, 'D', '1000', 2000);
+    const q = await quote(sg, 100, '10');
+    await call(sg, '/prepare', { spendKey: 'k', reward: '10', revision: 0, quoteId: q, bytes: 100, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'k', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: T0 });
+    const first = await call(sg, '/permit-send', { txId: 'SENT2', kind: 'upload', cycle: 1, spendKey: 'k', now: T0 });
+    const again = await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: T0 + 5000 });
+    expect(again.body.sendToken).toBe(first.body.sendToken); // the same in-flight send, no second lease
+    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + SEND_LEASE_MS - 1 })).body.code).toBe(SPEND_CODES.sendInFlight);
+    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + SEND_LEASE_MS + 1 })).body).toMatchObject({ state: 'released' });
+    // …and once released, the permit is refused to everyone (the earlier rule).
+    expect((await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: T0 + SEND_LEASE_MS + 2 })).body.code).toBe(SPEND_CODES.reservationReleased);
   });
 });
 

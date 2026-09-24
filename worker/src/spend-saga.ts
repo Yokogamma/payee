@@ -131,12 +131,28 @@ export async function activateSpend(
  *  «abort before send» branch). Best effort: a `prepared` one cannot be
  *  settled (its lease expires), an `active` one goes `released`; a refusal is
  *  logged and never changes the answer. */
-export async function releaseSpend(guard: DurableObjectStub, spendKey: string): Promise<void> {
+export type ReleaseResult = 'released' | 'in_flight' | 'terminal' | 'unavailable';
+
+export async function releaseSpend(guard: DurableObjectStub, spendKey: string): Promise<ReleaseResult> {
   const r = await guardPost(guard, '/settle', { spendKey, outcome: 'released' });
-  if (!isOk(r)) console.error('SPEND_RELEASE_NOT_APPLIED', spendKey.slice(-36), why(r));
+  if (isOk(r)) return 'released';
+  if ('unavailable' in r) return 'unavailable';
+  if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
+  if (r.status === 404 || r.status === 409) return 'terminal';
+  console.error('SPEND_RELEASE_NOT_APPLIED', spendKey.slice(-36), why(r));
+  return 'unavailable';
 }
 
-export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'refused' | 'unavailable';
+/**
+ * `settled` / `noop` — the guard applied or already held this outcome;
+ * `unknown` — no permit names this txId (a pre-D10 publication);
+ * `terminal_refusal` — the lattice refused for good (409: `spent_is_final`,
+ * `never_activated`, …; 400: a marker permit);
+ * `retry` — the guard did not answer, or refused for now (503: unavailable,
+ * `spend_send_in_flight`). Only the first three kinds and `terminal_refusal`
+ * end a money-reconciliation entry (review 24.09 #3, high 2).
+ */
+export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'terminal_refusal' | 'retry';
 
 /** Reconcile a reservation by the txId its permit named (§7 via `permit:<txId>`):
  *  the recheck path knows the txId, not the spendKey. Best effort — the
@@ -147,10 +163,12 @@ export async function settleByTx(
   args: { txId: string; outcome: 'spent' | 'released'; height?: number },
 ): Promise<SettleByTxResult> {
   const r = await guardPost(guard, '/settle-by-tx', { txId: args.txId, outcome: args.outcome, ...(args.height !== undefined ? { height: args.height } : {}) });
-  if ('unavailable' in r) return 'unavailable';
+  if ('unavailable' in r) return 'retry';
   if (r.status === 404) return 'unknown';
-  if (!isOk(r)) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'refused'; }
-  return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (r.status === 409 || r.status === 400) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'terminal_refusal'; }
+  console.error('SPEND_SETTLE_BY_TX_RETRY', args.txId, args.outcome, why(r));
+  return 'retry';
 }
 
 // ─── §3.4 balance detector ──────────────────────────────────────────────

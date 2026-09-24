@@ -21,7 +21,7 @@
  */
 
 import {
-  PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES,
+  PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SEND_LEASE_MS, SPEND_CODES,
   activateOutcome, addToBucket, available, creditDeposit, initTransition, permitDecision, prepareDecision,
   reinit, settle, spentLast24h,
   type CycleLedger, type FreezeState, type InitEvent, type InitRecord, type PermitKind, type PermitRecord,
@@ -33,6 +33,9 @@ import {
 interface StoredLedger { cycle: number; hInit: number | null; deposits: string; spent: string; pending: string }
 interface StoredReservation extends Omit<Reservation, 'reward'> {
   reward: string; quoteId?: string; leaseUntil?: number;
+  /** The txId whose permit names this reservation (set at permit-send) — the
+   *  reverse link `released` needs to see the send lease. */
+  permitTxId?: string;
   /** Cycle the reservation was CREATED in. */
   cycle: number;
   /** Cycle whose ledger the spending was BOOKED into at `settle('spent')` —
@@ -128,6 +131,7 @@ export class SpendGuard implements DurableObject {
     const now = typeof body.now === 'number' ? body.now : Date.now();
     switch (path) {
       case '/permit-send': return this.permitSend(body, now);
+      case '/send-done': return this.sendDone(body);
       case '/freeze': return this.freeze(body, now);
       case '/init-legacy': return this.initLegacy(body, now);
       // The two questions the closure of the legacy set asks the DO (§4.0
@@ -208,11 +212,35 @@ export class SpendGuard implements DurableObject {
         { txId, kind, cycle, spendKey: typeof body.spendKey === 'string' ? body.spendKey : undefined },
       );
       if (!decision.granted) return refuse(decision.code, 503);
-      if (!decision.existing) {
-        await txn.put<PermitRecord>(K.permit(txId), decision.permit);
-        await this.audit(txn, 'permit', { txId, kind, cycle });
+      // The permit is a LEASE on the money: from here until `/send-done` (or
+      // SEND_LEASE_MS) the reservation cannot be released — a sender whose
+      // answer is slow and a releaser deciding the redrop cannot both win.
+      const sending = decision.existing && decision.permit.sending && now - decision.permit.sending.since < SEND_LEASE_MS
+        ? decision.permit.sending
+        : { token: crypto.randomUUID(), since: now };
+      const permit: PermitRecord = { ...decision.permit, sending };
+      await txn.put<PermitRecord>(K.permit(txId), permit);
+      if (decision.permit.spendKey) {
+        const res = await txn.get<StoredReservation>(K.res(decision.permit.spendKey));
+        if (res && res.permitTxId !== txId) await txn.put<StoredReservation>(K.res(decision.permit.spendKey), { ...res, permitTxId: txId });
       }
-      return okJson({ granted: true, existing: decision.existing, permit: decision.permit });
+      if (!decision.existing) await this.audit(txn, 'permit', { txId, kind, cycle });
+      return okJson({ granted: true, existing: decision.existing, permit, sendToken: sending.token });
+    });
+  }
+
+  /** The sender reports the end of its POST (any outcome): the lease is
+   *  cleared under the token it was handed. Idempotent. */
+  private async sendDone(body: Record<string, unknown>): Promise<Response> {
+    const txId = String(body.txId ?? ''); const token = String(body.sendToken ?? '');
+    if (!txId || !token) return new Response('bad request', { status: 400 });
+    return this.state.storage.transaction(async (txn) => {
+      const permit = await txn.get<PermitRecord>(K.permit(txId));
+      if (!permit) return new Response('unknown permit', { status: 404 });
+      if (!permit.sending || permit.sending.token !== token) return okJson({ cleared: false });
+      const { sending: _s, ...rest } = permit; void _s;
+      await txn.put<PermitRecord>(K.permit(txId), rest);
+      return okJson({ cleared: true });
     });
   }
 
@@ -571,6 +599,14 @@ export class SpendGuard implements DurableObject {
     {
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
       if (!existing) return new Response('unknown reservation', { status: 404 });
+      // `released` under a live send lease is refused: the bytes may be on
+      // their way to the network right now (review 24.09 #3, high 1).
+      if (outcome === 'released' && existing.state === 'active' && existing.permitTxId) {
+        const permit = await txn.get<PermitRecord>(K.permit(existing.permitTxId));
+        if (permit?.sending && now - permit.sending.since < SEND_LEASE_MS) {
+          return refuse(SPEND_CODES.sendInFlight, 503, { txId: existing.permitTxId, since: permit.sending.since });
+        }
+      }
       const r = settle({ state: existing.state, reward: BigInt(existing.reward), revision: existing.revision, activatedBy: existing.activatedBy }, outcome);
       if (!r.ok) return refuse(SPEND_CODES.activateConflict, 409, { reason: r.reason, state: existing.state });
       const ledger = await this.getLedger(txn);
