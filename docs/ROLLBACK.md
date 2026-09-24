@@ -318,8 +318,10 @@ heuristic are retired: the boolean, once exported, silently authorized the
 next, different target, and the heuristic was fail-open —
 `staging.evil.example` matched it.)
 
-Every staging command (`deploy:staging`, `deploy:staging:check`) is gated by
-`npm run check:staging-config`, which fails with the checklist above while the
+`deploy:staging` is gated (its `predeploy` hook) by
+`npm run check:staging-config`; `deploy:staging:check` is a bare
+`wrangler deploy --env staging --dry-run` and runs no gate — treat it as a
+bundle check, not an admission. The gate fails with the checklist above while the
 KV placeholder is still in `wrangler.toml`.
 
 ### The floor as a gate, not a discipline (D2a)
@@ -2122,12 +2124,14 @@ exception. `UPLOADS_ENABLED = "false"` remains the global lever (a deploy).
 - After the writer: the reader is the hard floor (plan «Rollback floor —
   reader-before-writer»).
 
-### Not in this release
+### The operator map ships WITH this release
 
-The operator map (`STATUS_OPERATORS`, plan D11 / PR-4 #209): until it merges,
-every status origin counts as its own operator in the money quorum — two
-origins of one operator would be two voices. Documented in the plan block;
-the wiring is a small follow-up after #209.
+`STATUS_OPERATORS` (plan D11 / PR-4 #209, wired on the worker by #218 — a
+mandatory condition of the reader release, review 2026-09-25): every money
+quorum counts OPERATORS, two origins of one operator are one voice, an
+origin missing from the map is no voice. See «`STATUS_OPERATORS` — the
+operator map» above; the parser and the pin are shared with #209 byte for
+byte, so #218 is merged after #209.
 
 ## PR-2 «Метрики» — transport adapter + Analytics Engine (worker-only)
 
