@@ -46,12 +46,18 @@ import {
   type FreezeState, type InitRecord, type SpendCode, type SpendLimits,
 } from './spend-ledger';
 import { permittedPost } from './spend-send';
+import {
+  closeLegacySet as closeLegacySetReal,
+  type CloseLegacySetContext, type LegacyClosure, type LegacyClosureEnv, type LegacyItem,
+} from './legacy-closure';
+
+export type { CloseLegacySetContext, LegacyClosure, LegacyItem };
 
 // ─── Env ────────────────────────────────────────────────────────────────
 
 /** The slice of the worker `Env` this module reads (structural — the
  *  worker's `Env` satisfies it). */
-export interface SpendAdminEnv extends MetricsEnv {
+export interface SpendAdminEnv extends MetricsEnv, LegacyClosureEnv {
   SPEND_GUARD: DurableObjectNamespace;
   /** The ONLY key to `/admin/spend/*` (spec §1). */
   SPEND_ADMIN_SECRET?: string;
@@ -75,7 +81,7 @@ const ADMIN_BODY_CAP_BYTES = 4096;
 export const MARKER_DEAD_AGE_MS = 30 * 60_000;
 
 export const SPEND_ADMIN_PREFIX = '/admin/spend/';
-export const SPEND_ADMIN_OPS = ['freeze', 'init', 'reinit', 'credit-deposit', 'status'] as const;
+export const SPEND_ADMIN_OPS = ['freeze', 'init', 'reinit', 'credit-deposit', 'status', 'init-legacy-keys'] as const;
 export type SpendAdminOp = (typeof SPEND_ADMIN_OPS)[number];
 export const SPEND_ADMIN_PATHS = SPEND_ADMIN_OPS.map(op => `${SPEND_ADMIN_PREFIX}${op}`);
 
@@ -94,20 +100,6 @@ export function spendLimitsWire(l: SpendLimits): { walletFloor: string; windowCa
 
 // ─── Dependencies ───────────────────────────────────────────────────────
 
-export interface LegacyItem { txId: string; reward: string; source: 'permit' | 'journal' }
-
-/** What the closure of the legacy set (§4.0 п. 2–5) found. */
-export type LegacyClosure =
-  | { kind: 'closed'; items: readonly LegacyItem[] }
-  | { kind: 'open'; code: typeof SPEND_CODES.initLegacyOpen | typeof SPEND_CODES.initLegacyRewardUnknown | typeof SPEND_CODES.initKeysUnknown };
-
-export interface CloseLegacySetContext {
-  env: SpendAdminEnv;
-  emit: Emit;
-  walletAddress: string;
-  cycle: number;
-}
-
 export interface SpendAdminDeps {
   /** Enumerates and prices the transactions that may still be mined after the
    *  marker. Refuses (`open`) rather than guesses. */
@@ -119,16 +111,20 @@ export interface SpendAdminDeps {
   now: () => number;
 }
 
-/** The production default until the reader release carries the closure: the
- *  set is UNKNOWN, so `init` is refused. Not a stub that says «closed». */
-export const closeLegacySetNotCarried: SpendAdminDeps['closeLegacySet'] = async () =>
-  ({ kind: 'open', code: SPEND_CODES.initLegacyOpen });
+/** The closure of the legacy set (legacy-closure.ts), under the handler's
+ *  operator map and clock. */
+export const closeLegacySetDefault: SpendAdminDeps['closeLegacySet'] = ctx => closeLegacySetReal(ctx, { operatorOf: DEFAULT_OPERATOR_OF, now: () => Date.now() });
+const DEFAULT_OPERATOR_OF = (origin: string) => origin;
 
 export const DEFAULT_SPEND_ADMIN_DEPS: SpendAdminDeps = {
-  closeLegacySet: closeLegacySetNotCarried,
-  operatorOf: origin => origin,
+  closeLegacySet: closeLegacySetDefault,
+  operatorOf: DEFAULT_OPERATOR_OF,
   now: () => Date.now(),
 };
+
+/** Held legacy items resolved per `init` call in `done` (§4.0 п. 6) —
+ *  bounded by the subrequest budget (each item probes the status pool). */
+export const LEGACY_RESOLVE_BATCH = 20;
 
 // ─── Answers ────────────────────────────────────────────────────────────
 
@@ -238,6 +234,7 @@ export function createSpendAdminHandler(deps: SpendAdminDeps = DEFAULT_SPEND_ADM
       case 'reinit': return handleReinit(guard);
       case 'credit-deposit': return handleCreditDeposit(guard, env, body, emit, deps);
       case 'init': return handleInit(guard, env, emit, deps);
+      case 'init-legacy-keys': return handleInitLegacyKeys(guard, body);
     }
   };
 }
@@ -264,6 +261,17 @@ async function handleStatus(guard: DurableObjectStub, env: SpendAdminEnv): Promi
     walletAddress,
     statusOrigins: statusOrigins(env),
   });
+}
+
+/** §4.0 п. 2: keys the operator recovered from KV / backups, and the count of
+ *  old-format invites acknowledged as covered by them. */
+async function handleInitLegacyKeys(guard: DurableObjectStub, body: Record<string, unknown>): Promise<Response> {
+  if (body.publicKeys !== undefined && !Array.isArray(body.publicKeys)) return refuse(400, 'invalid_body', '`publicKeys` must be an array');
+  if (body.acknowledgeLegacyInvites !== undefined && (typeof body.acknowledgeLegacyInvites !== 'number' || !Number.isInteger(body.acknowledgeLegacyInvites) || body.acknowledgeLegacyInvites < 0)) {
+    return refuse(400, 'invalid_body', '`acknowledgeLegacyInvites` must be a non-negative integer');
+  }
+  const r = await guardCall(guard, '/legacy-keys-set', { keys: body.publicKeys ?? [], acknowledgeLegacyInvites: body.acknowledgeLegacyInvites ?? 0 });
+  return passRefusal(r, 'legacy-keys') ?? answer(200, { ok: true, legacyKeys: stripOk((r as { body: GuardBody }).body) });
 }
 
 async function handleReinit(guard: DurableObjectStub): Promise<Response> {
@@ -380,7 +388,7 @@ async function handleInit(guard: DurableObjectStub, env: SpendAdminEnv, emit: Em
     let step: InitStep;
     switch (record.state) {
       case 'done':
-        return answer(200, { ok: true, step: 'done', init: publicInit(record) });
+        return answer(200, { ok: true, step: 'done', init: publicInit(record), legacy: await resolveHeldLegacy(guard, env, emit, deps, record) });
       case 'none':
       case 'signing':
         step = await stepSign(guard, env, emit, deps, view.freeze, record, transport);
@@ -430,11 +438,12 @@ async function stepSign(
 
   // §4.0 п. 5: the legacy set must be closed BEFORE a marker is begun.
   const closure = await deps.closeLegacySet({ env, emit, walletAddress, cycle: record.cycle });
-  if (closure.kind === 'open') return { done: refuse(503, closure.code, 'The legacy set is not closed', { step: 'closure' }) };
+  if (closure.kind === 'open') return { done: refuse(503, closure.code, 'The legacy set is not closed', { step: 'closure', ...(closure.detail ?? {}) }) };
   if (closure.items.length > 0) {
-    const reg = await guardCall(guard, '/init-legacy', { items: closure.items });
+    const reg = await guardCall(guard, '/init-legacy', { items: closure.items, now: deps.now() });
     const refused = passRefusal(reg, 'init-legacy');
     if (refused) return { done: refused };
+    emit('legacy_held_registered', [], [closure.items.length]);
   }
 
   // Anchor and price BEFORE `begin`: nothing durable is touched until we know
@@ -510,6 +519,31 @@ async function markDead(guard: DurableObjectStub, emit: Emit, deps: SpendAdminDe
   if (refused) return { done: refused };
   emit('init_state', ['dead'], []);
   return { done: answer(200, { ok: true, step: 'dead', init: publicInit((dead as { body: GuardBody }).body.init as InitRecord), note: 'marker dead past the age guard; call init again to sign a new one' }) };
+}
+
+/**
+ * §4.0 п. 6 — what becomes of the held legacy transactions once the cycle is
+ * `done`: a money quorum above `h_init` → `spent` in this cycle; at or below
+ * → `dropped` (the pre-marker reserve); unanimous `dead` past the age guard
+ * (from the registration) → `dropped`; anything else stays held, no TTL.
+ * Run on every `init` in `done` (the operator's lever), bounded per call.
+ */
+async function resolveHeldLegacy(guard: DurableObjectStub, env: SpendAdminEnv, emit: Emit, deps: SpendAdminDeps, record: InitRecord): Promise<Record<string, unknown>> {
+  const list = await guardCall(guard, '/legacy-list', {});
+  if ('unavailable' in list) return { error: 'unavailable' };
+  const held = ((list.body.items as Array<{ txId: string; state: string; registeredAt?: number }> | undefined) ?? []).filter(i => i.state === 'held');
+  const out = { held: held.length, spent: 0, dropped: 0, kept: 0, batch: LEGACY_RESOLVE_BATCH };
+  if (record.hInit === undefined) return out;
+  for (const item of held.slice(0, LEGACY_RESOLVE_BATCH)) {
+    const { quorum, verdict } = await markerQuorum(env, emit, deps, item.txId);
+    let outcome: 'spent' | 'dropped' | null = null;
+    if (quorum.ok) outcome = quorum.height > record.hInit ? 'spent' : 'dropped';
+    else if (verdict.kind === 'dead' && typeof item.registeredAt === 'number' && deps.now() - item.registeredAt > MARKER_DEAD_AGE_MS) outcome = 'dropped';
+    if (outcome === null) { out.kept++; continue; }
+    const r = await guardCall(guard, '/legacy-resolve', { txId: item.txId, outcome, now: deps.now() });
+    if (passRefusal(r, 'legacy-resolve') === null) { out[outcome]++; emit('legacy_resolved', [outcome], []); } else out.kept++;
+  }
+  return out;
 }
 
 function pastAgeGuard(record: InitRecord, now: number): boolean {

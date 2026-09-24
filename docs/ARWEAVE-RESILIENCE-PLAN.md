@@ -1884,6 +1884,31 @@ Reader-релиз этим не блокируется: он не создаёт
   `registeredAt` → `dropped`, иначе `held` (без TTL); ответ `legacy:
   { held, spent, dropped, kept }`.
 
+**Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
+ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**
+
+- `worker/src/legacy-closure.ts` — `closeLegacySet`: (1) ключи — `InviteManager
+  /list-keys` (публичные ключи всех использованных `invite:*`, включая
+  отозванные, ∪ живые `pk:*`; инвайты старого формата без ключа считаются
+  `unknownLegacyInvites`) ∪ ключи, зарегистрированные оператором
+  (`/admin/spend/init-legacy-keys { publicKeys, acknowledgeLegacyInvites }`,
+  durable в `SpendGuard`); `unknownLegacyInvites > acknowledged` →
+  `503 spend_init_keys_unknown`; (2) `L₁` — `SpendGuard /open-permits`: разрешения
+  (не маркер) без терминального исхода резервации, награда — из резервации;
+  (3) `L₂` — журналы `/ops` каждого ключа за глубину хранения журнала: `posting`,
+  `finished` с `paidResult unknown`, `finished(accepted)` без денежного кворума
+  (`moneyQuorum` по пулу статусов); (4) награда `L₂` — только из заголовка
+  `/tx/<id>` у payload-origin, проверенного `verifyHeader` (равенство id,
+  подпись RSA-PSS, владелец из `TRUSTED_OWNERS`); недоступно у всех →
+  `503 spend_init_legacy_reward_unknown { txId }`; (5) уже зарегистрированные
+  (`/legacy-list`) не возвращаются — повторный вызов идемпотентен. Регистрация
+  — `/init-legacy` с `registeredAt`.
+- Разрешение удержанных после `done` (§4.0 п. 6) — на каждом `init` в
+  состоянии `done` (рычаг оператора), пачкой ≤ 20: денежный кворум выше
+  `h_init` → `spent`, на/ниже → `dropped`, unanimous `dead` старше 30 мин от
+  `registeredAt` → `dropped`, иначе `held` (без TTL); ответ `legacy:
+  { held, spent, dropped, kept }`.
+
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 
 Старый Worker не знает статус `signed`: `check-and-reserve` примет его как
