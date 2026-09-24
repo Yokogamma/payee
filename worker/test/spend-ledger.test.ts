@@ -42,10 +42,21 @@ describe('§3 ledger — available = deposits − spent − pending, never a gat
 });
 
 describe('§3/§4.4 the 24 h window is cross-cycle', () => {
-  it('sums only the buckets inside the window and survives reinit by construction', () => {
+  it('counts the bucket straddling the window start IN FULL (conservative), drops older ones', () => {
+    // Review 24.09 (high): a spend at 10:59 must still count at 10:01 the
+    // next day (23 h 02 min later); hour buckets cannot locate it inside the
+    // hour, so the whole boundary bucket counts.
+    const now = 100 * HOUR_MS + 60_000;                                        // «10:01»
+    let b = addToBucket(new Map(), now - SPEND_WINDOW_MS + 58 * 60_000, 500n); // «10:59» the day before: 23 h 02 min ago → boundary bucket, COUNTS
+    b = addToBucket(b, now - SPEND_WINDOW_MS - 2 * 60_000, 900n);              // «09:59» the day before: 24 h 02 min ago → one bucket older → dropped
+    b = addToBucket(b, now, 200n);
+    expect(spentLast24h(b, now)).toBe(700n);
+  });
+
+  it('survives reinit by construction: the cap still bites after a fresh cycle', () => {
     const now = 100 * HOUR_MS;
-    let b = addToBucket(new Map(), now - SPEND_WINDOW_MS - HOUR_MS, 500n); // just outside
-    b = addToBucket(b, now - SPEND_WINDOW_MS + HOUR_MS, 300n);              // inside
+    let b = addToBucket(new Map(), now - SPEND_WINDOW_MS - 2 * HOUR_MS, 500n); // outside even conservatively
+    b = addToBucket(b, now - SPEND_WINDOW_MS + HOUR_MS, 300n);                // inside
     b = addToBucket(b, now, 200n);
     expect(spentLast24h(b, now)).toBe(500n);
     // A fresh cycle changes nothing about the buckets: the cap still bites.
@@ -138,10 +149,21 @@ describe('§4.0 permit barrier and the freeze exception', () => {
     expect(permit(thawed, done, 'marker', 'M', 2)).toEqual({ granted: false, code: SPEND_CODES.notInitialized });
   });
 
-  it('an existing permit is returned as-is: resend never double-counts', () => {
+  it('an existing permit is returned as-is when thawed: resend never double-counts', () => {
     const existing = { txId: 'T', kind: 'upload' as const, cycle: 1, issuedAt: 1 };
-    const out = permitDecision({ freeze: frozen, init: done, existing, now: 9 }, { txId: 'T', kind: 'resend', cycle: 1 });
+    const out = permitDecision({ freeze: thawed, init: done, existing, now: 9 }, { txId: 'T', kind: 'resend', cycle: 1 });
     expect(out).toEqual({ granted: true, permit: existing, existing: true });
+  });
+
+  it('review 24.09 (high): an existing permit does NOT bypass the freeze — sent, answer lost, freeze, resend → refused; the permit itself is not the decision', () => {
+    const existing = { txId: 'T', kind: 'upload' as const, cycle: 1, issuedAt: 1 };
+    expect(permitDecision({ freeze: frozen, init: done, existing, now: 9 }, { txId: 'T', kind: 'resend', cycle: 1 }))
+      .toEqual({ granted: false, code: SPEND_CODES.frozen });
+    // The one exception survives: the current cycle's durable marker, even on a repeat.
+    const signedMarker = init({ state: 'signed', txId: 'M', token: 't', attempts: 1 });
+    const markerPermit = { txId: 'M', kind: 'marker' as const, cycle: 1, issuedAt: 1 };
+    expect(permitDecision({ freeze: frozen, init: signedMarker, existing: markerPermit, now: 9 }, { txId: 'M', kind: 'marker', cycle: 1 }))
+      .toEqual({ granted: true, permit: markerPermit, existing: true });
   });
 
   it('refusal branch (review #9 H3): abort only for a provably unsent operation', () => {
@@ -196,6 +218,11 @@ describe('§6 activate table', () => {
     expect(activateOutcome({ state: 'spent', reward: 10n, revision: 3, activatedBy: 'w1' }, req)).toBe('terminal-noop');
     expect(activateOutcome({ state: 'active', reward: 10n, revision: 3, activatedBy: 'w2' }, req)).toBe('conflict');
     expect(activateOutcome({ state: 'released', reward: 10n, revision: 3, activatedBy: 'w2' }, req)).toBe('conflict');
+  });
+
+  it('review 24.09 (medium): a released reservation that was NEVER activated (expired lease) is remapped, not a conflict', () => {
+    expect(activateOutcome({ state: 'released', reward: 10n, revision: 3 }, req)).toBe('remap');
+    expect(activateOutcome({ state: 'released', reward: 10n, revision: 3, activatedBy: 'w1' }, req)).toBe('terminal-noop');
   });
 });
 

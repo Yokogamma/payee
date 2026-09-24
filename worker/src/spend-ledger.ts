@@ -84,11 +84,19 @@ export function hourEpoch(nowMs: number): number {
   return Math.floor(nowMs / HOUR_MS);
 }
 
-/** Sum of the buckets inside the sliding 24 h window ending now (§3, §4.4). */
+/**
+ * Sum of the buckets that may hold spending from the last 24 h (§3, §4.4).
+ *
+ * Hour buckets cannot tell WHEN inside the hour a spend happened, so the
+ * bucket that straddles the window's start is counted IN FULL (review 24.09,
+ * high): dropping it would forget a spend made 23 h 02 min ago and let the
+ * sliding cap be exceeded. The price is conservatism — up to one extra hour
+ * of history counts against the cap — which is the safe side for money.
+ */
 export function spentLast24h(buckets: SpendBuckets, nowMs: number): bigint {
   const first = hourEpoch(nowMs - SPEND_WINDOW_MS);
   let sum = 0n;
-  for (const [hour, amount] of buckets) if (hour > first) sum += amount;
+  for (const [hour, amount] of buckets) if (hour >= first) sum += amount;
   return sum;
 }
 
@@ -194,27 +202,28 @@ export type PermitDecision =
 /**
  * The single path to the network (§4.0): decide `permit-send`.
  *
- *  - an existing permit for the txId is returned as-is (resend = same permit,
- *    no double accounting);
  *  - frozen → refused for every kind except the durable MARKER of the current
- *    cycle (`init.state ∈ {signed, posted}`, `txId === init.txId`) — §4.1;
- *  - not frozen → `marker` is allowed only for the current cycle's own txId
- *    (a marker of a foreign cycle is refused), and everything else requires
- *    `init.state === 'done'`.
+ *    cycle (`init.state ∈ {signed, posted}`, `txId === init.txId`) — §4.1.
+ *    This holds for a REPEAT request too (review 24.09, high): a txId that
+ *    already holds a permit — sent, answer lost — is exactly the durable
+ *    recovery §4.0 says must NOT be resent under freeze. The permit record and
+ *    the hold stay; only the answer «go» is withheld;
+ *  - not frozen → an existing permit for the txId is returned as-is (resend =
+ *    same permit, no double accounting); `marker` is allowed only for the
+ *    current cycle's own txId (a marker of a foreign cycle is refused), and
+ *    everything else requires `init.state === 'done'`.
  */
 export function permitDecision(
   ctx: { freeze: FreezeState; init: InitRecord; existing: PermitRecord | undefined; now: number },
   req: { txId: string; kind: PermitKind; cycle: number; spendKey?: string },
 ): PermitDecision {
-  if (ctx.existing !== undefined) return { granted: true, permit: ctx.existing, existing: true };
   const isCurrentMarker = req.kind === 'marker'
     && req.cycle === ctx.init.cycle
     && ctx.init.txId === req.txId
     && (ctx.init.state === 'signed' || ctx.init.state === 'posted');
-  if (req.kind === 'marker' && !isCurrentMarker) {
-    return { granted: false, code: ctx.freeze.active ? SPEND_CODES.frozen : SPEND_CODES.notInitialized };
-  }
   if (ctx.freeze.active && !isCurrentMarker) return { granted: false, code: SPEND_CODES.frozen };
+  if (ctx.existing !== undefined) return { granted: true, permit: ctx.existing, existing: true };
+  if (req.kind === 'marker' && !isCurrentMarker) return { granted: false, code: SPEND_CODES.notInitialized };
   if (!isCurrentMarker && ctx.init.state !== 'done') return { granted: false, code: SPEND_CODES.notInitialized };
   return { granted: true, permit: { txId: req.txId, kind: req.kind, cycle: req.cycle, issuedAt: ctx.now, spendKey: req.spendKey }, existing: false };
 }
@@ -314,8 +323,16 @@ export interface Reservation {
 
 export type ActivateOutcome = 'activate' | 'remap' | 'noop' | 'terminal-noop' | 'conflict';
 
-/** The `activate` table (§6, plan v18/v19). `remap` = the reservation must be
- *  re-prepared under the §5 checks and activated in one step (or refused). */
+/**
+ * The `activate` table (§6, plan v18/v19). `remap` = the reservation must be
+ * re-prepared under the §5 checks and activated in one step (or refused).
+ *
+ * A `released` reservation that was NEVER activated — a `prepared` lease that
+ * expired before the durable signature came back — is not a terminal outcome
+ * of anyone's activation: it is the same case as «record absent», so the
+ * activation re-runs the budget checks (review 24.09, medium). Only a
+ * reservation someone actually activated is terminal, and only for them.
+ */
 export function activateOutcome(
   reservation: Reservation | undefined,
   req: { reward: bigint; revision: number; activatedBy: string },
@@ -327,7 +344,9 @@ export function activateOutcome(
     case 'active':
       return reservation.activatedBy === req.activatedBy ? 'noop' : 'conflict';
     case 'spent':
+      return reservation.activatedBy === req.activatedBy ? 'terminal-noop' : 'conflict';
     case 'released':
+      if (reservation.activatedBy === undefined) return 'remap';
       return reservation.activatedBy === req.activatedBy ? 'terminal-noop' : 'conflict';
   }
 }
