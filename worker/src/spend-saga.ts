@@ -62,7 +62,7 @@ export async function guardPost(guard: DurableObjectStub, path: string, body: Re
 export const SPEND_UPLOAD_CODES: ReadonlySet<string> = new Set([
   SPEND_CODES.guardUnavailable, SPEND_CODES.guardUnconfigured, SPEND_CODES.frozen, SPEND_CODES.notInitialized,
   SPEND_CODES.floor, SPEND_CODES.windowCap, SPEND_CODES.quoteMismatch, SPEND_CODES.ledgerInconsistent,
-  SPEND_CODES.activateConflict, SPEND_CODES.remapRefused,
+  SPEND_CODES.activateConflict, SPEND_CODES.remapRefused, SPEND_CODES.reservationReleased,
 ]);
 
 export interface SpendRefusal { code: string; status: number; unavailable: boolean; detail: Record<string, unknown> }

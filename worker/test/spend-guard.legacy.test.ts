@@ -78,7 +78,7 @@ async function legacyEnv(name: string, wallet: Wallet, extra: Record<string, unk
 }
 
 describe('D10 legacy set L and init preconditions', () => {
-  it('(1)(2) a `posting` record without confirmation and an active permit → both are held from the CLOSURE (journal reward from the verified header, permit reward from the reservation); init passes; available is reduced by the holds', async () => {
+  it('(1)(2) a `posting` record without confirmation is HELD from the closure (reward from the verified header); an active permit is only REPORTED — its money is already the reservation, carried in pending (review #2 H3: never held twice); init passes', async () => {
     const wallet = await freshWallet();
     const { env: e, guard, invites } = await legacyEnv('l12', wallet);
     const key = await registeredKey(invites);
@@ -92,6 +92,8 @@ describe('D10 legacy set L and init preconditions', () => {
     await runInDurableObject(guard.get(guard.idFromName('global')), async (_i, s) => {
       await s.storage.put(`res:${spendKey}`, { state: 'active', reward: '5', revision: 0, activatedBy: '5:0', cycle: 0 });
       await s.storage.put(`permit:${permitTx}`, { txId: permitTx, kind: 'upload', cycle: 0, issuedAt: 1, spendKey });
+      // …carried into the new cycle's pending by reinit (what the ledger holds).
+      await s.storage.put('ledger', { cycle: 1, hInit: null, deposits: '0', spent: '0', pending: '5' });
     });
     headerAt('https://arweave.net', tx.txId, 200, tx.header);
     markerMocks(mockRoute, { price: '3' });
@@ -99,11 +101,72 @@ describe('D10 legacy set L and init preconditions', () => {
     expect(r.status, JSON.stringify(r.body)).toBe(200);
     expect(r.body.init).toMatchObject({ state: 'posted' });
     const list = await guardCall(guard, '/legacy-list');
-    expect((list.body.items as Array<{ txId: string; reward: string; source: string; state: string }>).sort((a, b) => a.txId.localeCompare(b.txId))).toEqual([
-      { txId: permitTx, reward: '5', source: 'permit', state: 'held', registeredAt: expect.any(Number) },
-      { txId: tx.txId, reward: '20', source: 'journal', state: 'held', registeredAt: expect.any(Number) },
-    ].sort((a, b) => a.txId.localeCompare(b.txId)));
-    expect((await guardStatus(guard)).ledger.pending).toBe('25'); // 20 (journal) + 5 (permit) held
+    expect(list.body.items).toEqual([{ txId: tx.txId, reward: '20', source: 'journal', state: 'held', registeredAt: expect.any(Number) }]);
+    // The permit's 5 is still the reservation's — reported by /open-permits, counted ONCE.
+    expect(((await guardCall(guard, '/open-permits')).body.items as Array<{ txId: string }>).map(i => i.txId)).toEqual([permitTx]);
+    expect((await guardStatus(guard)).ledger.pending).toBe('25'); // 5 (the carried reservation) + 20 (the journal hold)
+  });
+
+  it('(H3) an active reservation carried by reinit is settled ONCE: the closure holds nothing for it, and a later confirmed quorum spends exactly its reward', async () => {
+    const wallet = await freshWallet();
+    const { env: e, guard, invites } = await legacyEnv('l-h3', wallet);
+    await registeredKey(invites); // a key with an empty journal
+    // Cycle 1 done, one reservation activated and permitted, then reinit.
+    const initHandler = handlerWith({ closeLegacySet: async () => ({ kind: 'closed', items: [], scanned: { keys: 0, permits: 0, journal: 0 } }) });
+    markerMocks(mockRoute, { price: '3' });
+    const first = await viaHandler(initHandler, 'init', e);
+    confirmedAll(mockRoute, first.body.init!.txId!, [1000, 1001]);
+    expect((await viaHandler(initHandler, 'init', e)).body.step).toBe('done');
+    expect((await viaHandler(initHandler, 'freeze', e, { active: false })).status).toBe(200);
+    await guardCall(guard, '/credit-deposit', { txId: 'D'.repeat(43), amount: '100', depositHeight: 2000 });
+    const key = 'k'.repeat(64) + ':note:g1';
+    const q = await guardCall(guard, '/refresh-price', { bytes: 100, reward: '10' });
+    expect((await guardCall(guard, '/prepare', { spendKey: key, reward: '10', revision: 0, quoteId: q.body.quoteId, bytes: 100, limits: { walletFloor: '0', windowCap: '1000000', maxTxReward: '1000' } })).status).toBe(200);
+    await guardCall(guard, '/activate', { spendKey: key, reward: '10', revision: 0, activatedBy: '10:0' });
+    const txId = 'T'.repeat(43);
+    expect((await guardCall(guard, '/permit-send', { txId, kind: 'upload', cycle: 1, spendKey: key })).status).toBe(200);
+    await guardCall(guard, '/freeze', { active: true });
+    expect((await guardCall(guard, '/reinit', {})).body).toMatchObject({ archivedCycle: 1, cycle: 2, carriedActive: '10' });
+    expect((await guardStatus(guard)).ledger.pending).toBe('10');
+    // The PRODUCTION closure on cycle 2: the permit is reported, nothing is held.
+    markerMocks(mockRoute, { price: '3' });
+    const r = await viaWorker('init', e);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect((await guardCall(guard, '/legacy-list')).body.items).toEqual([]);
+    expect((await guardStatus(guard)).ledger.pending).toBe('10'); // not 20
+    confirmedAll(mockRoute, r.body.init!.txId!, [3000, 3001]);
+    expect((await viaWorker('init', e)).body.step).toBe('done');
+    // One settle, one spend.
+    expect((await guardCall(guard, '/settle-by-tx', { txId, outcome: 'spent', height: 3005 })).body).toMatchObject({ state: 'spent' });
+    const s = await guardStatus(guard);
+    expect(s.ledger).toMatchObject({ spent: '10', pending: '0' });
+    expect((await guardCall(guard, '/settle-by-tx', { txId, outcome: 'spent', height: 3006 })).body).toMatchObject({ state: 'spent', noop: true });
+    expect((await guardStatus(guard)).ledger.spent).toBe('10');
+  });
+
+  it('(H2) an enumeration that fails or answers an incomplete shape keeps the set OPEN — never «closed, nothing to hold»', async () => {
+    const wallet = await freshWallet();
+    const { env: e, invites } = await legacyEnv('l-h2', wallet);
+    await registeredKey(invites);
+    const broken = (body: string, status = 503) => ({
+      idFromName: () => ({}),
+      get: () => ({ fetch: async () => new Response(body, { status }) }),
+    }) as unknown as DurableObjectNamespace;
+    // InviteManager 503 with garbage.
+    let r = await viaWorker('init', { ...e, INVITE_MANAGER: broken('<html>oops') });
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe(SPEND_CODES.initLegacyOpen);
+    expect(String(r.body.reason)).toContain('/list-keys');
+    // InviteManager 200 but no keys[].
+    r = await viaWorker('init', { ...e, INVITE_MANAGER: broken('{"unknownLegacyInvites":0}', 200) });
+    expect(r.body.code).toBe(SPEND_CODES.initLegacyOpen);
+    // The journal answers a page without ops[].
+    r = await viaWorker('init', { ...e, RATE_LIMITER: broken('{"cursor":null}', 200) });
+    expect(r.body.code).toBe(SPEND_CODES.initLegacyOpen);
+    expect(String(r.body.reason)).toContain('/ops');
+    // The journal refuses the range.
+    r = await viaWorker('init', { ...e, RATE_LIMITER: broken('{"ops":[],"cursor":null,"error":"bad_range"}', 200) });
+    expect(r.body.code).toBe(SPEND_CODES.initLegacyOpen);
   });
 
   it('(3) an OLD reward of 20 above the NEW MAX_TX_REWARD of 10 is held at exactly 20 — the ceiling covers new transactions only', async () => {

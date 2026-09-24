@@ -76,10 +76,32 @@ const READ_TIMEOUT_MS = 10_000;
 
 type Body = Record<string, unknown> & { ok?: boolean; error?: string };
 
+/** A DO answer, or a typed failure. NEVER an empty default: a 503, a
+ *  non-JSON body or a missing field must keep the closure OPEN (review 24.09
+ *  #2, high 2 — an enumeration error is not «nothing to hold»). */
+class ClosureFailure extends Error {
+  constructor(public readonly where: string, message: string) { super(`${where}: ${message}`); }
+}
 async function doPost(ns: DurableObjectNamespace, name: string, path: string, body: Record<string, unknown> = {}): Promise<Body> {
-  const res = await ns.get(ns.idFromName(name)).fetch(`http://internal${path}`, { method: 'POST', body: JSON.stringify(body) });
+  let res: Response;
+  try {
+    res = await ns.get(ns.idFromName(name)).fetch(`http://internal${path}`, { method: 'POST', body: JSON.stringify(body) });
+  } catch (e) {
+    throw new ClosureFailure(path, `unreachable: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (res.status < 200 || res.status >= 300) throw new ClosureFailure(path, `HTTP ${res.status}`);
   const text = await res.text();
-  try { return JSON.parse(text) as Body; } catch { return { ok: false, error: text }; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { throw new ClosureFailure(path, 'not JSON'); }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new ClosureFailure(path, 'not an object');
+  return parsed as Body;
+}
+function requireArray(b: Body, field: string, where: string): unknown[] {
+  if (!Array.isArray(b[field])) throw new ClosureFailure(where, `missing ${field}[]`);
+  return b[field] as unknown[];
+}
+function requireOk(b: Body, where: string): void {
+  if (b.ok !== true) throw new ClosureFailure(where, `ok !== true (${typeof b.code === 'string' ? b.code : 'no code'})`);
 }
 
 function payloadOrigins(env: LegacyClosureEnv): string[] {
@@ -119,12 +141,14 @@ export async function readVerifiedReward(env: LegacyClosureEnv, txId: string, tr
   return null;
 }
 
-/** Every key that ever held access, and how many old-format invites hide one. */
+/** Every key that ever held access, and how many old-format invites hide one.
+ *  Throws `ClosureFailure` on any incomplete answer. */
 export async function listHistoricalKeys(env: LegacyClosureEnv): Promise<{ keys: string[]; unknownLegacyInvites: number }> {
   const b = await doPost(env.INVITE_MANAGER, 'global', '/list-keys');
-  const keys = Array.isArray(b.keys) ? (b.keys as unknown[]).filter((k): k is string => typeof k === 'string') : [];
-  const unknownLegacyInvites = typeof b.unknownLegacyInvites === 'number' ? b.unknownLegacyInvites : 0;
-  return { keys, unknownLegacyInvites };
+  const raw = requireArray(b, 'keys', '/list-keys');
+  if (!raw.every(k => typeof k === 'string')) throw new ClosureFailure('/list-keys', 'keys[] holds a non-string');
+  if (typeof b.unknownLegacyInvites !== 'number' || !Number.isInteger(b.unknownLegacyInvites) || b.unknownLegacyInvites < 0) throw new ClosureFailure('/list-keys', 'unknownLegacyInvites missing');
+  return { keys: raw as string[], unknownLegacyInvites: b.unknownLegacyInvites };
 }
 
 /** The journal candidates of ONE key: `posting`, `unknown`, and `accepted`
@@ -137,7 +161,9 @@ export async function journalCandidates(env: LegacyClosureEnv, key: string, now:
     let cursor: string | undefined;
     for (;;) {
       const page = await doPost(env.RATE_LIMITER, key, '/ops', { from, to, limit: OPS_PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
-      const ops = Array.isArray(page.ops) ? (page.ops as OpProjection[]) : [];
+      if (typeof page.error === 'string') throw new ClosureFailure('/ops', page.error);
+      const ops = requireArray(page, 'ops', '/ops') as OpProjection[];
+      if (page.cursor !== null && typeof page.cursor !== 'string') throw new ClosureFailure('/ops', 'cursor is neither string nor null');
       for (const op of ops) {
         if (typeof op.txId !== 'string') continue;
         if (op.status === 'posting') certain.add(op.txId);
@@ -152,11 +178,31 @@ export async function journalCandidates(env: LegacyClosureEnv, key: string, now:
 }
 
 /**
- * The closure (§4.0 п. 2–5). Refuses rather than guesses: unknown keys,
- * or a single reward that cannot be read from verified bytes, leave the set
- * OPEN. Idempotent: items already registered in the guard are not returned.
+ * The closure (§4.0 п. 2–5). Refuses rather than guesses: unknown keys, a
+ * single reward that cannot be read from verified bytes, or ANY failed or
+ * incomplete enumeration leave the set OPEN. Idempotent: items already
+ * registered in the guard are not returned.
+ *
+ * Permits (L₁) are REPORTED, never registered (review 24.09 #2, high 3): the
+ * money of a permitted txId is already held in the guard as its `active`
+ * reservation (carried across `reinit` into the new pending), and it is
+ * settled through that reservation — a second hold under `legacy:<txId>`
+ * would count the same reward twice. The set is closed by construction for
+ * them; only the journals' pre-D10 transactions need a hold.
  */
 export async function closeLegacySet(ctx: CloseLegacySetContext, deps: LegacyClosureDeps = { operatorOf: o => o, now: () => Date.now() }): Promise<LegacyClosure> {
+  try {
+    return await closeLegacySetStrict(ctx, deps);
+  } catch (e) {
+    if (e instanceof ClosureFailure) {
+      ctx.emit('legacy_closure_failed', [e.where], []);
+      return { kind: 'open', code: SPEND_CODES.initLegacyOpen, detail: { reason: e.message } };
+    }
+    throw e;
+  }
+}
+
+async function closeLegacySetStrict(ctx: CloseLegacySetContext, deps: LegacyClosureDeps): Promise<LegacyClosure> {
   const { env, emit } = ctx;
   const now = deps.now();
   let trustedOwners: string[];
@@ -166,27 +212,36 @@ export async function closeLegacySet(ctx: CloseLegacySetContext, deps: LegacyClo
   // ── keys ──
   const historical = await listHistoricalKeys(env);
   const stored = await doPost(env.SPEND_GUARD, 'global', '/legacy-keys');
-  const acknowledged = typeof stored.acknowledgedInvites === 'number' ? stored.acknowledgedInvites : 0;
-  const extraKeys = Array.isArray(stored.keys) ? (stored.keys as unknown[]).filter((k): k is string => typeof k === 'string') : [];
+  requireOk(stored, '/legacy-keys');
+  if (typeof stored.acknowledgedInvites !== 'number') throw new ClosureFailure('/legacy-keys', 'acknowledgedInvites missing');
+  const acknowledged = stored.acknowledgedInvites;
+  const extraKeys = requireArray(stored, 'keys', '/legacy-keys').filter((k): k is string => typeof k === 'string');
   if (historical.unknownLegacyInvites > acknowledged) {
     return { kind: 'open', code: SPEND_CODES.initKeysUnknown, detail: { unknownLegacyInvites: historical.unknownLegacyInvites, acknowledged } };
   }
   const keys = [...new Set([...historical.keys, ...extraKeys])];
 
-  // ── already registered + L₁ ──
+  // ── already registered + L₁ (accounted by their reservations) ──
   const registered = new Set<string>();
   const list = await doPost(env.SPEND_GUARD, 'global', '/legacy-list');
-  for (const it of Array.isArray(list.items) ? (list.items as Array<{ txId?: unknown }>) : []) if (typeof it.txId === 'string') registered.add(it.txId);
+  requireOk(list, '/legacy-list');
+  for (const it of requireArray(list, 'items', '/legacy-list') as Array<{ txId?: unknown }>) {
+    if (typeof it.txId !== 'string') throw new ClosureFailure('/legacy-list', 'item without txId');
+    registered.add(it.txId);
+  }
   const items: LegacyItem[] = [];
   const seen = new Set<string>(registered);
   const permits = await doPost(env.SPEND_GUARD, 'global', '/open-permits');
-  for (const p of Array.isArray(permits.items) ? (permits.items as Array<{ txId?: unknown; reward?: unknown }>) : []) {
-    if (typeof p.txId !== 'string' || seen.has(p.txId)) continue;
-    if (typeof p.reward !== 'string') return { kind: 'open', code: SPEND_CODES.initLegacyRewardUnknown, detail: { txId: p.txId, source: 'permit' } };
-    items.push({ txId: p.txId, reward: p.reward, source: 'permit' });
+  requireOk(permits, '/open-permits');
+  let permitCount = 0;
+  for (const p of requireArray(permits, 'items', '/open-permits') as Array<{ txId?: unknown; reward?: unknown; state?: unknown }>) {
+    if (typeof p.txId !== 'string') throw new ClosureFailure('/open-permits', 'item without txId');
+    // A permit whose reservation is gone has money nobody holds — that is not
+    // a closed set.
+    if (p.reward === null || p.state === null) return { kind: 'open', code: SPEND_CODES.initLegacyRewardUnknown, detail: { txId: p.txId, source: 'permit' } };
     seen.add(p.txId);
+    permitCount++;
   }
-  const permitCount = items.length;
 
   // ── L₂ ──
   const certain = new Set<string>(); const toCheck = new Set<string>();
@@ -208,5 +263,5 @@ export async function closeLegacySet(ctx: CloseLegacySetContext, deps: LegacyClo
     }
     items.push({ txId, reward, source: 'journal' });
   }
-  return { kind: 'closed', items, scanned: { keys: keys.length, permits: permitCount, journal: items.length - permitCount } };
+  return { kind: 'closed', items, scanned: { keys: keys.length, permits: permitCount, journal: items.length } };
 }
