@@ -187,14 +187,21 @@ export class SpendGuard implements DurableObject {
   private async initLegacy(body: Record<string, unknown>): Promise<Response> {
     const items = Array.isArray(body.items) ? (body.items as Array<{ txId?: unknown; reward?: unknown; source?: unknown }>) : null;
     if (!items) return new Response('bad request', { status: 400 });
+    // Validate the WHOLE batch before the first write (review 24.09, high): a
+    // 400 returned from inside the transaction callback commits what was
+    // written before it — a hold without its pending would have been left
+    // behind, and a retry would skip the «already registered» item.
+    const parsed: Array<{ txId: string; reward: bigint; source: 'permit' | 'journal' }> = [];
+    for (const item of items) {
+      const txId = String(item.txId ?? ''); const reward = amount(item.reward);
+      if (!txId || reward === null) return new Response('bad item', { status: 400 });
+      parsed.push({ txId, reward, source: item.source === 'permit' ? 'permit' : 'journal' });
+    }
     return this.state.storage.transaction(async (txn) => {
       if (!(await this.getFreeze(txn)).active) return refuse(SPEND_CODES.initNotFrozen, 503);
       const ledger = await this.getLedger(txn);
       let added = 0n; let held = 0;
-      for (const item of items) {
-        const txId = String(item.txId ?? ''); const reward = amount(item.reward);
-        const source = item.source === 'permit' ? 'permit' : 'journal';
-        if (!txId || reward === null) return new Response('bad item', { status: 400 });
+      for (const { txId, reward, source } of parsed) {
         if (await txn.get(K.legacy(txId))) { held++; continue; } // idempotent by txId
         await txn.put<StoredLegacy>(K.legacy(txId), { reward: reward.toString(), state: 'held', source });
         added += reward; held++;
@@ -252,15 +259,28 @@ export class SpendGuard implements DurableObject {
   private async reinit(): Promise<Response> {
     return this.state.storage.transaction(async (txn) => {
       const ledger = await this.getLedger(txn);
-      const r = reinit(ledger, await this.heldTotal(txn), (await this.getFreeze(txn)).active);
+      if (!(await this.getFreeze(txn)).active) return refuse(SPEND_CODES.initNotFrozen, 503);
+      // Reservations of the closing cycle are part of the closed set (§4.4):
+      // a `prepared` one never reached the network — released with the cycle,
+      // its money stays with the archive; an `active` one may have been POSTed
+      // — its reward is CARRIED into the new pending (like a legacy hold) and
+      // settles later against the new cycle. Neither may ever be released
+      // against the new cycle's pending (review 24.09, high: an old lease
+      // expiring after reinit made available = deposits + reward).
+      let carried = 0n; let releasedOld = 0;
+      for (const [key, res] of await txn.list<StoredReservation>({ prefix: 'res:' })) {
+        if (res.state === 'prepared') { await txn.put<StoredReservation>(key, { ...res, state: 'released', leaseUntil: undefined }); releasedOld++; }
+        else if (res.state === 'active') carried += BigInt(res.reward);
+      }
+      const r = reinit(ledger, (await this.heldTotal(txn)) + carried, true);
       if ('ok' in r) return refuse(r.code, 503);
-      await txn.put(K.archive(ledger.cycle), { ...fromLedger(r.archived), init: await this.getInit(txn), archivedAt: Date.now() });
+      await txn.put(K.archive(ledger.cycle), { ...fromLedger(r.archived), init: await this.getInit(txn), archivedAt: Date.now(), releasedPrepared: releasedOld, carriedActive: carried.toString() });
       await this.putLedger(txn, r.ledger);
       await txn.put<InitRecord>(K.init, { state: 'none', cycle: r.ledger.cycle, attempts: 0 });
       // Deposits of the old cycle belong to its archive; the per-txId markers
       // stay so a transfer can never be credited twice across cycles.
-      await this.audit(txn, 'reinit', { archivedCycle: ledger.cycle, newCycle: r.ledger.cycle });
-      return okJson({ archivedCycle: ledger.cycle, cycle: r.ledger.cycle });
+      await this.audit(txn, 'reinit', { archivedCycle: ledger.cycle, newCycle: r.ledger.cycle, releasedPrepared: releasedOld, carriedActive: carried.toString() });
+      return okJson({ archivedCycle: ledger.cycle, cycle: r.ledger.cycle, releasedPrepared: releasedOld, carriedActive: carried.toString() });
     });
   }
 
@@ -317,7 +337,8 @@ export class SpendGuard implements DurableObject {
     if (limits === null) return refuse(SPEND_CODES.guardUnconfigured, 503);
     return this.state.storage.transaction(async (txn) => {
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
-      if (existing && existing.state === 'prepared' && existing.revision === revision && existing.reward === reward.toString()) {
+      const ledgerNow = await this.getLedger(txn);
+      if (existing && existing.state === 'prepared' && existing.cycle === ledgerNow.cycle && existing.revision === revision && existing.reward === reward.toString()) {
         return okJson({ state: 'prepared', idempotent: true });
       }
       if (existing && existing.state !== 'released') return refuse(SPEND_CODES.activateConflict, 503, { state: existing.state });
@@ -357,10 +378,12 @@ export class SpendGuard implements DurableObject {
       if (outcome === 'remap') {
         // Re-run the §5 checks for the NEW reward in one step (the old pending,
         // if any, is replaced, never added); refusal rolls everything back.
+        // A prepared reservation of an OLDER cycle holds nothing in this
+        // pending (reinit released it), so nothing is replaced for it.
         const limits = this.readLimits(body.limits);
         if (limits === null) return refuse(SPEND_CODES.guardUnconfigured, 503);
         const ledger = await this.getLedger(txn);
-        const oldPending = existing && existing.state === 'prepared' ? BigInt(existing.reward) : 0n;
+        const oldPending = existing && existing.state === 'prepared' && existing.cycle === ledger.cycle ? BigInt(existing.reward) : 0n;
         const base = { ...ledger, pending: ledger.pending - oldPending };
         const init = await this.getInit(txn);
         const balance = await txn.get<StoredBalance>(K.balance);
@@ -392,6 +415,13 @@ export class SpendGuard implements DurableObject {
       const r = settle({ state: existing.state, reward: BigInt(existing.reward), revision: existing.revision, activatedBy: existing.activatedBy }, outcome);
       if (!r.ok) return refuse(SPEND_CODES.activateConflict, 409, { reason: r.reason, state: existing.state });
       const ledger = await this.getLedger(txn);
+      // An active reservation carried across reinit settles against the NEW
+      // cycle: its reward already sits in this pending (carried), so the same
+      // deltas apply; a stale prepared one of an old cycle cannot get here
+      // (released at reinit → prepared_cannot_settle / spent_is_final above).
+      if (existing.cycle !== ledger.cycle && existing.state !== 'active' && existing.state !== 'spent' && existing.state !== 'released') {
+        return refuse(SPEND_CODES.activateConflict, 409, { reason: 'foreign_cycle', state: existing.state });
+      }
       const next: CycleLedger = { ...ledger, spent: ledger.spent + r.spentDelta, pending: ledger.pending + r.pendingDelta };
       await this.putLedger(txn, next);
       if (r.spentDelta > 0n) await txn.put(K.buckets, fromBuckets(addToBucket(toBuckets(await txn.get(K.buckets)), now, r.spentDelta)));
@@ -406,9 +436,12 @@ export class SpendGuard implements DurableObject {
   private async expireLeases(now: number): Promise<Response> {
     return this.state.storage.transaction(async (txn) => {
       const all = await txn.list<StoredReservation>({ prefix: 'res:' });
+      const current = (await this.getLedger(txn)).cycle;
       let released = 0n; let count = 0;
       for (const [key, res] of all) {
-        if (res.state !== 'prepared' || (res.leaseUntil ?? 0) > now) continue;
+        // A prepared lease of an older cycle was released by reinit; anything
+        // still tagged with an older cycle is never charged to this one.
+        if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) > now) continue;
         await txn.put<StoredReservation>(key, { ...res, state: 'released' });
         released += BigInt(res.reward); count++;
       }

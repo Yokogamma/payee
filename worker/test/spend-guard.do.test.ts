@@ -17,7 +17,10 @@ const T0 = 1_800_000_000_000;
 
 async function call(stub: DurableObjectStub, path: string, body: Record<string, unknown> = {}) {
   const res = await stub.fetch(`http://spend-guard${path}`, { method: 'POST', body: JSON.stringify(body) });
-  return { status: res.status, body: (await res.json()) as Record<string, unknown> & { code?: string } };
+  const text = await res.text();
+  let parsed: Record<string, unknown> & { code?: string };
+  try { parsed = JSON.parse(text); } catch { parsed = { text }; }
+  return { status: res.status, body: parsed };
 }
 async function status(stub: DurableObjectStub) {
   const res = await stub.fetch('http://spend-guard/status');
@@ -106,12 +109,17 @@ describe('permit-send — the single path to the network', () => {
     expect((await call(sg, '/permit-send', { txId: 'MARKER2', kind: 'marker', cycle: 2 })).body.code).toBe(SPEND_CODES.notInitialized);
   });
 
-  it('a freeze in the middle: a txId that never held a permit is refused; one that did keeps its permit (idempotent, no double accounting)', async () => {
+  it('review 24.09 (high): a freeze binds a REPEAT too — sent, answer lost, freeze, resend → refused; the permit survives and is returned after the thaw', async () => {
     const sg = await initialized(fresh('midfreeze'));
-    expect((await call(sg, '/permit-send', { txId: 'SENT', kind: 'upload', cycle: 1 })).body.granted).toBe(true);
+    const first = await call(sg, '/permit-send', { txId: 'SENT', kind: 'upload', cycle: 1, now: T0 });
+    expect(first.body.granted).toBe(true);
     await call(sg, '/freeze', { active: true });
     expect((await call(sg, '/permit-send', { txId: 'PARKED', kind: 'upload', cycle: 1 })).body.code).toBe(SPEND_CODES.frozen);
-    expect((await call(sg, '/permit-send', { txId: 'SENT', kind: 'resend', cycle: 1 })).body).toMatchObject({ granted: true, existing: true });
+    expect((await call(sg, '/permit-send', { txId: 'SENT', kind: 'resend', cycle: 1 })).body.code).toBe(SPEND_CODES.frozen);
+    await call(sg, '/freeze', { active: false });
+    const again = await call(sg, '/permit-send', { txId: 'SENT', kind: 'resend', cycle: 1, now: T0 + 5 });
+    expect(again.body).toMatchObject({ granted: true, existing: true });
+    expect((again.body.permit as { issuedAt: number }).issuedAt).toBe(T0);
   });
 });
 
@@ -194,6 +202,71 @@ describe('deposits, prepare, activate, settle — the ledger on storage', () => 
     await call(sg, '/activate', { spendKey: 'b', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
     expect((await call(sg, '/expire-leases', { now: T0 + PREPARED_LEASE_MS - 1 })).body.expired).toBe(0);
     expect((await call(sg, '/expire-leases', { now: T0 + PREPARED_LEASE_MS })).body).toMatchObject({ expired: 1, released: '10' });
+    expect((await status(sg)).ledger.pending).toBe('10');
+  });
+});
+
+describe('review 24.09 — reinit and old reservations; init-legacy atomicity; expired lease remap', () => {
+  it('(high) an old prepared lease can never credit the new cycle: reinit releases it; a later expire-leases changes nothing', async () => {
+    const sg = await initialized(fresh('oldlease'));
+    await credit(sg, 'D1', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'old', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    expect((await status(sg)).ledger.pending).toBe('10');
+    await call(sg, '/freeze', { active: true, now: T0 + 1 });
+    expect((await call(sg, '/reinit', {})).body).toMatchObject({ cycle: 2, releasedPrepared: 1, carriedActive: '0' });
+    await call(sg, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    await call(sg, '/init-done', { txId: 'M2', heights: [3000, 3000], confirmations: [60, 60], now: T0 + 2 });
+    await call(sg, '/freeze', { active: false });
+    await credit(sg, 'D2', '100', 3001);
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 2, deposits: '100', pending: '0' });
+    expect((await call(sg, '/expire-leases', { now: T0 + PREPARED_LEASE_MS + 10 })).body).toMatchObject({ expired: 0, released: '0' });
+    expect((await status(sg)).available).toBe('100'); // not 110
+    // The released old reservation cannot be settled either.
+    expect((await call(sg, '/settle', { spendKey: 'old', outcome: 'spent', now: T0 + 3 })).status).toBe(409);
+  });
+
+  it('(high) an old ACTIVE reservation is carried into the new pending and settles against the new cycle', async () => {
+    const sg = await initialized(fresh('oldactive'));
+    await credit(sg, 'D1', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'act', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'act', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
+    await call(sg, '/freeze', { active: true, now: T0 + 1 });
+    expect((await call(sg, '/reinit', {})).body).toMatchObject({ cycle: 2, carriedActive: '10' });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 2, deposits: '0', spent: '0', pending: '10' });
+    await call(sg, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    await call(sg, '/init-done', { txId: 'M2', heights: [3000, 3000], confirmations: [60, 60], now: T0 + 2 });
+    await call(sg, '/freeze', { active: false });
+    await credit(sg, 'D2', '100', 3001);
+    expect((await status(sg)).available).toBe('90');
+    expect((await call(sg, '/settle', { spendKey: 'act', outcome: 'spent', now: T0 + 3 })).body).toMatchObject({ state: 'spent', available: '90' });
+    expect((await status(sg)).ledger).toMatchObject({ spent: '10', pending: '0' });
+  });
+
+  it('(high) init-legacy is all-or-nothing: a bad second item leaves no hold and no pending behind', async () => {
+    const sg = fresh('legacy-atomic');
+    await call(sg, '/freeze', { active: true, now: T0 });
+    const bad = await call(sg, '/init-legacy', { items: [{ txId: 'L1', reward: '20', source: 'journal' }, { txId: 'L2', reward: 'not-a-number' }] });
+    expect(bad.status).toBe(400);
+    expect((await status(sg)).ledger.pending).toBe('0');
+    // A retry registers L1 for real: hold AND pending together.
+    expect((await call(sg, '/init-legacy', { items: [{ txId: 'L1', reward: '20', source: 'journal' }] })).body).toMatchObject({ held: 1, pending: '20' });
+  });
+
+  it('(medium) an expired prepared lease followed by activate → remap under the budget checks, not activate_conflict', async () => {
+    const sg = await initialized(fresh('lease-remap'));
+    await credit(sg, 'D', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'k', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg, '/expire-leases', { now: T0 + PREPARED_LEASE_MS });
+    expect((await status(sg)).ledger.pending).toBe('0');
+    const act = await call(sg, '/activate', { spendKey: 'k', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 + PREPARED_LEASE_MS + 1 });
+    expect(act.body).toMatchObject({ state: 'active', outcome: 'remap' });
     expect((await status(sg)).ledger.pending).toBe('10');
   });
 });
