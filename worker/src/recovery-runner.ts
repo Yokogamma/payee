@@ -97,7 +97,7 @@ async function stepSigned(noteId: string, record: RecoveryRecord, env: RecoveryE
   if (action === 'advance_posted') {
     // Liveness moves the record; MONEY settles only under the guard's quorum
     // (the same rule as the recheck path — spend-saga / review 24.09).
-    if (money.ok) await settleByTx(guard, { txId: record.txId, outcome: 'spent', height: money.height });
+    if (money.ok) await settleByTx(guard, { txId: record.txId, outcome: 'spent', height: money.height }, emit);
     return (await host.cas(noteId, expected, toPosted(record, now))) ? 'posted' : 'discarded';
   }
   if (action === 'redrop') {
@@ -193,7 +193,7 @@ async function stepRedropPending(noteId: string, record: RecoveryRecord, env: Re
   {
     const recheck = await quorumOf(env, emit, deadTxId);
     if (recheck.money.ok) {
-      await settleByTx(guard, { txId: deadTxId, outcome: 'spent', height: recheck.money.height });
+      await settleByTx(guard, { txId: deadTxId, outcome: 'spent', height: recheck.money.height }, emit);
       return moneyAlreadySpent(noteId, record, host, emit, 'phase2');
     }
     if (recheck.verdict.kind !== 'dead') {

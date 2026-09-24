@@ -864,7 +864,7 @@ export class RateLimiter implements DurableObject {
       return p === 'expired' || p === 'unknown' ? 'expired' : 'held';
     };
     if (outcome !== null) {
-      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) }, emit);
       let asked: 'spent' | 'released' = outcome;
       if (outcome === 'released' && r === 'in_flight' && (await proveExpiry()) === 'expired') {
         // The proof took time; the dead verdict that led here is stale
@@ -874,9 +874,9 @@ export class RateLimiter implements DurableObject {
         const again = await probe();
         if (again.money.ok) {
           asked = 'spent';
-          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height }, emit);
         } else if (again.dead) {
-          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' });
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' }, emit);
         } else {
           emit('money_reconcile', ['released', 'recheck_pending'], [entry.attempts]);
           r = 'retry';
@@ -907,7 +907,7 @@ export class RateLimiter implements DurableObject {
       } else {
         const again = await probe();
         if (again.money.ok) {
-          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height }, emit);
           emit('money_reconcile', ['spent', r], [entry.attempts]);
           terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
           result = terminal ? `spent:${r}` : 'retry';

@@ -1128,7 +1128,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const liveOf = async (txId: string): Promise<'alive' | 'dead' | 'unavailable'> => {
     const { live, votes } = await getTxVerdictWorker(txId, emit, env);
     const q = moneyQuorum(votes, operatorOfEnv(env));
-    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height });
+    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height }, emit);
     return live;
   };
   /** The second call of the redrop order (§8): a PROVEN dead transaction

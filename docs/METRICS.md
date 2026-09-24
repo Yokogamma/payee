@@ -290,9 +290,10 @@ discriminator).
 | `legacy_resolved` | event, outcome (`spent` / `dropped`) | — | `/admin/spend/init` in `done`, one per held item resolved by the quorum |
 | `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
 
+| `spend_conflict` | event, outcome (`spent`) | — | `settleByTx` (recheck path, money index, scheduler) when the guard answered `conflict: true` — the lattice booked `released → spent` for a reservation that had been released (a late landing, §7). The soak's strict zero for money conflicts reads THIS counter (the DO's `audit:*` records have no read route); a `SPEND_CONFLICT` log line accompanies it |
+
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
-`legacy_resolved{outcome}`, `ledger_inconsistent`, `spend_conflict` and the
-remaining gauges — they come with the scheduler and the closure of the legacy set.
+`ledger_inconsistent` and the remaining gauges — they come with the writer.
 
 The `/upload` answer codes the saga adds (`worker/src/upload-codes.json`):
 `spend_guard_unconfigured` (step 0, pre-admission — the limits are missing)

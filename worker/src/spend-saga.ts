@@ -174,11 +174,22 @@ export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'terminal_refusa
 export async function settleByTx(
   guard: DurableObjectStub,
   args: { txId: string; outcome: 'spent' | 'released'; height?: number },
+  emit?: Emit,
 ): Promise<SettleByTxResult> {
   const r = await guardPost(guard, '/settle-by-tx', { txId: args.txId, outcome: args.outcome, ...(args.height !== undefined ? { height: args.height } : {}) });
   if ('unavailable' in r) return 'retry';
   if (r.status === 404) return 'unknown';
-  if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (isOk(r)) {
+    // «Money left after all» (§7, `released → spent`): the lattice booked a
+    // spend for a reservation that had been released — a late landing. The
+    // DO audits it; this is the OBSERVABLE counter the soak's strict zero
+    // reads (`spend_conflict`, spec §11.9; runbook review 25.09 M2).
+    if (bodyOf(r).conflict === true) {
+      console.error('SPEND_CONFLICT', args.txId, args.outcome);
+      emit?.('spend_conflict', [args.outcome], []);
+    }
+    return bodyOf(r).noop === true ? 'noop' : 'settled';
+  }
   if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
   if (r.status === 409 || r.status === 400) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'terminal_refusal'; }
   console.error('SPEND_SETTLE_BY_TX_RETRY', args.txId, args.outcome, why(r));
