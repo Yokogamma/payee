@@ -70,14 +70,21 @@ async function runNow(stub: DurableObjectStub, now = Date.now()) {
 
 /** A `signed` record as the writer leaves it: activated reservation in the
  *  guard, a permit already issued (the first POST's answer was lost). */
-async function writerSigned(ns: DurableObjectNamespace, pkB64: string, noteId: string, jwk: string, opts: { permitted?: boolean; ageMs?: number; signedTx?: string; txId?: string } = {}) {
+/** `sendDone: false` leaves the writer's send lease LIVE (a sender still in
+ *  flight, or crashed before reporting); by default the send completed and
+ *  reported — only its answer was lost. */
+async function writerSigned(ns: DurableObjectNamespace, pkB64: string, noteId: string, jwk: string, opts: { permitted?: boolean; sendDone?: boolean; ageMs?: number; signedTx?: string; txId?: string } = {}) {
   const bytes = await signedBytes(jwk, noteId);
   const txId = opts.txId ?? bytes.txId;
   const spendKey = await spendKeyFor(pkB64, noteId, 'g1');
   const q = await guardCall(ns, '/refresh-price', { bytes: 100, reward: '10' });
   expect((await guardCall(ns, '/prepare', { spendKey, reward: '10', revision: 0, quoteId: q.body.quoteId, bytes: 100, limits: { walletFloor: '0', windowCap: '1000000', maxTxReward: '1000' } })).status).toBe(200);
   expect((await guardCall(ns, '/activate', { spendKey, reward: '10', revision: 0, activatedBy: '10:0' })).status).toBe(200);
-  if (opts.permitted !== false) expect((await guardCall(ns, '/permit-send', { txId, kind: 'upload', cycle: 1, spendKey })).status).toBe(200);
+  if (opts.permitted !== false) {
+    const p = await guardCall(ns, '/permit-send', { txId, kind: 'upload', cycle: 1, spendKey });
+    expect(p.status).toBe(200);
+    if (opts.sendDone !== false) expect((await guardCall(ns, '/send-done', { txId, sendToken: p.body.sendToken })).body.cleared).toBe(true);
+  }
   const now = Date.now() - (opts.ageMs ?? 0);
   const record: RecoveryRecord = {
     status: 'signed', token: uuidV4(), gen: 0, txId, signedTx: opts.signedTx ?? bytes.signedTx,
@@ -172,6 +179,111 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     const p = await guardCall(ns, '/permit-send', { txId: record.txId, kind: 'resend', cycle: 1, spendKey });
     expect(p.status).toBe(503);
     expect(p.body.code).toBe(SPEND_CODES.reservationReleased);
+  });
+
+  it('(H1, round 3) the send protocol: while a granted permit is in flight, a releaser is REFUSED (spend_send_in_flight) — the sender posts, reports, and only then can the money be released; phase 2 waits for a live lease instead of signing', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-lease', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record, spendKey, bytes } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { permitted: false });
+    const stub = await seed(env, id.pkB64, noteId, record);
+    const { guardWithHook } = await import('./helpers/spend-saga');
+    let releaseAnswer: { status: number; body: { code?: string } } | null = null;
+    // Right AFTER the permit is granted (the lease is set), another party
+    // tries to release the money — the reviewer's late race.
+    const hooked = guardWithHook(ns, '/permit-send', async () => {
+      if (releaseAnswer) return;
+      releaseAnswer = await guardCall(ns, '/settle', { spendKey, outcome: 'released' });
+    });
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, SPEND_GUARD: hooked } as Parameters<RateLimiter['useEnvForTests']>[0]));
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, record.txId), 503, 'down')); // → resend path
+    const post = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
+    await runNow(stub, FAR);
+    expect(releaseAnswer).not.toBeNull();
+    expect(releaseAnswer!.status).toBe(503);
+    expect(releaseAnswer!.body.code).toBe(SPEND_CODES.sendInFlight);
+    expect(post.calls).toBe(1);
+    expect((JSON.parse(post.lastBody!) as { id: string }).id).toBe(bytes.txId);
+    expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
+    // The money is still held (the release was refused, the send reported).
+    expect((await status()).ledger.pending).toBe('10');
+    // The lease was cleared by /send-done: a release AFTER the send is allowed.
+    expect((await guardCall(ns, '/settle', { spendKey, outcome: 'released' })).body).toMatchObject({ state: 'released' });
+
+    // Phase 2 under a live lease of the OLD permit: rescheduled, nothing signed.
+    const noteB = uuidV4();
+    const b = await writerSigned(ns, id.pkB64, noteB, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000, sendDone: false });
+    await seed(env, id.pkB64, noteB, { ...b.record, status: 'redrop_pending', deadTxId: b.record.txId, dueAt: FAR });
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
+    // The writer's send of B never reported (sendDone: false): its lease is live.
+    await runNow(stub, FAR); // no anchor/price routes: a signature attempt would throw
+    expect(await note(stub, noteB)).toMatchObject({ status: 'redrop_pending', attempts: 1 });
+    expect((await status()).ledger.pending).toBe('10'); // B's 10 still held
+  });
+
+  it('(H2, round 3) a temporary refusal of the guard keeps the money entry: unavailable and spend_send_in_flight → retry with backoff; only a confirmed final state removes it', async () => {
+    const { env, ns, status } = await sagaEnv('rec-money-retry', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    paidLegs(mockRoute, { price: '10' });
+    const r = await upload(await uploadRequest(id, noteId), env);
+    expect(r.status).toBe(200);
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    // The guard is DOWN during the reconciliation step.
+    const down = { idFromName: () => ({}), get: () => ({ fetch: async () => { throw new Error('guard down'); } }) } as unknown as DurableObjectNamespace;
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, SPEND_GUARD: down } as Parameters<RateLimiter['useEnvForTests']>[0]));
+    let entry = (await recoveryStatus(stub)).money[noteId];
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    await runNow(stub, entry.dueAt);
+    entry = (await recoveryStatus(stub)).money[noteId];
+    expect(entry).toMatchObject({ txId: r.body.txId, attempts: 1 });
+    expect((await status()).ledger.pending).toBe('10');
+    // The guard answers 503 spend_send_in_flight (a live lease on the permit).
+    const busy = { idFromName: () => ({}), get: () => ({ fetch: async () => new Response(JSON.stringify({ ok: false, code: SPEND_CODES.sendInFlight }), { status: 503 }) }) } as unknown as DurableObjectNamespace;
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, SPEND_GUARD: busy } as Parameters<RateLimiter['useEnvForTests']>[0]));
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    await runNow(stub, entry.dueAt);
+    entry = (await recoveryStatus(stub)).money[noteId];
+    expect(entry.attempts).toBe(2);
+    // The real guard: settled → the entry leaves.
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    await runNow(stub, entry.dueAt);
+    expect((await recoveryStatus(stub)).money).toEqual({});
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    void ns;
+  });
+
+  it('(H3, round 3) reserved → committed (mark-posted lost three times) enters the money index too — the reservation is reconciled without any client request', async () => {
+    const { env, status } = await sagaEnv('rec-commit', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    // A namespace whose /mark-posted never lands; everything else is real.
+    const flaky = {
+      idFromName: (n: string) => RATE_LIMITER.idFromName(n),
+      get: (did: DurableObjectId) => {
+        const real = RATE_LIMITER.get(did);
+        return { fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = input instanceof Request ? input.url : String(input);
+          if (new URL(url).pathname === '/mark-posted') throw new Error('mark-posted lost');
+          return real.fetch(input as string, init);
+        } } as unknown as DurableObjectStub;
+      },
+    } as unknown as DurableObjectNamespace;
+    paidLegs(mockRoute, { price: '10' });
+    const r = await upload(await uploadRequest(id, noteId), { ...env, RATE_LIMITER: flaky });
+    expect(r.status).toBe(200);
+    expect(r.body.committed).toBe(true);
+    expect((await note(stub, noteId))?.status).toBe('committed');
+    const rs = await recoveryStatus(stub);
+    expect(rs.money[noteId]).toMatchObject({ txId: r.body.txId, attempts: 0 });
+    expect(rs.alarm).toBe(rs.money[noteId].dueAt);
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    await runNow(stub, rs.money[noteId].dueAt);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    expect((await recoveryStatus(stub)).money).toEqual({});
   });
 
   it('(H4) the money index: a fresh upload schedules the reconciliation of its reservation independently of the client; the alarm settles it as spent under a money quorum, or released after a dead verdict past the age guard, and leaves a pre-D10 txId alone', async () => {

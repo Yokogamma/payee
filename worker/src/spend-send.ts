@@ -31,7 +31,7 @@ export interface PermitRequest {
 }
 
 export type PermitAnswer =
-  | { granted: true; permit: PermitRecord; existing: boolean }
+  | { granted: true; permit: PermitRecord; existing: boolean; sendToken: string }
   /** The DO refused (frozen / not initialised) — the caller picks the §4.0
    *  branch from `existing === undefined` (no permit was ever issued). */
   | { granted: false; code: SpendCode; status: number }
@@ -42,7 +42,7 @@ export type PermitAnswer =
 /** Ask the global guard for the permit — one `storage.transaction` there. */
 export async function requestPermit(guard: DurableObjectStub, req: PermitRequest): Promise<PermitAnswer> {
   let res: Response;
-  let body: { ok?: boolean; code?: string; permit?: PermitRecord; existing?: boolean };
+  let body: { ok?: boolean; code?: string; permit?: PermitRecord; existing?: boolean; sendToken?: string };
   try {
     res = await guard.fetch('http://spend-guard/permit-send', {
       method: 'POST',
@@ -53,8 +53,8 @@ export async function requestPermit(guard: DurableObjectStub, req: PermitRequest
     console.error('SPEND_GUARD_UNAVAILABLE', 'permit-send', req.txId, e);
     return { granted: false, code: SPEND_CODES.guardUnavailable, status: 503, unavailable: true };
   }
-  if (res.ok && body.ok === true && body.permit) {
-    return { granted: true, permit: body.permit, existing: body.existing === true };
+  if (res.ok && body.ok === true && body.permit && typeof body.sendToken === 'string') {
+    return { granted: true, permit: body.permit, existing: body.existing === true, sendToken: body.sendToken };
   }
   const code = (typeof body.code === 'string' ? body.code : SPEND_CODES.guardUnavailable) as SpendCode;
   return { granted: false, code, status: res.status >= 400 ? res.status : 503 };
@@ -92,10 +92,19 @@ export async function permittedPost(
   }
   const permit = await requestPermit(guard, req);
   if (!permit.granted) return { sent: false, refusal: permit };
+  let result: PermittedPostResult;
   try {
     const r = await postSignedTx(arweave, tx, deps);
-    return { sent: true, status: r.status };
+    result = { sent: true, status: r.status };
   } catch (e) {
-    return { sent: 'unknown', error: e };
+    result = { sent: 'unknown', error: e };
   }
+  // The end of the send, reported under the lease token — whatever happened.
+  // Best effort: a lost report only lets the lease expire (SEND_LEASE_MS).
+  try {
+    await guard.fetch('http://spend-guard/send-done', { method: 'POST', body: JSON.stringify({ txId: req.txId, sendToken: permit.sendToken }) });
+  } catch (e) {
+    console.error('SPEND_SEND_DONE_LOST', req.txId, e);
+  }
+  return result;
 }
