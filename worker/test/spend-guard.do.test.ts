@@ -1,6 +1,9 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
-import { PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, LATE_LANDING_BOUND_MS, SPEND_CODES } from '../src/spend-ledger';
+import { ANCHOR_EXPIRY_BLOCKS, ANCHOR_EXPIRY_MARGIN_BLOCKS, PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES } from '../src/spend-ledger';
+
+const ANCHOR_A = 'A'.repeat(64);
+const ANCHOR_B = 'B'.repeat(64);
 
 // D10 SpendGuard DO on REAL storage (spec rev. 10 §4.0–4.4, §5–§7): the pure
 // rules of spend-ledger.ts through the DO routes, each in one storage
@@ -162,7 +165,7 @@ describe('the send lease — a permit and a release cannot both win (review 24.0
     const q = await quote(sg, 100, '10');
     await call(sg, '/prepare', { spendKey: 'k', reward: '10', revision: 0, quoteId: q, bytes: 100, limits: LIMITS, now: T0 });
     await call(sg, '/activate', { spendKey: 'k', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: T0 });
-    const first = await call(sg, '/permit-send', { txId: 'SENT2', kind: 'upload', cycle: 1, spendKey: 'k', now: T0 });
+    const first = await call(sg, '/permit-send', { txId: 'SENT2', kind: 'upload', cycle: 1, spendKey: 'k', anchor: ANCHOR_A, now: T0 });
     expect(first.body.granted).toBe(true);
     // The reviewer's counterexample: two executors, one token, the first's
     // report clears the lease while the second still posts. Now the second
@@ -178,26 +181,46 @@ describe('the send lease — a permit and a release cannot both win (review 24.0
     expect(third.body).toMatchObject({ granted: true, existing: true });
     expect(third.body.sendToken).not.toBe(first.body.sendToken);
     // The third executor never reports (crashed mid-POST). Time is not a
-    // report: 30 min, 1 h, 5 h later the money is still held and the txId
-    // still exclusive — a late POST of these bytes could still land.
-    for (const dt of [30 * 60_000 + 1, 3_600_000, 5 * 3_600_000]) {
-      expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 6000 + dt })).body.code).toBe(SPEND_CODES.sendInFlight);
+    // report and not a proof (review #5, high 1): 30 min, 6 h, 5 days later
+    // the money is still held and the txId still exclusive — the clock says
+    // nothing about whether a late POST of these bytes could still land.
+    for (const dt of [30 * 60_000 + 1, 6 * 3_600_000, 5 * 24 * 3_600_000]) {
+      expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 6000 + dt })).body).toMatchObject({ code: SPEND_CODES.sendInFlight, anchor: ANCHOR_A });
       expect((await call(sg, '/settle-by-tx', { txId: 'SENT2', outcome: 'released', now: T0 + 6000 + dt })).body.code).toBe(SPEND_CODES.sendInFlight);
       expect((await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: T0 + 6000 + dt })).body.code).toBe(SPEND_CODES.sendInFlight);
     }
     expect((await status(sg)).ledger.pending).toBe('10');
     // `spent` was never blocked: money that landed is money (the lattice).
-    // Only the network's anchor rule ends an unreported send: past the bound
-    // the bytes cannot be accepted by any node, and the release is a decision
-    // about dead bytes.
-    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 6000 + LATE_LANDING_BOUND_MS - 1 })).body.code).toBe(SPEND_CODES.sendInFlight);
-    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 6000 + LATE_LANDING_BOUND_MS })).body).toMatchObject({ state: 'released' });
+    // What DOES end an unreported send is the chain: the anchor's height and
+    // the confirmed chain height. A proof about a DIFFERENT anchor is not a
+    // proof of anything here; heights under which the anchor is still valid
+    // are refused too — and both leave the lease exactly where it was.
+    const late = T0 + 6000 + 5 * 24 * 3_600_000;
+    expect((await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_B, anchorHeight: 100, chainHeight: 1000, now: late })).body.code).toBe(SPEND_CODES.anchorMismatch);
+    expect((await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 100 + ANCHOR_EXPIRY_BLOCKS + ANCHOR_EXPIRY_MARGIN_BLOCKS - 1, now: late })).body.code).toBe(SPEND_CODES.anchorNotExpired);
+    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: late })).body.code).toBe(SPEND_CODES.sendInFlight);
+    expect((await status(sg)).ledger.pending).toBe('10');
+    // The chain has moved past the anchor's window: the bytes can no longer
+    // be accepted by any node. Now — and only now — the release is a
+    // decision about dead bytes.
+    const proof = await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 100 + ANCHOR_EXPIRY_BLOCKS + ANCHOR_EXPIRY_MARGIN_BLOCKS, now: late });
+    expect(proof.body).toMatchObject({ expired: true, noop: false, anchorHeight: 100 });
+    expect((await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 5000, now: late })).body).toMatchObject({ expired: true, noop: true });
+    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: late })).body).toMatchObject({ state: 'released' });
     expect((await status(sg)).ledger.pending).toBe('0');
     // …and once released, the permit is refused to everyone (the earlier rule).
-    expect((await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: T0 + 6000 + LATE_LANDING_BOUND_MS + 1 })).body.code).toBe(SPEND_CODES.reservationReleased);
+    expect((await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: late + 1 })).body.code).toBe(SPEND_CODES.reservationReleased);
     // A late report from the crashed executor is still accepted (its token
     // never expires) and is harmless: the lease is simply gone.
-    expect((await call(sg, '/send-done', { txId: 'SENT2', sendToken: third.body.sendToken })).body.cleared).toBe(true);
+    expect((await call(sg, '/send-done', { txId: 'SENT2', sendToken: third.body.sendToken })).body.cleared).toBe(false);
+    // A permit issued WITHOUT an anchor can never be proven unlandable: the
+    // hold is for good until the executor reports (the safe side).
+    const q2 = await quote(sg, 100, '10');
+    await call(sg, '/prepare', { spendKey: 'k2', reward: '10', revision: 0, quoteId: q2, bytes: 100, limits: LIMITS, now: late });
+    await call(sg, '/activate', { spendKey: 'k2', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: late });
+    expect((await call(sg, '/permit-send', { txId: 'NOANCHOR', kind: 'upload', cycle: 1, spendKey: 'k2', now: late })).body.granted).toBe(true);
+    expect((await call(sg, '/anchor-expired', { txId: 'NOANCHOR', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 5000, now: late })).body.code).toBe(SPEND_CODES.anchorMismatch);
+    expect((await call(sg, '/settle', { spendKey: 'k2', outcome: 'released', now: late + 30 * 24 * 3_600_000 })).body.code).toBe(SPEND_CODES.sendInFlight);
   });
 });
 

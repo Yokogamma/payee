@@ -2,10 +2,11 @@ import { runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import type { RateLimiter } from '../src/rate-limiter';
 import {
-  ALARM_BATCH, RECOVERY_AGE_GUARD_MS, RECOVERY_BACKOFF_BASE_MS, RECOVERY_COUNT_KEY, backoffMs, casOf, parseSignedTx, signedAction, toPosted,
+  ALARM_BATCH, MONEY_STALE_BACKOFF_MS, MONEY_STALE_MS, RECOVERY_AGE_GUARD_MS, RECOVERY_BACKOFF_BASE_MS, RECOVERY_COUNT_KEY,
+  backoffMs, casOf, parseSignedTx, signedAction, toPosted,
   type RecoveryRecord,
 } from '../src/recovery';
-import { LATE_LANDING_BOUND_MS, SPEND_CODES } from '../src/spend-ledger';
+import { ANCHOR_EXPIRY_BLOCKS, ANCHOR_EXPIRY_MARGIN_BLOCKS, SPEND_CODES } from '../src/spend-ledger';
 import { spendKeyFor } from '../src/spend-saga';
 import { setupOutboundMock, STATUS_ORIGINS, statusUrlRe } from './helpers/outbound-mock';
 import {
@@ -33,6 +34,19 @@ const FAR = Date.now() + 1_000_000_000;
 const { mockRoute } = setupOutboundMock();
 const uuidV4 = () => crypto.randomUUID();
 const ANCHOR = 'A'.repeat(64);
+/** The anchor block's height in every test that needs the chain. */
+const ANCHOR_HEIGHT = 1000;
+/** The height at which the anchor has provably expired (the rule + margin). */
+const EXPIRED_AT = ANCHOR_HEIGHT + ANCHOR_EXPIRY_BLOCKS + ANCHOR_EXPIRY_MARGIN_BLOCKS;
+const originRe = (origin: string, path: string) => new RegExp('^' + origin.replace(/\./g, '\\.') + path.replace(/\//g, '\\/') + '$');
+/** Both operators answer the two chain questions of the proof of expiry:
+ *  the anchor block's height and the chain height. */
+function chainAt(height: number, opts: { anchorHeight?: number; per?: Partial<Record<string, number>> } = {}) {
+  for (const o of STATUS_ORIGINS) {
+    mockRoute('GET', originRe(o, `/block/hash/${ANCHOR}`), 200, JSON.stringify({ indep_hash: ANCHOR, height: opts.anchorHeight ?? ANCHOR_HEIGHT }));
+    mockRoute('GET', originRe(o, '/info'), 200, JSON.stringify({ height: opts.per?.[o] ?? height }));
+  }
+}
 
 /** A REAL signed transaction (the writer's bytes) for `noteId`, so phase 2
  *  can rebuild the payload and tags from it and the resend can post it. */
@@ -94,7 +108,7 @@ async function writerSigned(ns: DurableObjectNamespace, pkB64: string, noteId: s
   expect((await guardCall(ns, '/prepare', { spendKey, reward: '10', revision: 0, quoteId: q.body.quoteId, bytes: 100, limits: { walletFloor: '0', windowCap: '1000000', maxTxReward: '1000' } })).status).toBe(200);
   expect((await guardCall(ns, '/activate', { spendKey, reward: '10', revision: 0, activatedBy: '10:0' })).status).toBe(200);
   if (opts.permitted !== false) {
-    const p = await guardCall(ns, '/permit-send', { txId, kind: 'upload', cycle: 1, spendKey });
+    const p = await guardCall(ns, '/permit-send', { txId, kind: 'upload', cycle: 1, spendKey, anchor: ANCHOR });
     expect(p.status).toBe(200);
     if (opts.sendDone !== false) expect((await guardCall(ns, '/send-done', { txId, sendToken: p.body.sendToken })).body.cleared).toBe(true);
   }
@@ -345,15 +359,19 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     await runNow(stub, entry.postedAt + RECOVERY_AGE_GUARD_MS + 1);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     // Released — but NOT gone: the txId had a permit, and a dead verdict is a
-    // snapshot. The entry stays under watch until the network can no longer
-    // accept the bytes (review #4 H2); then, still dead, it leaves.
+    // snapshot. The entry stays under watch until the CHAIN says the bytes
+    // can no longer be accepted (review #4 H2, #5 H1); then, still dead, it
+    // leaves. The clock is not an argument: five days with the anchor still
+    // inside its window keep the watch.
     const watch = moneyOf(await recoveryStatus(stub), noteB);
-    expect(watch).toMatchObject({ txId: rb.body.txId, watching: true });
+    expect(watch).toMatchObject({ txId: rb.body.txId, watching: true, anchor: ANCHOR });
     deadOnAll(mockRoute, rb.body.txId!);
-    await runNow(stub, watch.dueAt); // still inside the bound: dead, but kept
+    chainAt(EXPIRED_AT - 1); // dead, but the anchor is still valid → kept
+    await runNow(stub, watch.dueAt + 5 * 24 * 3_600_000);
     expect(moneyOf(await recoveryStatus(stub), noteB)).toMatchObject({ watching: true, attempts: 2 });
     deadOnAll(mockRoute, rb.body.txId!);
-    await runNow(stub, entry.postedAt + LATE_LANDING_BOUND_MS); // beyond the bound and still dead → gone
+    chainAt(EXPIRED_AT); // dead AND the anchor provably expired → gone
+    await runNow(stub, moneyOf(await recoveryStatus(stub), noteB).dueAt);
     expect((await recoveryStatus(stub)).money).toEqual({});
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
 
@@ -618,6 +636,116 @@ describe('the send protocol, review 24.09 #4 — three counterexamples closed', 
     expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
     expect((await recoveryStatus(stub)).recoveryCount).toBe(0);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+  });
+});
+
+describe('review 24.09 #5 — the proof of expiry comes from the chain; age never ends an obligation', () => {
+  it('(H1) an UNREPORTED writer lease: phase 1 cannot release; the money step holds through 5 days of clock and a chain that has not moved past the anchor; only the chain proof (anchor height + min chain height at 2 operators) frees the money, and the same proof ends the watch', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r5-h1', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record, spendKey } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000, sendDone: false });
+    const stub = await seed(env, id.pkB64, noteId, record);
+    // Phase 1: dead → redrop_pending; the release is REFUSED (the lease is
+    // open) and the dead txId enters the money index with its anchor.
+    deadOnAll(mockRoute, record.txId);
+    await runNow(stub, FAR);
+    let r = await note(stub, noteId);
+    expect(r).toMatchObject({ status: 'redrop_pending', deadTxId: record.txId });
+    expect((await status()).ledger.pending).toBe('10');
+    expect(moneyOf(await recoveryStatus(stub), noteId)).toMatchObject({ txId: record.txId, anchor: ANCHOR });
+    // Five days later, chain 20 blocks past the anchor (inside the window):
+    // dead → `released` → in_flight → the proof is read → `valid` → held.
+    // Phase 2 meets the same refusal and waits; nothing is signed.
+    let t = Math.max(r!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt) + 5 * 24 * 3_600_000;
+    deadOnAll(mockRoute, record.txId);
+    chainAt(ANCHOR_HEIGHT + 20);
+    await runNow(stub, t);
+    expect((await status()).ledger.pending).toBe('10');
+    expect(await note(stub, noteId)).toMatchObject({ status: 'redrop_pending' });
+    expect(moneyOf(await recoveryStatus(stub), noteId).watching).toBeUndefined();
+    // One operator ahead, the other behind: the MINIMUM decides → still valid.
+    t = Math.max((await note(stub, noteId))!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt);
+    deadOnAll(mockRoute, record.txId);
+    chainAt(EXPIRED_AT, { per: { 'https://g2.test': EXPIRED_AT - 1 } });
+    await runNow(stub, t);
+    expect((await status()).ledger.pending).toBe('10');
+    // Operators DISAGREE on the anchor's height: no proof → held.
+    t = Math.max((await note(stub, noteId))!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt);
+    deadOnAll(mockRoute, record.txId);
+    mockRoute('GET', originRe('https://arweave.net', `/block/hash/${ANCHOR}`), 200, JSON.stringify({ indep_hash: ANCHOR, height: ANCHOR_HEIGHT }));
+    mockRoute('GET', originRe('https://g2.test', `/block/hash/${ANCHOR}`), 200, JSON.stringify({ indep_hash: ANCHOR, height: ANCHOR_HEIGHT + 1 }));
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', originRe(o, '/info'), 200, JSON.stringify({ height: 9999 })));
+    await runNow(stub, t);
+    expect((await status()).ledger.pending).toBe('10');
+    // The chain has moved past the window at BOTH operators: the proof is
+    // accepted by the guard, the lease ends, `released` goes through, the
+    // entry turns into a watch; phase 2 signs and posts the new generation.
+    t = Math.max((await note(stub, noteId))!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt);
+    deadOnAll(mockRoute, record.txId);
+    chainAt(EXPIRED_AT);
+    const { post } = paidLegs(mockRoute, { price: '12' });
+    await runNow(stub, t);
+    r = await note(stub, noteId);
+    expect(r!.status).toBe('posted');
+    expect(r!.txId).not.toBe(record.txId);
+    expect(post!.calls).toBe(1);
+    expect((await status()).ledger).toMatchObject({ pending: '12', spent: '0' });
+    const gstub = ns.get(ns.idFromName('global'));
+    expect(await runInDurableObject(gstub, (_i, s) => s.storage.get<{ state: string }>(`res:${spendKey}`))).toMatchObject({ state: 'released' });
+    const oldPermit = await runInDurableObject(gstub, (_i, s) => s.storage.get<{ sending?: unknown; anchorExpired?: { chainHeight: number } }>(`permit:${record.txId}`));
+    expect(oldPermit!.sending).toBeUndefined();
+    expect(oldPermit!.anchorExpired).toMatchObject({ anchorHeight: ANCHOR_HEIGHT, chainHeight: EXPIRED_AT });
+    const rows = moneyRows(await recoveryStatus(stub), noteId);
+    expect(rows.find(x => x.txId === record.txId)).toMatchObject({ watching: true });
+    // The watch of the dead txId ends with the same proof (already on the
+    // permit: a no-op there) while the pool still says dead.
+    const oldWatch = rows.find(x => x.txId === record.txId)!;
+    deadOnAll(mockRoute, record.txId);
+    chainAt(EXPIRED_AT + 3);
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, r!.txId), 202, 'Pending'));
+    await runNow(stub, Math.max(oldWatch.dueAt, rows.find(x => x.txId === r!.txId)!.dueAt));
+    expect(moneyRows(await recoveryStatus(stub), noteId).map(x => x.txId)).toEqual([r!.txId]);
+  });
+
+  it('(H2) age never deletes an unresolved obligation: a watched txId with 49 confirmations on the 8th day stays (stale — slower, escalated), and when the 60th confirmation arrives it is booked spent', async () => {
+    const { env, status } = await sagaEnv('rec-r5-h2', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    paidLegs(mockRoute, { price: '10' });
+    const r = await upload(await uploadRequest(id, noteId), env);
+    expect(r.status).toBe(200);
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
+    const entry = moneyOf(await recoveryStatus(stub), noteId);
+    expect(entry.anchor).toBe(ANCHOR);
+    // Dead past the age guard → released → watch.
+    deadOnAll(mockRoute, r.body.txId!);
+    await runNow(stub, entry.postedAt + RECOVERY_AGE_GUARD_MS + 1);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '0' });
+    let w = moneyOf(await recoveryStatus(stub), noteId);
+    expect(w.watching).toBe(true);
+    // The reviewer's counterexample: the 8th day, both gateways confirmed
+    // with 49 — one short of the money quorum. The entry is NOT deleted: it
+    // is stale (escalated, slowed to MONEY_STALE_BACKOFF_MS), still there,
+    // and the alarm still follows it.
+    const day8 = entry.postedAt + MONEY_STALE_MS + 1;
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 49);
+    await runNow(stub, day8);
+    let rs = await recoveryStatus(stub);
+    w = moneyOf(rs, noteId);
+    expect(w).toMatchObject({ txId: r.body.txId, watching: true });
+    expect(w.dueAt).toBeGreaterThanOrEqual(day8 + MONEY_STALE_BACKOFF_MS);
+    expect(rs.alarm).toBe(w.dueAt);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '0' });
+    // The 60th confirmation: a money quorum → `released → spent` (the
+    // lattice's conflict), the obligation is booked, the entry leaves.
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    await runNow(stub, w.dueAt);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    rs = await recoveryStatus(stub);
+    expect(rs.money).toEqual({});
+    expect(rs.alarm).toBeNull();
   });
 });
 

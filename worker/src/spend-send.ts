@@ -28,6 +28,9 @@ export interface PermitRequest {
   /** Storage name of the reservation (`res:` key without the prefix) — absent
    *  for the marker, whose money is not a reservation. */
   spendKey?: string;
+  /** `last_tx` of the bytes: the permit records it, and only a proof about
+   *  THIS anchor can end an unreported lease (review 24.09 #5, high 1). */
+  anchor?: string;
 }
 
 export type PermitAnswer =
@@ -46,7 +49,7 @@ export async function requestPermit(guard: DurableObjectStub, req: PermitRequest
   try {
     res = await guard.fetch('http://spend-guard/permit-send', {
       method: 'POST',
-      body: JSON.stringify({ txId: req.txId, kind: req.kind, cycle: req.cycle, ...(req.spendKey !== undefined ? { spendKey: req.spendKey } : {}) }),
+      body: JSON.stringify({ txId: req.txId, kind: req.kind, cycle: req.cycle, ...(req.spendKey !== undefined ? { spendKey: req.spendKey } : {}), ...(req.anchor !== undefined ? { anchor: req.anchor } : {}) }),
     });
     body = (await res.json()) as typeof body;
   } catch (e) {
@@ -93,7 +96,10 @@ export async function permittedPost(
     // A programming error, and a money one: the permit names the bytes.
     return { sent: false, refusal: { granted: false, code: SPEND_CODES.remapRefused, status: 503 } };
   }
-  const permit = await requestPermit(guard, req);
+  // The anchor travels with the permit request: the bytes name it, and it is
+  // the only thing a later proof of expiry can be about.
+  const lastTx = typeof tx === 'object' && tx !== null && 'last_tx' in tx ? (tx as { last_tx?: unknown }).last_tx : undefined;
+  const permit = await requestPermit(guard, { ...req, ...(typeof lastTx === 'string' && req.anchor === undefined ? { anchor: lastTx } : {}) });
   if (!permit.granted) return { sent: false, refusal: permit };
   let result: PermittedPostResult;
   try {
@@ -104,9 +110,9 @@ export async function permittedPost(
   }
   // The end of the send, reported under the lease token — whatever happened.
   // Best effort: a lost report keeps the txId exclusive and its money held
-  // until the anchor rule makes the bytes unacceptable (LATE_LANDING_BOUND_MS
-  // in spend-ledger.ts) — time is not a report, only the network's rule ends
-  // an unreported send.
+  // until the chain proves the anchor expired (`anchor-expiry.ts` →
+  // `/anchor-expired`) — time is not a report, only the network's rule,
+  // read from the chain, ends an unreported send.
   try {
     await guard.fetch('http://spend-guard/send-done', { method: 'POST', body: JSON.stringify({ txId: req.txId, sendToken: permit.sendToken }) });
   } catch (e) {

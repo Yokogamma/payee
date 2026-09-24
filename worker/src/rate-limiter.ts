@@ -27,17 +27,18 @@
  */
 
 import {
-  ALARM_BATCH, MONEY_BATCH, MONEY_INDEX_PREFIX, MONEY_WATCH_MAX_MS, RECOVERY_AGE_GUARD_MS, RECOVERY_COUNT_KEY, RECOVERY_INDEX_PREFIX,
-  backoffMs, casMatches, isRecoveryStatus, minDueAt, moneyIndexKey, parseMoneyIndexKey, recoveryIndexKey, rescheduled,
+  ALARM_BATCH, MONEY_BATCH, MONEY_INDEX_PREFIX, MONEY_STALE_BACKOFF_MS, MONEY_STALE_MS, RECOVERY_AGE_GUARD_MS, RECOVERY_COUNT_KEY, RECOVERY_INDEX_PREFIX,
+  anchorOf, backoffMs, casMatches, isRecoveryStatus, minDueAt, moneyIndexKey, parseMoneyIndexKey, recoveryIndexKey, rescheduled,
   type MoneyEntry, type PostedRecord, type RecoveryCas, type RecoveryRecord,
 } from './recovery';
+import { proveAnchorExpired } from './anchor-expiry';
 import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
 import { statusVerdict } from '../../src/lib/status-quorum';
 import { parseOriginList } from '../../src/lib/gateways-parse';
 import { ARWEAVE_HOST } from './arweave-transport';
 import { probeStatusOrigin } from './gateway-reads';
 import { makeEmit } from './metrics';
-import { LATE_LANDING_BOUND_MS, moneyQuorum } from './spend-ledger';
+import { moneyQuorum } from './spend-ledger';
 import { settleByTx } from './spend-saga';
 import {
   type OpBegin, type OpRecord, type OpAbortRequest, type OpFinishRequest, type OpPostingRequest,
@@ -94,8 +95,10 @@ type Store = DurableObjectStorage | DurableObjectTransaction;
  *  records. Optional so a caller that has not computed one still functions:
  *  the record is then written legacy-shaped, exactly as before D2. */
 interface CheckAndReserveRequest { noteId: string; limit: number; fp?: string; op?: OpBegin }
-interface MarkPostedRequest { noteId: string; txId: string; token: string }
-interface CommitRequest { noteId: string; txId: string; token: string }
+/** `anchor` = `last_tx` of the posted bytes, for the money index (the proof
+ *  of expiry is about it); optional on the wire, the saga always sends it. */
+interface MarkPostedRequest { noteId: string; txId: string; token: string; anchor?: string }
+interface CommitRequest { noteId: string; txId: string; token: string; anchor?: string }
 interface ReleaseRequest { noteId: string; token: string }
 /**
  * `fp` of the payload about to be RE-posted. Absent → the record's own `fp` is
@@ -508,7 +511,7 @@ export class RateLimiter implements DurableObject {
   /** Record a successful Arweave POST BEFORE commit, so a lost commit stays
    *  reconcilable with the server's own txId. Slot stays inFlight. */
   private async handleMarkPosted(request: Request): Promise<Response> {
-    const { noteId, txId, token } = await request.json<MarkPostedRequest>();
+    const { noteId, txId, token, anchor } = await request.json<MarkPostedRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     // Idempotent: a retried mark-posted (lost response) for the same token+txId
     // that already landed must succeed, not report stale.
@@ -528,13 +531,13 @@ export class RateLimiter implements DurableObject {
       // The money of this txId is `active` in the guard until a quorum
       // settles it — schedule that reconciliation here, durably, so it does
       // not depend on the client ever rechecking (review 24.09 #2, high 4).
-      await this.scheduleMoneyInTxn(txn, noteId, txId, now);
+      await this.scheduleMoneyInTxn(txn, noteId, txId, now, now, typeof anchor === 'string' ? anchor : undefined);
     });
     return Response.json({ ok: true });
   }
 
   private async handleCommit(request: Request): Promise<Response> {
-    const { noteId, txId, token } = await request.json<CommitRequest>();
+    const { noteId, txId, token, anchor } = await request.json<CommitRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     if (!record || (record.status !== 'reserved' && record.status !== 'posted') || record.token !== token) {
       return Response.json({ ok: false, stale: true });
@@ -555,7 +558,7 @@ export class RateLimiter implements DurableObject {
       // `reserved → committed` (mark-posted lost three times) is a POSTed txId
       // too: its reservation is reconciled by the money index like any other
       // (review 24.09 #3, high 3). Idempotent for `posted → committed`.
-      await this.scheduleMoneyInTxn(txn, noteId, txId, record.postedAt ?? now);
+      await this.scheduleMoneyInTxn(txn, noteId, txId, record.postedAt ?? now, record.postedAt ?? now, typeof anchor === 'string' ? anchor : undefined);
     });
     return Response.json({ ok: true });
   }
@@ -754,7 +757,7 @@ export class RateLimiter implements DurableObject {
         // still land after the release — it goes under WATCH in the money
         // index, atomically with the transition (review 24.09 #4, high 2).
         if (rec.status === 'redrop_pending' && rec.deadTxId !== undefined && expected.status === 'signed') {
-          await this.scheduleMoneyInTxn(txn, noteId, rec.deadTxId, rec.postedAt ?? rec.signedAt, rec.redropAt);
+          await this.scheduleMoneyInTxn(txn, noteId, rec.deadTxId, rec.postedAt ?? rec.signedAt, rec.redropAt, anchorOf(rec.signedTx));
         }
       } else {
         await txn.delete(recoveryIndexKey(noteId));
@@ -762,7 +765,7 @@ export class RateLimiter implements DurableObject {
         await txn.put(RECOVERY_COUNT_KEY, Math.max(0, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) - 1));
         // Leaving the recovery set as `posted` hands the money over to the
         // money index — the reservation is still `active` in the guard.
-        await this.scheduleMoneyInTxn(txn, noteId, (next as PostedRecord).txId, (next as PostedRecord).postedAt);
+        await this.scheduleMoneyInTxn(txn, noteId, (next as PostedRecord).txId, (next as PostedRecord).postedAt, (next as PostedRecord).postedAt, (next as PostedRecord).anchor);
       }
       if (fault === 'count') throw new Error('fault injected after count');
       await this.rearmInTxn(txn);
@@ -785,9 +788,9 @@ export class RateLimiter implements DurableObject {
    *  after `dueFrom` (the POST by default; the phase-1 transition for a dead
    *  txId whose POST lies further back — `postedAt` still dates the POST, for
    *  the age guard and the landing bound). */
-  private async scheduleMoneyInTxn(txn: DurableObjectTransaction, noteId: string, txId: string, postedAt: number, dueFrom: number = postedAt): Promise<void> {
+  private async scheduleMoneyInTxn(txn: DurableObjectTransaction, noteId: string, txId: string, postedAt: number, dueFrom: number = postedAt, anchor?: string): Promise<void> {
     if (await txn.get<MoneyEntry>(moneyIndexKey(noteId, txId))) return;
-    await txn.put<MoneyEntry>(moneyIndexKey(noteId, txId), { txId, dueAt: dueFrom + backoffMs(0), attempts: 0, postedAt });
+    await txn.put<MoneyEntry>(moneyIndexKey(noteId, txId), { txId, dueAt: dueFrom + backoffMs(0), attempts: 0, postedAt, ...(anchor !== undefined ? { anchor } : {}) });
     await this.rearmInTxn(txn);
   }
 
@@ -810,20 +813,32 @@ export class RateLimiter implements DurableObject {
   }
 
   /**
-   * One money-reconciliation step (review 24.09 #2 high 4, #4 high 2): the
-   * status quorum for the POSTed txId; a money quorum → `settle-by-tx spent`
-   * — the entry ends once the guard has BOOKED the money (`settled`, `noop`),
-   * or says no permit names the txId (`unknown`, a pre-D10 publication), or
-   * refuses for good (`terminal_refusal`: `spent_is_final` — booked already —
-   * or a reservation that never could have been sent). Unanimous `dead` past
-   * the age guard → `released`, but a release does NOT end the entry: the
-   * bytes had a permit, and a dead verdict is a snapshot — the entry stays
-   * under WATCH until the network can no longer accept them
-   * (LATE_LANDING_BOUND_MS after the POST), so a late landing is re-booked by
-   * the lattice (`released → spent`, `spend_conflict`) by THIS step and not by
-   * nobody. A guard that did not answer, or refused for now
-   * (`spend_send_in_flight`), keeps the entry for the next pass with backoff
-   * (review 24.09 #3, high 2).
+   * One money-reconciliation step (review 24.09 #2 high 4, #4 high 2, #5
+   * high 1–2): the status quorum for the POSTed txId.
+   *
+   *  - a money quorum → `settle-by-tx spent`; the entry ends once the guard
+   *    has BOOKED the money (`settled`, `noop`), or says no permit names the
+   *    txId (`unknown`, a pre-D10 publication), or refuses for good
+   *    (`terminal_refusal`: `spent_is_final` — booked already — or a
+   *    reservation that never could have been sent);
+   *  - unanimous `dead` past the age guard → `released`. A release does NOT
+   *    end the entry: the bytes had a permit and a dead verdict is a
+   *    snapshot — the entry turns into a WATCH, so a late landing is
+   *    re-booked by the lattice (`released → spent`, `spend_conflict`) by
+   *    THIS step and not by nobody;
+   *  - `released` refused under an open send lease (`in_flight`): the step
+   *    fetches the chain's proof that the anchor expired (`anchor-expiry.ts`)
+   *    and, with it accepted by the guard, asks again in the same pass;
+   *    without it the hold stays;
+   *  - a WATCH ends only with the same proof from the chain, taken while the
+   *    pool still says dead — never with the clock;
+   *  - a guard that did not answer keeps the entry for the next pass with
+   *    backoff (review 24.09 #3, high 2);
+   *  - an entry older than MONEY_STALE_MS is never dropped (review #5 high
+   *    2): it escalates (`stale` result, a log line) and slows down to
+   *    MONEY_STALE_BACKOFF_MS. An unresolved money obligation ends with a
+   *    fact from the chain or the guard, not with age — 49 confirmations
+   *    today are 60 tomorrow.
    */
   private async reconcileMoney(noteId: string, entry: MoneyEntry, now: number): Promise<string> {
     const env = this.env;
@@ -834,15 +849,22 @@ export class RateLimiter implements DurableObject {
     const money = moneyQuorum(votes, o => o);
     const dead = statusVerdict(origins, votes).kind === 'dead';
     const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
-    const beyondLanding = now - entry.postedAt >= LATE_LANDING_BOUND_MS;
     let outcome: 'spent' | 'released' | null = null;
     if (money.ok) outcome = 'spent';
     else if (!entry.watching && dead && now - entry.postedAt > RECOVERY_AGE_GUARD_MS) outcome = 'released';
     let result = 'rescheduled';
     let terminal = false;
     let watching = entry.watching === true;
+    const proveExpiry = async (): Promise<'expired' | 'held'> => {
+      if (entry.anchor === undefined) { emit('anchor_proof', ['unavailable', 'no_anchor'], [-1]); return 'held'; }
+      const p = await proveAnchorExpired(env, guard, emit, { txId: entry.txId, anchor: entry.anchor });
+      return p === 'expired' || p === 'unknown' ? 'expired' : 'held';
+    };
     if (outcome !== null) {
-      const r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      if (outcome === 'released' && r === 'in_flight' && (await proveExpiry()) === 'expired') {
+        r = await settleByTx(guard, { txId: entry.txId, outcome });
+      }
       emit('money_reconcile', [outcome, r], [entry.attempts]);
       if (outcome === 'spent') {
         terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
@@ -852,24 +874,29 @@ export class RateLimiter implements DurableObject {
         terminal = true; // nothing of ours was ever sendable, or it is booked already
       }
       result = terminal ? `${outcome}:${r}` : watching && !entry.watching ? `${outcome}:watch` : 'retry';
-    } else if (watching && dead && beyondLanding) {
-      // The watch ends only with BOTH facts: the network still shows nothing
-      // AND it can no longer accept the bytes.
-      emit('money_reconcile', ['watch', 'expired'], [entry.attempts]);
-      terminal = true; result = 'watch:expired';
-    } else if (watching && now - entry.postedAt >= MONEY_WATCH_MAX_MS) {
-      console.error('MONEY_WATCH_ABANDONED', noteId, entry.txId, 'no dead verdict within MONEY_WATCH_MAX_MS');
-      emit('money_reconcile', ['watch', 'abandoned'], [entry.attempts]);
-      terminal = true; result = 'watch:abandoned';
+    } else if (watching && dead) {
+      // The watch ends only with BOTH facts from the chain: the pool still
+      // shows nothing AND the anchor has provably expired.
+      const p = await proveExpiry();
+      emit('money_reconcile', ['watch', p === 'expired' ? 'expired' : 'held'], [entry.attempts]);
+      if (p === 'expired') { terminal = true; result = 'watch:expired'; }
     } else {
       emit('money_reconcile', [watching ? 'watch' : 'wait', 'pending'], [entry.attempts]);
+    }
+    const stale = !terminal && now - entry.postedAt >= MONEY_STALE_MS;
+    if (stale) {
+      console.error('MONEY_RECONCILE_STALE', noteId, entry.txId, watching ? 'watch' : 'settle', 'attempts', entry.attempts);
+      emit('money_reconcile', [watching ? 'watch' : 'wait', 'stale'], [entry.attempts]);
     }
     await this.state.storage.transaction(async (txn) => {
       const key = moneyIndexKey(noteId, entry.txId);
       const current = await txn.get<MoneyEntry>(key);
       if (!current) return; // removed under us
       if (terminal) await txn.delete(key);
-      else await txn.put<MoneyEntry>(key, { ...current, ...(watching ? { watching: true } : {}), attempts: current.attempts + 1, dueAt: now + backoffMs(current.attempts + 1) });
+      else {
+        const wait = stale ? Math.max(backoffMs(current.attempts + 1), MONEY_STALE_BACKOFF_MS) : backoffMs(current.attempts + 1);
+        await txn.put<MoneyEntry>(key, { ...current, ...(watching ? { watching: true } : {}), attempts: current.attempts + 1, dueAt: now + wait });
+      }
       await this.rearmInTxn(txn);
     });
     return result;
