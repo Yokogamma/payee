@@ -306,6 +306,56 @@ describe('review 24.09 — reinit and old reservations; init-legacy atomicity; e
     expect((await status(sg2)).ledger).toMatchObject({ hInit: 300, spent: '10' });
   });
 
+  it('(high, round 3) a spend booked BEFORE reinit is never subtracted from the new ledger, whatever its height', async () => {
+    // Reviewer sequence: cycle 1 spend 10 confirmed at 201 → reinit → marker
+    // at 300 → done must not touch spent (it is in the archive) → +100 → 100.
+    const sg = await initialized(fresh('old-spend'));
+    await credit(sg, 'D1', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'k', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'k', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
+    await call(sg, '/settle', { spendKey: 'k', outcome: 'spent', height: 201, now: T0 });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 1, spent: '10' });
+    await call(sg, '/freeze', { active: true, now: T0 + 1 });
+    await call(sg, '/reinit', {});
+    await call(sg, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    await call(sg, '/init-done', { txId: 'M2', heights: [300, 300], confirmations: [60, 60], now: T0 + 4 });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 2, hInit: 300, spent: '0', pending: '0' });
+    await call(sg, '/freeze', { active: false });
+    await credit(sg, 'D2', '100', 301);
+    expect((await status(sg)).available).toBe('100'); // not 110
+  });
+
+  it('(high, round 3) several cycles: a carry settled in cycle 2 is booked there and left alone by the cycle-3 marker', async () => {
+    const sg = await initialized(fresh('multi-cycle'));
+    await credit(sg, 'D1', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'act', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'act', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
+    // → cycle 2: carry, marker 300, settle at 301 → booked into cycle 2
+    await call(sg, '/freeze', { active: true, now: T0 + 1 });
+    await call(sg, '/reinit', {});
+    await call(sg, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    await call(sg, '/init-done', { txId: 'M2', heights: [300, 300], confirmations: [60, 60], now: T0 + 3 });
+    await call(sg, '/settle', { spendKey: 'act', outcome: 'spent', height: 301, now: T0 + 4 });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 2, spent: '10', pending: '0' });
+    // → cycle 3: reinit (nothing active), marker 400 — the cycle-2 booking is archived, untouched
+    await call(sg, '/reinit', {});
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 3, spent: '0', pending: '0' });
+    await call(sg, '/init-begin', { token: 't3', now: T0 + 5 });
+    await call(sg, '/init-signed', { token: 't3', txId: 'M3', signedTx: 'b', anchor: 'a', now: T0 + 5 });
+    await call(sg, '/init-posted', { token: 't3', txId: 'M3', now: T0 + 5 });
+    await call(sg, '/init-done', { txId: 'M3', heights: [400, 400], confirmations: [60, 60], now: T0 + 6 });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 3, hInit: 400, spent: '0', pending: '0' });
+    await call(sg, '/freeze', { active: false });
+    await credit(sg, 'D3', '100', 401);
+    expect((await status(sg)).available).toBe('100');
+  });
+
   it('(high) init-legacy is all-or-nothing: a bad second item leaves no hold and no pending behind', async () => {
     const sg = fresh('legacy-atomic');
     await call(sg, '/freeze', { active: true, now: T0 });

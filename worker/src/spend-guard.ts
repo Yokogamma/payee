@@ -31,7 +31,18 @@ import {
 // ─── Storage shapes (strings for bigint) ────────────────────────────────
 
 interface StoredLedger { cycle: number; hInit: number | null; deposits: string; spent: string; pending: string }
-interface StoredReservation extends Omit<Reservation, 'reward'> { reward: string; quoteId?: string; leaseUntil?: number; cycle: number; settledHeight?: number; reclassified?: 'reserve' }
+interface StoredReservation extends Omit<Reservation, 'reward'> {
+  reward: string; quoteId?: string; leaseUntil?: number;
+  /** Cycle the reservation was CREATED in. */
+  cycle: number;
+  /** Cycle whose ledger the spending was BOOKED into at `settle('spent')` —
+   *  the only ledger a later reclassification may take it out of (review
+   *  24.09 round 3: a spend booked before reinit lives in the archive, not in
+   *  the new ledger, and must never be subtracted from it). */
+  settledCycle?: number;
+  settledHeight?: number;
+  reclassified?: 'reserve';
+}
 interface StoredLegacy { reward: string; state: 'held' | 'spent' | 'dropped'; source: 'permit' | 'journal' }
 interface StoredQuote { quoteId: string; bytes: number; reward: string; expiresAt: number }
 interface StoredBalance { observedMin: string | null; at: number }
@@ -237,7 +248,13 @@ export class SpendGuard implements DurableObject {
         // recorded its confirmed height can be moved; without a height it
         // stays `spent` (the conservative side).
         for (const [key, res] of await txn.list<StoredReservation>({ prefix: 'res:' })) {
-          if (res.state !== 'spent' || res.cycle >= t.record.cycle || res.settledHeight === undefined || res.reclassified) continue;
+          // Only spending BOOKED INTO THIS ledger (settledCycle = this cycle)
+          // by a reservation carried from an older one (created earlier) can
+          // be moved to the reserve; a spend booked before reinit sits in the
+          // archived ledger and is not here to subtract.
+          if (res.state !== 'spent' || res.reclassified) continue;
+          if (res.settledCycle !== t.record.cycle || res.cycle >= t.record.cycle) continue;
+          if (res.settledHeight === undefined) continue;
           if (res.settledHeight <= t.record.hInit) {
             spent -= BigInt(res.reward);
             await txn.put<StoredReservation>(key, { ...res, reclassified: 'reserve' });
@@ -446,7 +463,12 @@ export class SpendGuard implements DurableObject {
       const next: CycleLedger = { ...ledger, spent: ledger.spent + r.spentDelta, pending: ledger.pending + r.pendingDelta };
       await this.putLedger(txn, next);
       if (r.spentDelta > 0n) await txn.put(K.buckets, fromBuckets(addToBucket(toBuckets(await txn.get(K.buckets)), now, r.spentDelta)));
-      await txn.put<StoredReservation>(K.res(spendKey), { ...existing, state: r.state, ...(settledHeight !== undefined && r.state === 'spent' ? { settledHeight } : {}) });
+      await txn.put<StoredReservation>(K.res(spendKey), {
+        ...existing,
+        state: r.state,
+        ...(r.spentDelta > 0n ? { settledCycle: ledger.cycle } : {}),
+        ...(settledHeight !== undefined && r.state === 'spent' ? { settledHeight } : {}),
+      });
       await this.audit(txn, 'settle', { spendKey, outcome, conflict: r.conflict, reward: existing.reward, settledHeight: settledHeight ?? null });
       return okJson({ state: r.state, conflict: r.conflict, available: available(next).toString() });
     });
