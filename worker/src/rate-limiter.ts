@@ -32,6 +32,7 @@ import {
   type MoneyEntry, type PostedRecord, type RecoveryCas, type RecoveryRecord,
 } from './recovery';
 import { proveAnchorExpired } from './anchor-expiry';
+import { operatorOfEnv } from './operators';
 import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
 import { statusVerdict } from '../../src/lib/status-quorum';
 import { parseOriginList } from '../../src/lib/gateways-parse';
@@ -847,7 +848,7 @@ export class RateLimiter implements DurableObject {
     const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
     const probe = async () => {
       const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
-      return { money: moneyQuorum(votes, o => o), dead: statusVerdict(origins, votes).kind === 'dead' };
+      return { money: moneyQuorum(votes, operatorOfEnv(env)), dead: statusVerdict(origins, votes).kind === 'dead' };
     };
     const { money, dead } = await probe();
     const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));

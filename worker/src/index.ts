@@ -24,6 +24,7 @@ import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMI
 import { permittedPost } from './spend-send';
 import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
 import { moneyQuorum, SPEND_CODES } from './spend-ledger';
+import { distinctOperators, operatorOfEnv } from './operators';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -81,6 +82,12 @@ interface Env {
    *  Empty/unset falls back to a lone arweave.net, where `dead` is unreachable
    *  by construction. */
   STATUS_GATEWAYS?: string;
+  /** `canonicalOrigin=operatorId` pairs for the status pool (operators.ts):
+   *  the D10 money quorums count OPERATORS, not origins. MUST equal the pin
+   *  in scripts/gateway-pins.mjs; the deploy gate checks it. Unset falls back
+   *  to the pinned default; an origin missing from the map casts no money
+   *  vote (fail-closed). */
+  STATUS_OPERATORS?: string;
   /** Bare https origins for D9 publication authentication, comma separated,
    *  and the ORDER IS NORMATIVE — the pool is tried in sequence. Separate from
    *  STATUS_GATEWAYS because the two answer different questions: status needs
@@ -262,6 +269,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       statusQuorumPolicy: QUORUM_POLICY_ID,
       statusGatewaysCount: origins.length,
       statusGatewaysHash: await statusGatewaysHash(origins),
+      // How many DISTINCT operators the pool maps to (operators.ts): below
+      // MIN_BALANCE_SOURCES no money quorum can ever form — visible here, not
+      // discovered at the first settle.
+      statusOperatorsCount: distinctOperators(env, origins),
       // Identity of what is ACTUALLY running: the SHA the trusted workflow
       // deployed, and the version id Cloudflare activated. The SHA alone cannot
       // distinguish a re-deploy of the same commit — the version id can.
@@ -1116,7 +1127,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
    */
   const liveOf = async (txId: string): Promise<'alive' | 'dead' | 'unavailable'> => {
     const { live, votes } = await getTxVerdictWorker(txId, emit, env);
-    const q = moneyQuorum(votes, origin => origin);
+    const q = moneyQuorum(votes, operatorOfEnv(env));
     if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height });
     return live;
   };

@@ -28,6 +28,7 @@ import {
   casOf, nextGenerationSpendKey, parseSignedTx, rescheduled, signedAction, toPosted, toRedropPending, toSignedFromRedrop,
   type PostedRecord, type RecoveryCas, type RecoveryRecord,
 } from './recovery';
+import { operatorOfEnv } from './operators';
 import { readSpendLimits } from './spend-admin';
 import { moneyQuorum } from './spend-ledger';
 import { activateSpend, prepareSpend, releaseSpend, settleByTx } from './spend-saga';
@@ -37,6 +38,8 @@ export interface RecoveryEnv extends MetricsEnv {
   SPEND_GUARD: DurableObjectNamespace;
   ARWEAVE_JWK: string;
   STATUS_GATEWAYS?: string;
+  /** The operator map of the status pool (`operators.ts`). */
+  STATUS_OPERATORS?: string;
   WALLET_FLOOR_WINSTON?: string;
   SPEND_WINDOW_CAP_WINSTON?: string;
   MAX_TX_REWARD_WINSTON?: string;
@@ -69,7 +72,7 @@ function origins(env: RecoveryEnv): string[] {
 async function quorumOf(env: RecoveryEnv, emit: Emit, txId: string) {
   const o = origins(env);
   const votes: StatusVote[] = await Promise.all(o.map(origin => probeStatusOrigin(origin, txId, emit)));
-  return { verdict: statusVerdict(o, votes), money: moneyQuorum(votes, origin => origin) };
+  return { verdict: statusVerdict(o, votes), money: moneyQuorum(votes, operatorOfEnv(env)) };
 }
 
 /** One scheduler step for one recovery record. Never throws for a gateway or

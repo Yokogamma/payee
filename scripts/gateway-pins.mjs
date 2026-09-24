@@ -54,6 +54,19 @@ export const PAYLOAD_GATEWAYS = Object.freeze([
 export const INDEX_SOURCES =
   'https://arweave.net/graphql|https://vilenarios.com/graphql,https://arweave-search.goldsky.com/graphql';
 
+/**
+ * `canonicalOrigin → operatorId` for the STATUS pool (PR-4 / D11, v16 M4).
+ *
+ * The age of a txId one index returned and another omitted is established only
+ * by status origins run by DIFFERENT operators — two origins of one operator
+ * are one voice. Five approved origins, five operators (§2.1). The client's
+ * built-in default (`src/lib/gateways.ts`, DEFAULT_STATUS_OPERATORS) must say
+ * the same thing; `VITE_STATUS_OPERATORS`, when set, must equal this pin.
+ */
+export const STATUS_OPERATORS =
+  'https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,'
+  + 'https://frostor.xyz=frostor,https://permagate.io=permagate';
+
 /** Build-time floor: below two configured origins `dead` is unreachable, so a
  *  production build pinned to one gateway would silently disable redrop. */
 export const MIN_STATUS_ORIGINS = 2;

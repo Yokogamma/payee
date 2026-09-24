@@ -23,6 +23,7 @@ import { parseOriginList } from '../../src/lib/gateways-parse';
 import { ARWEAVE_HOST } from './arweave-transport';
 import { readWalletBalance } from './gateway-reads';
 import type { Emit } from './metrics';
+import { operatorOfEnv, type OperatorOf } from './operators';
 import { spendLimitsWire } from './spend-admin';
 import { BALANCE_CACHE_TTL_MS, MIN_BALANCE_SOURCES, SPEND_CODES, type SpendLimits } from './spend-ledger';
 
@@ -209,23 +210,24 @@ export type BalanceRefresh = 'cached' | 'refreshed' | 'inert' | 'unavailable';
  * balance NEVER raises `available`; it can only stop `prepare`.
  */
 export async function refreshBalanceIfStale(
-  env: { STATUS_GATEWAYS?: string },
+  env: { STATUS_GATEWAYS?: string; STATUS_OPERATORS?: string },
   guard: DurableObjectStub,
   address: string,
   emit: Emit,
-  opts: { now?: number; operatorOf?: (origin: string) => string } = {},
+  opts: { now?: number; operatorOf?: OperatorOf } = {},
 ): Promise<BalanceRefresh> {
   const now = opts.now ?? Date.now();
   const last = balanceReadAt.get(address);
   if (last !== undefined && now - last < BALANCE_CACHE_TTL_MS) return 'cached';
   const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
   const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
-  const operatorOf = opts.operatorOf ?? ((o: string) => o);
+  const operatorOf = opts.operatorOf ?? operatorOfEnv(env);
   const answers = await Promise.all(origins.map(async origin => ({ origin, value: await readWalletBalance(origin, address, emit) })));
   const byOperator = new Map<string, bigint>();
   for (const { origin, value } of answers) {
     if (value === null) continue;
     const op = operatorOf(origin);
+    if (op === null) continue; // no known operator, no voice (fail-closed)
     if (!byOperator.has(op)) byOperator.set(op, BigInt(value));
   }
   let observedMin: bigint | null = null;

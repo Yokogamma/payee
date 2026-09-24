@@ -2043,6 +2043,23 @@ edit); record the new values and the quote here. Balance for reference:
 0.9741 AR on 2026-09-24 — the first cycle's `credit-deposit` must leave
 `available ≥ WALLET_FLOOR + margin`.
 
+### `STATUS_OPERATORS` — the operator map (mandatory, review 25.09)
+
+`canonicalOrigin=operatorId` pairs in `worker/wrangler.toml` `[vars]` AND
+`[env.staging.vars]`: every money quorum of the guard — a settled spend
+(recheck and the money index), a credited deposit, the marker's `done`, the
+proof that an anchor expired — counts OPERATORS, and two origins run by one
+operator are ONE voice; an origin missing from the map casts NO money vote
+(fail-closed). The value MUST equal the pin in `scripts/gateway-pins.mjs`
+(`STATUS_OPERATORS`, shared with the client's D11 age quorum) and the
+worker's built-in default (`worker/src/operators.ts`). Gate:
+`scripts/check-gateways-vs-worker.mjs` (CI and the trusted deploy): equal to
+the pin, every `STATUS_GATEWAYS` origin covered, ≥ 2 distinct operators —
+applicable only to a config that carries the `SpendGuard` binding. Changing
+the composition = a reviewed PR to the pin AND both blocks (a var, so a new
+Worker version, never a dashboard edit). `/health` reports
+`statusOperatorsCount`: below 2 no money quorum can form — the smoke reads it.
+
 ### `SPEND_ADMIN_SECRET`
 
 `wrangler secret put SPEND_ADMIN_SECRET` (prod and `--env staging`; generate
