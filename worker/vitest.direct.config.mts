@@ -25,6 +25,12 @@ export default defineConfig({
           ARWEAVE_JWK: TEST_ARWEAVE_JWK,
           TRUSTED_OWNERS: TEST_WALLET_ADDRESS,
           RECOVERY_HMAC_SECRET: 'test-recovery-secret',
+          // D10 (PR-3b): the three spend limits are mandatory on every paid
+          // path (503 spend_guard_unconfigured without them). Same values as
+          // test/helpers/spend-guard-ready.ts SPEND_LIMITS_ENV.
+          WALLET_FLOOR_WINSTON: '0',
+          SPEND_WINDOW_CAP_WINSTON: '1000000000000000',
+          MAX_TX_REWARD_WINSTON: '1000000000000',
         },
       },
     }),
@@ -57,6 +63,9 @@ export default defineConfig({
       'test/spend-admin.test.ts',
       'test/spend-guard.marker.test.ts',
       'test/spend-guard.ledger.test.ts',
+      'test/spend-guard.permit.test.ts',
+      'test/upload-spend-saga.test.ts',
+      'test/rollback-reader-spend.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.

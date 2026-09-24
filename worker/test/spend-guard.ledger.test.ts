@@ -6,6 +6,9 @@ import {
   bringToDone, closed, freshWallet, guardStatus, handlerWith, isolatedGuard, mockTxAll, spendEnv, statusBody, txId43,
   viaHandler, viaWorker,
 } from './helpers/spend-admin';
+import { balanceOnAll, makeIdentity, paidLegs, sagaEnv, upload, uploadRequest } from './helpers/spend-saga';
+import { resetSpendBalanceCache } from '../src/spend-saga';
+import { SPEND_LIMITS_ENV } from './helpers/spend-guard-ready';
 
 // D10 §12 — «пополнение и маркер» (ревью #4–#6): `credit-deposit` through the
 // worker route with a stubbed gateway pool — the verification at ≥2 operators
@@ -117,10 +120,55 @@ describe('D10 deposits, marker height and the balance detector', () => {
     expect(r.body.code).toBe(SPEND_CODES.wrongScope);
   });
 
-  // The rows below belong to the upload saga (§8) and the §3.4 detector in the
-  // upload path — the next step of the reader release.
-  it.todo('prepare before init done → 503 spend_not_initialized (through /upload)');
+  it('prepare before init done → 503 spend_not_initialized through /upload; nothing pending, no POST', async () => {
+    const wallet = await freshWallet();
+    const ns = isolatedGuard('notinit');
+    const env = { ...spendEnv(ns, wallet), ...SPEND_LIMITS_ENV };
+    const id = await makeIdentity();
+    paidLegs(mockRoute, { price: '10', post: 'none' });
+    const r = await upload(await uploadRequest(id, crypto.randomUUID()), env);
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe(SPEND_CODES.notInitialized);
+    expect((await guardStatus(ns)).ledger.pending).toBe('0');
+  });
+
+  it('§3.4 detector: observedMin (minimum over ≥ MIN_BALANCE_SOURCES gateway answers) below available → 503 spend_ledger_inconsistent; fewer answers than MIN_BALANCE_SOURCES → inert, the ledger decides alone', async () => {
+    const { env, wallet, status } = await sagaEnv('detector', { deposit: '1000' });
+    const id = await makeIdentity();
+    // Both origins say 500 while the ledger says 1000 available: an outflow
+    // the ledger did not book → fail closed until reinit.
+    resetSpendBalanceCache();
+    balanceOnAll(mockRoute, wallet.address, '500');
+    paidLegs(mockRoute, { price: '10', post: 'none' });
+    const r1 = await upload(await uploadRequest(id, crypto.randomUUID()), env);
+    expect(r1.status).toBe(503);
+    expect(r1.body.code).toBe(SPEND_CODES.ledgerInconsistent);
+    expect((await status()).observedMin).toBe('500');
+    // The minimum wins when the origins disagree: 2000 and 900 → 900 < 1000.
+    resetSpendBalanceCache();
+    balanceOnAll(mockRoute, wallet.address, '2000', { 'https://g2.test': { status: 200, body: '900' } });
+    paidLegs(mockRoute, { price: '10', post: 'none' });
+    expect((await upload(await uploadRequest(id, crypto.randomUUID()), env)).body.code).toBe(SPEND_CODES.ledgerInconsistent);
+    // One origin only → no quorum → the detector is inert (observedMin null)
+    // and the upload proceeds on the ledger alone.
+    resetSpendBalanceCache();
+    balanceOnAll(mockRoute, wallet.address, '500', { 'https://g2.test': { status: 503, body: 'down' } });
+    const { post } = paidLegs(mockRoute, { price: '10' });
+    const r3 = await upload(await uploadRequest(id, crypto.randomUUID()), env);
+    expect(r3.status, JSON.stringify(r3.body)).toBe(200);
+    expect(post!.calls).toBe(1);
+    expect((await status()).observedMin).toBeNull();
+    // A gateway balance ABOVE the ledger never raises available.
+    resetSpendBalanceCache();
+    balanceOnAll(mockRoute, wallet.address, '999999');
+    const { post: post2 } = paidLegs(mockRoute, { price: '10' });
+    await upload(await uploadRequest(id, crypto.randomUUID()), env);
+    expect(post2!.calls).toBe(1);
+    expect((await status()).available).toBe('980');
+  });
+
+  // DO-level rows (spend-guard.do.test.ts covers the quote binding and the
+  // per-transaction isolation of the ledger); the concurrent case is the
+  // storage transaction's own guarantee.
   it.todo('concurrent prepare around credit-deposit: each in its own storage transaction, no partial state, available never goes negative');
-  it.todo('observedMin (minimum over ≥ MIN_BALANCE_SOURCES gateway answers) below available → 503 spend_ledger_inconsistent until reinit; fewer answers than MIN_BALANCE_SOURCES → detector inert, prepare proceeds on the ledger alone');
-  it.todo('price quote bound to size: quoteId from /refresh-price must match the bytes in prepare → otherwise 503 spend_quote_mismatch');
 });

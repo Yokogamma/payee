@@ -2,6 +2,8 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { spendGuardReady } from './helpers/spend-guard-ready';
+import { isolatedGuard } from './helpers/spend-admin';
 import { addressOfJwk } from '../test-stubs/wallet-address';
 import { computePublicationFp } from '../src/publication-fp';
 import { setupOutboundMock, b64, sha256, statusUrlRe } from './helpers/outbound-mock';
@@ -20,6 +22,9 @@ type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
 
 const { mockRoute, mockStatusOnAll } = setupOutboundMock();
+// D10 (PR-3b): the paid path needs an initialised, funded SpendGuard —
+// the fixture brings the shared one to `done` once, idempotently.
+beforeAll(() => spendGuardReady());
 
 const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes
@@ -38,6 +43,9 @@ beforeAll(async () => {
   );
   realJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
   realWalletOwners = await addressOfJwk(realJwk);
+  // …and the §3.4 balance detector must not add outbound calls to this
+  // suite's exact counts: mark the wallet's balance as just read.
+  await spendGuardReady({ walletAddress: realWalletOwners });
 });
 
 async function makeIdentity() {
@@ -256,9 +264,15 @@ describe('gateway protocol defects → invalid_response, not SDK garbage', () =>
     const id = await makeIdentity();
     const cap = capture();
     const overMax = '9007199254740992'; // MAX_SAFE_INTEGER + 1
+    // D10: such a reward is above the shared fixture's ceiling and funds — an
+    // isolated guard, funded and capped far above it, so the price string
+    // reaches the SDK and the metric is what this case is about.
+    const ns = isolatedGuard('overmax');
+    const huge = '1' + '0'.repeat(25);
+    await spendGuardReady({ ns, deposit: huge, walletAddress: realWalletOwners });
     const { post } = mockPaidLegs(overMax);
     const { request } = await uploadRequest(id, crypto.randomUUID());
-    const r = await worker.fetch(request, metricsEnv(cap.dataset));
+    const r = await worker.fetch(request, metricsEnv(cap.dataset, { SPEND_GUARD: ns, MAX_TX_REWARD_WINSTON: huge, SPEND_WINDOW_CAP_WINSTON: huge }));
     expect(r.status).toBe(200);
     const priceCall = cap.byEvent('gateway_call').find(p => p.blobs?.[1] === 'price')!;
     expect(priceCall.doubles?.[1]).toBe(-1); // not representable → "not recorded"
