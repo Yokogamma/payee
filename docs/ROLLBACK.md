@@ -2010,6 +2010,108 @@ expires.
   must ALSO take a coarse action: rotate `ADMIN_SECRET`/`ARWEAVE_JWK`, or
   disable the Worker route — do not rely on revoke alone.
 
+## PR-3b reader release — Spend guard (D10), worker-only
+
+What ships (draft PRs #212–#215 + this PR-6, in one worker release): the
+global `SpendGuard` Durable Object (migration `v3`, binding `SPEND_GUARD`), the
+operator routes `/admin/spend/*` behind the DEDICATED `SPEND_ADMIN_SECRET`,
+the upload saga (`refresh-balance → refresh-price → prepare → sign →
+op-posting → activate → permit-send → POST → settle`), the recovery scheduler
+in `RateLimiter` (reads and resumes `signed` / `redrop_pending`, never
+creates them), the closure of the legacy set, and the three limits below.
+The client is untouched; the `/upload` contract gains only 503 codes
+(`spend_*`, `activate_conflict`, `recovery_*` — `worker/src/upload-codes.json`).
+Spec: private repo `arweave-pr3b-d10-spendguard-spec-2026-09-23.md` rev. 10;
+plan §4.PR-3b and its dated «Уточнения реализации PR-3b» blocks.
+
+### Spend guard limits
+
+Winston as decimal strings in `worker/wrangler.toml` `[vars]` AND
+`[env.staging.vars]`; read on every request; any missing → the worker answers
+`503 spend_guard_unconfigured` on every paid path (fail closed, no default).
+Gate: `scripts/check-spend-limits.mjs` (CI and the trusted deploy, over the
+candidate's config; not applicable to a candidate without the binding).
+
+| Limit | Value (PROPOSED 2026-09-24 — **owner approval pending**) | Method (spec §10) | Input |
+|---|---|---|---|
+| `MAX_TX_REWARD_WINSTON` | `15000000000` (0.015 AR) | price of one publication at `MAX_BODY_BYTES = 51200` × ~4.5 — the ceiling of ONE NEW transaction; legacy transactions are held at their SIGNED reward | `arweave.net/price/51200` = 3 295 552 823 W on 2026-09-24 10:50Z |
+| `SPEND_WINDOW_CAP_WINSTON` | `150000000000` (0.15 AR) | sliding 24 h cap = 21 publications/day (the soak budget) × ~3.3e9 × 2 | soak v3 volume (3–21 publications/day) |
+| `WALLET_FLOOR_WINSTON` | `70000000000` (0.07 AR) | 7 days × ~3 publications × ~3.3e9 — the untouchable remainder of the CYCLE's credited funds, so a trip leaves time to top up | the same price |
+
+Changing a limit = a reviewed PR + a deploy (they are vars, not a dashboard
+edit); record the new values and the quote here. Balance for reference:
+0.9741 AR on 2026-09-24 — the first cycle's `credit-deposit` must leave
+`available ≥ WALLET_FLOOR + margin`.
+
+### `SPEND_ADMIN_SECRET`
+
+`wrangler secret put SPEND_ADMIN_SECRET` (prod and `--env staging`; generate
+`openssl rand -base64 32`) — the ONLY bearer of `/admin/spend/*`;
+`METRICS_ADMIN_SECRET` and `ADMIN_SECRET` answer `403 wrong_scope` there,
+an unset secret answers `503 spend_admin_unconfigured`. Blast radius and
+rotation: `docs/SECRETS.md`.
+
+### Bringing the guard into service (spec §4.3 — the ONLY order)
+
+1. Deploy the reader with `UPLOADS_ENABLED = "false"` (every paid path
+   refuses; nothing new can be signed).
+2. `POST /admin/spend/freeze {"active":true}`.
+3. `POST /admin/spend/init` — repeat until `step: "done"`. The first call
+   closes the legacy set (keys ∪ open permits ∪ journals, rewards from
+   verified headers) and registers the holds, then signs and sends the
+   marker (a tiny, `quantity 0`, paid transaction); later calls continue by
+   state (resend of the same bytes / the quorum). Refusals to act on, not
+   to retry blindly: `spend_init_keys_unknown` → recover the keys from KV /
+   backups and `POST /admin/spend/init-legacy-keys {"publicKeys":[…],
+   "acknowledgeLegacyInvites":N}`; `spend_init_legacy_reward_unknown {txId}`
+   → the header of that transaction is unreadable at every payload origin;
+   wait for the gateways, never guess a reward.
+4. (Optional, only now) move the pre-marker remainder to another address of
+   the owner — the reserve below the marker is not part of the cycle.
+5. Transfer the working sum INTO the worker wallet, then
+   `POST /admin/spend/credit-deposit {"txId":"<transfer id>"}` (verified at
+   ≥ 2 operators, ≥ 50 confirmations, height strictly above the marker).
+6. `POST /admin/spend/status` → `available ≥ WALLET_FLOOR + margin`; then
+   `freeze {"active":false}` (refused until `done`) and
+   `UPLOADS_ENABLED = "true"` (a deploy).
+7. Record here: the number and sum of the holds, the marker txId and
+   `h_init`, the deposit txIds and amounts, per cycle.
+
+Staging rehearsal (spec §9): `npm --prefix worker run smoke:spend` with
+`SMOKE_URL`/`SPEND_ADMIN_SECRET` (+ `SMOKE_SPEND_FREEZE=1`,
+`SMOKE_DEPOSIT_TXID`, `SMOKE_SPEND_THAW=1` as the steps require), then
+`smoke:v3` / `smoke:v4` for the paid cycle. The marker costs real AR on that
+contour's wallet.
+
+### Kill lever
+
+`POST /admin/spend/freeze {"active":true}` — durable in the DO, not a var:
+every `permit-send` is refused from that moment on, including a handler
+already past its budget checks; the marker of the current cycle is the one
+exception. `UPLOADS_ENABLED = "false"` remains the global lever (a deploy).
+
+### Rollback
+
+- **Reader → the previous worker (394156d line):** allowed by the floor only
+  while the writer has not shipped (the writer sets a hard floor at the
+  reader). The `SpendGuard` DO and migration `v3` stay in the account unused;
+  its state is durable and resumes unchanged when the reader returns. Per-key
+  `signed` / `redrop_pending` records do not exist before the writer, so
+  nothing is stranded. `SPEND_ADMIN_SECRET` and the limits are inert on the
+  old worker.
+- **Never** delete migration `v3` or the binding on a roll-forward; never
+  edit the limits on the dashboard (the next deploy would silently restore
+  the repo value).
+- After the writer: the reader is the hard floor (plan «Rollback floor —
+  reader-before-writer»).
+
+### Not in this release
+
+The operator map (`STATUS_OPERATORS`, plan D11 / PR-4 #209): until it merges,
+every status origin counts as its own operator in the money quorum — two
+origins of one operator would be two voices. Documented in the plan block;
+the wiring is a small follow-up after #209.
+
 ## PR-2 «Метрики» — transport adapter + Analytics Engine (worker-only)
 
 What ships: an explicit Arweave transport adapter
