@@ -16,9 +16,12 @@
  *
  * FAIL-CLOSED: an origin the map does not know casts NO money vote (`null`),
  * so a list extended without extending the map cannot loosen a quorum — it
- * can only fail to reach one. An unset/empty var falls back to the pinned
- * default, exactly as the client does; a SET var is taken as-is (the gate
- * holds it equal to the pin).
+ * can only fail to reach one. UNSET is not the same as CORRUPT (review 25.09,
+ * M4): a var that is absent or blank means «the pinned default»; a var that
+ * is present but yields no entry means a broken configuration, and a broken
+ * configuration must not quietly become trust — it yields an EMPTY map, under
+ * which no money quorum can form and `/health` shows 0 operators. The deploy
+ * gate refuses both a corrupt and a drifted var before any of this runs.
  */
 
 import { parseOperatorMap } from '../../src/lib/gateways-parse';
@@ -35,8 +38,9 @@ export interface OperatorEnv { STATUS_OPERATORS?: string }
 export type OperatorOf = (origin: string) => string | null;
 
 export function operatorMapOf(env: OperatorEnv): ReadonlyMap<string, string> {
-  const parsed = parseOperatorMap(env.STATUS_OPERATORS ?? '');
-  return parsed.size > 0 ? parsed : parseOperatorMap(DEFAULT_STATUS_OPERATORS);
+  const raw = env.STATUS_OPERATORS;
+  if (raw === undefined || raw.trim() === '') return parseOperatorMap(DEFAULT_STATUS_OPERATORS); // unset → the pin
+  return parseOperatorMap(raw); // set → as-is; corrupt → empty → no quorum, ever (fail-closed)
 }
 
 export function operatorOfEnv(env: OperatorEnv): OperatorOf {

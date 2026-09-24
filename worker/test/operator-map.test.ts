@@ -33,12 +33,19 @@ function chainAt(height: number) {
   }
 }
 describe('operators.ts — the map from the env, the pinned default, fail-closed unknowns', () => {
-  it('unset/empty → the pinned default (five origins, five operators); set → as-is; an unknown origin is null', () => {
+  it('unset/blank → the pinned default (five origins, five operators); set → as-is; CORRUPT → an empty map, never the default (review 25.09 M4); an unknown origin is null', () => {
     const def = operatorMapOf({});
     expect(def.size).toBe(5);
     expect(new Set(def.values()).size).toBe(5);
     expect(operatorMapOf({ STATUS_OPERATORS: '' }).size).toBe(5);
-    expect(operatorMapOf({ STATUS_OPERATORS: 'garbage' }).size).toBe(5); // unparseable = unset
+    expect(operatorMapOf({ STATUS_OPERATORS: '  ' }).size).toBe(5);
+    // The reviewer's counterexample: a corrupt var must not turn into trust.
+    for (const corrupt of ['garbage', 'https://arweave.net', 'http://arweave.net=arweave', '=arweave', 'https://arweave.net/path=arweave']) {
+      const m = operatorMapOf({ STATUS_OPERATORS: corrupt });
+      expect(m.size, corrupt).toBe(0);
+      expect(operatorOfEnv({ STATUS_OPERATORS: corrupt })('https://arweave.net'), corrupt).toBeNull();
+      expect(distinctOperators({ STATUS_OPERATORS: corrupt }, [...STATUS_ORIGINS]), corrupt).toBe(0);
+    }
     const one = operatorOfEnv({ STATUS_OPERATORS: ONE_OPERATOR });
     expect(one('https://arweave.net')).toBe('same');
     expect(one('https://g2.test')).toBe('same');
@@ -136,11 +143,26 @@ describe('anchor expiry: the proof needs two operators', () => {
 });
 
 describe('/health attests the operator count', () => {
-  it('statusOperatorsCount = 2 under the bindings, 1 under a one-operator map', async () => {
+  it('statusOperatorsCount = 2 under the bindings, 1 under a one-operator map, 0 under a corrupt one', async () => {
     const { env } = await sagaEnv('opmap-health');
     const h = async (e: typeof env) => (await (await worker.fetch(new Request('https://proxy.example.com/health'), e)).json()) as { statusOperatorsCount: number; statusGatewaysCount: number };
     expect(await h(env)).toMatchObject({ statusGatewaysCount: 2, statusOperatorsCount: 2 });
     expect((await h({ ...env, STATUS_OPERATORS: ONE_OPERATOR })).statusOperatorsCount).toBe(1);
+    expect((await h({ ...env, STATUS_OPERATORS: 'garbage' })).statusOperatorsCount).toBe(0);
+  });
+
+  it('a corrupt map on the money path: both origins confirmed, no quorum — the reservation stays pending (nothing trusted by default)', async () => {
+    const { env, status } = await sagaEnv('opmap-corrupt', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    paidLegs(mockRoute, { price: '10' });
+    const r = await upload(await uploadRequest(id, noteId), env);
+    expect(r.status).toBe(200);
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, STATUS_OPERATORS: 'garbage' } as Parameters<RateLimiter['useEnvForTests']>[0]));
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    await runNow(stub, (await money(stub))[0].dueAt);
+    expect((await status()).ledger).toMatchObject({ pending: '10', spent: '0' });
   });
 });
 
