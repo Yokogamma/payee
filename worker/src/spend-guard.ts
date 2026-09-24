@@ -195,8 +195,16 @@ export class SpendGuard implements DurableObject {
     const cycle = Number(body.cycle);
     if (!txId || !['upload', 'resend', 'redrop2', 'marker'].includes(kind) || !Number.isInteger(cycle)) return new Response('bad request', { status: 400 });
     return this.state.storage.transaction(async (txn) => {
+      const existing = await txn.get<PermitRecord>(K.permit(txId));
+      // A repeat for a txId whose reservation was RELEASED (phase 1 of a
+      // redrop decided it is dead): the right to send is gone for every
+      // executor, however stale — a durable lever, not a race (review, H1).
+      if (existing?.spendKey) {
+        const res = await txn.get<StoredReservation>(K.res(existing.spendKey));
+        if (res?.state === 'released') return refuse(SPEND_CODES.reservationReleased, 503, { txId });
+      }
       const decision = permitDecision(
-        { freeze: await this.getFreeze(txn), init: await this.getInit(txn), existing: await txn.get<PermitRecord>(K.permit(txId)), now },
+        { freeze: await this.getFreeze(txn), init: await this.getInit(txn), existing, now },
         { txId, kind, cycle, spendKey: typeof body.spendKey === 'string' ? body.spendKey : undefined },
       );
       if (!decision.granted) return refuse(decision.code, 503);

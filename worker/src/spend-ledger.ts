@@ -58,6 +58,10 @@ export const SPEND_CODES = {
   /** A durable marker record whose bytes do not parse or do not match its
    *  txId: neither resent nor re-signed (plan «порча signedTx» — fail closed). */
   markerCorrupt: 'spend_marker_corrupt',
+  /** The permit names a reservation that is `released` (a dead txId whose
+   *  redrop was decided): no executor may send those bytes any more
+   *  (review 24.09 #2, high 1 — a stale run is stripped of its right to send). */
+  reservationReleased: 'spend_reservation_released',
   windowCap: 'spend_window_cap',
   floor: 'spend_floor',
 } as const;

@@ -42,9 +42,22 @@ export const RECOVERY_BACKOFF_CAP_MS = 3_600_000;
 export const SIGNED_TX_MAX_BYTES = 75 * 1024;
 export const RECOVERY_COUNT_KEY = 'recoveryCount';
 export const RECOVERY_INDEX_PREFIX = 'recovery:';
+/** The MONEY reconciliation index (review 24.09 #2, high 4): a note whose
+ *  transaction was POSTed but whose D10 reservation is not settled yet —
+ *  `money:<noteId> = { txId, dueAt, attempts }`. Independent of the client's
+ *  rechecks and of the recovery set: it is entered at `mark-posted` (the
+ *  ordinary path) and at recovery → posted, and leaves only when the guard
+ *  says the reservation is terminal. */
+export const MONEY_INDEX_PREFIX = 'money:';
+export const MONEY_BATCH = 5;
+
+export interface MoneyEntry { txId: string; dueAt: number; attempts: number; postedAt: number }
 
 export function recoveryIndexKey(noteId: string): string {
   return `${RECOVERY_INDEX_PREFIX}${noteId}`;
+}
+export function moneyIndexKey(noteId: string): string {
+  return `${MONEY_INDEX_PREFIX}${noteId}`;
 }
 
 // ─── Records ────────────────────────────────────────────────────────────

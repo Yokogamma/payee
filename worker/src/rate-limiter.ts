@@ -27,10 +27,18 @@
  */
 
 import {
-  ALARM_BATCH, RECOVERY_COUNT_KEY, RECOVERY_INDEX_PREFIX, casMatches, isRecoveryStatus, minDueAt, recoveryIndexKey, rescheduled,
-  type PostedRecord, type RecoveryCas, type RecoveryRecord,
+  ALARM_BATCH, MONEY_BATCH, MONEY_INDEX_PREFIX, RECOVERY_AGE_GUARD_MS, RECOVERY_COUNT_KEY, RECOVERY_INDEX_PREFIX,
+  backoffMs, casMatches, isRecoveryStatus, minDueAt, moneyIndexKey, recoveryIndexKey, rescheduled,
+  type MoneyEntry, type PostedRecord, type RecoveryCas, type RecoveryRecord,
 } from './recovery';
 import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
+import { statusVerdict } from '../../src/lib/status-quorum';
+import { parseOriginList } from '../../src/lib/gateways-parse';
+import { ARWEAVE_HOST } from './arweave-transport';
+import { probeStatusOrigin } from './gateway-reads';
+import { makeEmit } from './metrics';
+import { moneyQuorum } from './spend-ledger';
+import { settleByTx } from './spend-saga';
 import {
   type OpBegin, type OpRecord, type OpAbortRequest, type OpFinishRequest, type OpPostingRequest,
   applyAbort, applyFinish, applyPosting, newOpRecord, projectOp, isValidOpBegin, isPrunable,
@@ -512,9 +520,16 @@ export class RateLimiter implements DurableObject {
     }
     // `fp` is carried UNCHANGED: it describes the payload, and posting does not
     // change the payload.
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
-      status: 'posted', token, gen: record.gen, txId, reservedAt: record.reservedAt, postedAt: Date.now(),
-    }, record.fp));
+    const now = Date.now();
+    await this.state.storage.transaction(async (txn) => {
+      await txn.put<NoteRecord>(`note:${noteId}`, withFp({
+        status: 'posted', token, gen: record.gen, txId, reservedAt: record.reservedAt, postedAt: now,
+      }, record.fp));
+      // The money of this txId is `active` in the guard until a quorum
+      // settles it — schedule that reconciliation here, durably, so it does
+      // not depend on the client ever rechecking (review 24.09 #2, high 4).
+      await this.scheduleMoneyInTxn(txn, noteId, txId, now);
+    });
     return Response.json({ ok: true });
   }
 
@@ -732,6 +747,9 @@ export class RateLimiter implements DurableObject {
         await txn.delete(recoveryIndexKey(noteId));
         if (fault === 'index') throw new Error('fault injected after index');
         await txn.put(RECOVERY_COUNT_KEY, Math.max(0, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) - 1));
+        // Leaving the recovery set as `posted` hands the money over to the
+        // money index — the reservation is still `active` in the guard.
+        await this.scheduleMoneyInTxn(txn, noteId, (next as PostedRecord).txId, (next as PostedRecord).postedAt);
       }
       if (fault === 'count') throw new Error('fault injected after count');
       await this.rearmInTxn(txn);
@@ -740,26 +758,80 @@ export class RateLimiter implements DurableObject {
     });
   }
 
-  /** alarm := min(dueAt) over the index, or none. */
+  /** alarm := min(dueAt) over BOTH indexes (recovery and money), or none. */
   private async rearmInTxn(txn: DurableObjectTransaction | DurableObjectStorage): Promise<number | null> {
     const idx = await txn.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
-    const min = minDueAt(idx.values());
+    const money = await txn.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX });
+    const min = minDueAt([...idx.values(), ...[...money.values()].map(m => m.dueAt)]);
     if (min === null) await txn.deleteAlarm();
     else await txn.setAlarm(min);
     return min;
   }
 
+  /** Enter (or keep) the money index for a POSTed txId; due at once. */
+  private async scheduleMoneyInTxn(txn: DurableObjectTransaction, noteId: string, txId: string, postedAt: number): Promise<void> {
+    const existing = await txn.get<MoneyEntry>(moneyIndexKey(noteId));
+    if (existing && existing.txId === txId) return;
+    await txn.put<MoneyEntry>(moneyIndexKey(noteId), { txId, dueAt: postedAt + backoffMs(0), attempts: 0, postedAt });
+    await this.rearmInTxn(txn);
+  }
+
   private async healRecoveryAlarm(): Promise<void> {
     const count = (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0;
-    if (count <= 0) return;
+    if (count <= 0) {
+      const money = await this.state.storage.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX, limit: 1 });
+      if (money.size === 0) return;
+    }
     if ((await this.state.storage.getAlarm()) !== null) return;
     try { await this.rearmInTxn(this.state.storage); } catch (e) { console.error('RECOVERY_ALARM_HEAL_FAILED', e); }
   }
 
-  /** The host of one run: the CAS, and ONE instant for the whole run (ages,
-   *  backoffs and `postedAt` are measured against it). */
   private recoveryHost(now: number): RecoveryHost {
-    return { cas: (noteId, expected, next) => this.casRecovery(noteId, expected, next), now: () => now };
+    return {
+      cas: (noteId, expected, next) => this.casRecovery(noteId, expected, next),
+      stillMine: async (noteId, expected) => casMatches(await this.state.storage.get<NoteRecord>(`note:${noteId}`), expected),
+      now: () => now,
+    };
+  }
+
+  /**
+   * One money-reconciliation step (review 24.09 #2, high 4): the status
+   * quorum for the POSTed txId; a money quorum → `settle-by-tx spent`;
+   * unanimous `dead` past the age guard → `released`; otherwise backoff. The
+   * entry leaves the index once the guard says the reservation is terminal
+   * (`settled`, `noop`) or that no permit names this txId (`unknown` — a
+   * pre-D10 publication). A refusal (`spent_is_final` and the like) is
+   * terminal as well.
+   */
+  private async reconcileMoney(noteId: string, entry: MoneyEntry, now: number): Promise<string> {
+    const env = this.env;
+    const emit = makeEmit(env);
+    const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
+    const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
+    const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
+    const money = moneyQuorum(votes, o => o);
+    const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
+    let outcome: 'spent' | 'released' | null = null;
+    if (money.ok) outcome = 'spent';
+    else if (statusVerdict(origins, votes).kind === 'dead' && now - entry.postedAt > RECOVERY_AGE_GUARD_MS) outcome = 'released';
+    let result = 'rescheduled';
+    let terminal = false;
+    if (outcome !== null) {
+      const r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      emit('money_reconcile', [outcome, r], [entry.attempts]);
+      terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'refused';
+      result = terminal ? `${outcome}:${r}` : 'unavailable';
+    } else {
+      emit('money_reconcile', ['wait', 'pending'], [entry.attempts]);
+    }
+    await this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<MoneyEntry>(moneyIndexKey(noteId));
+      if (!current || current.txId !== entry.txId) return; // moved under us
+      if (terminal) await txn.delete(moneyIndexKey(noteId));
+      else await txn.put<MoneyEntry>(moneyIndexKey(noteId), { ...current, attempts: current.attempts + 1, dueAt: now + backoffMs(current.attempts + 1) });
+      await this.rearmInTxn(txn);
+    });
+    return result;
   }
 
   /** The alarm handler: due records, sequentially, at most ALARM_BATCH;
@@ -769,12 +841,21 @@ export class RateLimiter implements DurableObject {
     await this.runRecovery(Date.now());
   }
 
-  async runRecovery(now: number): Promise<{ processed: number; remaining: number }> {
-    let processed = 0; let remaining = 0;
+  async runRecovery(now: number): Promise<{ processed: number; remaining: number; money: number }> {
+    let processed = 0; let remaining = 0; let money = 0;
     try {
       const idx = await this.state.storage.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
       const due = [...idx.entries()].filter(([, d]) => d <= now).sort((a, b) => a[1] - b[1]);
       remaining = Math.max(0, due.length - ALARM_BATCH);
+      // Money reconciliation: its own bounded batch, each in its own try/catch.
+      const moneyIdx = await this.state.storage.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX });
+      const moneyDue = [...moneyIdx.entries()].filter(([, m]) => m.dueAt <= now).sort((a, b) => a[1].dueAt - b[1].dueAt);
+      remaining += Math.max(0, moneyDue.length - MONEY_BATCH);
+      for (const [key, entry] of moneyDue.slice(0, MONEY_BATCH)) {
+        const noteId = key.slice(MONEY_INDEX_PREFIX.length);
+        try { await this.reconcileMoney(noteId, entry, now); } catch (e) { console.error('MONEY_RECONCILE_FAILED', noteId, e); }
+        money++;
+      }
       for (const [key] of due.slice(0, ALARM_BATCH)) {
         const noteId = key.slice(RECOVERY_INDEX_PREFIX.length);
         try {
@@ -805,7 +886,7 @@ export class RateLimiter implements DurableObject {
         }
       }
     }
-    return { processed, remaining };
+    return { processed, remaining, money };
   }
 
   /** One step for one note (the alarm's unit, and the recheck's nudge). */
@@ -844,10 +925,12 @@ export class RateLimiter implements DurableObject {
 
   private async handleRecoveryStatus(): Promise<Response> {
     const idx = await this.state.storage.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+    const money = await this.state.storage.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX });
     return Response.json({
       recoveryCount: (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0,
       alarm: await this.state.storage.getAlarm(),
       due: Object.fromEntries([...idx.entries()].map(([k, d]) => [k.slice(RECOVERY_INDEX_PREFIX.length), d])),
+      money: Object.fromEntries([...money.entries()].map(([k, m]) => [k.slice(MONEY_INDEX_PREFIX.length), m])),
     });
   }
 }

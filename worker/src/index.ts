@@ -23,7 +23,7 @@ import { probeStatusOrigin } from './gateway-reads';
 import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
 import { permittedPost } from './spend-send';
 import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
-import { moneyQuorum } from './spend-ledger';
+import { moneyQuorum, SPEND_CODES } from './spend-ledger';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -1691,6 +1691,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       uploadError(503, activated.refusal.code, 'Spend guard refused the activation', activated.refusal.detail));
   }
   if (activated.outcome === 'remap') emit('activate_remap', [], []);
+  if (activated.state !== 'active') {
+    // A terminal no-op (`spent` / `released` under our own activatedBy): the
+    // saga already ended elsewhere — POST is forbidden after a terminal
+    // activate (plan v19 «терминальный no-op», review 24.09 #2 H1).
+    emit('activate_conflict', ['terminal'], []);
+    const aborted = await abortBeforeSend(SPEND_CODES.activateConflict);
+    return settle(aborted ? 'audit_aborted' : SPEND_CODES.activateConflict,
+      uploadError(503, SPEND_CODES.activateConflict, 'Reservation already settled', { state: activated.state }));
+  }
 
   // Phase C. permit-send → the send, with nothing in between (spend-send.ts is
   // the ONLY path to POST /tx; worker/scripts/permit-send-static.test.mjs).

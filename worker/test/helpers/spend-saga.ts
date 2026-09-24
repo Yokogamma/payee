@@ -113,7 +113,7 @@ export function balanceOnAll(mockRoute: MockRoute, address: string, winston: str
 
 /** A namespace whose stub runs `hook` right AFTER the DO answered `afterPath`
  *  — the way to freeze the guard between `activate` and `permit-send`. */
-export function guardWithHook(ns: DurableObjectNamespace, afterPath: string, hook: () => Promise<void>): DurableObjectNamespace {
+export function guardWithHook(ns: DurableObjectNamespace, afterPath: string, hook: () => Promise<void>, when: 'before' | 'after' = 'after'): DurableObjectNamespace {
   return {
     idFromName: (n: string) => ns.idFromName(n),
     get: (id: DurableObjectId) => {
@@ -121,8 +121,10 @@ export function guardWithHook(ns: DurableObjectNamespace, afterPath: string, hoo
       return {
         fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
           const url = input instanceof Request ? input.url : String(input);
+          const hit = new URL(url).pathname === afterPath;
+          if (hit && when === 'before') await hook();
           const res = await real.fetch(input as string, init);
-          if (new URL(url).pathname === afterPath) await hook();
+          if (hit && when === 'after') await hook();
           return res;
         },
       } as unknown as DurableObjectStub;
