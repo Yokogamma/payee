@@ -97,7 +97,9 @@ describe('handleUpload answers', () => {
 
   it('the token-CAS abort is called exactly once, and only BEFORE the POST (test 8)', () => {
     const abortCalls = [...handler.matchAll(/await opAbort\(/g)].map(m => m.index);
-    const postCall = handler.indexOf('await postSignedTx(');
+    // The send is `permittedPost` (spend-send.ts: permit-send → postSignedTx);
+    // worker/scripts/permit-send-static.test.mjs pins that shape.
+    const postCall = handler.indexOf('await permittedPost(');
     expect(abortCalls).toHaveLength(1);
     expect(postCall).toBeGreaterThan(0);
     expect(abortCalls[0]).toBeLessThan(postCall);

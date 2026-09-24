@@ -1674,6 +1674,39 @@ Reader-релиз этим не блокируется: он не создаёт
 - Пробы статуса переехали в `worker/src/gateway-reads.ts` без изменения
   поведения (маркер и депозит задают тот же вопрос, что recheck).
 
+**Уточнения реализации PR-3b — сага загрузки §8 (2026-09-24, ветка
+`arweave/pr3b-upload-saga`, draft, поверх операторских маршрутов):**
+
+- Порядок в `handleUpload` (worker/src/spend-saga.ts): гейт шага 0 «три
+  предела заданы» (иначе `503 spend_guard_unconfigured` до допуска) →
+  `check-and-reserve` → `/refresh-balance` (минимум по ≥ 2 операторам,
+  кэш `BALANCE_CACHE_TTL_MS` на кошелёк; без кворума детектор инертен) →
+  anchor → price → `/refresh-price` (котировка привязана к размеру) →
+  `/prepare` **до подписи** → подпись → `/op-posting` → `/activate` с
+  `reward` подписанной транзакции → `permit-send` → POST → `settle`.
+- `spendKey = sha256(publicKeyB64):noteId:gen`, где в текущем формате
+  `gen` = идентификатор операции (одна допущенная операция = одна
+  generation; redrop = новая операция = новая generation). `revision` = 0
+  до writer-формата.
+- Отказ до отправки (prepare/activate/permit) = ветка §4.0 «доказанно не
+  отправлено»: `/op-abort` с кодом отказа (единственная точка вызова —
+  `abortBeforeSend`), per-key резервация и резервация `SpendGuard`
+  освобождаются, ответ `503 <код DO>` (закрытый список
+  `SPEND_UPLOAD_CODES`). После разрешения: POST с неизвестным исходом или
+  5xx шлюза оставляют резервацию `active` (без TTL) до кворума.
+- `settle` — по кворуму: `confirmed` на пути recheck → `/settle-by-tx`
+  (`permit:<txId>` → `spendKey`) со стоимостью и высотой; `dead` + факт
+  redrop → `released` старой резервации перед новой generation. Планировщик
+  — авторитетный реконсилятор (следующий шаг); эти вызовы — best effort и
+  не меняют ответ.
+- Lease `prepared` — alarm DO (`prepare` взводит, `alarm()` → expire-leases и
+  перевзвод на ближайший lease); `active` alarm не трогает.
+- Статический гейт `worker/scripts/permit-send-static.test.mjs`: SDK-`post`
+  только в `postSignedTx`, `postSignedTx` только в `permittedPost` после
+  `requestPermit`, `/permit-send` только в spend-send.ts (и диспетчере DO).
+  Наблюдение тестами: повторный `confirmed` не должен переписывать
+  `settledHeight` первого учёта — исправлено в DO.
+
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 
 Старый Worker не знает статус `signed`: `check-and-reserve` примет его как
