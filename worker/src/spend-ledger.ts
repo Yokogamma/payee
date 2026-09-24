@@ -55,6 +55,9 @@ export const SPEND_CODES = {
   guardUnavailable: 'spend_guard_unavailable',
   adminUnconfigured: 'spend_admin_unconfigured',
   wrongScope: 'wrong_scope',
+  /** A durable marker record whose bytes do not parse or do not match its
+   *  txId: neither resent nor re-signed (plan «порча signedTx» — fail closed). */
+  markerCorrupt: 'spend_marker_corrupt',
   windowCap: 'spend_window_cap',
   floor: 'spend_floor',
 } as const;
@@ -125,6 +128,9 @@ export interface InitRecord {
   dueAt?: number;
   hInit?: number;
   initAt?: number;
+  /** When the POST of the marker was accepted (`posted`) — the age guard of the
+   *  dead verdict (§4.1 «мёртвый маркер») is measured from here. */
+  postedAt?: number;
 }
 
 export type InitEvent =
@@ -168,7 +174,7 @@ export function initTransition(record: InitRecord, event: InitEvent): InitTransi
     case 'posted': {
       if (record.state === 'posted' && record.txId === event.txId) return { ok: true, record }; // idempotent
       if (record.state !== 'signed' || record.token !== event.token || record.txId !== event.txId) return { ok: false, code: SPEND_CODES.staleToken };
-      return { ok: true, record: { ...record, state: 'posted', dueAt: event.now + PREPARED_LEASE_MS } };
+      return { ok: true, record: { ...record, state: 'posted', postedAt: event.now, dueAt: event.now + PREPARED_LEASE_MS } };
     }
     case 'done': {
       if (record.state !== 'posted' || record.txId !== event.txId) return { ok: false, code: SPEND_CODES.staleToken };

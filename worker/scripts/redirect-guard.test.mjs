@@ -53,7 +53,10 @@ describe('worker sources and the redirect mode', () => {
   it('the gateway readers ask for "manual" explicitly', async () => {
     // Not merely "not error": `follow` would let one host answer for two
     // configured origins, which is the pooling flaw the mode exists to stop.
-    for (const file of ['publication-auth.ts', 'index.ts']) {
+    // The status probe (and the balance / tx readers of the D10 guard) moved
+    // from index.ts to gateway-reads.ts; index.ts itself no longer fetches a
+    // gateway.
+    for (const file of ['publication-auth.ts', 'gateway-reads.ts']) {
       const text = await readFile(join(WORKER_SRC, file), 'utf8');
       expect(text, `${file} must pin the redirect mode`).toMatch(/redirect\s*:\s*'manual'/);
     }
