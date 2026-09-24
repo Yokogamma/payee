@@ -1170,11 +1170,12 @@ async function sweepSource(
   ownerHash: string,
   signal: AbortSignal | undefined,
   deadlineAt: number,
-): Promise<SourceSweep & { firstPageFailed: boolean; transport: string | null }> {
+): Promise<SourceSweep & { firstPageFailed: boolean; transport: string | null; merged: boolean }> {
   let anyFirstPage = false;
   // Union of everything any transport returned for this source, keyed by txId.
   const found = new Map<string, IndexEdge>();
   let lastTransport: string | null = null;
+  let transportsThatFound = 0;
   for (const url of urls) {
     if (signal?.aborted) break;
     const edges: IndexEdge[] = [];
@@ -1219,6 +1220,7 @@ async function sweepSource(
       if (next === cursor) { outcome = 'bounded'; break; }
       cursor = next;
     }
+    if (edges.length > 0) transportsThatFound++;
     if (outcome === 'complete') {
       // The completing transport's pages come first (its own HEIGHT_DESC
       // order, byte-identical in single-transport mode); anything a failed
@@ -1227,7 +1229,11 @@ async function sweepSource(
       const ordered = [...edges];
       const listed = new Set(edges.map(e => e.txId));
       for (const [txId, edge] of found) if (!listed.has(txId)) ordered.push(edge);
-      return { source, complete: true, edges: ordered, firstPageFailed: false, transport: url };
+      // Appended finds make this list no single HEIGHT_DESC stream: say so, and
+      // the union applies its total order before any sentinel decision
+      // (review 24.09 #2: an appended NEWER candidate must not sit below a
+      // sentinel of the same Note-Id and be dropped before D9).
+      return { source, complete: true, edges: ordered, firstPageFailed: false, transport: url, merged: ordered.length !== edges.length };
     }
     if (outcome === 'bounded') break;
   }
@@ -1237,6 +1243,7 @@ async function sweepSource(
     edges: [...found.values()],
     firstPageFailed: !anyFirstPage,
     transport: lastTransport,
+    merged: transportsThatFound > 1,
   };
 }
 

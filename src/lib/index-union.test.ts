@@ -55,6 +55,13 @@ describe('unionSweeps — single source keeps the edge order, byte for byte', ()
     expect(out.metadataConflicts).toBe(0);
   });
 
+  it('a single source assembled from two transports IS re-sorted (review 24.09 #2)', () => {
+    const edges = [edge('t-known', 'n', 8), edge('t-early', 'n', 9)]; // appended find last
+    const out = unionSweeps([{ ...sweep(0, edges), merged: true }]);
+    expect(out.resorted).toBe(true);
+    expect(out.ordered.map(c => c.txId)).toEqual(['t-early', 't-known']);
+  });
+
   it('collapses a txId an index returned twice (paging glitch) into one candidate', () => {
     const out = unionSweeps([sweep(0, [edge('t1', 'n1', 3), edge('t1', 'n1', 3)])]);
     expect(out.ordered).toHaveLength(1);

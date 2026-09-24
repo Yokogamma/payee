@@ -50,6 +50,12 @@ export interface SourceSweep {
    *  disagreement (v16). */
   complete: boolean;
   edges: readonly IndexEdge[];
+  /** `true` when `edges` were assembled from MORE THAN ONE transport (a
+   *  failed primary's finds appended to the fallback's walk). Such a list is
+   *  not one index's HEIGHT_DESC stream any more, so the single-source
+   *  «keep the edge order» guarantee does not apply to it (review 24.09 #2):
+   *  the union must apply the total order even with one logical source. */
+  merged?: boolean;
 }
 
 /** A txId after the union: the identity the sweep will act on, and who said so. */
@@ -78,9 +84,11 @@ export interface UnionResult {
   presenceDisagreements: string[];
   /** Number of txIds whose signed-field metadata differed between sources. */
   metadataConflicts: number;
-  /** `true` when the deterministic multi-source ordering was applied;
-   *  `false` in single-source mode, where the index's own edge order is kept
-   *  byte-for-byte (regression anchor: arweave.incremental.test.ts). */
+  /** `true` when the deterministic total ordering was applied: ≥2 sources,
+   *  or one source whose edges came from more than one transport. `false`
+   *  only for ONE source read through ONE transport, where the index's own
+   *  edge order is kept byte-for-byte (regression anchor:
+   *  arweave.incremental.test.ts). */
   resorted: boolean;
 }
 
@@ -115,7 +123,9 @@ export function compareCandidates(
  *    candidate `metadataConflict` (identity untrusted); the txId stays;
  *  - a height disagreement is resolved by the ordering rule alone;
  *  - presence is judged ONLY between COMPLETE sources;
- *  - with ONE source the edge order is preserved exactly (no re-sort).
+ *  - with ONE source read through ONE transport the edge order is preserved
+ *    exactly (no re-sort); a source assembled from several transports is
+ *    ordered like a multi-source union (its edges are no single stream).
  */
 export function unionSweeps(sweeps: readonly SourceSweep[]): UnionResult {
   const byId = new Map<string, {
@@ -150,7 +160,7 @@ export function unionSweeps(sweeps: readonly SourceSweep[]): UnionResult {
     return { ...c, seenBy: [...c.seenBy] as readonly number[] };
   });
 
-  const resorted = sweeps.length > 1;
+  const resorted = sweeps.length > 1 || sweeps.some(s => s.merged === true);
   if (resorted) candidates.sort(compareCandidates);
 
   const completeSources = sweeps.filter(s => s.complete).map(s => s.source);

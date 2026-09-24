@@ -285,6 +285,34 @@ describe('transport fallback inside one logical source', () => {
     expect(gw.graphqlCalls().filter(u => u === SRC_A_FALLBACK)).toHaveLength(1);
   });
 
+  it('review 24.09 #2: a candidate found by the failed primary and NEWER than a sentinel the fallback listed is fetched, exactly as in a one-transport full walk', async () => {
+    const key = await noteKey();
+    const { encryptEnvelope } = await import('./crypto');
+    const held = await encryptEnvelope(key, 'held locally');
+    // Same Note-Id TAG as the sentinel (what the sentinel rule keys on); the
+    // property under test is that EARLY reaches D9 + decrypt at all — whether
+    // its body then wins is decrypt's business, not the index walk's.
+    const early = { ...(await encryptEnvelope(key, 'newer, listed only by the failed primary')), noteId: held.noteId };
+    const run = async (pages: Record<string, EdgeLabel[][]>, sources: string, onGraphql?: (call: number, url: string) => Response | undefined) => {
+      vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetModules();
+      const gw = await stubSources({ sources, pages, payloads: { KNOWN: v2wire(held), EARLY: v2wire(early) }, onGraphql });
+      const { fetchAllNotes } = await import('./arweave');
+      const out = await fetchAllNotes('oh', ring(key), undefined, { known: gw.known(['KNOWN', { noteId: held.noteId, kind: 'note' }]) });
+      return { raw: gw.rawCalls(), texts: out.notes.map(n => n.text), incomplete: out.incomplete, resorted: out.indexDiagnostics?.sources };
+    };
+    // Reference: one transport lists both in HEIGHT_DESC — EARLY (9) above the sentinel (8) is collected and fetched.
+    const full = await run({ [SRC_A]: [[{ txId: 'EARLY', noteId: held.noteId, height: 9 }, { txId: 'KNOWN', noteId: held.noteId, height: 8 }]] }, SRC_A);
+    expect(full.raw).toEqual(['EARLY']); // above the sentinel → fetched
+    // Fallback: the primary lists EARLY then fails; the fallback lists only KNOWN. Same outcome required.
+    const merged = await run(
+      { [SRC_A]: [[{ txId: 'EARLY', noteId: held.noteId, height: 9 }], [{ txId: 'KNOWN', noteId: held.noteId, height: 8 }]], [SRC_A_FALLBACK]: [[{ txId: 'KNOWN', noteId: held.noteId, height: 8 }]] },
+      `${SRC_A}|${SRC_A_FALLBACK}`,
+      (call, url) => (url === SRC_A && call === 1 ? new Response('down', { status: 503 }) : undefined),
+    );
+    expect(merged.raw).toEqual(full.raw); // NOT dropped below the sentinel before D9
+    expect(merged.incomplete).toBe(false);
+  });
+
   it('every transport fails → everything any transport found is kept and the source is incomplete', async () => {
     const key = await noteKey();
     const { encryptEnvelope } = await import('./crypto');
