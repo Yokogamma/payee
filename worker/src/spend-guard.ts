@@ -395,6 +395,9 @@ export class SpendGuard implements DurableObject {
     if (!spendKey || reward === null || !Number.isInteger(revision) || !quoteId || !Number.isInteger(bytes)) return new Response('bad request', { status: 400 });
     if (limits === null) return refuse(SPEND_CODES.guardUnconfigured, 503);
     return this.state.storage.transaction(async (txn) => {
+      // Ended leases first — they hold nothing (§ leases), and a lost alarm
+      // must not make them hold the budget against this request.
+      await this.expireLeasesInTxn(txn, now);
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
       const ledgerNow = await this.getLedger(txn);
       if (existing && existing.state === 'prepared' && existing.cycle === ledgerNow.cycle && existing.revision === revision && existing.reward === reward.toString()) {
@@ -450,8 +453,12 @@ export class SpendGuard implements DurableObject {
         // pending (reinit released it), so nothing is replaced for it.
         const limits = this.readLimits(body.limits);
         if (limits === null) return refuse(SPEND_CODES.guardUnconfigured, 503);
+        // Ended leases of OTHER keys first (same reason as in prepare); this
+        // key's own expired lease is what the remap replaces below.
+        await this.expireLeasesInTxn(txn, now);
+        const refreshed = await txn.get<StoredReservation>(K.res(spendKey));
         const ledger = await this.getLedger(txn);
-        const oldPending = existing && existing.state === 'prepared' && existing.cycle === ledger.cycle ? BigInt(existing.reward) : 0n;
+        const oldPending = refreshed && refreshed.state === 'prepared' && refreshed.cycle === ledger.cycle ? BigInt(refreshed.reward) : 0n;
         const base = { ...ledger, pending: ledger.pending - oldPending };
         const init = await this.getInit(txn);
         const balance = await txn.get<StoredBalance>(K.balance);
@@ -536,29 +543,42 @@ export class SpendGuard implements DurableObject {
 
   private async expireLeases(now: number): Promise<Response> {
     return this.state.storage.transaction(async (txn) => {
-      const all = await txn.list<StoredReservation>({ prefix: 'res:' });
-      const current = (await this.getLedger(txn)).cycle;
-      let released = 0n; let count = 0;
-      for (const [key, res] of all) {
-        // A prepared lease of an older cycle was released by reinit; anything
-        // still tagged with an older cycle is never charged to this one.
-        if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) > now) continue;
-        await txn.put<StoredReservation>(key, { ...res, state: 'released' });
-        released += BigInt(res.reward); count++;
-      }
-      if (count > 0) {
-        const ledger = await this.getLedger(txn);
-        await this.putLedger(txn, { ...ledger, pending: ledger.pending - released });
-        await this.audit(txn, 'expire-leases', { count, released: released.toString() });
-      }
-      // The earliest lease still open (for the alarm to re-arm on).
-      let nextDueAt: number | null = null;
-      for (const res of all.values()) {
-        if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) <= now) continue;
-        if (nextDueAt === null || res.leaseUntil! < nextDueAt) nextDueAt = res.leaseUntil!;
-      }
-      return okJson({ expired: count, released: released.toString(), nextDueAt });
+      const r = await this.expireLeasesInTxn(txn, now);
+      return okJson({ expired: r.count, released: r.released.toString(), nextDueAt: r.nextDueAt });
     });
+  }
+
+  /**
+   * Release every `prepared` lease of the current cycle that has ended.
+   * Called by the alarm AND, before the budget checks, by `prepare` and by
+   * an `activate` remap (review 24.09, medium): the alarm is only an
+   * accelerator — a lost `setAlarm` must never let an ended lease hold the
+   * budget against the next request, which is exactly when the request is
+   * refused `spend_floor` and could not arm an alarm itself.
+   */
+  private async expireLeasesInTxn(txn: Txn, now: number): Promise<{ count: number; released: bigint; nextDueAt: number | null }> {
+    const all = await txn.list<StoredReservation>({ prefix: 'res:' });
+    const current = (await this.getLedger(txn)).cycle;
+    let released = 0n; let count = 0;
+    for (const [key, res] of all) {
+      // A prepared lease of an older cycle was released by reinit; anything
+      // still tagged with an older cycle is never charged to this one.
+      if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) > now) continue;
+      await txn.put<StoredReservation>(key, { ...res, state: 'released' });
+      released += BigInt(res.reward); count++;
+    }
+    if (count > 0) {
+      const ledger = await this.getLedger(txn);
+      await this.putLedger(txn, { ...ledger, pending: ledger.pending - released });
+      await this.audit(txn, 'expire-leases', { count, released: released.toString() });
+    }
+    // The earliest lease still open (for the alarm to re-arm on).
+    let nextDueAt: number | null = null;
+    for (const res of all.values()) {
+      if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) <= now) continue;
+      if (nextDueAt === null || res.leaseUntil! < nextDueAt) nextDueAt = res.leaseUntil!;
+    }
+    return { count, released, nextDueAt };
   }
 
   // ─── status ─────────────────────────────────────────────────────────────

@@ -1706,6 +1706,17 @@ Reader-релиз этим не блокируется: он не создаёт
   `requestPermit`, `/permit-send` только в spend-send.ts (и диспетчере DO).
   Наблюдение тестами: повторный `confirmed` не должен переписывать
   `settledHeight` первого учёта — исправлено в DO.
+- **Ревью 24.09 (2 high, 1 medium) внесено:** (H1) списание `spent` — не по
+  вердикту живости PR-3a (достаточно одного `200` с нулём подтверждений), а
+  по денежному кворуму `moneyQuorum` (spend-ledger.ts): ≥ 2 операторов,
+  каждый `confirmed ≥ MIN_DEPOSIT_CONFIRMATIONS`, высоты в skew, высота —
+  максимум; до кворума резервация остаётся `pending`; то же правило у
+  маркера и депозита. (H2) `signed` сначала реконсилируется кворумом
+  (кворум → `posted` → `done` без повторной отправки; unanimous `dead` старше
+  `MARKER_DEAD_AGE_MS` от `signedAt`/`postedAt` → `none`), resend тех же байт
+  — только без кворума; новой подписи нет. (M) просроченные lease `prepared`
+  освобождаются внутри транзакции `prepare`/remap-`activate` ДО проверок
+  бюджета; alarm — лишь ускоритель, его потеря не удерживает бюджет.
 
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 

@@ -14,7 +14,7 @@ import { readAllowCache } from './allowlist';
 // bundle picks them up as plain TypeScript. Precedent: worker/test/
 // client-parity.test.ts already imports src/lib/crypto.ts.
 import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
-import { QUORUM_POLICY_ID, statusVerdict, type QuorumVerdict } from '../../src/lib/status-quorum';
+import { QUORUM_POLICY_ID, statusVerdict, type QuorumVerdict, type StatusVote } from '../../src/lib/status-quorum';
 import { parseTrustedOwners } from '../../src/lib/trusted-owners';
 import { authenticatePublication, type ReadStage } from './publication-auth';
 import { metricsErrorCodes, metricsRay } from './metrics-diagnostics';
@@ -23,6 +23,7 @@ import { probeStatusOrigin } from './gateway-reads';
 import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
 import { permittedPost } from './spend-send';
 import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
+import { moneyQuorum } from './spend-ledger';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -1102,15 +1103,21 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
 
   /**
-   * Status verdict + D10 reconciliation in one step: a `confirmed` verdict
-   * settles the reservation this txId's permit named as `spent` (at the
-   * confirmed height). Best effort — the scheduler is the authoritative
-   * reconciler; a refusal never changes the answer, and a txId without a
-   * permit (a pre-D10 publication) is simply unknown to the guard.
+   * Status verdict + D10 reconciliation in one step. Liveness (the PR-3a
+   * verdict: one valid 200 is `alive`) answers the CLIENT; money is settled
+   * only under the guard's own quorum rule (`moneyQuorum`: ≥ 2 operators, each
+   * ≥ MIN_DEPOSIT_CONFIRMATIONS, heights within the skew — review 24.09,
+   * high: a single 200 with zero confirmations must not turn a hold into a
+   * final spend, nor lend its height to the marker classification). Until
+   * that quorum forms the reservation stays `pending`. Best effort — the
+   * scheduler is the authoritative reconciler; a refusal never changes the
+   * answer, and a txId without a permit (a pre-D10 publication) is simply
+   * unknown to the guard.
    */
   const liveOf = async (txId: string): Promise<'alive' | 'dead' | 'unavailable'> => {
-    const { live, verdict } = await getTxVerdictWorker(txId, emit, env);
-    if (verdict.kind === 'confirmed') await settleByTx(guard, { txId, outcome: 'spent', height: verdict.blockHeight });
+    const { live, votes } = await getTxVerdictWorker(txId, emit, env);
+    const q = moneyQuorum(votes, origin => origin);
+    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height });
     return live;
   };
   /** The second call of the redrop order (§8): a PROVEN dead transaction
@@ -2008,7 +2015,7 @@ async function getTxVerdictWorker(
   txId: string,
   emit: Emit,
   env: Env,
-): Promise<{ live: 'alive' | 'dead' | 'unavailable'; verdict: QuorumVerdict }> {
+): Promise<{ live: 'alive' | 'dead' | 'unavailable'; verdict: QuorumVerdict; votes: StatusVote[] }> {
   const origins = statusOrigins(env);
   const votes = await Promise.all(origins.map(origin => probeStatusOrigin(origin, txId, emit)));
 
@@ -2026,7 +2033,7 @@ async function getTxVerdictWorker(
         : 'unavailable';
   emit('status_verdict', [coarse, QUORUM_METRIC_HOST],
     [verdict.kind === 'confirmed' ? verdict.confirmations : -1]);
-  return { live: coarse, verdict };
+  return { live: coarse, verdict, votes };
 }
 
 /** Sentinel host for the aggregated row (see getTxStatusWorker). */
