@@ -72,6 +72,10 @@ export const SPEND_CODES = {
   anchorMismatch: 'spend_anchor_mismatch',
   /** `/anchor-expired` brought heights under which the anchor is still valid. */
   anchorNotExpired: 'spend_anchor_not_expired',
+  /** `permit-send` for bytes whose anchor is PROVEN expired: the network
+   *  cannot accept them, and a lease on them could only wedge money (review
+   *  24.09 #6, medium). The record must go dead → redrop, not resend. */
+  anchorExpired: 'spend_anchor_expired',
   windowCap: 'spend_window_cap',
   floor: 'spend_floor',
 } as const;
@@ -233,11 +237,14 @@ export interface PermitRecord {
   anchorExpired?: { anchorHeight: number; chainHeight: number; at: number };
 }
 
-/** Is the lease binding: an executor holds it and has not reported. Time is
- *  not an argument (review 24.09 #5, high 1): a block interval has a target
- *  average and no upper bound, so no wall-clock span proves an anchor stale. */
-export function leaseOpen(sending: PermitRecord['sending']): boolean {
-  return sending !== undefined;
+/** Is the lease binding: an executor holds it, has not reported, and the
+ *  anchor is not proven expired. Time is not an argument (review 24.09 #5,
+ *  high 1): a block interval has a target average and no upper bound, so no
+ *  wall-clock span proves an anchor stale. A permit whose anchor IS proven
+ *  expired binds nothing, whatever `sending` says (review #6, medium): its
+ *  bytes cannot land, so no lease on them may hold money. */
+export function leaseOpen(permit: Pick<PermitRecord, 'sending' | 'anchorExpired'> | undefined): boolean {
+  return permit !== undefined && permit.sending !== undefined && permit.anchorExpired === undefined;
 }
 
 /**
