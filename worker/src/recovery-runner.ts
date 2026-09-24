@@ -101,12 +101,14 @@ async function stepSigned(noteId: string, record: RecoveryRecord, env: RecoveryE
     // Phase 1 (plan «Redrop — явно двухфазный»): the CAS transition FIRST,
     // then the second call of the order — the dead transaction's reservation
     // is released (idempotent; repeated at every phase-2 attempt as well).
-    const ok = await host.cas(noteId, expected, toRedropPending(record, crypto.randomUUID(), now));
+    const pending = toRedropPending(record, crypto.randomUUID(), now);
+    const ok = await host.cas(noteId, expected, pending);
     if (!ok) return 'discarded';
     // A refused release (a send still in flight under the permit's lease, or
     // the guard down) is not an error: phase 2 repeats it before it signs.
     const rel = await releaseSpend(guard, record.spendKey);
-    if (rel !== 'released' && rel !== 'terminal') emit('recovery_refused', ['release', rel], []);
+    if (rel === 'spent') return moneyAlreadySpent(noteId, pending, host, emit, 'phase1');
+    if (rel !== 'released' && rel !== 'noop' && rel !== 'absent' && rel !== 'terminal') emit('recovery_refused', ['release', rel], []);
     return 'redrop_pending';
   }
   if (action === 'reschedule') {
@@ -171,8 +173,14 @@ async function stepRedropPending(noteId: string, record: RecoveryRecord, env: Re
   // between the two calls is healed here). Phase 2 signs ONLY once the old
   // money is provably free: a send still in flight under the old permit's
   // lease, or a guard that does not answer, postpones the new signature
-  // (review 24.09 #3, high 1 — the durable half of the send protocol).
+  // (review 24.09 #3, high 1 — the durable half of the send protocol). And
+  // «free» is not the same as «refused»: a lattice that answers
+  // `spent_is_final` says the dead verdict was wrong — a concurrent
+  // reconciliation confirmed the OLD transaction and booked its money. Then
+  // there is nothing to redrop: the old txId is the publication, and a new
+  // signature would be a second paid one (review 24.09 #4, high 3).
   const rel = await releaseSpend(guard, record.spendKey);
+  if (rel === 'spent') return moneyAlreadySpent(noteId, record, host, emit, 'phase2');
   if (rel === 'in_flight' || rel === 'unavailable') {
     emit('recovery_refused', ['release', rel], []);
     return (await host.cas(noteId, expected, rescheduled(record, now))) ? 'rescheduled' : 'discarded';
@@ -251,6 +259,20 @@ async function stepRedropPending(noteId: string, record: RecoveryRecord, env: Re
   else if (sent.sent === 'unknown') console.error('RECOVERY_PHASE2_POST_UNKNOWN', noteId, tx.id, sent.error);
   await host.cas(noteId, signedCas, rescheduled(nextSigned, host.now()));
   return 'signed';
+}
+
+/**
+ * The guard says the money of the record's (dead-looking) transaction is
+ * SPENT — confirmed by a money quorum elsewhere. The redrop stops here: the
+ * record becomes `posted` with the OLD txId (`deadTxId` when phase 1 already
+ * ran), nothing is signed, nothing is sent. A lost CAS means someone else
+ * moved the record first — nothing to do either.
+ */
+async function moneyAlreadySpent(noteId: string, record: RecoveryRecord, host: RecoveryHost, emit: Emit, where: 'phase1' | 'phase2'): Promise<StepOutcome> {
+  const txId = record.deadTxId ?? record.txId;
+  emit('recovery_step', [record.status, `spent_${where}`], [record.attempts]);
+  const posted = toPosted({ ...record, txId }, record.postedAt ?? host.now());
+  return (await host.cas(noteId, casOf(record), posted)) ? 'posted' : 'discarded';
 }
 
 function transport(emit: Emit): TransportDeps {

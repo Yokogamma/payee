@@ -42,22 +42,41 @@ export const RECOVERY_BACKOFF_CAP_MS = 3_600_000;
 export const SIGNED_TX_MAX_BYTES = 75 * 1024;
 export const RECOVERY_COUNT_KEY = 'recoveryCount';
 export const RECOVERY_INDEX_PREFIX = 'recovery:';
-/** The MONEY reconciliation index (review 24.09 #2, high 4): a note whose
- *  transaction was POSTed but whose D10 reservation is not settled yet —
- *  `money:<noteId> = { txId, dueAt, attempts }`. Independent of the client's
- *  rechecks and of the recovery set: it is entered at `mark-posted` (the
- *  ordinary path) and at recovery → posted, and leaves only when the guard
- *  says the reservation is terminal. */
+/** The MONEY reconciliation index (review 24.09 #2 high 4, #4 high 2): a
+ *  txId that was (or may have been) POSTed and whose D10 reservation is not
+ *  finally accounted yet — `money:<noteId>:<txId> = { txId, dueAt, attempts,
+ *  postedAt, watching? }`. Keyed by txId as well as note: a redrop leaves the
+ *  DEAD txId under watch while the new one is being settled. Independent of
+ *  the client's rechecks and of the recovery set: entered at `mark-posted`
+ *  (the ordinary path), at recovery → posted, and at phase 1 of a redrop (the
+ *  dead txId, whose permit was issued). It leaves only when the guard has
+ *  booked the money (`spent`), or when the bytes were released AND the
+ *  network can no longer accept them (`watching` for LATE_LANDING_BOUND_MS
+ *  after the POST — a late landing is then re-booked `released → spent`). */
 export const MONEY_INDEX_PREFIX = 'money:';
 export const MONEY_BATCH = 5;
+/** Hard ceiling on a watch whose status never settles (a pool that answers
+ *  `pending`/`unavailable` forever): the entry is dropped with a log line. */
+export const MONEY_WATCH_MAX_MS = 7 * 24 * 3_600_000;
 
-export interface MoneyEntry { txId: string; dueAt: number; attempts: number; postedAt: number }
+export interface MoneyEntry {
+  txId: string; dueAt: number; attempts: number; postedAt: number;
+  /** The reservation is `released` in the guard; the entry stays only to catch
+   *  a late landing (review 24.09 #4, high 2). */
+  watching?: boolean;
+}
 
 export function recoveryIndexKey(noteId: string): string {
   return `${RECOVERY_INDEX_PREFIX}${noteId}`;
 }
-export function moneyIndexKey(noteId: string): string {
-  return `${MONEY_INDEX_PREFIX}${noteId}`;
+export function moneyIndexKey(noteId: string, txId: string): string {
+  return `${MONEY_INDEX_PREFIX}${noteId}:${txId}`;
+}
+/** `money:<noteId>:<txId>` → the pair (a txId carries no `:`, a noteId is a UUID). */
+export function parseMoneyIndexKey(key: string): { noteId: string; txId: string } {
+  const rest = key.slice(MONEY_INDEX_PREFIX.length);
+  const at = rest.lastIndexOf(':');
+  return { noteId: rest.slice(0, at), txId: rest.slice(at + 1) };
 }
 
 // ─── Records ────────────────────────────────────────────────────────────

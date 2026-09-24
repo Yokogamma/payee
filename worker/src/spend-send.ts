@@ -76,7 +76,10 @@ export type PermittedPostResult =
 /**
  * permit-send → POST, with nothing in between. The permit request carries the
  * txId of the SIGNED bytes about to go out; a repeat for the same txId returns
- * the same permit (resend = no double accounting, §4.0).
+ * the same permit (resend = no double accounting, §4.0) under a NEW lease —
+ * and only once the previous executor reported: while a lease is open the
+ * guard answers `spend_send_in_flight` and nothing is sent (one executor per
+ * txId, review 24.09 #4 high 1).
  */
 export async function permittedPost(
   guard: DurableObjectStub,
@@ -100,7 +103,10 @@ export async function permittedPost(
     result = { sent: 'unknown', error: e };
   }
   // The end of the send, reported under the lease token — whatever happened.
-  // Best effort: a lost report only lets the lease expire (SEND_LEASE_MS).
+  // Best effort: a lost report keeps the txId exclusive and its money held
+  // until the anchor rule makes the bytes unacceptable (LATE_LANDING_BOUND_MS
+  // in spend-ledger.ts) — time is not a report, only the network's rule ends
+  // an unreported send.
   try {
     await guard.fetch('http://spend-guard/send-done', { method: 'POST', body: JSON.stringify({ txId: req.txId, sendToken: permit.sendToken }) });
   } catch (e) {

@@ -127,18 +127,27 @@ export async function activateSpend(
   return { ok: true, state: String(b.state), outcome: String(b.outcome), cycle: Number(b.cycle) };
 }
 
-/** Release a reservation that PROVABLY never reached the network (the §4.0
- *  «abort before send» branch). Best effort: a `prepared` one cannot be
- *  settled (its lease expires), an `active` one goes `released`; a refusal is
- *  logged and never changes the answer. */
-export type ReleaseResult = 'released' | 'in_flight' | 'terminal' | 'unavailable';
+/**
+ * Release a reservation: the §4.0 «abort before send» branch of the saga, and
+ * the second call of the redrop order in the scheduler. Best effort, and the
+ * answer is TYPED because the caller's next step depends on it (review 24.09
+ * #4, high 3): `released` / `noop` — the money is free (now, or already);
+ * `spent` — the lattice refused because the transaction was CONFIRMED and its
+ * money booked (`spent_is_final`): nothing is free, the old txId stands, and
+ * no new signature may follow; `in_flight` — an open send lease; `absent` —
+ * no reservation under this key (nothing was ever reserved); `terminal` — a
+ * refusal that leaves nothing to release (`prepared_cannot_settle`,
+ * `never_activated`, `foreign_cycle`); `unavailable` — no answer.
+ */
+export type ReleaseResult = 'released' | 'noop' | 'spent' | 'in_flight' | 'absent' | 'terminal' | 'unavailable';
 
 export async function releaseSpend(guard: DurableObjectStub, spendKey: string): Promise<ReleaseResult> {
   const r = await guardPost(guard, '/settle', { spendKey, outcome: 'released' });
-  if (isOk(r)) return 'released';
+  if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'released';
   if ('unavailable' in r) return 'unavailable';
   if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
-  if (r.status === 404 || r.status === 409) return 'terminal';
+  if (r.status === 404) return 'absent';
+  if (r.status === 409) return r.body.reason === 'spent_is_final' ? 'spent' : 'terminal';
   console.error('SPEND_RELEASE_NOT_APPLIED', spendKey.slice(-36), why(r));
   return 'unavailable';
 }
