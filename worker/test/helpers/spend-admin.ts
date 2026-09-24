@@ -43,6 +43,19 @@ export function isolatedGuard(name: string): DurableObjectNamespace {
 
 export const guardStub = (ns: DurableObjectNamespace) => ns.get(ns.idFromName('global'));
 
+/** The same isolation for ANY `idFromName('global')` namespace (the
+ *  InviteManager of the legacy closure). */
+export function isolatedNs(base: DurableObjectNamespace, name: string): DurableObjectNamespace {
+  const prefix = `iso-${name}-${RUN}`;
+  return {
+    idFromName: (n: string) => base.idFromName(`${prefix}:${n}`),
+    get: (id: DurableObjectId) => base.get(id),
+    newUniqueId: () => base.newUniqueId(),
+    idFromString: (s: string) => base.idFromString(s),
+    jurisdiction: () => base,
+  } as unknown as DurableObjectNamespace;
+}
+
 export async function guardStatus(ns: DurableObjectNamespace) {
   const res = await guardStub(ns).fetch('http://spend-guard/status');
   return (await res.json()) as {

@@ -43,7 +43,9 @@ interface StoredReservation extends Omit<Reservation, 'reward'> {
   settledHeight?: number;
   reclassified?: 'reserve';
 }
-interface StoredLegacy { reward: string; state: 'held' | 'spent' | 'dropped'; source: 'permit' | 'journal' }
+interface StoredLegacy { reward: string; state: 'held' | 'spent' | 'dropped'; source: 'permit' | 'journal'; registeredAt?: number }
+/** Operator-registered keys / acknowledgements for the legacy closure. */
+interface StoredLegacyKeys { keys: string[]; acknowledgedInvites: number }
 interface StoredQuote { quoteId: string; bytes: number; reward: string; expiresAt: number }
 interface StoredBalance { observedMin: string | null; at: number }
 
@@ -56,6 +58,7 @@ const K = {
   audit: 'auditseq',
   permit: (txId: string) => `permit:${txId}`,
   legacy: (txId: string) => `legacy:${txId}`,
+  legacyKeys: 'legacy-keys',
   deposit: (txId: string) => `deposit:${txId}`,
   res: (spendKey: string) => `res:${spendKey}`,
   quote: (id: string) => `quote:${id}`,
@@ -126,7 +129,13 @@ export class SpendGuard implements DurableObject {
     switch (path) {
       case '/permit-send': return this.permitSend(body, now);
       case '/freeze': return this.freeze(body, now);
-      case '/init-legacy': return this.initLegacy(body);
+      case '/init-legacy': return this.initLegacy(body, now);
+      // The two questions the closure of the legacy set asks the DO (§4.0
+      // п. 1, 4): permits without a terminal outcome, and what is registered.
+      case '/open-permits': return this.openPermits();
+      case '/legacy-list': return this.legacyList();
+      case '/legacy-keys': return okJson({ ...(await this.getLegacyKeys()) });
+      case '/legacy-keys-set': return this.setLegacyKeys(body);
       case '/init-begin': return this.initStep({ kind: 'begin', token: String(body.token ?? ''), now, frozen: (await this.getFreeze()).active, legacyOpen: body.legacyOpen === true, rewardUnknown: body.rewardUnknown === true });
       case '/init-signed': return this.initStep({ kind: 'signed', token: String(body.token ?? ''), txId: String(body.txId ?? ''), signedTx: String(body.signedTx ?? ''), anchor: String(body.anchor ?? ''), now });
       case '/init-posted': return this.initStep({ kind: 'posted', token: String(body.token ?? ''), txId: String(body.txId ?? ''), now });
@@ -220,7 +229,7 @@ export class SpendGuard implements DurableObject {
 
   // ─── §4.0 п. 4 init-legacy ──────────────────────────────────────────────
 
-  private async initLegacy(body: Record<string, unknown>): Promise<Response> {
+  private async initLegacy(body: Record<string, unknown>, now: number): Promise<Response> {
     const items = Array.isArray(body.items) ? (body.items as Array<{ txId?: unknown; reward?: unknown; source?: unknown }>) : null;
     if (!items) return new Response('bad request', { status: 400 });
     // Validate the WHOLE batch before the first write (review 24.09, high): a
@@ -239,13 +248,56 @@ export class SpendGuard implements DurableObject {
       let added = 0n; let held = 0;
       for (const { txId, reward, source } of parsed) {
         if (await txn.get(K.legacy(txId))) { held++; continue; } // idempotent by txId
-        await txn.put<StoredLegacy>(K.legacy(txId), { reward: reward.toString(), state: 'held', source });
+        await txn.put<StoredLegacy>(K.legacy(txId), { reward: reward.toString(), state: 'held', source, registeredAt: now });
         added += reward; held++;
       }
       const next = { ...ledger, pending: ledger.pending + added };
       await this.putLedger(txn, next);
       await this.audit(txn, 'init-legacy', { held, added: added.toString() });
       return okJson({ held, pending: next.pending.toString() });
+    });
+  }
+
+  /** L₁: permits (all cycles, never the marker) whose reservation has no
+   *  terminal outcome and which are not registered as legacy yet. The reward
+   *  is the reservation's — what the transaction was signed with. */
+  private async openPermits(): Promise<Response> {
+    const items: Array<{ txId: string; reward: string | null; spendKey: string; state: string | null }> = [];
+    for (const [key, permit] of await this.state.storage.list<PermitRecord>({ prefix: 'permit:' })) {
+      if (permit.kind === 'marker' || !permit.spendKey) continue;
+      const txId = key.slice('permit:'.length);
+      if (await this.state.storage.get(K.legacy(txId))) continue;
+      const res = await this.state.storage.get<StoredReservation>(K.res(permit.spendKey));
+      if (res && (res.state === 'spent' || res.state === 'released')) continue;
+      items.push({ txId, reward: res?.reward ?? null, spendKey: permit.spendKey, state: res?.state ?? null });
+    }
+    return okJson({ items });
+  }
+
+  private async legacyList(): Promise<Response> {
+    const items: Array<{ txId: string } & StoredLegacy> = [];
+    for (const [key, rec] of await this.state.storage.list<StoredLegacy>({ prefix: 'legacy:' })) {
+      items.push({ txId: key.slice('legacy:'.length), ...rec });
+    }
+    return okJson({ items });
+  }
+
+  private async getLegacyKeys(): Promise<StoredLegacyKeys> {
+    return (await this.state.storage.get<StoredLegacyKeys>(K.legacyKeys)) ?? { keys: [], acknowledgedInvites: 0 };
+  }
+
+  /** The operator's explicit registration (§4.0 п. 2): keys recovered from
+   *  KV / backups, and the count of old-format invites acknowledged as
+   *  covered. Monotone: keys are added, the acknowledgement never shrinks. */
+  private async setLegacyKeys(body: Record<string, unknown>): Promise<Response> {
+    const keys = Array.isArray(body.keys) ? (body.keys as unknown[]).filter((k): k is string => typeof k === 'string' && k.length > 0 && k.length <= 64) : [];
+    const ack = typeof body.acknowledgeLegacyInvites === 'number' && Number.isInteger(body.acknowledgeLegacyInvites) && body.acknowledgeLegacyInvites >= 0 ? body.acknowledgeLegacyInvites : 0;
+    return this.state.storage.transaction(async (txn) => {
+      const current = (await txn.get<StoredLegacyKeys>(K.legacyKeys)) ?? { keys: [], acknowledgedInvites: 0 };
+      const next: StoredLegacyKeys = { keys: [...new Set([...current.keys, ...keys])], acknowledgedInvites: Math.max(current.acknowledgedInvites, ack) };
+      await txn.put<StoredLegacyKeys>(K.legacyKeys, next);
+      await this.audit(txn, 'legacy-keys', { added: keys.length, acknowledgedInvites: next.acknowledgedInvites });
+      return okJson({ ...next });
     });
   }
 

@@ -280,6 +280,10 @@ discriminator).
 | `recovery_step` | event, state (`signed` / `redrop_pending`), action (`advance_posted` / `reschedule` / `resend` / `redrop` / `phase2`) | attempts so far | the per-key scheduler (RateLimiter alarm, or the recheck's nudge) at the start of one step |
 | `recovery_refused` | event, leg (`activate` / `permit` / `prepare` / `limits`), code | — | a step the guard or the configuration refused: the record is kept and rescheduled |
 | `recovery_corrupt` | event, state | — | the stored bytes do not parse or are not the recorded txId: nothing sent, nothing signed |
+| `gateway_call` kind=`legacy_header` | event, `legacy_header`, host, statusClass (`invalid_response` = a header that does not verify: id ≠, signature, owner) | latencyMs | the legacy closure reading `/tx/<id>` of a pre-D10 transaction at a payload origin |
+| `legacy_reward_unknown` | event | — | the closure could not read a verified header at any origin: `init` refused |
+| `legacy_held_registered` | event | items registered | `/admin/spend/init` after the closure registered holds |
+| `legacy_resolved` | event, outcome (`spent` / `dropped`) | — | `/admin/spend/init` in `done`, one per held item resolved by the quorum |
 | `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
 
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
