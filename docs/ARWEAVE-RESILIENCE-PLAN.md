@@ -1776,7 +1776,6 @@ Reader-релиз этим не блокируется: он не создаёт
   `settle-by-tx spent` / `dead` + age guard → `released` / backoff, выход
   только по терминальному ответу guard; (M) smoke считает исходом последний
   ответ `init` (`done`/`waiting` — успех, иначе отказ).
-<<<<<<< Updated upstream
 
 **Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
 ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**
@@ -1802,8 +1801,6 @@ Reader-релиз этим не блокируется: он не создаёт
   `h_init` → `spent`, на/ниже → `dropped`, unanimous `dead` старше 30 мин от
   `registeredAt` → `dropped`, иначе `held` (без TTL); ответ `legacy:
   { held, spent, dropped, kept }`.
-=======
->>>>>>> Stashed changes
 
 **Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
 ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**
