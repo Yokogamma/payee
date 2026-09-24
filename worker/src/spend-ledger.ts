@@ -357,7 +357,7 @@ export type SettleOutcome = 'spent' | 'released';
 
 export type SettleResult =
   | { ok: true; state: ReservationState; spentDelta: bigint; pendingDelta: bigint; conflict: boolean }
-  | { ok: false; reason: 'prepared_cannot_settle' | 'spent_is_final' };
+  | { ok: false; reason: 'prepared_cannot_settle' | 'spent_is_final' | 'never_activated' };
 
 /**
  * `settle` (§7): `active → spent` (pending −= reward, spent += reward, bucket,
@@ -380,9 +380,13 @@ export function settle(reservation: Reservation, outcome: SettleOutcome): Settle
         ? { ok: true, state: 'spent', spentDelta: 0n, pendingDelta: 0n, conflict: false }
         : { ok: false, reason: 'spent_is_final' };
     case 'released':
-      return outcome === 'released'
-        ? { ok: true, state: 'released', spentDelta: 0n, pendingDelta: 0n, conflict: false }
-        : { ok: true, state: 'spent', spentDelta: r, pendingDelta: 0n, conflict: true };
+      if (outcome === 'released') return { ok: true, state: 'released', spentDelta: 0n, pendingDelta: 0n, conflict: false };
+      // «Money left after all» presumes the transaction was ACTIVATED (and so
+      // could have been POSTed). A released reservation nobody activated — an
+      // expired lease, or one released with its cycle at reinit — never
+      // reached the network; it cannot turn into spending (review 24.09).
+      if (reservation.activatedBy === undefined) return { ok: false, reason: 'never_activated' };
+      return { ok: true, state: 'spent', spentDelta: r, pendingDelta: 0n, conflict: true };
   }
 }
 
