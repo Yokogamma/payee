@@ -480,7 +480,8 @@ describe('the two-phase redrop', () => {
     expect((await status()).ledger.pending).toBe('0'); // the old reservation was released
     const gstub = ns.get(ns.idFromName('global'));
     expect(await runInDurableObject(gstub, (_i, s) => s.storage.get<{ state: string }>(`res:${spendKey}`))).toMatchObject({ state: 'released' });
-    // Phase 2.
+    // Phase 2 (it re-reads the old txId right before signing: dead again).
+    deadOnAll(mockRoute, record.txId);
     const { post } = paidLegs(mockRoute, { price: '12' });
     await runNow(stub, r!.dueAt);
     r = await note(stub, noteId);
@@ -508,6 +509,7 @@ describe('the two-phase redrop', () => {
     deadOnAll(mockRoute, record.txId);
     await runNow(stub, FAR);
     // Phase 2: anchor + price ok, POST fails → the new signed stays, rescheduled.
+    deadOnAll(mockRoute, record.txId); // phase 2's re-check before signing
     paidLegs(mockRoute, { price: '12', post: 500 });
     let r = await note(stub, noteId);
     await runNow(stub, r!.dueAt);
@@ -573,7 +575,8 @@ describe('the send protocol, review 24.09 #4 — three counterexamples closed', 
     // Next pass: the money step sees dead + age guard → `released` (a no-op,
     // phase 1 did it) → the entry turns into a watch; phase 2 signs the new
     // generation and posts it → a SECOND entry for the new txId.
-    deadOnAll(mockRoute, record.txId);
+    deadOnAll(mockRoute, record.txId); // the money step
+    deadOnAll(mockRoute, record.txId); // phase 2's re-check before signing
     const { post } = paidLegs(mockRoute, { price: '12' });
     await runNow(stub, Math.max(r!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt));
     r = await note(stub, noteId);
@@ -609,7 +612,10 @@ describe('the send protocol, review 24.09 #4 — three counterexamples closed', 
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
     // No anchor / price / POST routes: a phase 2 that went ahead would throw
-    // at the anchor and leave the record `redrop_pending`, rescheduled.
+    // at the anchor and leave the record `redrop_pending`, rescheduled. The
+    // pool lags behind the guard (still dead): the guard's `spent_is_final`
+    // on the release decides.
+    deadOnAll(mockRoute, record.txId);
     await runNow(stub, FAR);
     expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
     const rs = await recoveryStatus(stub);
@@ -683,8 +689,10 @@ describe('review 24.09 #5 — the proof of expiry comes from the chain; age neve
     // accepted by the guard, the lease ends, `released` goes through, the
     // entry turns into a watch; phase 2 signs and posts the new generation.
     t = Math.max((await note(stub, noteId))!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt);
-    deadOnAll(mockRoute, record.txId);
+    deadOnAll(mockRoute, record.txId); // money step, first read
     chainAt(EXPIRED_AT);
+    deadOnAll(mockRoute, record.txId); // money step, the re-read after the proof
+    deadOnAll(mockRoute, record.txId); // phase 2's re-check before signing
     const { post } = paidLegs(mockRoute, { price: '12' });
     await runNow(stub, t);
     r = await note(stub, noteId);
@@ -827,6 +835,109 @@ describe('review 24.09 #6 — a dead read BEFORE the proof is not evidence for t
     expect(post.calls).toBe(0);
     expect(await note(stub, noteId)).toMatchObject({ status: 'signed', txId: record.txId, attempts: 1 });
     expect((await status()).ledger.pending).toBe('10'); // the reservation is untouched until the quorum decides
+  });
+});
+
+describe('review 24.09 #6, second half — the re-read guards the RELEASE of an active reservation and phase 2 itself', () => {
+  it('(H) unreported lease → proof → the pool is read AGAIN before the money is freed: mined in between → spent (10) and the old txId is the publication, phase 2 signs nothing; pending → nothing freed, phase 2 waits; dead again → released and phase 2 goes on', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r7-h', { deposit: '1000' });
+    const id = await makeIdentity();
+    const mk = async () => {
+      const noteId = uuidV4();
+      const w = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000, sendDone: false });
+      const stub = await seed(env, id.pkB64, noteId, w.record);
+      deadOnAll(mockRoute, w.record.txId);
+      await runNow(stub, FAR); // phase 1: redrop_pending, release refused (lease open), dead txId indexed
+      expect(await note(stub, noteId)).toMatchObject({ status: 'redrop_pending', deadTxId: w.record.txId });
+      const due = Math.max((await note(stub, noteId))!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt);
+      return { noteId, stub, record: w.record, spendKey: w.spendKey, due };
+    };
+    const gstub = ns.get(ns.idFromName('global'));
+    const resOf = (spendKey: string) => runInDurableObject(gstub, (_i, s) => s.storage.get<{ state: string }>(`res:${spendKey}`));
+
+    // (a) The reviewer's scenario: dead at the first read, the proof says
+    // expired — and the transaction was mined meanwhile. The second read
+    // finds the quorum: the money is booked SPENT (never released), phase 2
+    // in the same pass meets `spent_is_final` → posted with the OLD txId.
+    const a = await mk();
+    deadOnAll(mockRoute, a.record.txId);          // money step, first read
+    chainAt(EXPIRED_AT);                           // the proof
+    confirmedOnAll(mockRoute, a.record.txId, 5000, 60); // money step, second read
+    confirmedOnAll(mockRoute, a.record.txId, 5000, 60); // phase 2's own re-check, before any release
+    const postA = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK', 0);
+    await runNow(a.stub, a.due);
+    expect(postA.calls).toBe(0);
+    expect(await note(a.stub, a.noteId)).toMatchObject({ status: 'posted', txId: a.record.txId });
+    expect(await resOf(a.spendKey)).toMatchObject({ state: 'spent' });
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    // The posted record re-enters the money index for the old txId; it
+    // reconciles to a no-op (already spent) and leaves.
+    expect(moneyRows(await recoveryStatus(a.stub), a.noteId).map(x => x.txId)).toEqual([a.record.txId]);
+    confirmedOnAll(mockRoute, a.record.txId, 5000, 60);
+    await runNow(a.stub, moneyOf(await recoveryStatus(a.stub), a.noteId).dueAt);
+    expect(moneyRows(await recoveryStatus(a.stub), a.noteId)).toEqual([]);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+
+    // (b) Dead, expired — and PENDING at the second read: nothing is freed
+    // (the reservation stays active, pending stays), phase 2 meets the open
+    // lease and waits. No signature.
+    const b = await mk();
+    deadOnAll(mockRoute, b.record.txId);
+    chainAt(EXPIRED_AT);
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, b.record.txId), 202, 'Pending'));
+    await runNow(b.stub, b.due);
+    expect(await note(b.stub, b.noteId)).toMatchObject({ status: 'redrop_pending' });
+    expect(await resOf(b.spendKey)).toMatchObject({ state: 'active' });
+    expect((await status()).ledger).toMatchObject({ pending: '10', spent: '10' });
+    expect(moneyOf(await recoveryStatus(b.stub), b.noteId).watching).toBeUndefined();
+
+    // (c) Dead, expired, dead AGAIN: released → watch; phase 2's own
+    // re-check (dead once more) lets it sign and post the new generation.
+    const c = await mk();
+    deadOnAll(mockRoute, c.record.txId); // money step, first read
+    chainAt(EXPIRED_AT);
+    deadOnAll(mockRoute, c.record.txId); // money step, second read
+    deadOnAll(mockRoute, c.record.txId); // phase 2, the re-check before signing
+    const { post } = paidLegs(mockRoute, { price: '12' });
+    await runNow(c.stub, c.due);
+    const rc = await note(c.stub, c.noteId);
+    expect(rc!.status).toBe('posted');
+    expect(rc!.txId).not.toBe(c.record.txId);
+    expect(post!.calls).toBe(1);
+    expect(await resOf(c.spendKey)).toMatchObject({ state: 'released' });
+    expect(moneyRows(await recoveryStatus(c.stub), c.noteId).find(x => x.txId === c.record.txId)).toMatchObject({ watching: true });
+  });
+
+  it('(H) phase 2 re-reads the old txId right before signing, whoever released the money: pending → no signature, rescheduled; confirmed → `released → spent` and posted with the old txId; only dead → the new generation', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r7-p2', { deposit: '1000' });
+    const id = await makeIdentity();
+    const mk = async () => {
+      const noteId = uuidV4();
+      const w = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000 });
+      // Phase 1 already ran and released the money (the lease was reported).
+      expect((await guardCall(ns, '/settle', { spendKey: w.spendKey, outcome: 'released' })).body).toMatchObject({ state: 'released' });
+      await seed(env, id.pkB64, noteId, { ...w.record, status: 'redrop_pending', deadTxId: w.record.txId, dueAt: FAR });
+      return { noteId, stub: RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64)), record: w.record, spendKey: w.spendKey };
+    };
+    // pending at the re-check → no signature, rescheduled.
+    const p = await mk();
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, p.record.txId), 202, 'Pending'));
+    await runNow(p.stub, FAR);
+    expect(await note(p.stub, p.noteId)).toMatchObject({ status: 'redrop_pending', attempts: 1 });
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '0' });
+    // confirmed at the re-check → the released money is re-booked spent
+    // (the lattice's conflict), the old txId is the publication.
+    const c = await mk();
+    confirmedOnAll(mockRoute, c.record.txId, 5000, 60);
+    await runNow(c.stub, FAR);
+    expect(await note(c.stub, c.noteId)).toMatchObject({ status: 'posted', txId: c.record.txId });
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    // 49 confirmations: neither a money quorum nor dead → wait, no signature.
+    const s = await mk();
+    confirmedOnAll(mockRoute, s.record.txId, 5000, 49);
+    await runNow(s.stub, FAR);
+    expect(await note(s.stub, s.noteId)).toMatchObject({ status: 'redrop_pending', attempts: 1 });
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
   });
 });
 
