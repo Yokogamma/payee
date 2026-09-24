@@ -236,7 +236,9 @@ describe('§7 settle lattice', () => {
   it('prepared cannot settle; spent is final; released → spent dominates with a conflict', () => {
     expect(settle({ ...active, state: 'prepared' }, 'spent')).toEqual({ ok: false, reason: 'prepared_cannot_settle' });
     expect(settle({ ...active, state: 'spent' }, 'released')).toEqual({ ok: false, reason: 'spent_is_final' });
-    expect(settle({ ...active, state: 'released' }, 'spent')).toEqual({ ok: true, state: 'spent', spentDelta: 10n, pendingDelta: 0n, conflict: true });
+    expect(settle({ ...active, state: 'released', activatedBy: 'w1' }, 'spent')).toEqual({ ok: true, state: 'spent', spentDelta: 10n, pendingDelta: 0n, conflict: true });
+    // …but only for a reservation that WAS activated: an expired/reinit-released one never reached the network.
+    expect(settle({ ...active, state: 'released' }, 'spent')).toEqual({ ok: false, reason: 'never_activated' });
   });
 });
 
