@@ -255,31 +255,37 @@ describe('transport fallback inside one logical source', () => {
     expect(out.indexDiagnostics?.sources).toEqual([{ complete: true, transport: SRC_A_FALLBACK }, { complete: true, transport: SRC_B }]);
   });
 
-  it('primary fails on page 2 → RESTART on the fallback from page 1; pages of the two transports are never mixed', async () => {
+  it('primary fails on page 2 → RESTART on the fallback from page 1; a candidate the primary already found is KEPT, completeness comes from the fallback', async () => {
+    // Review 24.09 (high): restarting the PAGINATION on the fallback is
+    // right; forgetting a genuine, correctly encrypted record the primary had
+    // already listed is not. Candidates and the proof of completeness are two
+    // different things.
     const key = await noteKey();
     const { encryptEnvelope } = await import('./crypto');
     const n1 = await encryptEnvelope(key, 'genuine');
-    const decoy = await encryptEnvelope(key, 'only on the failed primary');
+    const early = await encryptEnvelope(key, 'listed by the primary before it failed');
     const gw = await stubSources({
       sources: `${SRC_A}|${SRC_A_FALLBACK}`,
       pages: {
-        // The primary's page 1 carries a candidate the fallback never lists;
-        // once the primary fails on page 2 that page is DISCARDED with it.
-        [SRC_A]: [[{ txId: 'DECOY', noteId: decoy.noteId, height: 9 }], [{ txId: 'T1', noteId: n1.noteId, height: 8 }]],
+        [SRC_A]: [[{ txId: 'EARLY', noteId: early.noteId, height: 9 }], [{ txId: 'T1', noteId: n1.noteId, height: 8 }]],
         [SRC_A_FALLBACK]: [[{ txId: 'T1', noteId: n1.noteId, height: 8 }]],
       },
-      payloads: { T1: v2wire(n1), DECOY: v2wire(decoy) },
+      payloads: { T1: v2wire(n1), EARLY: v2wire(early) },
       onGraphql: (call, url) => (url === SRC_A && call === 1 ? new Response('down', { status: 503 }) : undefined),
     });
     const { fetchAllNotes } = await import('./arweave');
     const out = await fetchAllNotes('oh', ring(key));
-    expect(out.notes.map(n => n.text)).toEqual(['genuine']);
+    expect(out.notes.map(n => n.text).sort()).toEqual(['genuine', 'listed by the primary before it failed']);
     expect(out.incomplete).toBe(false);
-    expect(gw.rawCalls()).toEqual(['T1']);
+    expect(gw.rawCalls().sort()).toEqual(['EARLY', 'T1']);
     expect(out.indexDiagnostics?.sources).toEqual([{ complete: true, transport: SRC_A_FALLBACK }]);
+    // The fallback's own pages are not re-read from the primary: exactly one
+    // page from the primary, one from the fallback.
+    expect(gw.graphqlCalls().filter(u => u === SRC_A)).toHaveLength(2);
+    expect(gw.graphqlCalls().filter(u => u === SRC_A_FALLBACK)).toHaveLength(1);
   });
 
-  it('every transport fails → the LONGEST partial read is kept and the source is incomplete', async () => {
+  it('every transport fails → everything any transport found is kept and the source is incomplete', async () => {
     const key = await noteKey();
     const { encryptEnvelope } = await import('./crypto');
     const n1 = await encryptEnvelope(key, 'partial but kept');

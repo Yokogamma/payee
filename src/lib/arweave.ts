@@ -1149,19 +1149,20 @@ function createPayloadPool(ownerAddresses: readonly string[]) {
  * Walk ONE logical index source through its transports.
  *
  * Pages are read sequentially from the primary URL. If the primary fails
- * (a page could not be fetched — not an abort, not a bound), the source is
+ * (a page could not be fetched — not an abort, not a bound), the walk is
  * RESTARTED from the first page on the next transport: the `after` cursor is
- * opaque and not portable between transports, so pages of two transports are
- * never mixed — the edges read so far from the failed transport are discarded,
- * and the source is either read to its end through ONE transport or reported
- * incomplete. A transport that hit a walk bound (pages, candidates, deadline)
+ * opaque and not portable between transports, so the PAGINATION of two
+ * transports is never mixed. Two things are kept apart on purpose (review
+ * 24.09, high): the CANDIDATES and the PROOF OF COMPLETENESS. Every txId any
+ * transport returned stays in the source's edge set — a txId is never
+ * un-found, each candidate still passes D9 + decrypt, so keeping it can only
+ * add safety — while `complete` is claimed only when ONE transport was read
+ * to its end. A transport that hit a walk bound (pages, candidates, deadline)
  * is NOT restarted elsewhere: the fallback would walk the same index into the
  * same bound and only spend the deadline.
  *
  * `firstPageFailed` = no transport of this source ever answered its first
  * page (the input to ArweaveIndexUnavailableError, decided across sources).
- * When every transport failed, the LONGEST partial read is kept: candidates
- * can only add safety (each still passes D9 + decrypt), never remove it.
  */
 async function sweepSource(
   source: number,
@@ -1171,13 +1172,14 @@ async function sweepSource(
   deadlineAt: number,
 ): Promise<SourceSweep & { firstPageFailed: boolean; transport: string | null }> {
   let anyFirstPage = false;
-  let best: { edges: IndexEdge[]; transport: string } | null = null;
+  // Union of everything any transport returned for this source, keyed by txId.
+  const found = new Map<string, IndexEdge>();
+  let lastTransport: string | null = null;
   for (const url of urls) {
     if (signal?.aborted) break;
     const edges: IndexEdge[] = [];
     let cursor: string | null = null;
     let pages = 0;
-    let firstPageOk = false;
     let outcome: 'complete' | 'failed' | 'bounded';
     while (true) {
       // Every bound ends the walk as INCOMPLETE rather than looping: a partial
@@ -1193,7 +1195,7 @@ async function sweepSource(
         outcome = 'failed';
         break;
       }
-      if (cursor === null) { anyFirstPage = true; firstPageOk = true; }
+      if (cursor === null) { anyFirstPage = true; lastTransport = url; }
       for (const edge of page.edges) {
         const noteIdTag = edge.node.tags.find(t => t.name === 'Note-Id');
         const appNameTag = edge.node.tags.find(t => t.name === 'App-Name');
@@ -1206,7 +1208,9 @@ async function sweepSource(
         if (!appNameTag || appNameTag.value !== APP_NAME) continue;
         if (!versionTag || !SUPPORTED_VERSIONS.has(versionTag.value)) continue;
         if (!noteIdTag) continue;
-        edges.push({ txId: edge.node.id, noteId: noteIdTag.value, version: versionTag.value, height: edge.node.height });
+        const candidate: IndexEdge = { txId: edge.node.id, noteId: noteIdTag.value, version: versionTag.value, height: edge.node.height };
+        edges.push(candidate);
+        if (!found.has(candidate.txId)) found.set(candidate.txId, candidate);
       }
       if (page.edges.length === 0 || !page.hasNextPage) { outcome = 'complete'; break; }
       pages++;
@@ -1215,18 +1219,24 @@ async function sweepSource(
       if (next === cursor) { outcome = 'bounded'; break; }
       cursor = next;
     }
-    if (outcome === 'complete') return { source, complete: true, edges, firstPageFailed: false, transport: url };
-    // A transport that never answered its first page read nothing and is not
-    // «the transport that produced the edges kept».
-    if (firstPageOk && (best === null || edges.length > best.edges.length)) best = { edges, transport: url };
+    if (outcome === 'complete') {
+      // The completing transport's pages come first (its own HEIGHT_DESC
+      // order, byte-identical in single-transport mode); anything a failed
+      // transport found that this one did not list is appended — still a
+      // candidate, still verified (D9), just without a position claim.
+      const ordered = [...edges];
+      const listed = new Set(edges.map(e => e.txId));
+      for (const [txId, edge] of found) if (!listed.has(txId)) ordered.push(edge);
+      return { source, complete: true, edges: ordered, firstPageFailed: false, transport: url };
+    }
     if (outcome === 'bounded') break;
   }
   return {
     source,
     complete: false,
-    edges: best?.edges ?? [],
+    edges: [...found.values()],
     firstPageFailed: !anyFirstPage,
-    transport: best?.transport ?? null,
+    transport: lastTransport,
   };
 }
 
