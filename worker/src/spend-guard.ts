@@ -31,7 +31,7 @@ import {
 // ─── Storage shapes (strings for bigint) ────────────────────────────────
 
 interface StoredLedger { cycle: number; hInit: number | null; deposits: string; spent: string; pending: string }
-interface StoredReservation extends Omit<Reservation, 'reward'> { reward: string; quoteId?: string; leaseUntil?: number; cycle: number }
+interface StoredReservation extends Omit<Reservation, 'reward'> { reward: string; quoteId?: string; leaseUntil?: number; cycle: number; settledHeight?: number; reclassified?: 'reserve' }
 interface StoredLegacy { reward: string; state: 'held' | 'spent' | 'dropped'; source: 'permit' | 'journal' }
 interface StoredQuote { quoteId: string; bytes: number; reward: string; expiresAt: number }
 interface StoredBalance { observedMin: string | null; at: number }
@@ -222,12 +222,29 @@ export class SpendGuard implements DurableObject {
       if (!t.ok) return refuse(t.code, t.code === SPEND_CODES.initInProgress ? 409 : 503, { initState: record.state });
       await txn.put<InitRecord>(K.init, t.record);
       if (t.opensCycle !== undefined && t.record.hInit !== undefined) {
-        // `done` opens the cycle ledger: deposits 0, spent 0, pending = Σ held.
-        // Held legacy sums already sit in `pending` since `/init-legacy`; a
-        // reservation pending from before the freeze (there should be none —
-        // uploads are off during init) is carried, never dropped.
+        // `done` fixes the marker height on the CURRENT ledger — it never
+        // resets it (review 24.09 #1): the cycle ledger was opened at reinit
+        // (or is the fresh default), and anything settled between reinit and
+        // done — a carried reservation whose transaction confirmed while the
+        // marker was still `posted` — is already in `spent`. Deposits are 0 by
+        // construction (crediting needs h_init).
         const ledger = await this.getLedger(txn);
-        await this.putLedger(txn, { cycle: t.record.cycle, hInit: t.record.hInit, deposits: 0n, spent: 0n, pending: ledger.pending });
+        let spent = ledger.spent;
+        // Classification once the boundary is known (§4.0 п. 6 applied to
+        // carried reservations): a carried transaction confirmed AT OR BELOW
+        // h_init was mined before the marker — it belongs to the pre-marker
+        // reserve, not to this cycle's spending. Only a reservation that
+        // recorded its confirmed height can be moved; without a height it
+        // stays `spent` (the conservative side).
+        for (const [key, res] of await txn.list<StoredReservation>({ prefix: 'res:' })) {
+          if (res.state !== 'spent' || res.cycle >= t.record.cycle || res.settledHeight === undefined || res.reclassified) continue;
+          if (res.settledHeight <= t.record.hInit) {
+            spent -= BigInt(res.reward);
+            await txn.put<StoredReservation>(key, { ...res, reclassified: 'reserve' });
+            await this.audit(txn, 'carried-reclassified-reserve', { spendKey: key.slice(4), reward: res.reward, settledHeight: res.settledHeight, hInit: t.record.hInit });
+          }
+        }
+        await this.putLedger(txn, { ...ledger, cycle: t.record.cycle, hInit: t.record.hInit, spent });
       }
       await this.audit(txn, `init-${event.kind}`, { state: t.record.state, txId: t.record.txId ?? null, cycle: t.record.cycle });
       return okJson({ init: t.record });
@@ -409,6 +426,10 @@ export class SpendGuard implements DurableObject {
   private async settle(body: Record<string, unknown>, now: number): Promise<Response> {
     const spendKey = String(body.spendKey ?? ''); const outcome = body.outcome;
     if (!spendKey || (outcome !== 'spent' && outcome !== 'released')) return new Response('bad request', { status: 400 });
+    // The confirmed block height from the status quorum (optional): a carried
+    // reservation settled while the marker is not yet `done` is classified
+    // against h_init later (see initStep); without it, `spent` is final.
+    const settledHeight = typeof body.height === 'number' && Number.isInteger(body.height) ? body.height : undefined;
     return this.state.storage.transaction(async (txn) => {
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
       if (!existing) return new Response('unknown reservation', { status: 404 });
@@ -425,8 +446,8 @@ export class SpendGuard implements DurableObject {
       const next: CycleLedger = { ...ledger, spent: ledger.spent + r.spentDelta, pending: ledger.pending + r.pendingDelta };
       await this.putLedger(txn, next);
       if (r.spentDelta > 0n) await txn.put(K.buckets, fromBuckets(addToBucket(toBuckets(await txn.get(K.buckets)), now, r.spentDelta)));
-      await txn.put<StoredReservation>(K.res(spendKey), { ...existing, state: r.state });
-      await this.audit(txn, 'settle', { spendKey, outcome, conflict: r.conflict, reward: existing.reward });
+      await txn.put<StoredReservation>(K.res(spendKey), { ...existing, state: r.state, ...(settledHeight !== undefined && r.state === 'spent' ? { settledHeight } : {}) });
+      await this.audit(txn, 'settle', { spendKey, outcome, conflict: r.conflict, reward: existing.reward, settledHeight: settledHeight ?? null });
       return okJson({ state: r.state, conflict: r.conflict, available: available(next).toString() });
     });
   }

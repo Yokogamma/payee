@@ -248,6 +248,64 @@ describe('review 24.09 — reinit and old reservations; init-legacy atomicity; e
     expect((await status(sg)).ledger).toMatchObject({ spent: '10', pending: '0' });
   });
 
+  it('(high, round 2) a carried reservation settled between init-posted and init-done is NOT forgotten by done', async () => {
+    // Review 24.09 #1: reinit carried a hold of 10; the old transaction
+    // confirmed at 301 while the marker (at 300) was still `posted`; done
+    // must keep spent = 10, so the 100 credited afterwards leaves 90.
+    const sg = await initialized(fresh('carry-settle'));
+    await credit(sg, 'D1', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'act', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'act', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
+    await call(sg, '/freeze', { active: true, now: T0 + 1 });
+    expect((await call(sg, '/reinit', {})).body).toMatchObject({ cycle: 2, carriedActive: '10' });
+    await call(sg, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    // Reconciliation is allowed under freeze: the carried transaction confirms first.
+    expect((await call(sg, '/settle', { spendKey: 'act', outcome: 'spent', height: 301, now: T0 + 3 })).body).toMatchObject({ state: 'spent' });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 2, spent: '10', pending: '0' });
+    await call(sg, '/init-done', { txId: 'M2', heights: [300, 300], confirmations: [60, 60], now: T0 + 4 });
+    expect((await status(sg)).ledger).toMatchObject({ cycle: 2, hInit: 300, deposits: '0', spent: '10', pending: '0' });
+    await call(sg, '/freeze', { active: false });
+    await credit(sg, 'D2', '100', 301);
+    expect((await status(sg)).available).toBe('90');
+  });
+
+  it('(high, round 2) a carried reservation confirmed AT OR BELOW the marker height belongs to the pre-marker reserve, not to the cycle', async () => {
+    const sg = await initialized(fresh('carry-reserve'));
+    await credit(sg, 'D1', '1000', 2000);
+    const q = await quote(sg, 1000, '10');
+    await call(sg, '/prepare', { spendKey: 'act', reward: '10', revision: 1, quoteId: q, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'act', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
+    await call(sg, '/freeze', { active: true, now: T0 + 1 });
+    await call(sg, '/reinit', {});
+    await call(sg, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    await call(sg, '/settle', { spendKey: 'act', outcome: 'spent', height: 299, now: T0 + 3 });
+    expect((await status(sg)).ledger).toMatchObject({ spent: '10', pending: '0' }); // conservative until the boundary is known
+    await call(sg, '/init-done', { txId: 'M2', heights: [300, 300], confirmations: [60, 60], now: T0 + 4 });
+    expect((await status(sg)).ledger).toMatchObject({ hInit: 300, spent: '0', pending: '0' }); // mined before the marker → reserve
+    await call(sg, '/freeze', { active: false });
+    await credit(sg, 'D2', '100', 301);
+    expect((await status(sg)).available).toBe('100');
+    // Without a recorded height nothing is reclassified: spent stays (conservative).
+    const sg2 = await initialized(fresh('carry-noheight'));
+    await credit(sg2, 'D1', '1000', 2000);
+    const q2 = await quote(sg2, 1000, '10');
+    await call(sg2, '/prepare', { spendKey: 'act', reward: '10', revision: 1, quoteId: q2, bytes: 1000, limits: LIMITS, now: T0 });
+    await call(sg2, '/activate', { spendKey: 'act', reward: '10', revision: 1, activatedBy: 'w1', limits: LIMITS, now: T0 });
+    await call(sg2, '/freeze', { active: true, now: T0 + 1 });
+    await call(sg2, '/reinit', {});
+    await call(sg2, '/init-begin', { token: 't2', now: T0 + 2 });
+    await call(sg2, '/init-signed', { token: 't2', txId: 'M2', signedTx: 'b', anchor: 'a', now: T0 + 2 });
+    await call(sg2, '/init-posted', { token: 't2', txId: 'M2', now: T0 + 2 });
+    await call(sg2, '/settle', { spendKey: 'act', outcome: 'spent', now: T0 + 3 });
+    await call(sg2, '/init-done', { txId: 'M2', heights: [300, 300], confirmations: [60, 60], now: T0 + 4 });
+    expect((await status(sg2)).ledger).toMatchObject({ hInit: 300, spent: '10' });
+  });
+
   it('(high) init-legacy is all-or-nothing: a bad second item leaves no hold and no pending behind', async () => {
     const sg = fresh('legacy-atomic');
     await call(sg, '/freeze', { active: true, now: T0 });
