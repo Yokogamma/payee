@@ -62,10 +62,10 @@ export const SPEND_CODES = {
    *  redrop was decided): no executor may send those bytes any more
    *  (review 24.09 #2, high 1 — a stale run is stripped of its right to send). */
   reservationReleased: 'spend_reservation_released',
-  /** `released` was asked for a reservation whose permit is SENDING (a
-   *  granted permit whose outcome was not reported yet, within the lease):
-   *  the money cannot be freed under a send that may still land (review
-   *  24.09 #3, high 1). */
+  /** A send lease is open on the txId: `released` was asked for its
+   *  reservation, or a SECOND executor asked `permit-send` for the same bytes
+   *  (review 24.09 #3 high 1, #4 high 1) — the money cannot be freed and the
+   *  right to send cannot be shared while a POST may still be in progress. */
   sendInFlight: 'spend_send_in_flight',
   windowCap: 'spend_window_cap',
   floor: 'spend_floor',
@@ -212,18 +212,36 @@ export interface FreezeState { active: boolean; epoch: number; since?: number }
 
 export interface PermitRecord {
   txId: string; kind: PermitKind; cycle: number; issuedAt: number; spendKey?: string;
-  /** The send lease (review 24.09 #3, high 1): set when the permit is handed
-   *  out, cleared by `/send-done` with the token. While it is set and younger
-   *  than SEND_LEASE_MS, `released` is refused for the reservation. */
+  /** The send lease (review 24.09 #3 high 1, #4 high 1–2): ONE executor at a
+   *  time holds the right to POST these bytes. Set when the permit is handed
+   *  out, cleared only by `/send-done` with the token — the executor's own
+   *  report that its POST ended. While it is set, `permit-send` for the same
+   *  txId is refused to everyone else and `released` is refused for the
+   *  reservation, until the network itself can no longer accept the bytes
+   *  (LATE_LANDING_BOUND_MS). */
   sending?: { token: string; since: number };
 }
 
-/** How long a granted permit blocks `released` without a `/send-done`: the
- *  bound for a sender that crashed mid-POST. A POST has no timeout of its own
- *  (arweave-transport), so this is deliberately generous; a POST that outlives
- *  it lands on a released reservation and is re-booked by the lattice
- *  (`released → spent` dominates, `spend_conflict`). */
-export const SEND_LEASE_MS = 30 * 60_000;
+/**
+ * The one bound on an unreported send (review 24.09 #4, high 2). Time alone
+ * proves nothing about a sender: a lease that is «old» may still be a POST in
+ * progress. What DOES end the question is the network's anchor rule — a
+ * transaction whose `last_tx` (a block hash from `/tx_anchor`) is older than
+ * `ANCHOR_EXPIRY_BLOCKS` is refused by every node, so bytes signed before
+ * the permit cannot land once that many blocks have passed since the permit.
+ * This constant over-approximates those blocks in wall-clock time (50 blocks
+ * × 2 min nominal = 100 min; 6 h leaves a 3.6× margin for slow blocks).
+ * Until it passes, a lease without a report keeps the money held and keeps
+ * the txId exclusive; after it, a release is a decision about dead bytes, and
+ * the money index still WATCHES a released txId for the same span after its
+ * POST (`released → spent` is re-booked by the lattice if it lands after all).
+ */
+export const LATE_LANDING_BOUND_MS = 6 * 60 * 60_000;
+
+/** Is the lease still binding at `now`: set, and the bytes could still land. */
+export function leaseOpen(sending: PermitRecord['sending'], now: number): boolean {
+  return sending !== undefined && now - sending.since < LATE_LANDING_BOUND_MS;
+}
 
 export type PermitDecision =
   | { granted: true; permit: PermitRecord; existing: boolean }
