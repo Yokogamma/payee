@@ -77,17 +77,24 @@ if (process.env.SMOKE_SPEND_FREEZE === '1') {
   if (f.status === 200) ok(`freeze: epoch ${f.json?.freeze?.epoch}`); else fail(`freeze: HTTP ${f.status} ${JSON.stringify(f.json)}`);
 }
 
-// 3. init — continue by state, at most 6 calls in this run.
+// 3. init — continue by state, at most 6 calls in this run. The verdict is
+// the LAST answer: only `done` or `waiting` is a pass; retries that never
+// get there are a failure, not a shrug (review 24.09 #2, medium).
+let last = null;
 for (let i = 0; i < 6; i++) {
   const r = await call('init');
+  last = r;
   const step = r.json?.step ?? r.json?.code ?? `HTTP ${r.status}`;
   console.log(`  init #${i + 1}: ${step} ${r.json?.init ? `(state ${r.json.init.state}, txId ${r.json.init.txId ?? '-'})` : ''}${r.json?.legacy ? ` legacy=${JSON.stringify(r.json.legacy)}` : ''}`);
-  if (r.status === 200 && (r.json?.step === 'done' || r.json?.step === 'waiting')) { ok(`init: ${r.json.step}`); break; }
+  if (r.status === 200 && (r.json?.step === 'done' || r.json?.step === 'waiting')) break;
   if (r.status === 200 && r.json?.step === 'dead') { console.log('  marker dead — a new one is signed on the next call'); continue; }
-  if (r.status >= 500 && /^spend_init_/.test(String(r.json?.code))) { fail(`init refused: ${r.json.code} ${JSON.stringify(r.json)} — close the legacy set (docs/ROLLBACK.md «Spend guard»)`); break; }
+  if (r.status >= 500 && /^spend_init_/.test(String(r.json?.code))) break;
   if (r.status === 502) { console.log(`  gateway: ${r.json?.code} — retrying`); continue; }
-  if (r.status >= 400) { fail(`init: HTTP ${r.status} ${JSON.stringify(r.json)}`); break; }
+  if (r.status >= 400) break;
 }
+if (last && last.status === 200 && (last.json?.step === 'done' || last.json?.step === 'waiting')) ok(`init: ${last.json.step}`);
+else if (last && /^spend_init_/.test(String(last.json?.code))) fail(`init refused: ${last.json.code} ${JSON.stringify(last.json)} — close the legacy set (docs/ROLLBACK.md «Spend guard»)`);
+else fail(`init did not reach done/waiting: last answer HTTP ${last?.status} ${JSON.stringify(last?.json)}`);
 
 // 4. credit-deposit (optional)
 if (process.env.SMOKE_DEPOSIT_TXID) {
