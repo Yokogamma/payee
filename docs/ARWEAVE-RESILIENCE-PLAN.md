@@ -1718,6 +1718,48 @@ Reader-релиз этим не блокируется: он не создаёт
   освобождаются внутри транзакции `prepare`/remap-`activate` ДО проверок
   бюджета; alarm — лишь ускоритель, его потеря не удерживает бюджет.
 
+**Уточнения реализации PR-3b — recovery-записи и планировщик (2026-09-24,
+ветка `arweave/pr3b-recovery-scheduler`, draft, поверх саги; reader-часть):**
+
+- Чистые правила — `worker/src/recovery.ts` (запись `signed`/`redrop_pending`
+  по storage-контракту: txId, `signedTx` inline, `signedAt`, `dueAt`,
+  `attempts`, `deadTxId`, `spendKey`/`reward`/`spendRevision`, `generation`;
+  backoff 1 мин ×2 до 1 ч; таблица вердиктов; переходы фазы 1/2; разбор
+  байт с равенством id). Сетевой шаг — `worker/src/recovery-runner.ts`.
+  Планировщик — в `RateLimiter`: индекс `recovery:<noteId> = dueAt`,
+  persistent `recoveryCount` (cap = `limit`), alarm = min(dueAt); КАЖДАЯ
+  мутация множества — одна `storage.transaction` (запись, индекс, счётчик,
+  alarm через `txn.setAlarm`), CAS по `{status, token, txId}`;
+  `ALARM_BATCH = 5`, каждая запись в своём try/catch, `finally` перевзводит
+  alarm (ретрай ×3), остаток — немедленный alarm; self-healing на входе
+  `/check-and-reserve`.
+- Таблица `signed`: `confirmed` → `posted` (деньги — только под
+  `moneyQuorum`, settle-by-tx); `pending` → reschedule; `unavailable` и
+  `dead` до age guard → **resend тех же байт** (activate идемпотентно →
+  `permit-send(resend)` → POST; уточнение к таблице плана, где оба —
+  «reschedule»: без resend `signed`, чей первый POST не ушёл, не был бы
+  отправлен никогда) + reschedule; `dead` + age guard (от max(signedAt,
+  postedAt)) → фаза 1. Порча байт — ни resend, ни новой подписи, только
+  кворум.
+- Redrop двухфазный: фаза 1 — CAS `signed → redrop_pending` (deadTxId,
+  старые байты сохраняются, capacity не освобождается, dueAt = now) →
+  `settle(старый spendKey, released)` (повторяется идемпотентно на каждой
+  попытке фазы 2); фаза 2 — байты разбираются и обязаны быть мёртвой tx,
+  data и теги переносятся без изменений (`Arweave.utils`), новая
+  generation = новый `spendKey` (`…:g<n>`) → prepare → подпись → CAS
+  `redrop_pending → signed` (новые txId/байты) → activate →
+  `permit-send(redrop2)` → POST → `posted`; сбой после CAS оставляет новый
+  `signed` (resend тех же байт на следующем проходе, вторая подпись не
+  создаётся).
+- Reader: `decide()` отвечает `recovering` (воркер: один шаг `/recover-now`
+  + `503 recovery_in_progress`) и `recovery_capacity` (503 до подписи);
+  новых `signed` reader не создаёт — `adoptRecovery` (примитив writer-а и
+  посев тестов) не вызывается ни одним маршрутом.
+- Готчи стенда: alarm в прошлом срабатывает сам немедленно (тесты сеют
+  далёкий `dueAt` и ведут прогон явно `runRecovery(now)`); DO видит env
+  биндингов — сьют передаёт изолированный guard и подписываемый кошелёк
+  через seam `useEnvForTests`; один инстант `now` на весь прогон.
+
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 
 Старый Worker не знает статус `signed`: `check-and-reserve` примет его как

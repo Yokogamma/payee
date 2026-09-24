@@ -27,6 +27,11 @@
  */
 
 import {
+  ALARM_BATCH, RECOVERY_COUNT_KEY, RECOVERY_INDEX_PREFIX, casMatches, isRecoveryStatus, minDueAt, recoveryIndexKey, rescheduled,
+  type PostedRecord, type RecoveryCas, type RecoveryRecord,
+} from './recovery';
+import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
+import {
   type OpBegin, type OpRecord, type OpAbortRequest, type OpFinishRequest, type OpPostingRequest,
   applyAbort, applyFinish, applyPosting, newOpRecord, projectOp, isValidOpBegin, isPrunable,
   opKey, opIndexKey, opIndexLowerBound, opIndexUpperBound, OP_INDEX_PREFIX, OP_META_KEY, type OpMeta,
@@ -38,7 +43,10 @@ const RESERVE_TTL_MS = 600_000;     // 10 min — a reservation older than this 
 const ATTEMPT_FACTOR = 3;           // attempts ceiling = limit × 3
 
 interface NoteRecord {
-  status: 'reserved' | 'posted' | 'committed';
+  /** `signed` / `redrop_pending` are the PR-3b recovery records (recovery.ts):
+   *  read and resumed by the scheduler below, never created by a reader
+   *  route. Their extra fields live on `RecoveryRecord`. */
+  status: 'reserved' | 'posted' | 'committed' | 'signed' | 'redrop_pending';
   token: string;
   gen: number;
   txId?: string;
@@ -127,16 +135,30 @@ export class RateLimiter implements DurableObject {
    * that window). Read once per admission; `undefined` in every real request.
    */
   faultAfter?: 'decide' | 'op' | 'index';
+  /** TEST SEAM for the recovery transactions (`casRecovery`): throw INSIDE
+   *  the transaction right after the named write — the rollback proof. */
+  recoveryFaultAfter?: 'note' | 'index' | 'count' | 'alarm';
   /** TEST SEAM for the pruning threshold (production: OP_PRUNE_MIN_COUNT). */
   pruneMinCount = OP_PRUNE_MIN_COUNT;
+  private env: RecoveryEnv;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env: RecoveryEnv) {
     this.state = state;
+    this.env = env;
+  }
+
+  /** TEST SEAM — never called by production code. The DO sees the BINDING
+   *  env (the unsignable test wallet, the shared guard); a suite that drives
+   *  the scheduler hands it the env its worker requests run under. */
+  useEnvForTests(env: RecoveryEnv): void {
+    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/check-and-reserve') return this.handleCheckAndReserve(request);
+    if (url.pathname === '/recover-now') return this.handleRecoverNow(request);
+    if (url.pathname === '/recovery-status') return this.handleRecoveryStatus();
     if (url.pathname === '/mark-posted') return this.handleMarkPosted(request);
     if (url.pathname === '/commit') return this.handleCommit(request);
     if (url.pathname === '/release') return this.handleRelease(request);
@@ -184,6 +206,9 @@ export class RateLimiter implements DurableObject {
   private async handleCheckAndReserve(request: Request): Promise<Response> {
     const { noteId, limit, fp: requestedFp, op } = await request.json<CheckAndReserveRequest>();
     const now = Date.now();
+    // Self-healing invariant (plan «Отказоустойчивость обработчика»): a
+    // recovery backlog without an alarm gets its alarm back on ANY entry.
+    await this.healRecoveryAlarm();
 
     if (op === undefined) {
       const bare = await this.decide(this.state.storage, noteId, limit, requestedFp, now);
@@ -250,6 +275,14 @@ export class RateLimiter implements DurableObject {
     store: Store, noteId: string, limit: number, requestedFp: string | undefined, now: number,
   ): Promise<{ http: number; body: Record<string, unknown> }> {
     const record = await store.get<NoteRecord>(`note:${noteId}`);
+
+    // ── PR-3b recovery records: the scheduler owns them ──
+    // A `signed` / `redrop_pending` note is neither a dedupe nor a free slot:
+    // release and TTL are forbidden, only the reconciliation moves it. The
+    // worker nudges one step (`/recover-now`) and answers a retryable 503.
+    if (record !== undefined && isRecoveryStatus(record.status)) {
+      return { http: 200, body: { status: 'recovering', txId: record.txId, recoveryStatus: record.status } };
+    }
 
     // ── The fingerprint comparison, in EVERY state that has a txId ──
     //
@@ -324,6 +357,12 @@ export class RateLimiter implements DurableObject {
       // whole answer.
       return { http: 200, body: { status: 'reserved' } };
     }
+
+    // Bounded backlog (plan «Bounded backlog»): MAX_RECOVERY_INFLIGHT =
+    // quotaLimit recovery records per key; at the cap a new upload is refused
+    // BEFORE anything is signed, so no durable/postable txId exists beyond it.
+    const recoveryCount = (await store.get<number>(RECOVERY_COUNT_KEY)) ?? 0;
+    if (recoveryCount >= limit) return { http: 503, body: { status: 'recovery_capacity', recoveryCount } };
 
     // No record or a STALE reservation we replace — reuse its own inFlight slot.
     const w = await this.window(store, now);
@@ -650,5 +689,165 @@ export class RateLimiter implements DurableObject {
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
     }, requestedFp ?? record.fp));
     return Response.json({ ok: true, token });
+  }
+
+  // ─── PR-3b recovery: the single-alarm scheduler ─────────────────────────
+  //
+  // Recovery records (`signed`, `redrop_pending` — recovery.ts) are indexed
+  // by `recovery:<noteId> = dueAt`; `recoveryCount` is the persistent size of
+  // that set (the cap). Every mutation of the set is ONE storage transaction
+  // that writes the note, the index, the counter and the alarm
+  // (= min(dueAt), or none) together — the only crash-atomicity mechanism.
+  // The network half of a step is recovery-runner.ts; this DO owns the CAS.
+
+  /**
+   * The WRITER's primitive (and the tests' seed): admit a recovery record.
+   * No route of the READER calls it — the reader resumes, it does not
+   * create. Kept here because the transaction is the same one the writer
+   * will need, and the reader must already understand what it writes.
+   */
+  async adoptRecovery(noteId: string, record: RecoveryRecord): Promise<void> {
+    await this.state.storage.transaction(async (txn) => {
+      const existing = await txn.get<NoteRecord>(`note:${noteId}`);
+      const wasRecovery = existing !== undefined && isRecoveryStatus(existing.status);
+      await txn.put<NoteRecord>(`note:${noteId}`, record as unknown as NoteRecord);
+      await txn.put(recoveryIndexKey(noteId), record.dueAt);
+      if (!wasRecovery) await txn.put(RECOVERY_COUNT_KEY, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) + 1);
+      await this.rearmInTxn(txn);
+    });
+  }
+
+  /** CAS-guarded transition of a recovery record — one transaction for the
+   *  note, the index, the counter and the alarm (plan «Атомарность»). */
+  async casRecovery(noteId: string, expected: RecoveryCas, next: RecoveryRecord | PostedRecord): Promise<boolean> {
+    const fault = this.recoveryFaultAfter;
+    return this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<NoteRecord>(`note:${noteId}`);
+      if (!casMatches(current, expected)) return false;
+      await txn.put<NoteRecord>(`note:${noteId}`, next as unknown as NoteRecord);
+      if (fault === 'note') throw new Error('fault injected after note');
+      if (isRecoveryStatus(next.status)) {
+        await txn.put(recoveryIndexKey(noteId), (next as RecoveryRecord).dueAt);
+      } else {
+        await txn.delete(recoveryIndexKey(noteId));
+        if (fault === 'index') throw new Error('fault injected after index');
+        await txn.put(RECOVERY_COUNT_KEY, Math.max(0, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) - 1));
+      }
+      if (fault === 'count') throw new Error('fault injected after count');
+      await this.rearmInTxn(txn);
+      if (fault === 'alarm') throw new Error('fault injected after alarm');
+      return true;
+    });
+  }
+
+  /** alarm := min(dueAt) over the index, or none. */
+  private async rearmInTxn(txn: DurableObjectTransaction | DurableObjectStorage): Promise<number | null> {
+    const idx = await txn.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+    const min = minDueAt(idx.values());
+    if (min === null) await txn.deleteAlarm();
+    else await txn.setAlarm(min);
+    return min;
+  }
+
+  private async healRecoveryAlarm(): Promise<void> {
+    const count = (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0;
+    if (count <= 0) return;
+    if ((await this.state.storage.getAlarm()) !== null) return;
+    try { await this.rearmInTxn(this.state.storage); } catch (e) { console.error('RECOVERY_ALARM_HEAL_FAILED', e); }
+  }
+
+  /** The host of one run: the CAS, and ONE instant for the whole run (ages,
+   *  backoffs and `postedAt` are measured against it). */
+  private recoveryHost(now: number): RecoveryHost {
+    return { cas: (noteId, expected, next) => this.casRecovery(noteId, expected, next), now: () => now };
+  }
+
+  /** The alarm handler: due records, sequentially, at most ALARM_BATCH;
+   *  each in its own try/catch; the alarm is ALWAYS re-armed in `finally`
+   *  (with a bounded retry), and an unprocessed remainder gets it now. */
+  async alarm(): Promise<void> {
+    await this.runRecovery(Date.now());
+  }
+
+  async runRecovery(now: number): Promise<{ processed: number; remaining: number }> {
+    let processed = 0; let remaining = 0;
+    try {
+      const idx = await this.state.storage.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+      const due = [...idx.entries()].filter(([, d]) => d <= now).sort((a, b) => a[1] - b[1]);
+      remaining = Math.max(0, due.length - ALARM_BATCH);
+      for (const [key] of due.slice(0, ALARM_BATCH)) {
+        const noteId = key.slice(RECOVERY_INDEX_PREFIX.length);
+        try {
+          await this.recoverNote(noteId, now);
+        } catch (e) {
+          console.error('RECOVERY_STEP_FAILED', noteId, e);
+          // Reschedule with backoff so one broken record cannot spin; if even
+          // that write fails the finally below still re-arms the alarm.
+          try {
+            const record = await this.state.storage.get<RecoveryRecord>(`note:${noteId}`);
+            if (record && isRecoveryStatus(record.status)) {
+              await this.casRecovery(noteId, { status: record.status, token: record.token, txId: record.txId }, rescheduled(record, Date.now()));
+            }
+          } catch (e2) {
+            console.error('RECOVERY_RESCHEDULE_FAILED', noteId, e2);
+          }
+        }
+        processed++;
+      }
+    } finally {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          if (remaining > 0) await this.state.storage.setAlarm(Date.now());
+          else await this.rearmInTxn(this.state.storage);
+          break;
+        } catch (e) {
+          console.error('RECOVERY_REARM_FAILED', attempt, e);
+        }
+      }
+    }
+    return { processed, remaining };
+  }
+
+  /** One step for one note (the alarm's unit, and the recheck's nudge). */
+  private async recoverNote(noteId: string, now: number): Promise<string> {
+    const record = await this.state.storage.get<RecoveryRecord>(`note:${noteId}`);
+    if (!record || !isRecoveryStatus(record.status)) {
+      // A stale index entry (the record moved on): drop it and keep the
+      // counter honest.
+      await this.state.storage.transaction(async (txn) => {
+        if (await txn.get(recoveryIndexKey(noteId)) === undefined) return;
+        await txn.delete(recoveryIndexKey(noteId));
+        await txn.put(RECOVERY_COUNT_KEY, Math.max(0, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) - 1));
+        await this.rearmInTxn(txn);
+      });
+      return 'not_recovery';
+    }
+    return recoverOne(noteId, record, this.env, this.recoveryHost(now));
+  }
+
+  /** Trigger (а) of the reconciliation: a recheck of this note runs one step
+   *  now instead of waiting for the alarm. */
+  private async handleRecoverNow(request: Request): Promise<Response> {
+    const { noteId } = await request.json<{ noteId: string }>();
+    if (typeof noteId !== 'string') return Response.json({ ok: false, reason: 'bad_note' });
+    try {
+      const outcome = await this.recoverNote(noteId, Date.now());
+      const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
+      return Response.json({ ok: true, outcome, status: record?.status ?? null, txId: record?.txId ?? null });
+    } catch (e) {
+      console.error('RECOVER_NOW_FAILED', noteId, e);
+      return Response.json({ ok: false, reason: 'step_failed' });
+    } finally {
+      await this.healRecoveryAlarm();
+    }
+  }
+
+  private async handleRecoveryStatus(): Promise<Response> {
+    const idx = await this.state.storage.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+    return Response.json({
+      recoveryCount: (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0,
+      alarm: await this.state.storage.getAlarm(),
+      due: Object.fromEntries([...idx.entries()].map(([k, d]) => [k.slice(RECOVERY_INDEX_PREFIX.length), d])),
+    });
   }
 }

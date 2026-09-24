@@ -1383,6 +1383,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     attest('conflict', checkResult.txId);
     return settle('conflict', idPayloadConflict(checkResult.txId), { txId: checkResult.txId });
   }
+  if (checkResult.status === 'recovering') {
+    // PR-3b: the scheduler owns this note (`signed` / `redrop_pending`).
+    // Trigger (а) of the reconciliation: one step now, then a retryable 503 —
+    // the record moves only by resend of the same bytes or by the quorum,
+    // never by this request's payload. The DO closed the journal record
+    // itself; settle repeats the identical finish.
+    try { await doCall('/recover-now', { noteId }); } catch (e) { console.error('RECOVER_NOW_UNREACHABLE', noteId, e); }
+    return settle('recovery_in_progress', uploadError(503, 'recovery_in_progress', 'Publication is being recovered server-side, retry later', { txId: checkResult.txId }));
+  }
+  if (checkResult.status === 'recovery_capacity') {
+    // The recovery cap (MAX_RECOVERY_INFLIGHT = the hourly quota): refused
+    // BEFORE anything is signed, retryable once the backlog drains.
+    return settle('recovery_capacity', uploadError(503, 'recovery_capacity', 'Too many publications in recovery for this key, retry later'));
+  }
 
   let reserveToken: string;
   // True whenever the upcoming POST creates a NEW paid txId after a PROVEN

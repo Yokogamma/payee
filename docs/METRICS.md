@@ -277,6 +277,10 @@ discriminator).
 | `activate_conflict` | event, `activate_conflict` | — | `/upload` when the reservation under this operation's key belongs to someone else (incident: a protocol defect, not a path) |
 | `activate_remap` | event | — | `/upload` when `activate` re-reserved under the §5 checks (expired lease, changed reward) |
 | `observed_min_winston` | event | the minimum gateway balance handed to the detector (Winston, or −1 when not a safe integer) | `/upload` after a fresh balance read with a quorum (§3.4) |
+| `recovery_step` | event, state (`signed` / `redrop_pending`), action (`advance_posted` / `reschedule` / `resend` / `redrop` / `phase2`) | attempts so far | the per-key scheduler (RateLimiter alarm, or the recheck's nudge) at the start of one step |
+| `recovery_refused` | event, leg (`activate` / `permit` / `prepare` / `limits`), code | — | a step the guard or the configuration refused: the record is kept and rescheduled |
+| `recovery_corrupt` | event, state | — | the stored bytes do not parse or are not the recorded txId: nothing sent, nothing signed |
+| `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
 
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
 `legacy_resolved{outcome}`, `ledger_inconsistent`, `spend_conflict` and the
@@ -287,7 +291,10 @@ The `/upload` answer codes the saga adds (`worker/src/upload-codes.json`):
 and, post-admission, `spend_guard_unavailable`, `spend_frozen`,
 `spend_not_initialized`, `spend_floor`, `spend_window_cap`,
 `spend_quote_mismatch`, `spend_ledger_inconsistent`, `activate_conflict`,
-`spend_remap_refused` — all 503, all BEFORE any POST.
+`spend_remap_refused` — all 503, all BEFORE any POST. The scheduler adds
+`recovery_in_progress` (the note is a `signed` / `redrop_pending` record the
+scheduler owns; the request nudged one step) and `recovery_capacity` (the
+per-key recovery cap, refused before signing) — both 503, retryable.
 
 ## What PR-3a deliberately does NOT measure
 

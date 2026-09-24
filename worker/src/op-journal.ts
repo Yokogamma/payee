@@ -320,6 +320,10 @@ export function newOpRecord(
 export const DO_TERMINAL_VERDICTS: Readonly<Record<string, { outcome: string; httpStatus: number; code: string }>> = {
   rate_limited: { outcome: 'rate_limited', httpStatus: 429, code: 'rate_limited' },
   reserved: { outcome: 'in_progress', httpStatus: 409, code: 'upload_in_progress' },
+  // PR-3b: a note the scheduler owns, and the recovery cap (plan «Bounded
+  // backlog») — both retryable 503s decided by the DO itself.
+  recovering: { outcome: 'recovery_in_progress', httpStatus: 503, code: 'recovery_in_progress' },
+  recovery_capacity: { outcome: 'recovery_capacity', httpStatus: 503, code: 'recovery_capacity' },
 };
 
 const OP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

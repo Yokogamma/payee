@@ -125,9 +125,11 @@ describe('upload → spend saga, crash after each boundary', () => {
   });
 
   it.todo('crash after sign before durable signed → the ephemeral signature is dropped; resign_violation does NOT fire on an ephemeral signature (writer format)');
-  it.todo('crash after durable signed before activate → recovery activates (same {reward, revision}) and continues; a changed reward → remap under §5 checks (scheduler step)');
-  it.todo('crash between activate and permit-send → recovery asks permit-send first; under freeze it is refused and the record is kept (no release) (scheduler step)');
-  it.todo('crash after permit-send before POST → the same permit is returned and the same bytes are POSTed; one txId (scheduler step)');
+  // The durable-`signed` boundaries (after signed before activate; between
+  // activate and permit-send; after permit-send before POST) are the
+  // scheduler's resend path — test/recovery-scheduler.test.ts «pending →
+  // reschedule … unavailable → the SAME bytes are resent», «a frozen guard
+  // refuses the resend permit».
 
   it('crash after POST before settle (the answer was lost): the reservation stays `active` — never released by a timer — until the quorum confirms; a gateway 5xx keeps it too', async () => {
     const { env, status } = await sagaEnv('unknown');
