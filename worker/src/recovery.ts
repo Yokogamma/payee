@@ -55,15 +55,31 @@ export const RECOVERY_INDEX_PREFIX = 'recovery:';
  *  after the POST — a late landing is then re-booked `released → spent`). */
 export const MONEY_INDEX_PREFIX = 'money:';
 export const MONEY_BATCH = 5;
-/** Hard ceiling on a watch whose status never settles (a pool that answers
- *  `pending`/`unavailable` forever): the entry is dropped with a log line. */
-export const MONEY_WATCH_MAX_MS = 7 * 24 * 3_600_000;
+/** An entry this old is STALE: the step escalates (`money_reconcile` result
+ *  `stale`, a log line) and probes no more often than
+ *  MONEY_STALE_BACKOFF_MS — but never drops it (review 24.09 #5, high 2): an
+ *  unresolved money obligation is not ended by age, only by a fact. */
+export const MONEY_STALE_MS = 7 * 24 * 3_600_000;
+export const MONEY_STALE_BACKOFF_MS = 6 * 3_600_000;
 
 export interface MoneyEntry {
   txId: string; dueAt: number; attempts: number; postedAt: number;
   /** The reservation is `released` in the guard; the entry stays only to catch
    *  a late landing (review 24.09 #4, high 2). */
   watching?: boolean;
+  /** `last_tx` of the bytes — what the proof of expiry is about. Absent for
+   *  a record older than this field: such an entry can never be proven
+   *  unlandable and stays until the chain confirms it (the safe side). */
+  anchor?: string;
+}
+
+/** The `last_tx` of stored `toJSON()` bytes, or undefined. */
+export function anchorOf(signedTx: string | undefined): string | undefined {
+  if (typeof signedTx !== 'string') return undefined;
+  try {
+    const raw = JSON.parse(signedTx) as { last_tx?: unknown };
+    return typeof raw?.last_tx === 'string' && raw.last_tx.length > 0 ? raw.last_tx : undefined;
+  } catch { return undefined; }
 }
 
 export function recoveryIndexKey(noteId: string): string {
@@ -225,9 +241,12 @@ export function toSignedFromRedrop(
  *  ordinary `posted` (the client's recheck commits it, as today). */
 export interface PostedRecord {
   status: 'posted'; token: string; gen: number; txId: string; reservedAt?: number; postedAt: number; fp?: string;
+  /** `last_tx` of the posted bytes, for the money index (proof of expiry). */
+  anchor?: string;
 }
 export function toPosted(r: RecoveryRecord, now: number): PostedRecord {
-  return { status: 'posted', token: r.token, gen: r.gen, txId: r.txId, reservedAt: r.reservedAt, postedAt: now, ...(r.fp !== undefined ? { fp: r.fp } : {}) };
+  const anchor = anchorOf(r.signedTx);
+  return { status: 'posted', token: r.token, gen: r.gen, txId: r.txId, reservedAt: r.reservedAt, postedAt: now, ...(r.fp !== undefined ? { fp: r.fp } : {}), ...(anchor !== undefined ? { anchor } : {}) };
 }
 
 /** The spendKey of the NEXT generation: same tenant, same note, `g<n>`. */

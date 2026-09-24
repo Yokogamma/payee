@@ -21,8 +21,8 @@
  */
 
 import {
-  PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES,
-  activateOutcome, addToBucket, available, creditDeposit, initTransition, leaseOpen, permitDecision, prepareDecision,
+  ANCHOR_RE, PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES,
+  activateOutcome, addToBucket, anchorExpired, available, creditDeposit, initTransition, leaseOpen, permitDecision, prepareDecision,
   reinit, settle, spentLast24h,
   type CycleLedger, type FreezeState, type InitEvent, type InitRecord, type PermitKind, type PermitRecord,
   type Reservation, type SpendCode, type SpendLimits,
@@ -132,6 +132,7 @@ export class SpendGuard implements DurableObject {
     switch (path) {
       case '/permit-send': return this.permitSend(body, now);
       case '/send-done': return this.sendDone(body);
+      case '/anchor-expired': return this.anchorExpiredRoute(body, now);
       case '/freeze': return this.freeze(body, now);
       case '/init-legacy': return this.initLegacy(body, now);
       // The two questions the closure of the legacy set asks the DO (§4.0
@@ -198,8 +199,16 @@ export class SpendGuard implements DurableObject {
     const kind = body.kind as PermitKind;
     const cycle = Number(body.cycle);
     if (!txId || !['upload', 'resend', 'redrop2', 'marker'].includes(kind) || !Number.isInteger(cycle)) return new Response('bad request', { status: 400 });
+    // The anchor of the bytes (optional on the wire for the DO's own tests;
+    // the worker's one send path always names it): recorded once, and a
+    // repeat must name the SAME one — a permit is about one set of bytes.
+    const anchor = body.anchor === undefined ? undefined : String(body.anchor);
+    if (anchor !== undefined && !ANCHOR_RE.test(anchor)) return new Response('bad anchor', { status: 400 });
     return this.state.storage.transaction(async (txn) => {
       const existing = await txn.get<PermitRecord>(K.permit(txId));
+      if (existing?.anchor !== undefined && anchor !== undefined && existing.anchor !== anchor) {
+        return refuse(SPEND_CODES.remapRefused, 503, { txId, reason: 'anchor_differs' });
+      }
       // A repeat for a txId whose reservation was RELEASED (phase 1 of a
       // redrop decided it is dead): the right to send is gone for every
       // executor, however stale — a durable lever, not a race (review, H1).
@@ -217,13 +226,14 @@ export class SpendGuard implements DurableObject {
       // reservation cannot be released. A shared token would let the first
       // executor's report clear the lease while the second still posts
       // (review 24.09 #4, high 1); so a second request meets a refusal, not a
-      // copy of the lease. The refusal ends only with the report — or once
-      // the network can no longer accept the bytes (LATE_LANDING_BOUND_MS).
-      if (decision.existing && leaseOpen(decision.permit.sending, now)) {
-        return refuse(SPEND_CODES.sendInFlight, 503, { txId, since: decision.permit.sending!.since });
+      // copy of the lease. The refusal ends only with the report — or with a
+      // proof from the chain that the bytes can no longer land
+      // (`/anchor-expired`, review #5 high 1). Never with the clock.
+      if (decision.existing && leaseOpen(decision.permit.sending)) {
+        return refuse(SPEND_CODES.sendInFlight, 503, { txId, since: decision.permit.sending!.since, anchor: decision.permit.anchor ?? null });
       }
       const sending = { token: crypto.randomUUID(), since: now };
-      const permit: PermitRecord = { ...decision.permit, sending };
+      const permit: PermitRecord = { ...decision.permit, sending, ...(decision.permit.anchor === undefined && anchor !== undefined ? { anchor } : {}) };
       await txn.put<PermitRecord>(K.permit(txId), permit);
       if (decision.permit.spendKey) {
         const res = await txn.get<StoredReservation>(K.res(decision.permit.spendKey));
@@ -231,6 +241,34 @@ export class SpendGuard implements DurableObject {
       }
       if (!decision.existing) await this.audit(txn, 'permit', { txId, kind, cycle });
       return okJson({ granted: true, existing: decision.existing, permit, sendToken: sending.token });
+    });
+  }
+
+  /**
+   * The chain's proof that an unreported send can never land (review 24.09
+   * #5, high 1): the worker read the height of the PERMIT'S anchor block and
+   * the chain height at ≥ MIN_BALANCE_SOURCES operators (`anchor-expiry.ts`)
+   * and brings both. The DO checks that the proof is about the permitted
+   * anchor and that the rule (`anchorExpired`) holds under those numbers;
+   * then, and only then, the lease is gone: `released` may proceed and a
+   * fresh permit may be issued (a resend of expired bytes is harmless — the
+   * network refuses them). Recorded on the permit for the audit. Idempotent.
+   */
+  private async anchorExpiredRoute(body: Record<string, unknown>, now: number): Promise<Response> {
+    const txId = String(body.txId ?? ''); const anchor = String(body.anchor ?? '');
+    const anchorHeight = Number(body.anchorHeight); const chainHeight = Number(body.chainHeight);
+    if (!txId || !ANCHOR_RE.test(anchor) || !Number.isInteger(anchorHeight) || !Number.isInteger(chainHeight)) return new Response('bad request', { status: 400 });
+    return this.state.storage.transaction(async (txn) => {
+      const permit = await txn.get<PermitRecord>(K.permit(txId));
+      if (!permit) return new Response('unknown permit', { status: 404 });
+      if (permit.anchor === undefined || permit.anchor !== anchor) return refuse(SPEND_CODES.anchorMismatch, 409, { txId, permitAnchor: permit.anchor ?? null });
+      if (!anchorExpired(anchorHeight, chainHeight)) return refuse(SPEND_CODES.anchorNotExpired, 409, { txId, anchorHeight, chainHeight });
+      if (permit.anchorExpired) return okJson({ expired: true, noop: true, ...permit.anchorExpired });
+      const { sending: _s, ...rest } = permit; void _s;
+      const next: PermitRecord = { ...rest, anchorExpired: { anchorHeight, chainHeight, at: now } };
+      await txn.put<PermitRecord>(K.permit(txId), next);
+      await this.audit(txn, 'anchor-expired', { txId, anchorHeight, chainHeight, hadLease: permit.sending !== undefined });
+      return okJson({ expired: true, noop: false, anchorHeight, chainHeight, at: now });
     });
   }
 
@@ -607,13 +645,14 @@ export class SpendGuard implements DurableObject {
       if (!existing) return new Response('unknown reservation', { status: 404 });
       // `released` under an open send lease is refused: the bytes may be on
       // their way to the network right now, and the passing of time is not a
-      // report (review 24.09 #3 high 1, #4 high 2). The hold ends with the
-      // executor's `/send-done`, or once the anchor rule has made the bytes
-      // unacceptable to every node (LATE_LANDING_BOUND_MS) — never earlier.
+      // report (review 24.09 #3 high 1, #4 high 2, #5 high 1). The hold ends
+      // with the executor's `/send-done`, or with the chain's proof that the
+      // anchor expired (`/anchor-expired`) — never with the clock. The
+      // refusal names the anchor so the caller can go and fetch that proof.
       if (outcome === 'released' && existing.state === 'active' && existing.permitTxId) {
         const permit = await txn.get<PermitRecord>(K.permit(existing.permitTxId));
-        if (leaseOpen(permit?.sending, now)) {
-          return refuse(SPEND_CODES.sendInFlight, 503, { txId: existing.permitTxId, since: permit!.sending!.since });
+        if (leaseOpen(permit?.sending)) {
+          return refuse(SPEND_CODES.sendInFlight, 503, { txId: existing.permitTxId, since: permit!.sending!.since, anchor: permit!.anchor ?? null });
         }
       }
       const r = settle({ state: existing.state, reward: BigInt(existing.reward), revision: existing.revision, activatedBy: existing.activatedBy }, outcome);
