@@ -73,6 +73,8 @@ const OPS_PAGE_MS = 14 * 24 * 3_600_000;
 const OPS_PAGE_LIMIT = 500;
 const HEADER_CAP_BYTES = 64 * 1024;
 const READ_TIMEOUT_MS = 10_000;
+const TXID_RE = /^[A-Za-z0-9_-]{43}$/;
+const WINSTON_RE = /^\d{1,40}$/;
 
 type Body = Record<string, unknown> & { ok?: boolean; error?: string };
 
@@ -234,11 +236,16 @@ async function closeLegacySetStrict(ctx: CloseLegacySetContext, deps: LegacyClos
   const permits = await doPost(env.SPEND_GUARD, 'global', '/open-permits');
   requireOk(permits, '/open-permits');
   let permitCount = 0;
-  for (const p of requireArray(permits, 'items', '/open-permits') as Array<{ txId?: unknown; reward?: unknown; state?: unknown }>) {
-    if (typeof p.txId !== 'string') throw new ClosureFailure('/open-permits', 'item without txId');
-    // A permit whose reservation is gone has money nobody holds — that is not
-    // a closed set.
+  for (const p of requireArray(permits, 'items', '/open-permits') as Array<{ txId?: unknown; reward?: unknown; state?: unknown; spendKey?: unknown }>) {
+    // Every field, its type and its value are checked (review 24.09 #3,
+    // medium): an item that lacks a field is not «verified», it is unknown.
+    if (typeof p.txId !== 'string' || !TXID_RE.test(p.txId)) throw new ClosureFailure('/open-permits', 'item without a canonical txId');
+    if (typeof p.spendKey !== 'string' || p.spendKey === '') throw new ClosureFailure('/open-permits', `item ${p.txId} without spendKey`);
+    // A permit whose reservation is gone (null) has money nobody holds — that
+    // is not a closed set; any other shape is an incomplete answer.
     if (p.reward === null || p.state === null) return { kind: 'open', code: SPEND_CODES.initLegacyRewardUnknown, detail: { txId: p.txId, source: 'permit' } };
+    if (typeof p.reward !== 'string' || !WINSTON_RE.test(p.reward)) throw new ClosureFailure('/open-permits', `item ${p.txId} without a Winston reward`);
+    if (p.state !== 'prepared' && p.state !== 'active') throw new ClosureFailure('/open-permits', `item ${p.txId} in state ${String(p.state)} is not an open reservation`);
     seen.add(p.txId);
     permitCount++;
   }

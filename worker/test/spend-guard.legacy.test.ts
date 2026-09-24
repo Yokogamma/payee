@@ -144,6 +144,38 @@ describe('D10 legacy set L and init preconditions', () => {
     expect((await guardStatus(guard)).ledger.spent).toBe('10');
   });
 
+  it('(M, round 3) an /open-permits item that lacks a field, or names a state that is not an open reservation, keeps the set OPEN', async () => {
+    const wallet = await freshWallet();
+    const { env: e, guard, invites } = await legacyEnv('l-m3', wallet);
+    await registeredKey(invites);
+    const override = (items: unknown[]) => ({
+      idFromName: (n: string) => guard.idFromName(n),
+      get: (did: DurableObjectId) => {
+        const real = guard.get(did);
+        return { fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = input instanceof Request ? input.url : String(input);
+          if (new URL(url).pathname === '/open-permits') return Response.json({ ok: true, items });
+          return real.fetch(input as string, init);
+        } } as unknown as DurableObjectStub;
+      },
+    }) as unknown as DurableObjectNamespace;
+    for (const items of [
+      [{ txId: 'UNHELD' }],                                                                    // no fields at all
+      [{ txId: 'U'.repeat(43), spendKey: 'k', reward: '5' }],                                  // state missing
+      [{ txId: 'U'.repeat(43), spendKey: 'k', reward: 5, state: 'active' }],                   // reward not a string
+      [{ txId: 'U'.repeat(43), spendKey: 'k', reward: '5', state: 'spent' }],                  // not an open reservation
+    ]) {
+      const r = await viaWorker('init', { ...e, SPEND_GUARD: override(items) });
+      expect(r.status, JSON.stringify(items)).toBe(503);
+      expect(r.body.code).toBe(SPEND_CODES.initLegacyOpen);
+      expect(String(r.body.reason)).toContain('/open-permits');
+    }
+    // A reservation that is GONE (null) is money nobody holds: open, reward unknown.
+    const gone = await viaWorker('init', { ...e, SPEND_GUARD: override([{ txId: 'U'.repeat(43), spendKey: 'k', reward: null, state: null }]) });
+    expect(gone.body.code).toBe(SPEND_CODES.initLegacyRewardUnknown);
+    expect((await guardStatus(guard)).init.state).toBe('none');
+  });
+
   it('(H2) an enumeration that fails or answers an incomplete shape keeps the set OPEN — never «closed, nothing to hold»', async () => {
     const wallet = await freshWallet();
     const { env: e, invites } = await legacyEnv('l-h2', wallet);
