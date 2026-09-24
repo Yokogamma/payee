@@ -265,7 +265,10 @@ describe('the anchor rule (review 24.09 #5, high 1) — the ONE proof that permi
     expect(anchorExpired(-1, 5000)).toBe(false);
     expect(anchorExpired(1000, Number.NaN)).toBe(false);
     expect(leaseOpen(undefined)).toBe(false);
-    expect(leaseOpen({ token: 't', since: 0 })).toBe(true);
-    expect(leaseOpen({ token: 't', since: -365 * 24 * 3_600_000 })).toBe(true);
+    expect(leaseOpen({ sending: undefined })).toBe(false);
+    expect(leaseOpen({ sending: { token: 't', since: 0 } })).toBe(true);
+    expect(leaseOpen({ sending: { token: 't', since: -365 * 24 * 3_600_000 } })).toBe(true);
+    // A proven expiry binds nothing, whatever `sending` says (review #6, medium).
+    expect(leaseOpen({ sending: { token: 't', since: 0 }, anchorExpired: { anchorHeight: 1, chainHeight: 999, at: 0 } })).toBe(false);
   });
 });

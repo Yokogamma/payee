@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import { ANCHOR_EXPIRY_BLOCKS, ANCHOR_EXPIRY_MARGIN_BLOCKS, PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES } from '../src/spend-ledger';
 
@@ -205,9 +205,27 @@ describe('the send lease — a permit and a release cannot both win (review 24.0
     // decision about dead bytes.
     const proof = await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 100 + ANCHOR_EXPIRY_BLOCKS + ANCHOR_EXPIRY_MARGIN_BLOCKS, now: late });
     expect(proof.body).toMatchObject({ expired: true, noop: false, anchorHeight: 100 });
-    expect((await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 5000, now: late })).body).toMatchObject({ expired: true, noop: true });
+    expect((await call(sg, '/anchor-expired', { txId: 'SENT2', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 5000, now: late })).body).toMatchObject({ expired: true, noop: true, leaseCleared: false });
+    // No NEW lease for proven-expired bytes (review #6, medium): a permit
+    // here could only hold money that a repeated proof would answer
+    // `noop` to. The way forward is dead → redrop, not resend.
+    expect((await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: late })).body).toMatchObject({ code: SPEND_CODES.anchorExpired, anchorHeight: 100 });
     expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: late })).body).toMatchObject({ state: 'released' });
     expect((await status(sg)).ledger.pending).toBe('0');
+    // Defence in depth for a record that already carries BOTH a proven
+    // expiry and a lease (written before the refusal above existed): the
+    // lease binds nothing, and a repeated proof clears it explicitly.
+    const q3 = await quote(sg, 100, '10');
+    await call(sg, '/prepare', { spendKey: 'k3', reward: '10', revision: 0, quoteId: q3, bytes: 100, limits: LIMITS, now: late });
+    await call(sg, '/activate', { spendKey: 'k3', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: late });
+    expect((await call(sg, '/permit-send', { txId: 'COMBO', kind: 'upload', cycle: 1, spendKey: 'k3', anchor: ANCHOR_A, now: late })).body.granted).toBe(true);
+    await runInDurableObject(sg, async (_i, s) => {
+      const p = (await s.storage.get<Record<string, unknown>>('permit:COMBO'))!;
+      await s.storage.put('permit:COMBO', { ...p, anchorExpired: { anchorHeight: 100, chainHeight: 5000, at: late } });
+    });
+    expect((await call(sg, '/settle', { spendKey: 'k3', outcome: 'released', now: late })).body).toMatchObject({ state: 'released' });
+    expect((await call(sg, '/anchor-expired', { txId: 'COMBO', anchor: ANCHOR_A, anchorHeight: 100, chainHeight: 5000, now: late })).body).toMatchObject({ expired: true, noop: true, leaseCleared: true });
+    expect(await runInDurableObject(sg, (_i, s) => s.storage.get<{ sending?: unknown }>('permit:COMBO'))).not.toHaveProperty('sending');
     // …and once released, the permit is refused to everyone (the earlier rule).
     expect((await call(sg, '/permit-send', { txId: 'SENT2', kind: 'resend', cycle: 1, spendKey: 'k', now: late + 1 })).body.code).toBe(SPEND_CODES.reservationReleased);
     // A late report from the crashed executor is still accepted (its token
