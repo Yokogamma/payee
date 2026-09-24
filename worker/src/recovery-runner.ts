@@ -179,6 +179,25 @@ async function stepRedropPending(noteId: string, record: RecoveryRecord, env: Re
   // reconciliation confirmed the OLD transaction and booked its money. Then
   // there is nothing to redrop: the old txId is the publication, and a new
   // signature would be a second paid one (review 24.09 #4, high 3).
+  // The dead verdict phase 1 acted on is a snapshot: read the pool AGAIN
+  // before anything of phase 2 — before the release of the old money and
+  // before a new signature can exist (review 24.09 #6, high, both halves).
+  // Mined after all → its money is booked (`released → spent` if phase 1
+  // already freed it) and the OLD txId is the publication; pending /
+  // unavailable / confirmations short of the quorum → nothing is released,
+  // nothing is signed, the slot waits; only a fresh `dead` lets phase 2 go
+  // on. A second paid publication is the one outcome this must prevent.
+  {
+    const recheck = await quorumOf(env, emit, deadTxId);
+    if (recheck.money.ok) {
+      await settleByTx(guard, { txId: deadTxId, outcome: 'spent', height: recheck.money.height });
+      return moneyAlreadySpent(noteId, record, host, emit, 'phase2');
+    }
+    if (recheck.verdict.kind !== 'dead') {
+      emit('recovery_refused', ['recheck', recheck.verdict.kind], []);
+      return (await host.cas(noteId, expected, rescheduled(record, now))) ? 'rescheduled' : 'discarded';
+    }
+  }
   const rel = await releaseSpend(guard, record.spendKey);
   if (rel === 'spent') return moneyAlreadySpent(noteId, record, host, emit, 'phase2');
   if (rel === 'in_flight' || rel === 'unavailable') {

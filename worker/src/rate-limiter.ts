@@ -864,18 +864,32 @@ export class RateLimiter implements DurableObject {
     };
     if (outcome !== null) {
       let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      let asked: 'spent' | 'released' = outcome;
       if (outcome === 'released' && r === 'in_flight' && (await proveExpiry()) === 'expired') {
-        r = await settleByTx(guard, { txId: entry.txId, outcome });
+        // The proof took time; the dead verdict that led here is stale
+        // (review #6 high, second half): read the pool AGAIN before the
+        // money is freed. Mined in between → spent; still dead → released;
+        // anything else → nothing is freed, the entry waits.
+        const again = await probe();
+        if (again.money.ok) {
+          asked = 'spent';
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+        } else if (again.dead) {
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' });
+        } else {
+          emit('money_reconcile', ['released', 'recheck_pending'], [entry.attempts]);
+          r = 'retry';
+        }
       }
-      emit('money_reconcile', [outcome, r], [entry.attempts]);
-      if (outcome === 'spent') {
+      if (r !== 'retry' || asked === 'spent') emit('money_reconcile', [asked, r], [entry.attempts]);
+      if (asked === 'spent') {
         terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
       } else if (r === 'settled' || r === 'noop') {
         watching = true; // released — now watch for a late landing
       } else if (r === 'unknown' || r === 'terminal_refusal') {
         terminal = true; // nothing of ours was ever sendable, or it is booked already
       }
-      result = terminal ? `${outcome}:${r}` : watching && !entry.watching ? `${outcome}:watch` : 'retry';
+      result = terminal ? `${asked}:${r}` : watching && !entry.watching ? `${asked}:watch` : 'retry';
     } else if (watching && dead) {
       // The watch ends only with BOTH facts from the chain, in THIS order:
       // the anchor has provably expired, AND the pool — asked AGAIN, after
