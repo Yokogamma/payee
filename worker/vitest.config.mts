@@ -56,6 +56,11 @@ export default defineConfig({
       'test/legacy-backfill-e2e.test.ts',
       'test/op-journal-e2e.test.ts',
       'test/admin-ops.test.ts',
+      // D10 /admin/spend/* suites: direct dispatch with env overrides and a
+      // stubbed gateway pool — same isolation reasoning as above.
+      'test/spend-admin.test.ts',
+      'test/spend-guard.marker.test.ts',
+      'test/spend-guard.ledger.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that

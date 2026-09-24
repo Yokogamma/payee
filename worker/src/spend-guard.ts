@@ -114,6 +114,10 @@ export class SpendGuard implements DurableObject {
       case '/init-posted': return this.initStep({ kind: 'posted', token: String(body.token ?? ''), txId: String(body.txId ?? ''), now });
       case '/init-done': return this.initStep({ kind: 'done', txId: String(body.txId ?? ''), heights: (body.heights as number[]) ?? [], confirmations: (body.confirmations as number[]) ?? [], now });
       case '/init-dead': return this.initStep({ kind: 'dead', txId: String(body.txId ?? ''), now });
+      // The FULL marker record, signed bytes included — for the worker that
+      // resends them (§4.1: POST only ever resends what is durable). Internal
+      // only; `/status` masks the bytes.
+      case '/init-read': return okJson({ init: await this.getInit(), freeze: await this.getFreeze(), ledger: fromLedger(await this.getLedger()) });
       case '/legacy-resolve': return this.legacyResolve(body, now);
       case '/reinit': return this.reinit();
       case '/credit-deposit': return this.creditDeposit(body);

@@ -256,6 +256,28 @@ Workers Free: 100k writes/day, 10k SQL reads/day — a large margin for this
 schema (≤ ~6 points per upload, 2 per status check).
 
 
+## PR-3b (reader) — D10 spend guard events (not yet deployed)
+
+Written by `worker/src/spend-admin.ts` and `worker/src/gateway-reads.ts` on the
+PR-3b branches; they reach a contour only with the reader release. Same schema
+rules as above (blob1 = event, the first caller blob is the index
+discriminator).
+
+| Event | blobs (in order) | doubles | Fires |
+|---|---|---|---|
+| `gateway_call` kind=`balance` | event, `balance`, host, statusClass | latencyMs | `readWalletBalance` (§3.4 detector input — the upload saga) |
+| `gateway_call` kind=`tx` | event, `tx`, host, statusClass (`invalid_response` includes a body whose `id` ≠ the requested txId) | latencyMs | `readTxJson` — deposit verification (`/admin/spend/credit-deposit`) |
+| `gateway_call` kind=`status` / `status_verdict` | as PR-3a | as PR-3a | the marker quorum and the deposit verification probe the SAME pool with the SAME function (`probeStatusOrigin`, relocated to gateway-reads.ts unchanged) |
+| `init_state` | event, state (`signed` / `done` / `dead`) | — | `/admin/spend/init` after the DO accepted the transition |
+| `deposit_credited` | event | amount (Winston, or −1 when not a safe integer) | `/admin/spend/credit-deposit` when the DO credited a NEW transfer |
+| `deposit_refused` | event, reason (`unverified` / a DO code such as `deposit_before_marker` / `unavailable`) | — | `/admin/spend/credit-deposit` on any refusal |
+| `spend_prepare_refused` | event, reason (`spend_quote_mismatch` for the marker's own quote) | — | `/admin/spend/init` when the marker quote exceeds `MAX_TX_REWARD_WINSTON` |
+
+Reserved for the upload saga (§8) and listed in the spec §11.9, NOT written yet:
+`permit_granted{kind}`, `permit_refused{reason}`, `freeze_active`,
+`legacy_held_winston`, `legacy_resolved{outcome}`, `ledger_inconsistent`,
+`activate_remap`, `activate_conflict`, `spend_conflict` and the gauges.
+
 ## What PR-3a deliberately does NOT measure
 
 D9 verification runs in the CLIENT, and D5 keeps telemetry server-side. So the

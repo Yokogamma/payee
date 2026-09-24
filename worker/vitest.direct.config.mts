@@ -52,6 +52,11 @@ export default defineConfig({
       // namespace (failure injection), and /admin/ops with env overrides.
       'test/op-journal-e2e.test.ts',
       'test/admin-ops.test.ts',
+      // D10 /admin/spend/* (spend-admin.ts): direct dispatch, env overrides,
+      // the isolate's fetch stubbed for the gateway pool.
+      'test/spend-admin.test.ts',
+      'test/spend-guard.marker.test.ts',
+      'test/spend-guard.ledger.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.
