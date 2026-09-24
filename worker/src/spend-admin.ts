@@ -42,7 +42,7 @@ import { probeStatusOrigin, readTxJson } from './gateway-reads';
 import { makeEmit, type Emit, type MetricsEnv } from './metrics';
 import { APP_NAME } from './protocol';
 import {
-  MARKER_MAX_BYTES, MAX_STATUS_HEIGHT_SKEW, MIN_BALANCE_SOURCES, MIN_DEPOSIT_CONFIRMATIONS, SPEND_CODES,
+  MARKER_MAX_BYTES, MIN_BALANCE_SOURCES, MIN_DEPOSIT_CONFIRMATIONS, SPEND_CODES, moneyQuorum,
   type FreezeState, type InitRecord, type SpendCode, type SpendLimits,
 } from './spend-ledger';
 import { permittedPost } from './spend-send';
@@ -312,9 +312,17 @@ export async function verifyDeposit(
   if (witnesses.length < MIN_BALANCE_SOURCES) return { ok: false, reason: `${witnesses.length} operator(s) verified, need ${MIN_BALANCE_SOURCES}: ${reasons.join('; ') || 'no answers'}` };
   const quantities = new Set(witnesses.map(w => w.quantity));
   if (quantities.size !== 1) return { ok: false, reason: `operators disagree on quantity: ${[...quantities].join(', ')}` };
-  const heights = witnesses.map(w => w.height);
-  if (Math.max(...heights) - Math.min(...heights) > MAX_STATUS_HEIGHT_SKEW) return { ok: false, reason: `heights disagree beyond the skew: ${heights.join(', ')}` };
-  return { ok: true, amount: witnesses[0].quantity, depositHeight: Math.min(...heights), witnesses: witnesses.length };
+  // The same rule as the marker and the settle (moneyQuorum) over the
+  // witnesses that passed the transaction checks above.
+  const operatorByOrigin = new Map(witnesses.map(w => [w.origin, w.operator]));
+  const q = moneyQuorum(
+    witnesses.map(w => ({ origin: w.origin, kind: 'confirmed' as const, confirmations: w.confirmations, blockHeight: w.height })),
+    origin => operatorByOrigin.get(origin) ?? origin,
+  );
+  if (!q.ok) return { ok: false, reason: `heights disagree beyond the skew: ${witnesses.map(w => w.height).join(', ')}` };
+  // A deposit is credited at the MINIMUM agreed height (§4.2): the strict side
+  // for «above the marker».
+  return { ok: true, amount: witnesses[0].quantity, depositHeight: Math.min(...q.heights), witnesses: witnesses.length };
 }
 
 async function handleCreditDeposit(
@@ -378,7 +386,7 @@ async function handleInit(guard: DurableObjectStub, env: SpendAdminEnv, emit: Em
         step = await stepSign(guard, env, emit, deps, view.freeze, record, transport);
         break;
       case 'signed':
-        step = await stepPost(guard, env, record, transport);
+        step = await stepPost(guard, env, emit, deps, record, transport);
         break;
       case 'posted':
         step = await stepQuorum(guard, env, emit, deps, record);
@@ -471,13 +479,57 @@ async function stepSign(
   return { next: ((signed as { body: GuardBody }).body.init as InitRecord) };
 }
 
-/** `signed` → permit (kind `marker`, the one exception under freeze) → POST
- *  the SAME bytes → `posted`. A lost answer leaves `signed`; the next call
- *  resends the same bytes (208 counts as accepted). */
-async function stepPost(guard: DurableObjectStub, env: SpendAdminEnv, record: InitRecord, transport: TransportDeps): Promise<InitStep> {
+/** The status pool's answer for the marker, under the ONE money quorum rule
+ *  (`moneyQuorum`), plus the liveness verdict for the dead branch. */
+async function markerQuorum(env: SpendAdminEnv, emit: Emit, deps: SpendAdminDeps, txId: string) {
+  const origins = statusOrigins(env);
+  const votes: StatusVote[] = await Promise.all(origins.map(origin => probeStatusOrigin(origin, txId, emit)));
+  return { quorum: moneyQuorum(votes, deps.operatorOf), verdict: statusVerdict(origins, votes) };
+}
+
+/** `posted` (idempotent) → `done` with the agreed heights. */
+async function markDone(guard: DurableObjectStub, emit: Emit, deps: SpendAdminDeps, record: InitRecord, q: Extract<ReturnType<typeof moneyQuorum>, { ok: true }>): Promise<InitStep> {
+  if (record.state === 'signed') {
+    // The network has the bytes (a lost POST answer): record the fact first.
+    const posted = await guardCall(guard, '/init-posted', { token: record.token, txId: record.txId, now: deps.now() });
+    const refused = passRefusal(posted, 'init-posted');
+    if (refused) return { done: refused };
+  }
+  const done = await guardCall(guard, '/init-done', { txId: record.txId, heights: q.heights, confirmations: q.confirmations, now: deps.now() });
+  const refused = passRefusal(done, 'init-done');
+  if (refused) return { done: refused };
+  emit('init_state', ['done'], []);
+  return { next: ((done as { body: GuardBody }).body.init as InitRecord) };
+}
+
+/** Unanimous `dead` past the age guard → `none` (a new signature only from
+ *  there); the guard is measured from the latest durable event. */
+async function markDead(guard: DurableObjectStub, emit: Emit, deps: SpendAdminDeps, record: InitRecord): Promise<InitStep> {
+  const dead = await guardCall(guard, '/init-dead', { txId: record.txId, now: deps.now() });
+  const refused = passRefusal(dead, 'init-dead');
+  if (refused) return { done: refused };
+  emit('init_state', ['dead'], []);
+  return { done: answer(200, { ok: true, step: 'dead', init: publicInit((dead as { body: GuardBody }).body.init as InitRecord), note: 'marker dead past the age guard; call init again to sign a new one' }) };
+}
+
+function pastAgeGuard(record: InitRecord, now: number): boolean {
+  const since = Math.max(record.postedAt ?? 0, record.signedAt ?? 0);
+  return since > 0 && now - since > MARKER_DEAD_AGE_MS;
+}
+
+/** `signed` → FIRST the quorum (review 24.09, high: a POST whose answer was
+ *  lost may already be mined — resending forever while other gateways
+ *  confirm it would strand the marker in `signed`): a money quorum → `posted`
+ *  → `done` without another send; unanimous `dead` past the age guard →
+ *  `none`; otherwise permit (kind `marker`, the one exception under freeze)
+ *  → POST the SAME bytes → `posted`. Never a second signature. */
+async function stepPost(guard: DurableObjectStub, env: SpendAdminEnv, emit: Emit, deps: SpendAdminDeps, record: InitRecord, transport: TransportDeps): Promise<InitStep> {
   if (!record.txId || !record.signedTx || !record.token) {
     return { done: refuse(503, SPEND_CODES.markerCorrupt, 'signed marker record is incomplete', { step: 'post' }) };
   }
+  const { quorum, verdict } = await markerQuorum(env, emit, deps, record.txId);
+  if (quorum.ok) return markDone(guard, emit, deps, record, quorum);
+  if (verdict.kind === 'dead' && pastAgeGuard(record, deps.now())) return markDead(guard, emit, deps, record);
   // The durable bytes as the SDK's `toJSON()` object; `post` rebuilds the
   // Transaction from it (data included) and prepares the chunks itself.
   let tx: { id?: unknown };
@@ -503,10 +555,9 @@ async function stepPost(guard: DurableObjectStub, env: SpendAdminEnv, record: In
   if (r.status !== 200 && r.status !== 202 && r.status !== 208) {
     return { done: refuse(502, 'arweave_rejected', `Arweave error: ${r.status}`, { step: 'post', init: publicInit(record) }) };
   }
-  const posted = await guardCall(guard, '/init-posted', { token: record.token, txId: record.txId, now: Date.now() });
+  const posted = await guardCall(guard, '/init-posted', { token: record.token, txId: record.txId, now: deps.now() });
   const refused = passRefusal(posted, 'init-posted');
   if (refused) return { done: refused };
-  void env;
   return { next: ((posted as { body: GuardBody }).body.init as InitRecord) };
 }
 
@@ -516,36 +567,12 @@ async function stepPost(guard: DurableObjectStub, env: SpendAdminEnv, record: In
  *  `none` (a new marker only from there); anything else → `waiting`. */
 async function stepQuorum(guard: DurableObjectStub, env: SpendAdminEnv, emit: Emit, deps: SpendAdminDeps, record: InitRecord): Promise<InitStep> {
   if (!record.txId) return { done: refuse(503, SPEND_CODES.markerCorrupt, 'posted marker record has no txId', { step: 'quorum' }) };
-  const origins = statusOrigins(env);
-  const votes: StatusVote[] = await Promise.all(origins.map(origin => probeStatusOrigin(origin, record.txId!, emit)));
-  const byOperator = new Map<string, Extract<StatusVote, { kind: 'confirmed' }>>();
-  for (const v of votes) {
-    if (v.kind !== 'confirmed' || v.confirmations < MIN_DEPOSIT_CONFIRMATIONS) continue;
-    const op = deps.operatorOf(v.origin);
-    if (!byOperator.has(op)) byOperator.set(op, v);
-  }
-  const agreed = [...byOperator.values()];
-  if (agreed.length >= MIN_BALANCE_SOURCES) {
-    const heights = agreed.map(v => v.blockHeight);
-    if (Math.max(...heights) - Math.min(...heights) <= MAX_STATUS_HEIGHT_SKEW) {
-      const done = await guardCall(guard, '/init-done', { txId: record.txId, heights, confirmations: agreed.map(v => v.confirmations), now: deps.now() });
-      const refused = passRefusal(done, 'init-done');
-      if (refused) return { done: refused };
-      emit('init_state', ['done'], []);
-      return { next: ((done as { body: GuardBody }).body.init as InitRecord) };
-    }
-  }
-  const verdict = statusVerdict(origins, votes);
-  if (verdict.kind === 'dead' && record.postedAt !== undefined && deps.now() - record.postedAt > MARKER_DEAD_AGE_MS) {
-    const dead = await guardCall(guard, '/init-dead', { txId: record.txId, now: deps.now() });
-    const refused = passRefusal(dead, 'init-dead');
-    if (refused) return { done: refused };
-    emit('init_state', ['dead'], []);
-    return { done: answer(200, { ok: true, step: 'dead', init: publicInit((dead as { body: GuardBody }).body.init as InitRecord), note: 'marker dead past the age guard; call init again to sign a new one' }) };
-  }
+  const { quorum, verdict } = await markerQuorum(env, emit, deps, record.txId);
+  if (quorum.ok) return markDone(guard, emit, deps, record, quorum);
+  if (verdict.kind === 'dead' && pastAgeGuard(record, deps.now())) return markDead(guard, emit, deps, record);
   return { done: answer(200, {
     ok: true, step: 'waiting', init: publicInit(record),
-    quorum: { verdict: verdict.kind, confirmedOperators: agreed.length, need: MIN_BALANCE_SOURCES, minConfirmations: MIN_DEPOSIT_CONFIRMATIONS },
+    quorum: { verdict: verdict.kind, confirmedOperators: quorum.operators, need: MIN_BALANCE_SOURCES, minConfirmations: MIN_DEPOSIT_CONFIRMATIONS },
   }) };
 }
 

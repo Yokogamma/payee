@@ -128,8 +128,10 @@ export interface InitRecord {
   dueAt?: number;
   hInit?: number;
   initAt?: number;
-  /** When the POST of the marker was accepted (`posted`) — the age guard of the
-   *  dead verdict (§4.1 «мёртвый маркер») is measured from here. */
+  /** When the signature became durable (`signed`) / when the POST was accepted
+   *  (`posted`) — the age guard of the dead verdict (§4.1 «мёртвый маркер») is
+   *  measured from the latest of them. */
+  signedAt?: number;
   postedAt?: number;
 }
 
@@ -169,7 +171,7 @@ export function initTransition(record: InitRecord, event: InitEvent): InitTransi
     case 'signed': {
       if (record.state !== 'signing' || record.token !== event.token) return { ok: false, code: SPEND_CODES.staleToken };
       if ((record.dueAt ?? 0) <= event.now) return { ok: false, code: SPEND_CODES.staleToken };
-      return { ok: true, record: { ...record, state: 'signed', txId: event.txId, signedTx: event.signedTx, anchor: event.anchor, dueAt: event.now + PREPARED_LEASE_MS } };
+      return { ok: true, record: { ...record, state: 'signed', txId: event.txId, signedTx: event.signedTx, anchor: event.anchor, signedAt: event.now, dueAt: event.now + PREPARED_LEASE_MS } };
     }
     case 'posted': {
       if (record.state === 'posted' && record.txId === event.txId) return { ok: true, record }; // idempotent
@@ -394,6 +396,46 @@ export function settle(reservation: Reservation, outcome: SettleOutcome): Settle
       if (reservation.activatedBy === undefined) return { ok: false, reason: 'never_activated' };
       return { ok: true, state: 'spent', spentDelta: r, pendingDelta: 0n, conflict: true };
   }
+}
+
+// ─── The money quorum (§4.1 `done`, §4.2 deposits, §7 settle by the quorum) ─
+
+/** One status origin's answer, as the shared quorum module shapes it. */
+export interface ConfirmedVote { origin: string; kind: 'confirmed'; confirmations: number; blockHeight: number }
+export type QuorumVoteLike = ConfirmedVote | { origin: string; kind: string };
+
+export type MoneyQuorum =
+  | { ok: true; height: number; heights: number[]; confirmations: number[]; operators: number }
+  | { ok: false; operators: number };
+
+/**
+ * The ONE rule under which the guard treats a transaction as CONFIRMED for
+ * money (review 24.09, high): at least `MIN_BALANCE_SOURCES` independent
+ * OPERATORS (two origins of one operator are one voice), each answering
+ * `confirmed` with ≥ `MIN_DEPOSIT_CONFIRMATIONS`, their heights within
+ * `MAX_STATUS_HEIGHT_SKEW`. Liveness (the PR-3a `statusVerdict`, satisfied by
+ * a single 200 with zero confirmations) is a different question and never
+ * settles a spend, credits a deposit or fixes a marker.
+ *
+ * `height` is the MAXIMUM of the agreed heights — the conservative side for
+ * money: a spend is reclassified out of the ledger only when it is provably
+ * at or below the marker (`spend-guard.ts` initStep), and the marker's own
+ * `h_init` is the maximum too (§4.1).
+ */
+export function moneyQuorum(votes: readonly QuorumVoteLike[], operatorOf: (origin: string) => string): MoneyQuorum {
+  const byOperator = new Map<string, ConfirmedVote>();
+  for (const v of votes) {
+    if (v.kind !== 'confirmed') continue;
+    const c = v as ConfirmedVote;
+    if (c.confirmations < MIN_DEPOSIT_CONFIRMATIONS) continue;
+    const op = operatorOf(c.origin);
+    if (!byOperator.has(op)) byOperator.set(op, c);
+  }
+  const agreed = [...byOperator.values()];
+  if (agreed.length < MIN_BALANCE_SOURCES) return { ok: false, operators: agreed.length };
+  const heights = agreed.map(v => v.blockHeight);
+  if (Math.max(...heights) - Math.min(...heights) > MAX_STATUS_HEIGHT_SKEW) return { ok: false, operators: agreed.length };
+  return { ok: true, height: Math.max(...heights), heights, confirmations: agreed.map(v => v.confirmations), operators: agreed.length };
 }
 
 // ─── §4.0 п. 6 Legacy resolution after `done` ───────────────────────────

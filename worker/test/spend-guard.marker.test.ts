@@ -169,6 +169,40 @@ describe('D10 marker automaton on durable storage', () => {
     expect(fresh.body.init!.txId).not.toBe(oldTx);
   });
 
+  it('signed, the POST keeps failing while other gateways already confirm the marker: the next init reconciles by the quorum → posted → done WITHOUT another send (review 24.09, high)', async () => {
+    const env = await frozen('stuck');
+    const { post } = markerMocks(mockRoute, { post: 500 });
+    const first = await viaHandler(handler, 'init', env);
+    expect(first.body.code).toBe('arweave_rejected');
+    const txId = (await guardStatus(env.SPEND_GUARD)).init.txId!;
+    expect(post!.calls).toBe(1);
+    // No POST route registered: a resend would throw (post_unknown) — the
+    // quorum must be asked FIRST and be enough on its own.
+    confirmedAll(mockRoute, txId, [2000, 2001]);
+    const second = await viaHandler(handler, 'init', env);
+    expect(second.body.step, JSON.stringify(second.body)).toBe('done');
+    const s = await guardStatus(env.SPEND_GUARD);
+    expect(s.init).toMatchObject({ state: 'done', txId, hInit: 2001 });
+  });
+
+  it('signed and unanimously dead past the age guard → none (a new marker only from there); before the age guard the bytes are resent', async () => {
+    const env = await frozen('signeddead');
+    markerMocks(mockRoute, { post: 500 });
+    await viaHandler(handler, 'init', env);
+    const txId = (await guardStatus(env.SPEND_GUARD)).init.txId!;
+    // Young: dead on both, but the guard has not passed → the same bytes go out again.
+    deadAll(mockRoute, txId);
+    const resend = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 500, 'nope');
+    expect((await viaHandler(handler, 'init', env)).body.code).toBe('arweave_rejected');
+    expect(resend.calls).toBe(1);
+    expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('signed');
+    // Old: → none, and nothing is sent.
+    const aged = handlerWith({ closeLegacySet: closed(), now: () => Date.now() + MARKER_DEAD_AGE_MS + 1 });
+    deadAll(mockRoute, txId);
+    expect((await viaHandler(aged, 'init', env)).body.step).toBe('dead');
+    expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('none');
+  });
+
   it('a corrupt durable record (bytes ≠ txId) is neither resent nor re-signed: 503 spend_marker_corrupt, no network', async () => {
     const env = await frozen('corrupt');
     await guardCall(env.SPEND_GUARD, '/init-begin', { token: 't' });
