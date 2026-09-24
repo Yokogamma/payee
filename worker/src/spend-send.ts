@@ -28,10 +28,13 @@ export interface PermitRequest {
   /** Storage name of the reservation (`res:` key without the prefix) — absent
    *  for the marker, whose money is not a reservation. */
   spendKey?: string;
+  /** `last_tx` of the bytes: the permit records it, and only a proof about
+   *  THIS anchor can end an unreported lease (review 24.09 #5, high 1). */
+  anchor?: string;
 }
 
 export type PermitAnswer =
-  | { granted: true; permit: PermitRecord; existing: boolean }
+  | { granted: true; permit: PermitRecord; existing: boolean; sendToken: string }
   /** The DO refused (frozen / not initialised) — the caller picks the §4.0
    *  branch from `existing === undefined` (no permit was ever issued). */
   | { granted: false; code: SpendCode; status: number }
@@ -42,19 +45,19 @@ export type PermitAnswer =
 /** Ask the global guard for the permit — one `storage.transaction` there. */
 export async function requestPermit(guard: DurableObjectStub, req: PermitRequest): Promise<PermitAnswer> {
   let res: Response;
-  let body: { ok?: boolean; code?: string; permit?: PermitRecord; existing?: boolean };
+  let body: { ok?: boolean; code?: string; permit?: PermitRecord; existing?: boolean; sendToken?: string };
   try {
     res = await guard.fetch('http://spend-guard/permit-send', {
       method: 'POST',
-      body: JSON.stringify({ txId: req.txId, kind: req.kind, cycle: req.cycle, ...(req.spendKey !== undefined ? { spendKey: req.spendKey } : {}) }),
+      body: JSON.stringify({ txId: req.txId, kind: req.kind, cycle: req.cycle, ...(req.spendKey !== undefined ? { spendKey: req.spendKey } : {}), ...(req.anchor !== undefined ? { anchor: req.anchor } : {}) }),
     });
     body = (await res.json()) as typeof body;
   } catch (e) {
     console.error('SPEND_GUARD_UNAVAILABLE', 'permit-send', req.txId, e);
     return { granted: false, code: SPEND_CODES.guardUnavailable, status: 503, unavailable: true };
   }
-  if (res.ok && body.ok === true && body.permit) {
-    return { granted: true, permit: body.permit, existing: body.existing === true };
+  if (res.ok && body.ok === true && body.permit && typeof body.sendToken === 'string') {
+    return { granted: true, permit: body.permit, existing: body.existing === true, sendToken: body.sendToken };
   }
   const code = (typeof body.code === 'string' ? body.code : SPEND_CODES.guardUnavailable) as SpendCode;
   return { granted: false, code, status: res.status >= 400 ? res.status : 503 };
@@ -76,7 +79,10 @@ export type PermittedPostResult =
 /**
  * permit-send → POST, with nothing in between. The permit request carries the
  * txId of the SIGNED bytes about to go out; a repeat for the same txId returns
- * the same permit (resend = no double accounting, §4.0).
+ * the same permit (resend = no double accounting, §4.0) under a NEW lease —
+ * and only once the previous executor reported: while a lease is open the
+ * guard answers `spend_send_in_flight` and nothing is sent (one executor per
+ * txId, review 24.09 #4 high 1).
  */
 export async function permittedPost(
   guard: DurableObjectStub,
@@ -90,12 +96,27 @@ export async function permittedPost(
     // A programming error, and a money one: the permit names the bytes.
     return { sent: false, refusal: { granted: false, code: SPEND_CODES.remapRefused, status: 503 } };
   }
-  const permit = await requestPermit(guard, req);
+  // The anchor travels with the permit request: the bytes name it, and it is
+  // the only thing a later proof of expiry can be about.
+  const lastTx = typeof tx === 'object' && tx !== null && 'last_tx' in tx ? (tx as { last_tx?: unknown }).last_tx : undefined;
+  const permit = await requestPermit(guard, { ...req, ...(typeof lastTx === 'string' && req.anchor === undefined ? { anchor: lastTx } : {}) });
   if (!permit.granted) return { sent: false, refusal: permit };
+  let result: PermittedPostResult;
   try {
     const r = await postSignedTx(arweave, tx, deps);
-    return { sent: true, status: r.status };
+    result = { sent: true, status: r.status };
   } catch (e) {
-    return { sent: 'unknown', error: e };
+    result = { sent: 'unknown', error: e };
   }
+  // The end of the send, reported under the lease token — whatever happened.
+  // Best effort: a lost report keeps the txId exclusive and its money held
+  // until the chain proves the anchor expired (`anchor-expiry.ts` →
+  // `/anchor-expired`) — time is not a report, only the network's rule,
+  // read from the chain, ends an unreported send.
+  try {
+    await guard.fetch('http://spend-guard/send-done', { method: 'POST', body: JSON.stringify({ txId: req.txId, sendToken: permit.sendToken }) });
+  } catch (e) {
+    console.error('SPEND_SEND_DONE_LOST', req.txId, e);
+  }
+  return result;
 }

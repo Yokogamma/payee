@@ -62,7 +62,7 @@ export async function guardPost(guard: DurableObjectStub, path: string, body: Re
 export const SPEND_UPLOAD_CODES: ReadonlySet<string> = new Set([
   SPEND_CODES.guardUnavailable, SPEND_CODES.guardUnconfigured, SPEND_CODES.frozen, SPEND_CODES.notInitialized,
   SPEND_CODES.floor, SPEND_CODES.windowCap, SPEND_CODES.quoteMismatch, SPEND_CODES.ledgerInconsistent,
-  SPEND_CODES.activateConflict, SPEND_CODES.remapRefused,
+  SPEND_CODES.activateConflict, SPEND_CODES.remapRefused, SPEND_CODES.reservationReleased,
 ]);
 
 export interface SpendRefusal { code: string; status: number; unavailable: boolean; detail: Record<string, unknown> }
@@ -127,16 +127,44 @@ export async function activateSpend(
   return { ok: true, state: String(b.state), outcome: String(b.outcome), cycle: Number(b.cycle) };
 }
 
-/** Release a reservation that PROVABLY never reached the network (the §4.0
- *  «abort before send» branch). Best effort: a `prepared` one cannot be
- *  settled (its lease expires), an `active` one goes `released`; a refusal is
- *  logged and never changes the answer. */
-export async function releaseSpend(guard: DurableObjectStub, spendKey: string): Promise<void> {
+/**
+ * Release a reservation: the §4.0 «abort before send» branch of the saga, and
+ * the second call of the redrop order in the scheduler. Best effort, and the
+ * answer is TYPED because the caller's next step depends on it (review 24.09
+ * #4, high 3): `released` / `noop` — the money is free (now, or already);
+ * `spent` — the lattice refused because the transaction was CONFIRMED and its
+ * money booked (`spent_is_final`): nothing is free, the old txId stands, and
+ * no new signature may follow; `in_flight` — an open send lease; `absent` —
+ * no reservation under this key (nothing was ever reserved); `terminal` — a
+ * refusal that leaves nothing to release (`prepared_cannot_settle`,
+ * `never_activated`, `foreign_cycle`); `unavailable` — no answer.
+ */
+export type ReleaseResult = 'released' | 'noop' | 'spent' | 'in_flight' | 'absent' | 'terminal' | 'unavailable';
+
+export async function releaseSpend(guard: DurableObjectStub, spendKey: string): Promise<ReleaseResult> {
   const r = await guardPost(guard, '/settle', { spendKey, outcome: 'released' });
-  if (!isOk(r)) console.error('SPEND_RELEASE_NOT_APPLIED', spendKey.slice(-36), why(r));
+  if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'released';
+  if ('unavailable' in r) return 'unavailable';
+  if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
+  if (r.status === 404) return 'absent';
+  if (r.status === 409) return r.body.reason === 'spent_is_final' ? 'spent' : 'terminal';
+  console.error('SPEND_RELEASE_NOT_APPLIED', spendKey.slice(-36), why(r));
+  return 'unavailable';
 }
 
-export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'refused' | 'unavailable';
+/**
+ * `settled` / `noop` — the guard applied or already held this outcome;
+ * `unknown` — no permit names this txId (a pre-D10 publication);
+ * `terminal_refusal` — the lattice refused for good (409: `spent_is_final`,
+ * `never_activated`, …; 400: a marker permit);
+ * `retry` — the guard did not answer, or refused for now (503: unavailable,
+ * `spend_send_in_flight`). Only the first three kinds and `terminal_refusal`
+ * end a money-reconciliation entry (review 24.09 #3, high 2).
+ */
+export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'terminal_refusal' | 'retry'
+  /** `released` refused under an open send lease: the caller may bring the
+   *  chain's proof of anchor expiry (`anchor-expiry.ts`) and ask again. */
+  | 'in_flight';
 
 /** Reconcile a reservation by the txId its permit named (§7 via `permit:<txId>`):
  *  the recheck path knows the txId, not the spendKey. Best effort — the
@@ -147,10 +175,13 @@ export async function settleByTx(
   args: { txId: string; outcome: 'spent' | 'released'; height?: number },
 ): Promise<SettleByTxResult> {
   const r = await guardPost(guard, '/settle-by-tx', { txId: args.txId, outcome: args.outcome, ...(args.height !== undefined ? { height: args.height } : {}) });
-  if ('unavailable' in r) return 'unavailable';
+  if ('unavailable' in r) return 'retry';
   if (r.status === 404) return 'unknown';
-  if (!isOk(r)) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'refused'; }
-  return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
+  if (r.status === 409 || r.status === 400) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'terminal_refusal'; }
+  console.error('SPEND_SETTLE_BY_TX_RETRY', args.txId, args.outcome, why(r));
+  return 'retry';
 }
 
 // ─── §3.4 balance detector ──────────────────────────────────────────────

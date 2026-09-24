@@ -1662,10 +1662,11 @@ Reader-релиз этим не блокируется: он не создаёт
   permit-send непосредственно перед `postSignedTx`); статический гейт «нет
   POST вне permit-send» — следующий шаг (сага загрузки).
 - Закрытие множества `L` (§4.0 п. 2–5) — **зависимость** `closeLegacySet`;
-  производственное значение до реализации — «множество не закрыто» →
-  `init` отвечает `503 spend_init_legacy_open` (fail-closed, не заглушка
-  «закрыто»). Тождество операторов (`operatorOf`) — из карты PR-4
-  (`STATUS_OPERATORS`) после её мержа; до того каждый origin — свой оператор.
+  до шага 5 производственное значение было «множество не закрыто»
+  (`503 spend_init_legacy_open`); с шага 5 (ниже) — реализация
+  `worker/src/legacy-closure.ts`. Тождество операторов (`operatorOf`) — из
+  карты PR-4 (`STATUS_OPERATORS`) после её мержа; до того каждый origin —
+  свой оператор.
 - `credit-deposit { txId }`: `/tx/<id>` (равенство `id`) и статус у каждого
   origin; свидетель — origin с `target` = кошелёк воркера, отправитель ≠
   кошелёк воркера, `confirmed ≥ MIN_DEPOSIT_CONFIRMATIONS`; ≥ 2 операторов,
@@ -1717,6 +1718,171 @@ Reader-релиз этим не блокируется: он не создаёт
   — только без кворума; новой подписи нет. (M) просроченные lease `prepared`
   освобождаются внутри транзакции `prepare`/remap-`activate` ДО проверок
   бюджета; alarm — лишь ускоритель, его потеря не удерживает бюджет.
+
+**Уточнения реализации PR-3b — recovery-записи и планировщик (2026-09-24,
+ветка `arweave/pr3b-recovery-scheduler`, draft, поверх саги; reader-часть):**
+
+- Чистые правила — `worker/src/recovery.ts` (запись `signed`/`redrop_pending`
+  по storage-контракту: txId, `signedTx` inline, `signedAt`, `dueAt`,
+  `attempts`, `deadTxId`, `spendKey`/`reward`/`spendRevision`, `generation`;
+  backoff 1 мин ×2 до 1 ч; таблица вердиктов; переходы фазы 1/2; разбор
+  байт с равенством id). Сетевой шаг — `worker/src/recovery-runner.ts`.
+  Планировщик — в `RateLimiter`: индекс `recovery:<noteId> = dueAt`,
+  persistent `recoveryCount` (cap = `limit`), alarm = min(dueAt); КАЖДАЯ
+  мутация множества — одна `storage.transaction` (запись, индекс, счётчик,
+  alarm через `txn.setAlarm`), CAS по `{status, token, txId}`;
+  `ALARM_BATCH = 5`, каждая запись в своём try/catch, `finally` перевзводит
+  alarm (ретрай ×3), остаток — немедленный alarm; self-healing на входе
+  `/check-and-reserve`.
+- Таблица `signed`: `confirmed` → `posted` (деньги — только под
+  `moneyQuorum`, settle-by-tx); `pending` → reschedule; `unavailable` и
+  `dead` до age guard → **resend тех же байт** (activate идемпотентно →
+  `permit-send(resend)` → POST; уточнение к таблице плана, где оба —
+  «reschedule»: без resend `signed`, чей первый POST не ушёл, не был бы
+  отправлен никогда) + reschedule; `dead` + age guard (от max(signedAt,
+  postedAt)) → фаза 1. Порча байт — ни resend, ни новой подписи, только
+  кворум.
+- Redrop двухфазный: фаза 1 — CAS `signed → redrop_pending` (deadTxId,
+  старые байты сохраняются, capacity не освобождается, dueAt = now) →
+  `settle(старый spendKey, released)` (повторяется идемпотентно на каждой
+  попытке фазы 2); фаза 2 — байты разбираются и обязаны быть мёртвой tx,
+  data и теги переносятся без изменений (`Arweave.utils`), новая
+  generation = новый `spendKey` (`…:g<n>`) → prepare → подпись → CAS
+  `redrop_pending → signed` (новые txId/байты) → activate →
+  `permit-send(redrop2)` → POST → `posted`; сбой после CAS оставляет новый
+  `signed` (resend тех же байт на следующем проходе, вторая подпись не
+  создаётся).
+- Reader: `decide()` отвечает `recovering` (воркер: один шаг `/recover-now`
+  + `503 recovery_in_progress`) и `recovery_capacity` (503 до подписи);
+  новых `signed` reader не создаёт — `adoptRecovery` (примитив writer-а и
+  посев тестов) не вызывается ни одним маршрутом.
+- Готчи стенда: alarm в прошлом срабатывает сам немедленно (тесты сеют
+  далёкий `dueAt` и ведут прогон явно `runRecovery(now)`); DO видит env
+  биндингов — сьют передаёт изолированный guard и подписываемый кошелёк
+  через seam `useEnvForTests`; один инстант `now` на весь прогон.
+- **Ревью 24.09 #2 (4 high, 1 medium) внесено:** (H1) устаревший исполнитель
+  теряет право отправки: `activate` с терминальным no-op (`released`/`spent`)
+  → POST запрещён (сага и планировщик), перечитывание записи `stillMine`
+  непосредственно перед отправкой, и durable-рычаг в DO — `permit-send` по
+  txId, чья резервация `released`, отвечает `503 spend_reservation_released`
+  всем; (H2) закрытие множества: любой сбой или неполный ответ DO
+  (`/list-keys`, `/legacy-keys`, `/legacy-list`, `/open-permits`, страница
+  `/ops`) → `open` с причиной, никаких пустых значений по умолчанию;
+  (H3) L₁ только сообщается, не регистрируется — деньги разрешения уже
+  удерживает его резервация (перенесённая `reinit` в pending), учёт по одной
+  записи; (H4) отдельный долговечный индекс денежной реконсиляции
+  `money:<noteId>` в RateLimiter: заводится на `mark-posted` (обычный путь)
+  и на recovery → posted, alarm = min по обоим индексам, шаг = кворум →
+  `settle-by-tx spent` / `dead` + age guard → `released` / backoff, выход
+  только по терминальному ответу guard; (M) smoke считает исходом последний
+  ответ `init` (`done`/`waiting` — успех, иначе отказ).
+- **Ревью 24.09 #3 (3 high, 1 medium) внесено:** (H1) **протокол отправки** —
+  разрешение = lease на деньги: `permit-send` записывает `sending {token,
+  since}` и возвращает `sendToken`; отправитель после POST (любой исход)
+  отчитывается `/send-done {txId, sendToken}`; `released` для резервации,
+  чьё разрешение в `sending` моложе `SEND_LEASE_MS` (30 мин), отвечает
+  `503 spend_send_in_flight` (`settle` и `settle-by-tx`); повтор
+  `permit-send` внутри lease возвращает тот же lease; фаза 2 не подписывает,
+  пока старые деньги не освобождены (`in_flight`/`unavailable` →
+  reschedule). Крах отправителя → lease истекает; POST дольше 30 мин
+  ложится на `released` и переучитывается решёткой (`spend_conflict`).
+  (H2) `settle-by-tx`: `retry` (guard не ответил, 503) сохраняет запись
+  денежного индекса; терминально только `settled`/`noop`/`unknown`/
+  `terminal_refusal` (409/400). (H3) `commit` из `reserved` (mark-posted
+  потерян трижды) атомарно заводит денежную запись. (M) элементы
+  `/open-permits` проверяются по полям, типам и состояниям
+  (`prepared`/`active`), неполный элемент держит множество открытым.
+- **Ревью 24.09 #4 (3 high, протокол отправки) внесено:** (H1) **один
+  исполнитель на txId** — lease эксклюзивен: пока `sending` открыт, повторный
+  `permit-send` того же txId отвечает `503 spend_send_in_flight` (а не копией
+  токена), так что отчёт первого исполнителя не может снять защиту с
+  второго — второго не существует; `/send-done` принимает свой токен без
+  срока. (H2) **истечение времени — не отчёт**: `SEND_LEASE_MS` (30 мин)
+  снят; неотчитавшийся lease держит деньги и эксклюзивность до
+  `LATE_LANDING_BOUND_MS` (6 ч) — оценки сверху сетевого правила анкера
+  (`last_tx` из `/tx_anchor` старше `ANCHOR_EXPIRY_BLOCKS` = 50 блоков
+  отвергается узлами; 50 × 2 мин = 100 мин, запас 3,6×), после чего байты
+  не могут быть приняты сетью и `released` — решение о мёртвых байтах.
+  Долговечный путь реконсиляции: денежный индекс переведён на ключ
+  `money:<noteId>:<txId>`; фаза 1 redrop атомарно заводит запись для
+  МЁРТВОГО txId; `released` не завершает запись, а переводит её в `watching`
+  до границы приземления (при мёртвом вердикте), и позднее приземление
+  переучитывается решёткой этим же шагом (`released → spent`,
+  `spend_conflict`); дозор без мёртвого вердикта в `MONEY_WATCH_MAX_MS`
+  (7 дней) снимается с записью в лог. Сага: отказ `spend_send_in_flight`
+  на `permit-send` — ветка «durable recovery» (`post_unknown`, без
+  abort), недостижимо для свежего txId. (H3) **`spent_is_final` ≠
+  освобождение**: `releaseSpend` различает `released`/`noop`/`spent`/
+  `in_flight`/`absent`/`terminal`; ответ `spent` (старая транзакция
+  подтверждена и учтена конкурентной реконсиляцией) останавливает redrop в
+  обеих фазах — запись становится `posted` со СТАРЫМ txId, ничего не
+  подписывается и не отправляется; новых резерваций нет.
+- **Ревью 24.09 #5 (2 high) внесено:** (H1) **6 ч — не доказательство**:
+  `LATE_LANDING_BOUND_MS` снят целиком, `leaseOpen` = «lease установлен» без
+  часов. Истечение анкера доказывается по состоянию цепи: `permit-send`
+  записывает `anchor` (`last_tx` байтов; повтор с другим анкером → отказ),
+  `anchor-expiry.ts` читает у каждого оператора высоту блока анкера
+  (`/block/hash/<hash>`, равенство `indep_hash`, высоты ≥ 2 операторов
+  должны СОВПАДАТЬ) и высоту цепи (`/info`, МИНИМУМ по ≥ 2 операторам) и
+  применяет правило `anchorExpired`: `chainHeight − anchorHeight ≥
+  ANCHOR_EXPIRY_BLOCKS (50) + ANCHOR_EXPIRY_MARGIN_BLOCKS (5)`; маршрут DO
+  `/anchor-expired {txId, anchor, anchorHeight, chainHeight}` проверяет, что
+  доказательство о том самом анкере и что правило выполняется, и лишь тогда
+  снимает lease (запись `anchorExpired` на разрешении, аудит); без
+  доказательства (нет кворума, разногласие по высоте анкера, разрешение без
+  анкера) удержание сохраняется бессрочно. Шаг денежного индекса при
+  `in_flight` добывает доказательство и повторяет `released` в том же
+  проходе; дозор завершается только `dead` ∧ доказательство. Денежная
+  запись несёт `anchor` (`mark-posted`/`commit` от саги, `toPosted` и фаза 1
+  из сохранённых байтов). (H2) **возраст не уничтожает обязательство**:
+  ветка `watch:abandoned` (7 дней) удалена; `MONEY_STALE_MS` (7 дней) лишь
+  эскалирует (`money_reconcile … stale`, лог `MONEY_RECONCILE_STALE`) и
+  замедляет проверки до `MONEY_STALE_BACKOFF_MS` (6 ч); запись с 49
+  подтверждениями на восьмые сутки остаётся и при 60-м подтверждении
+  учитывается `released → spent`.
+- **Ревью 24.09 #6 (1 high, 1 medium) внесено:** (H) `dead`, прочитанный
+  ДО доказательства, — не основание для удаления дозора: истечение анкера
+  запрещает будущее включение, но не исключает уже состоявшееся между двумя
+  чтениями. Порядок шага: доказательство → ПОВТОРНОЕ чтение полного набора
+  статусов → денежный кворум → `settle-by-tx spent` (`released → spent`);
+  снова `dead` → дозор завершён; `pending`/недоступность/подтверждения
+  ниже кворума → обязательство сохраняется (`money_reconcile watch
+  recheck_pending`). То же ПЕРЕД освобождением активной резервации: путь
+  `in_flight` → доказательство → повторное чтение → `spent` / `released` /
+  ничего не освобождать (`released recheck_pending`); и в фазе 2 redrop —
+  перечитывание старого txId непосредственно перед подписью: кворум →
+  `settle spent` и `posted` со старым txId, не `dead` → `recovery_refused
+  recheck`, без подписи; только свежий `dead` открывает новую генерацию.
+  (M) для доказанно истёкшего анкера `permit-send`
+  отвечает `503 spend_anchor_expired` — новых lease на такие байты нет
+  (путь: dead → redrop, не resend); `leaseOpen` = `sending` ∧ ¬`anchorExpired`
+  (запись с обоими полями ничего не удерживает), повторный `/anchor-expired`
+  снимает и такой lease (`leaseCleared`), факт записывается один раз.
+
+**Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
+ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**
+
+- `worker/src/legacy-closure.ts` — `closeLegacySet`: (1) ключи — `InviteManager
+  /list-keys` (публичные ключи всех использованных `invite:*`, включая
+  отозванные, ∪ живые `pk:*`; инвайты старого формата без ключа считаются
+  `unknownLegacyInvites`) ∪ ключи, зарегистрированные оператором
+  (`/admin/spend/init-legacy-keys { publicKeys, acknowledgeLegacyInvites }`,
+  durable в `SpendGuard`); `unknownLegacyInvites > acknowledged` →
+  `503 spend_init_keys_unknown`; (2) `L₁` — `SpendGuard /open-permits`: разрешения
+  (не маркер) без терминального исхода резервации, награда — из резервации;
+  (3) `L₂` — журналы `/ops` каждого ключа за глубину хранения журнала: `posting`,
+  `finished` с `paidResult unknown`, `finished(accepted)` без денежного кворума
+  (`moneyQuorum` по пулу статусов); (4) награда `L₂` — только из заголовка
+  `/tx/<id>` у payload-origin, проверенного `verifyHeader` (равенство id,
+  подпись RSA-PSS, владелец из `TRUSTED_OWNERS`); недоступно у всех →
+  `503 spend_init_legacy_reward_unknown { txId }`; (5) уже зарегистрированные
+  (`/legacy-list`) не возвращаются — повторный вызов идемпотентен. Регистрация
+  — `/init-legacy` с `registeredAt`.
+- Разрешение удержанных после `done` (§4.0 п. 6) — на каждом `init` в
+  состоянии `done` (рычаг оператора), пачкой ≤ 20: денежный кворум выше
+  `h_init` → `spent`, на/ниже → `dropped`, unanimous `dead` старше 30 мин от
+  `registeredAt` → `dropped`, иначе `held` (без TTL); ответ `legacy:
+  { held, spent, dropped, kept }`.
 
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 

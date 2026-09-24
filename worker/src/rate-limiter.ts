@@ -27,6 +27,20 @@
  */
 
 import {
+  ALARM_BATCH, MONEY_BATCH, MONEY_INDEX_PREFIX, MONEY_STALE_BACKOFF_MS, MONEY_STALE_MS, RECOVERY_AGE_GUARD_MS, RECOVERY_COUNT_KEY, RECOVERY_INDEX_PREFIX,
+  anchorOf, backoffMs, casMatches, isRecoveryStatus, minDueAt, moneyIndexKey, parseMoneyIndexKey, recoveryIndexKey, rescheduled,
+  type MoneyEntry, type PostedRecord, type RecoveryCas, type RecoveryRecord,
+} from './recovery';
+import { proveAnchorExpired } from './anchor-expiry';
+import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
+import { statusVerdict } from '../../src/lib/status-quorum';
+import { parseOriginList } from '../../src/lib/gateways-parse';
+import { ARWEAVE_HOST } from './arweave-transport';
+import { probeStatusOrigin } from './gateway-reads';
+import { makeEmit } from './metrics';
+import { moneyQuorum } from './spend-ledger';
+import { settleByTx } from './spend-saga';
+import {
   type OpBegin, type OpRecord, type OpAbortRequest, type OpFinishRequest, type OpPostingRequest,
   applyAbort, applyFinish, applyPosting, newOpRecord, projectOp, isValidOpBegin, isPrunable,
   opKey, opIndexKey, opIndexLowerBound, opIndexUpperBound, OP_INDEX_PREFIX, OP_META_KEY, type OpMeta,
@@ -38,7 +52,10 @@ const RESERVE_TTL_MS = 600_000;     // 10 min — a reservation older than this 
 const ATTEMPT_FACTOR = 3;           // attempts ceiling = limit × 3
 
 interface NoteRecord {
-  status: 'reserved' | 'posted' | 'committed';
+  /** `signed` / `redrop_pending` are the PR-3b recovery records (recovery.ts):
+   *  read and resumed by the scheduler below, never created by a reader
+   *  route. Their extra fields live on `RecoveryRecord`. */
+  status: 'reserved' | 'posted' | 'committed' | 'signed' | 'redrop_pending';
   token: string;
   gen: number;
   txId?: string;
@@ -78,8 +95,10 @@ type Store = DurableObjectStorage | DurableObjectTransaction;
  *  records. Optional so a caller that has not computed one still functions:
  *  the record is then written legacy-shaped, exactly as before D2. */
 interface CheckAndReserveRequest { noteId: string; limit: number; fp?: string; op?: OpBegin }
-interface MarkPostedRequest { noteId: string; txId: string; token: string }
-interface CommitRequest { noteId: string; txId: string; token: string }
+/** `anchor` = `last_tx` of the posted bytes, for the money index (the proof
+ *  of expiry is about it); optional on the wire, the saga always sends it. */
+interface MarkPostedRequest { noteId: string; txId: string; token: string; anchor?: string }
+interface CommitRequest { noteId: string; txId: string; token: string; anchor?: string }
 interface ReleaseRequest { noteId: string; token: string }
 /**
  * `fp` of the payload about to be RE-posted. Absent → the record's own `fp` is
@@ -127,16 +146,30 @@ export class RateLimiter implements DurableObject {
    * that window). Read once per admission; `undefined` in every real request.
    */
   faultAfter?: 'decide' | 'op' | 'index';
+  /** TEST SEAM for the recovery transactions (`casRecovery`): throw INSIDE
+   *  the transaction right after the named write — the rollback proof. */
+  recoveryFaultAfter?: 'note' | 'index' | 'count' | 'alarm';
   /** TEST SEAM for the pruning threshold (production: OP_PRUNE_MIN_COUNT). */
   pruneMinCount = OP_PRUNE_MIN_COUNT;
+  private env: RecoveryEnv;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env: RecoveryEnv) {
     this.state = state;
+    this.env = env;
+  }
+
+  /** TEST SEAM — never called by production code. The DO sees the BINDING
+   *  env (the unsignable test wallet, the shared guard); a suite that drives
+   *  the scheduler hands it the env its worker requests run under. */
+  useEnvForTests(env: RecoveryEnv): void {
+    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/check-and-reserve') return this.handleCheckAndReserve(request);
+    if (url.pathname === '/recover-now') return this.handleRecoverNow(request);
+    if (url.pathname === '/recovery-status') return this.handleRecoveryStatus();
     if (url.pathname === '/mark-posted') return this.handleMarkPosted(request);
     if (url.pathname === '/commit') return this.handleCommit(request);
     if (url.pathname === '/release') return this.handleRelease(request);
@@ -184,6 +217,9 @@ export class RateLimiter implements DurableObject {
   private async handleCheckAndReserve(request: Request): Promise<Response> {
     const { noteId, limit, fp: requestedFp, op } = await request.json<CheckAndReserveRequest>();
     const now = Date.now();
+    // Self-healing invariant (plan «Отказоустойчивость обработчика»): a
+    // recovery backlog without an alarm gets its alarm back on ANY entry.
+    await this.healRecoveryAlarm();
 
     if (op === undefined) {
       const bare = await this.decide(this.state.storage, noteId, limit, requestedFp, now);
@@ -250,6 +286,14 @@ export class RateLimiter implements DurableObject {
     store: Store, noteId: string, limit: number, requestedFp: string | undefined, now: number,
   ): Promise<{ http: number; body: Record<string, unknown> }> {
     const record = await store.get<NoteRecord>(`note:${noteId}`);
+
+    // ── PR-3b recovery records: the scheduler owns them ──
+    // A `signed` / `redrop_pending` note is neither a dedupe nor a free slot:
+    // release and TTL are forbidden, only the reconciliation moves it. The
+    // worker nudges one step (`/recover-now`) and answers a retryable 503.
+    if (record !== undefined && isRecoveryStatus(record.status)) {
+      return { http: 200, body: { status: 'recovering', txId: record.txId, recoveryStatus: record.status } };
+    }
 
     // ── The fingerprint comparison, in EVERY state that has a txId ──
     //
@@ -324,6 +368,12 @@ export class RateLimiter implements DurableObject {
       // whole answer.
       return { http: 200, body: { status: 'reserved' } };
     }
+
+    // Bounded backlog (plan «Bounded backlog»): MAX_RECOVERY_INFLIGHT =
+    // quotaLimit recovery records per key; at the cap a new upload is refused
+    // BEFORE anything is signed, so no durable/postable txId exists beyond it.
+    const recoveryCount = (await store.get<number>(RECOVERY_COUNT_KEY)) ?? 0;
+    if (recoveryCount >= limit) return { http: 503, body: { status: 'recovery_capacity', recoveryCount } };
 
     // No record or a STALE reservation we replace — reuse its own inFlight slot.
     const w = await this.window(store, now);
@@ -461,7 +511,7 @@ export class RateLimiter implements DurableObject {
   /** Record a successful Arweave POST BEFORE commit, so a lost commit stays
    *  reconcilable with the server's own txId. Slot stays inFlight. */
   private async handleMarkPosted(request: Request): Promise<Response> {
-    const { noteId, txId, token } = await request.json<MarkPostedRequest>();
+    const { noteId, txId, token, anchor } = await request.json<MarkPostedRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     // Idempotent: a retried mark-posted (lost response) for the same token+txId
     // that already landed must succeed, not report stale.
@@ -473,30 +523,43 @@ export class RateLimiter implements DurableObject {
     }
     // `fp` is carried UNCHANGED: it describes the payload, and posting does not
     // change the payload.
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
-      status: 'posted', token, gen: record.gen, txId, reservedAt: record.reservedAt, postedAt: Date.now(),
-    }, record.fp));
+    const now = Date.now();
+    await this.state.storage.transaction(async (txn) => {
+      await txn.put<NoteRecord>(`note:${noteId}`, withFp({
+        status: 'posted', token, gen: record.gen, txId, reservedAt: record.reservedAt, postedAt: now,
+      }, record.fp));
+      // The money of this txId is `active` in the guard until a quorum
+      // settles it — schedule that reconciliation here, durably, so it does
+      // not depend on the client ever rechecking (review 24.09 #2, high 4).
+      await this.scheduleMoneyInTxn(txn, noteId, txId, now, now, typeof anchor === 'string' ? anchor : undefined);
+    });
     return Response.json({ ok: true });
   }
 
   private async handleCommit(request: Request): Promise<Response> {
-    const { noteId, txId, token } = await request.json<CommitRequest>();
+    const { noteId, txId, token, anchor } = await request.json<CommitRequest>();
     const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
     if (!record || (record.status !== 'reserved' && record.status !== 'posted') || record.token !== token) {
       return Response.json({ ok: false, stale: true });
     }
 
     const now = Date.now();
-    const w = await this.window(this.state.storage, now);
-    let committedGen = record.gen;
-    if (record.gen === w.resetAt) {
-      if (w.inFlight > 0) await this.state.storage.put('inFlight', w.inFlight - 1);
-      await this.state.storage.put('count', w.count + 1);
-      committedGen = w.resetAt;
-    }
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
-      status: 'committed', token, gen: committedGen, txId, committedAt: now,
-    }, record.fp)); // carried, never re-derived
+    await this.state.storage.transaction(async (txn) => {
+      const w = await this.window(txn, now);
+      let committedGen = record.gen;
+      if (record.gen === w.resetAt) {
+        if (w.inFlight > 0) await txn.put('inFlight', w.inFlight - 1);
+        await txn.put('count', w.count + 1);
+        committedGen = w.resetAt;
+      }
+      await txn.put<NoteRecord>(`note:${noteId}`, withFp({
+        status: 'committed', token, gen: committedGen, txId, committedAt: now,
+      }, record.fp)); // carried, never re-derived
+      // `reserved → committed` (mark-posted lost three times) is a POSTed txId
+      // too: its reservation is reconciled by the money index like any other
+      // (review 24.09 #3, high 3). Idempotent for `posted → committed`.
+      await this.scheduleMoneyInTxn(txn, noteId, txId, record.postedAt ?? now, record.postedAt ?? now, typeof anchor === 'string' ? anchor : undefined);
+    });
     return Response.json({ ok: true });
   }
 
@@ -650,5 +713,329 @@ export class RateLimiter implements DurableObject {
       status: 'reserved', token, gen: w.resetAt, reservedAt: now,
     }, requestedFp ?? record.fp));
     return Response.json({ ok: true, token });
+  }
+
+  // ─── PR-3b recovery: the single-alarm scheduler ─────────────────────────
+  //
+  // Recovery records (`signed`, `redrop_pending` — recovery.ts) are indexed
+  // by `recovery:<noteId> = dueAt`; `recoveryCount` is the persistent size of
+  // that set (the cap). Every mutation of the set is ONE storage transaction
+  // that writes the note, the index, the counter and the alarm
+  // (= min(dueAt), or none) together — the only crash-atomicity mechanism.
+  // The network half of a step is recovery-runner.ts; this DO owns the CAS.
+
+  /**
+   * The WRITER's primitive (and the tests' seed): admit a recovery record.
+   * No route of the READER calls it — the reader resumes, it does not
+   * create. Kept here because the transaction is the same one the writer
+   * will need, and the reader must already understand what it writes.
+   */
+  async adoptRecovery(noteId: string, record: RecoveryRecord): Promise<void> {
+    await this.state.storage.transaction(async (txn) => {
+      const existing = await txn.get<NoteRecord>(`note:${noteId}`);
+      const wasRecovery = existing !== undefined && isRecoveryStatus(existing.status);
+      await txn.put<NoteRecord>(`note:${noteId}`, record as unknown as NoteRecord);
+      await txn.put(recoveryIndexKey(noteId), record.dueAt);
+      if (!wasRecovery) await txn.put(RECOVERY_COUNT_KEY, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) + 1);
+      await this.rearmInTxn(txn);
+    });
+  }
+
+  /** CAS-guarded transition of a recovery record — one transaction for the
+   *  note, the index, the counter and the alarm (plan «Атомарность»). */
+  async casRecovery(noteId: string, expected: RecoveryCas, next: RecoveryRecord | PostedRecord): Promise<boolean> {
+    const fault = this.recoveryFaultAfter;
+    return this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<NoteRecord>(`note:${noteId}`);
+      if (!casMatches(current, expected)) return false;
+      await txn.put<NoteRecord>(`note:${noteId}`, next as unknown as NoteRecord);
+      if (fault === 'note') throw new Error('fault injected after note');
+      if (isRecoveryStatus(next.status)) {
+        const rec = next as RecoveryRecord;
+        await txn.put(recoveryIndexKey(noteId), rec.dueAt);
+        // Phase 1 of a redrop: the DEAD txId had a permit, so its bytes may
+        // still land after the release — it goes under WATCH in the money
+        // index, atomically with the transition (review 24.09 #4, high 2).
+        if (rec.status === 'redrop_pending' && rec.deadTxId !== undefined && expected.status === 'signed') {
+          await this.scheduleMoneyInTxn(txn, noteId, rec.deadTxId, rec.postedAt ?? rec.signedAt, rec.redropAt, anchorOf(rec.signedTx));
+        }
+      } else {
+        await txn.delete(recoveryIndexKey(noteId));
+        if (fault === 'index') throw new Error('fault injected after index');
+        await txn.put(RECOVERY_COUNT_KEY, Math.max(0, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) - 1));
+        // Leaving the recovery set as `posted` hands the money over to the
+        // money index — the reservation is still `active` in the guard.
+        await this.scheduleMoneyInTxn(txn, noteId, (next as PostedRecord).txId, (next as PostedRecord).postedAt, (next as PostedRecord).postedAt, (next as PostedRecord).anchor);
+      }
+      if (fault === 'count') throw new Error('fault injected after count');
+      await this.rearmInTxn(txn);
+      if (fault === 'alarm') throw new Error('fault injected after alarm');
+      return true;
+    });
+  }
+
+  /** alarm := min(dueAt) over BOTH indexes (recovery and money), or none. */
+  private async rearmInTxn(txn: DurableObjectTransaction | DurableObjectStorage): Promise<number | null> {
+    const idx = await txn.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+    const money = await txn.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX });
+    const min = minDueAt([...idx.values(), ...[...money.values()].map(m => m.dueAt)]);
+    if (min === null) await txn.deleteAlarm();
+    else await txn.setAlarm(min);
+    return min;
+  }
+
+  /** Enter (or keep) the money index for a POSTed txId; due one backoff
+   *  after `dueFrom` (the POST by default; the phase-1 transition for a dead
+   *  txId whose POST lies further back — `postedAt` still dates the POST, for
+   *  the age guard and the landing bound). */
+  private async scheduleMoneyInTxn(txn: DurableObjectTransaction, noteId: string, txId: string, postedAt: number, dueFrom: number = postedAt, anchor?: string): Promise<void> {
+    if (await txn.get<MoneyEntry>(moneyIndexKey(noteId, txId))) return;
+    await txn.put<MoneyEntry>(moneyIndexKey(noteId, txId), { txId, dueAt: dueFrom + backoffMs(0), attempts: 0, postedAt, ...(anchor !== undefined ? { anchor } : {}) });
+    await this.rearmInTxn(txn);
+  }
+
+  private async healRecoveryAlarm(): Promise<void> {
+    const count = (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0;
+    if (count <= 0) {
+      const money = await this.state.storage.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX, limit: 1 });
+      if (money.size === 0) return;
+    }
+    if ((await this.state.storage.getAlarm()) !== null) return;
+    try { await this.rearmInTxn(this.state.storage); } catch (e) { console.error('RECOVERY_ALARM_HEAL_FAILED', e); }
+  }
+
+  private recoveryHost(now: number): RecoveryHost {
+    return {
+      cas: (noteId, expected, next) => this.casRecovery(noteId, expected, next),
+      stillMine: async (noteId, expected) => casMatches(await this.state.storage.get<NoteRecord>(`note:${noteId}`), expected),
+      now: () => now,
+    };
+  }
+
+  /**
+   * One money-reconciliation step (review 24.09 #2 high 4, #4 high 2, #5
+   * high 1–2): the status quorum for the POSTed txId.
+   *
+   *  - a money quorum → `settle-by-tx spent`; the entry ends once the guard
+   *    has BOOKED the money (`settled`, `noop`), or says no permit names the
+   *    txId (`unknown`, a pre-D10 publication), or refuses for good
+   *    (`terminal_refusal`: `spent_is_final` — booked already — or a
+   *    reservation that never could have been sent);
+   *  - unanimous `dead` past the age guard → `released`. A release does NOT
+   *    end the entry: the bytes had a permit and a dead verdict is a
+   *    snapshot — the entry turns into a WATCH, so a late landing is
+   *    re-booked by the lattice (`released → spent`, `spend_conflict`) by
+   *    THIS step and not by nobody;
+   *  - `released` refused under an open send lease (`in_flight`): the step
+   *    fetches the chain's proof that the anchor expired (`anchor-expiry.ts`)
+   *    and, with it accepted by the guard, asks again in the same pass;
+   *    without it the hold stays;
+   *  - a WATCH ends only with the same proof from the chain, taken while the
+   *    pool still says dead — never with the clock;
+   *  - a guard that did not answer keeps the entry for the next pass with
+   *    backoff (review 24.09 #3, high 2);
+   *  - an entry older than MONEY_STALE_MS is never dropped (review #5 high
+   *    2): it escalates (`stale` result, a log line) and slows down to
+   *    MONEY_STALE_BACKOFF_MS. An unresolved money obligation ends with a
+   *    fact from the chain or the guard, not with age — 49 confirmations
+   *    today are 60 tomorrow.
+   */
+  private async reconcileMoney(noteId: string, entry: MoneyEntry, now: number): Promise<string> {
+    const env = this.env;
+    const emit = makeEmit(env);
+    const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
+    const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
+    const probe = async () => {
+      const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
+      return { money: moneyQuorum(votes, o => o), dead: statusVerdict(origins, votes).kind === 'dead' };
+    };
+    const { money, dead } = await probe();
+    const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
+    let outcome: 'spent' | 'released' | null = null;
+    if (money.ok) outcome = 'spent';
+    else if (!entry.watching && dead && now - entry.postedAt > RECOVERY_AGE_GUARD_MS) outcome = 'released';
+    let result = 'rescheduled';
+    let terminal = false;
+    let watching = entry.watching === true;
+    const proveExpiry = async (): Promise<'expired' | 'held'> => {
+      if (entry.anchor === undefined) { emit('anchor_proof', ['unavailable', 'no_anchor'], [-1]); return 'held'; }
+      const p = await proveAnchorExpired(env, guard, emit, { txId: entry.txId, anchor: entry.anchor });
+      return p === 'expired' || p === 'unknown' ? 'expired' : 'held';
+    };
+    if (outcome !== null) {
+      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      let asked: 'spent' | 'released' = outcome;
+      if (outcome === 'released' && r === 'in_flight' && (await proveExpiry()) === 'expired') {
+        // The proof took time; the dead verdict that led here is stale
+        // (review #6 high, second half): read the pool AGAIN before the
+        // money is freed. Mined in between → spent; still dead → released;
+        // anything else → nothing is freed, the entry waits.
+        const again = await probe();
+        if (again.money.ok) {
+          asked = 'spent';
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+        } else if (again.dead) {
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' });
+        } else {
+          emit('money_reconcile', ['released', 'recheck_pending'], [entry.attempts]);
+          r = 'retry';
+        }
+      }
+      if (r !== 'retry' || asked === 'spent') emit('money_reconcile', [asked, r], [entry.attempts]);
+      if (asked === 'spent') {
+        terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
+      } else if (r === 'settled' || r === 'noop') {
+        watching = true; // released — now watch for a late landing
+      } else if (r === 'unknown' || r === 'terminal_refusal') {
+        terminal = true; // nothing of ours was ever sendable, or it is booked already
+      }
+      result = terminal ? `${asked}:${r}` : watching && !entry.watching ? `${asked}:watch` : 'retry';
+    } else if (watching && dead) {
+      // The watch ends only with BOTH facts from the chain, in THIS order:
+      // the anchor has provably expired, AND the pool — asked AGAIN, after
+      // the proof — still shows nothing. A dead verdict read BEFORE the
+      // proof is not evidence for the deletion (review #6, high): the
+      // transaction may have been mined between the two reads; expiry
+      // forbids a future inclusion, not one that already happened. So the
+      // second read decides: a money quorum → booked spent; still dead →
+      // the watch ends; pending, unavailable or confirmed short of the
+      // quorum → the obligation stays.
+      const p = await proveExpiry();
+      if (p !== 'expired') {
+        emit('money_reconcile', ['watch', 'held'], [entry.attempts]);
+      } else {
+        const again = await probe();
+        if (again.money.ok) {
+          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          emit('money_reconcile', ['spent', r], [entry.attempts]);
+          terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
+          result = terminal ? `spent:${r}` : 'retry';
+        } else if (again.dead) {
+          emit('money_reconcile', ['watch', 'expired'], [entry.attempts]);
+          terminal = true; result = 'watch:expired';
+        } else {
+          emit('money_reconcile', ['watch', 'recheck_pending'], [entry.attempts]);
+        }
+      }
+    } else {
+      emit('money_reconcile', [watching ? 'watch' : 'wait', 'pending'], [entry.attempts]);
+    }
+    const stale = !terminal && now - entry.postedAt >= MONEY_STALE_MS;
+    if (stale) {
+      console.error('MONEY_RECONCILE_STALE', noteId, entry.txId, watching ? 'watch' : 'settle', 'attempts', entry.attempts);
+      emit('money_reconcile', [watching ? 'watch' : 'wait', 'stale'], [entry.attempts]);
+    }
+    await this.state.storage.transaction(async (txn) => {
+      const key = moneyIndexKey(noteId, entry.txId);
+      const current = await txn.get<MoneyEntry>(key);
+      if (!current) return; // removed under us
+      if (terminal) await txn.delete(key);
+      else {
+        const wait = stale ? Math.max(backoffMs(current.attempts + 1), MONEY_STALE_BACKOFF_MS) : backoffMs(current.attempts + 1);
+        await txn.put<MoneyEntry>(key, { ...current, ...(watching ? { watching: true } : {}), attempts: current.attempts + 1, dueAt: now + wait });
+      }
+      await this.rearmInTxn(txn);
+    });
+    return result;
+  }
+
+  /** The alarm handler: due records, sequentially, at most ALARM_BATCH;
+   *  each in its own try/catch; the alarm is ALWAYS re-armed in `finally`
+   *  (with a bounded retry), and an unprocessed remainder gets it now. */
+  async alarm(): Promise<void> {
+    await this.runRecovery(Date.now());
+  }
+
+  async runRecovery(now: number): Promise<{ processed: number; remaining: number; money: number }> {
+    let processed = 0; let remaining = 0; let money = 0;
+    try {
+      const idx = await this.state.storage.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+      const due = [...idx.entries()].filter(([, d]) => d <= now).sort((a, b) => a[1] - b[1]);
+      remaining = Math.max(0, due.length - ALARM_BATCH);
+      // Money reconciliation: its own bounded batch, each in its own try/catch.
+      const moneyIdx = await this.state.storage.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX });
+      const moneyDue = [...moneyIdx.entries()].filter(([, m]) => m.dueAt <= now).sort((a, b) => a[1].dueAt - b[1].dueAt);
+      remaining += Math.max(0, moneyDue.length - MONEY_BATCH);
+      for (const [key, entry] of moneyDue.slice(0, MONEY_BATCH)) {
+        const { noteId } = parseMoneyIndexKey(key);
+        try { await this.reconcileMoney(noteId, entry, now); } catch (e) { console.error('MONEY_RECONCILE_FAILED', noteId, e); }
+        money++;
+      }
+      for (const [key] of due.slice(0, ALARM_BATCH)) {
+        const noteId = key.slice(RECOVERY_INDEX_PREFIX.length);
+        try {
+          await this.recoverNote(noteId, now);
+        } catch (e) {
+          console.error('RECOVERY_STEP_FAILED', noteId, e);
+          // Reschedule with backoff so one broken record cannot spin; if even
+          // that write fails the finally below still re-arms the alarm.
+          try {
+            const record = await this.state.storage.get<RecoveryRecord>(`note:${noteId}`);
+            if (record && isRecoveryStatus(record.status)) {
+              await this.casRecovery(noteId, { status: record.status, token: record.token, txId: record.txId }, rescheduled(record, Date.now()));
+            }
+          } catch (e2) {
+            console.error('RECOVERY_RESCHEDULE_FAILED', noteId, e2);
+          }
+        }
+        processed++;
+      }
+    } finally {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          if (remaining > 0) await this.state.storage.setAlarm(Date.now());
+          else await this.rearmInTxn(this.state.storage);
+          break;
+        } catch (e) {
+          console.error('RECOVERY_REARM_FAILED', attempt, e);
+        }
+      }
+    }
+    return { processed, remaining, money };
+  }
+
+  /** One step for one note (the alarm's unit, and the recheck's nudge). */
+  private async recoverNote(noteId: string, now: number): Promise<string> {
+    const record = await this.state.storage.get<RecoveryRecord>(`note:${noteId}`);
+    if (!record || !isRecoveryStatus(record.status)) {
+      // A stale index entry (the record moved on): drop it and keep the
+      // counter honest.
+      await this.state.storage.transaction(async (txn) => {
+        if (await txn.get(recoveryIndexKey(noteId)) === undefined) return;
+        await txn.delete(recoveryIndexKey(noteId));
+        await txn.put(RECOVERY_COUNT_KEY, Math.max(0, ((await txn.get<number>(RECOVERY_COUNT_KEY)) ?? 0) - 1));
+        await this.rearmInTxn(txn);
+      });
+      return 'not_recovery';
+    }
+    return recoverOne(noteId, record, this.env, this.recoveryHost(now));
+  }
+
+  /** Trigger (а) of the reconciliation: a recheck of this note runs one step
+   *  now instead of waiting for the alarm. */
+  private async handleRecoverNow(request: Request): Promise<Response> {
+    const { noteId } = await request.json<{ noteId: string }>();
+    if (typeof noteId !== 'string') return Response.json({ ok: false, reason: 'bad_note' });
+    try {
+      const outcome = await this.recoverNote(noteId, Date.now());
+      const record = await this.state.storage.get<NoteRecord>(`note:${noteId}`);
+      return Response.json({ ok: true, outcome, status: record?.status ?? null, txId: record?.txId ?? null });
+    } catch (e) {
+      console.error('RECOVER_NOW_FAILED', noteId, e);
+      return Response.json({ ok: false, reason: 'step_failed' });
+    } finally {
+      await this.healRecoveryAlarm();
+    }
+  }
+
+  private async handleRecoveryStatus(): Promise<Response> {
+    const idx = await this.state.storage.list<number>({ prefix: RECOVERY_INDEX_PREFIX });
+    const money = await this.state.storage.list<MoneyEntry>({ prefix: MONEY_INDEX_PREFIX });
+    return Response.json({
+      recoveryCount: (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0,
+      alarm: await this.state.storage.getAlarm(),
+      due: Object.fromEntries([...idx.entries()].map(([k, d]) => [k.slice(RECOVERY_INDEX_PREFIX.length), d])),
+      money: Object.fromEntries([...money.entries()].map(([k, m]) => [k.slice(MONEY_INDEX_PREFIX.length), m])),
+    });
   }
 }
