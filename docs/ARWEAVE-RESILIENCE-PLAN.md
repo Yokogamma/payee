@@ -1847,7 +1847,13 @@ Reader-релиз этим не блокируется: он не создаёт
   статусов → денежный кворум → `settle-by-tx spent` (`released → spent`);
   снова `dead` → дозор завершён; `pending`/недоступность/подтверждения
   ниже кворума → обязательство сохраняется (`money_reconcile watch
-  recheck_pending`). (M) для доказанно истёкшего анкера `permit-send`
+  recheck_pending`). То же ПЕРЕД освобождением активной резервации: путь
+  `in_flight` → доказательство → повторное чтение → `spent` / `released` /
+  ничего не освобождать (`released recheck_pending`); и в фазе 2 redrop —
+  перечитывание старого txId непосредственно перед подписью: кворум →
+  `settle spent` и `posted` со старым txId, не `dead` → `recovery_refused
+  recheck`, без подписи; только свежий `dead` открывает новую генерацию.
+  (M) для доказанно истёкшего анкера `permit-send`
   отвечает `503 spend_anchor_expired` — новых lease на такие байты нет
   (путь: dead → redrop, не resend); `leaseOpen` = `sending` ∧ ¬`anchorExpired`
   (запись с обоими полями ничего не удерживает), повторный `/anchor-expired`
