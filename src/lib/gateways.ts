@@ -21,7 +21,7 @@
  * production deploy gate refuses to ship that configuration at all.
  */
 
-import { parseIndexSources, parseOriginList } from './gateways-parse';
+import { parseIndexSources, parseOperatorMap, parseOriginList } from './gateways-parse';
 
 export { MIN_STATUS_ORIGINS, QUORUM_POLICY_ID } from './status-quorum';
 
@@ -69,3 +69,28 @@ export const INDEX_SOURCES: readonly (readonly string[])[] = (() => {
 
 /** The discovery endpoint used by the restore sweep (PR-3a: single index). */
 export const INDEX_QUERY_URL: string = INDEX_SOURCES[0][0];
+
+/**
+ * `canonicalOrigin → operatorId` for the STATUS pool (D11, v16 M4).
+ *
+ * The age of a txId that one index returned and another omitted is established
+ * ONLY by status origins run by DIFFERENT operators — two origins of one
+ * operator are one voice. Pinned at build time like the lists themselves; the
+ * default covers the approved composition (§2.1: five origins, five operators).
+ * An origin missing from the map casts NO age vote (fail-closed), so a list
+ * extended without extending the map cannot loosen the rule — it can only fail
+ * to tighten it, and `scripts/check-deploy-config.mjs` refuses that build.
+ */
+const DEFAULT_STATUS_OPERATORS =
+  'https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,'
+  + 'https://frostor.xyz=frostor,https://permagate.io=permagate';
+
+export const STATUS_OPERATORS: ReadonlyMap<string, string> = (() => {
+  const parsed = parseOperatorMap(import.meta.env.VITE_STATUS_OPERATORS ?? '');
+  return parsed.size > 0 ? parsed : parseOperatorMap(DEFAULT_STATUS_OPERATORS);
+})();
+
+/** The operator behind a canonical status origin, or null when unknown. */
+export function operatorOf(origin: string): string | null {
+  return STATUS_OPERATORS.get(origin) ?? null;
+}
