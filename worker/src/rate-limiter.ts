@@ -845,9 +845,11 @@ export class RateLimiter implements DurableObject {
     const emit = makeEmit(env);
     const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
     const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
-    const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
-    const money = moneyQuorum(votes, o => o);
-    const dead = statusVerdict(origins, votes).kind === 'dead';
+    const probe = async () => {
+      const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
+      return { money: moneyQuorum(votes, o => o), dead: statusVerdict(origins, votes).kind === 'dead' };
+    };
+    const { money, dead } = await probe();
     const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
     let outcome: 'spent' | 'released' | null = null;
     if (money.ok) outcome = 'spent';
@@ -875,11 +877,32 @@ export class RateLimiter implements DurableObject {
       }
       result = terminal ? `${outcome}:${r}` : watching && !entry.watching ? `${outcome}:watch` : 'retry';
     } else if (watching && dead) {
-      // The watch ends only with BOTH facts from the chain: the pool still
-      // shows nothing AND the anchor has provably expired.
+      // The watch ends only with BOTH facts from the chain, in THIS order:
+      // the anchor has provably expired, AND the pool — asked AGAIN, after
+      // the proof — still shows nothing. A dead verdict read BEFORE the
+      // proof is not evidence for the deletion (review #6, high): the
+      // transaction may have been mined between the two reads; expiry
+      // forbids a future inclusion, not one that already happened. So the
+      // second read decides: a money quorum → booked spent; still dead →
+      // the watch ends; pending, unavailable or confirmed short of the
+      // quorum → the obligation stays.
       const p = await proveExpiry();
-      emit('money_reconcile', ['watch', p === 'expired' ? 'expired' : 'held'], [entry.attempts]);
-      if (p === 'expired') { terminal = true; result = 'watch:expired'; }
+      if (p !== 'expired') {
+        emit('money_reconcile', ['watch', 'held'], [entry.attempts]);
+      } else {
+        const again = await probe();
+        if (again.money.ok) {
+          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          emit('money_reconcile', ['spent', r], [entry.attempts]);
+          terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
+          result = terminal ? `spent:${r}` : 'retry';
+        } else if (again.dead) {
+          emit('money_reconcile', ['watch', 'expired'], [entry.attempts]);
+          terminal = true; result = 'watch:expired';
+        } else {
+          emit('money_reconcile', ['watch', 'recheck_pending'], [entry.attempts]);
+        }
+      }
     } else {
       emit('money_reconcile', [watching ? 'watch' : 'wait', 'pending'], [entry.attempts]);
     }

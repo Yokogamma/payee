@@ -370,7 +370,8 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     await runNow(stub, watch.dueAt + 5 * 24 * 3_600_000);
     expect(moneyOf(await recoveryStatus(stub), noteB)).toMatchObject({ watching: true, attempts: 2 });
     deadOnAll(mockRoute, rb.body.txId!);
-    chainAt(EXPIRED_AT); // dead AND the anchor provably expired → gone
+    chainAt(EXPIRED_AT); // dead, the anchor provably expired, and dead AGAIN after the proof → gone
+    deadOnAll(mockRoute, rb.body.txId!);
     await runNow(stub, moneyOf(await recoveryStatus(stub), noteB).dueAt);
     expect((await recoveryStatus(stub)).money).toEqual({});
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
@@ -703,6 +704,7 @@ describe('review 24.09 #5 — the proof of expiry comes from the chain; age neve
     const oldWatch = rows.find(x => x.txId === record.txId)!;
     deadOnAll(mockRoute, record.txId);
     chainAt(EXPIRED_AT + 3);
+    deadOnAll(mockRoute, record.txId); // the re-check after the proof
     STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, r!.txId), 202, 'Pending'));
     await runNow(stub, Math.max(oldWatch.dueAt, rows.find(x => x.txId === r!.txId)!.dueAt));
     expect(moneyRows(await recoveryStatus(stub), noteId).map(x => x.txId)).toEqual([r!.txId]);
@@ -746,6 +748,85 @@ describe('review 24.09 #5 — the proof of expiry comes from the chain; age neve
     rs = await recoveryStatus(stub);
     expect(rs.money).toEqual({});
     expect(rs.alarm).toBeNull();
+  });
+});
+
+describe('review 24.09 #6 — a dead read BEFORE the proof is not evidence for the deletion', () => {
+  it('(H) the watch re-reads the full status set AFTER the proof: mined in between → booked spent (10, not 0); pending or short of the quorum → kept; only dead again → ended', async () => {
+    const { env, status } = await sagaEnv('rec-r6-h', { deposit: '1000' });
+    const id = await makeIdentity();
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
+    // Three watched notes, one per interleaving.
+    const notes: Array<{ noteId: string; txId: string; postedAt: number }> = [];
+    for (let i = 0; i < 3; i++) {
+      const noteId = uuidV4();
+      paidLegs(mockRoute, { price: '10' });
+      const r = await upload(await uploadRequest(id, noteId), env);
+      expect(r.status).toBe(200);
+      const e = moneyOf(await recoveryStatus(stub), noteId);
+      deadOnAll(mockRoute, r.body.txId!);
+      await runNow(stub, e.postedAt + RECOVERY_AGE_GUARD_MS + 1 + i); // released → watch
+      expect(moneyOf(await recoveryStatus(stub), noteId).watching).toBe(true);
+      notes.push({ noteId, txId: r.body.txId!, postedAt: e.postedAt });
+    }
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '0' });
+    const [mined, pending, short] = notes;
+    const dueOf = async (noteId: string) => moneyOf(await recoveryStatus(stub), noteId).dueAt;
+
+    // (a) The reviewer's counterexample: dead at the first read, the proof
+    // says expired — and the transaction was mined in between. The second
+    // read finds the money quorum: `released → spent`, the entry leaves.
+    deadOnAll(mockRoute, mined.txId);
+    chainAt(EXPIRED_AT);
+    confirmedOnAll(mockRoute, mined.txId, 5000, 60);
+    await runNow(stub, await dueOf(mined.noteId));
+    expect(moneyRows(await recoveryStatus(stub), mined.noteId)).toEqual([]);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+
+    // (b) Dead, expired — and PENDING at the second read: the obligation stays.
+    deadOnAll(mockRoute, pending.txId);
+    chainAt(EXPIRED_AT);
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, pending.txId), 202, 'Pending'));
+    await runNow(stub, await dueOf(pending.noteId));
+    expect(moneyOf(await recoveryStatus(stub), pending.noteId)).toMatchObject({ watching: true });
+
+    // (c) Dead, expired — and confirmed with 49 at the second read: not a
+    // money quorum, not dead either → kept; the 60th confirmation books it.
+    deadOnAll(mockRoute, short.txId);
+    chainAt(EXPIRED_AT);
+    confirmedOnAll(mockRoute, short.txId, 5000, 49);
+    await runNow(stub, await dueOf(short.noteId));
+    expect(moneyOf(await recoveryStatus(stub), short.noteId)).toMatchObject({ watching: true });
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    confirmedOnAll(mockRoute, short.txId, 5000, 60);
+    await runNow(stub, await dueOf(short.noteId));
+    expect(moneyRows(await recoveryStatus(stub), short.noteId)).toEqual([]);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '20' });
+
+    // (d) Dead, expired, and dead AGAIN: only now the watch ends, with the
+    // ledger untouched.
+    deadOnAll(mockRoute, pending.txId);
+    chainAt(EXPIRED_AT);
+    deadOnAll(mockRoute, pending.txId);
+    await runNow(stub, await dueOf(pending.noteId));
+    expect((await recoveryStatus(stub)).money).toEqual({});
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '20' });
+  });
+
+  it('(M) proven-expired bytes get no new lease: the resend permit is refused spend_anchor_expired, nothing is posted, the record is rescheduled (dead → redrop is the way)', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r6-m', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk); // permitted and reported
+    const stub = await seed(env, id.pkB64, noteId, record);
+    expect((await guardCall(ns, '/anchor-expired', { txId: record.txId, anchor: ANCHOR, anchorHeight: ANCHOR_HEIGHT, chainHeight: EXPIRED_AT })).body).toMatchObject({ expired: true });
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, record.txId), 503, 'down')); // → resend path
+    const post = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK', 0);
+    await runNow(stub, FAR);
+    expect(post.calls).toBe(0);
+    expect(await note(stub, noteId)).toMatchObject({ status: 'signed', txId: record.txId, attempts: 1 });
+    expect((await status()).ledger.pending).toBe('10'); // the reservation is untouched until the quorum decides
   });
 });
 

@@ -229,7 +229,13 @@ export class SpendGuard implements DurableObject {
       // copy of the lease. The refusal ends only with the report — or with a
       // proof from the chain that the bytes can no longer land
       // (`/anchor-expired`, review #5 high 1). Never with the clock.
-      if (decision.existing && leaseOpen(decision.permit.sending)) {
+      // Bytes whose anchor is PROVEN expired get no new lease (review #6,
+      // medium): the network refuses them, and a lease would only hold money
+      // that a repeated proof answers `noop` to. Dead → redrop is the way.
+      if (decision.existing && decision.permit.anchorExpired) {
+        return refuse(SPEND_CODES.anchorExpired, 503, { txId, ...decision.permit.anchorExpired });
+      }
+      if (decision.existing && leaseOpen(decision.permit)) {
         return refuse(SPEND_CODES.sendInFlight, 503, { txId, since: decision.permit.sending!.since, anchor: decision.permit.anchor ?? null });
       }
       const sending = { token: crypto.randomUUID(), since: now };
@@ -263,12 +269,18 @@ export class SpendGuard implements DurableObject {
       if (!permit) return new Response('unknown permit', { status: 404 });
       if (permit.anchor === undefined || permit.anchor !== anchor) return refuse(SPEND_CODES.anchorMismatch, 409, { txId, permitAnchor: permit.anchor ?? null });
       if (!anchorExpired(anchorHeight, chainHeight)) return refuse(SPEND_CODES.anchorNotExpired, 409, { txId, anchorHeight, chainHeight });
-      if (permit.anchorExpired) return okJson({ expired: true, noop: true, ...permit.anchorExpired });
+      // A repeated proof is a no-op for the FACT (recorded once) — but never
+      // for a lease: whatever `sending` a permit still carries next to a
+      // proven expiry (a record written before the refusal above existed)
+      // is cleared here too (review #6, medium).
       const { sending: _s, ...rest } = permit; void _s;
-      const next: PermitRecord = { ...rest, anchorExpired: { anchorHeight, chainHeight, at: now } };
+      const fact = permit.anchorExpired ?? { anchorHeight, chainHeight, at: now };
+      const next: PermitRecord = { ...rest, anchorExpired: fact };
       await txn.put<PermitRecord>(K.permit(txId), next);
-      await this.audit(txn, 'anchor-expired', { txId, anchorHeight, chainHeight, hadLease: permit.sending !== undefined });
-      return okJson({ expired: true, noop: false, anchorHeight, chainHeight, at: now });
+      if (permit.anchorExpired === undefined || permit.sending !== undefined) {
+        await this.audit(txn, 'anchor-expired', { txId, ...fact, hadLease: permit.sending !== undefined, repeat: permit.anchorExpired !== undefined });
+      }
+      return okJson({ expired: true, noop: permit.anchorExpired !== undefined, leaseCleared: permit.sending !== undefined, ...fact });
     });
   }
 
@@ -651,7 +663,7 @@ export class SpendGuard implements DurableObject {
       // refusal names the anchor so the caller can go and fetch that proof.
       if (outcome === 'released' && existing.state === 'active' && existing.permitTxId) {
         const permit = await txn.get<PermitRecord>(K.permit(existing.permitTxId));
-        if (leaseOpen(permit?.sending)) {
+        if (leaseOpen(permit)) {
           return refuse(SPEND_CODES.sendInFlight, 503, { txId: existing.permitTxId, since: permit!.sending!.since, anchor: permit!.anchor ?? null });
         }
       }
