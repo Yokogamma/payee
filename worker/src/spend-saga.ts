@@ -161,7 +161,10 @@ export async function releaseSpend(guard: DurableObjectStub, spendKey: string): 
  * `spend_send_in_flight`). Only the first three kinds and `terminal_refusal`
  * end a money-reconciliation entry (review 24.09 #3, high 2).
  */
-export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'terminal_refusal' | 'retry';
+export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'terminal_refusal' | 'retry'
+  /** `released` refused under an open send lease: the caller may bring the
+   *  chain's proof of anchor expiry (`anchor-expiry.ts`) and ask again. */
+  | 'in_flight';
 
 /** Reconcile a reservation by the txId its permit named (§7 via `permit:<txId>`):
  *  the recheck path knows the txId, not the spendKey. Best effort — the
@@ -175,6 +178,7 @@ export async function settleByTx(
   if ('unavailable' in r) return 'retry';
   if (r.status === 404) return 'unknown';
   if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
   if (r.status === 409 || r.status === 400) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'terminal_refusal'; }
   console.error('SPEND_SETTLE_BY_TX_RETRY', args.txId, args.outcome, why(r));
   return 'retry';

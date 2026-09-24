@@ -1761,7 +1761,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   let anchored = false;
   for (let attempt = 0; attempt < 3 && !anchored; attempt++) {
     try {
-      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken });
+      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken, anchor: signedTx.last_tx });
       const body: { ok: boolean } = await resp.json();
       if (resp.ok && body.ok) anchored = true;
     } catch { /* retry */ }
@@ -1772,7 +1772,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   let committed = false;
   for (let attempt = 0; attempt < 3 && !committed; attempt++) {
     try {
-      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken });
+      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken, anchor: signedTx.last_tx });
       const commit: { ok: boolean; stale?: boolean } = await commitResp.json();
       if (commitResp.ok && commit.ok) committed = true;
       else if (commit.stale) break; // reservation superseded — do not keep retrying

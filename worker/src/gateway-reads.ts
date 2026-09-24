@@ -178,3 +178,66 @@ export async function readTxJson(origin: string, txId: string, emit: Emit): Prom
     return null;
   }
 }
+
+const INFO_BODY_CAP = 8 * 1024;
+const BLOCK_BODY_CAP = 256 * 1024;
+const BLOCK_HASH_RE = /^[A-Za-z0-9_-]{43,64}$/;
+
+/**
+ * GET `<origin>/info` → the gateway's chain height, or `null`. A chain fact
+ * for the proof of anchor expiry (`anchor-expiry.ts`): the caller takes the
+ * MINIMUM over ≥ MIN_BALANCE_SOURCES operators — the chain is at least this
+ * far, whatever one gateway runs ahead of.
+ */
+export async function readChainHeight(origin: string, emit: Emit): Promise<number | null> {
+  const host = new URL(origin).host;
+  const started = performance.now();
+  try {
+    const r = await fetch(`${origin}/info`, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
+    const elapsed = performance.now() - started;
+    if (r.status !== 200) {
+      emit('gateway_call', ['info', host, classifyStatus(r.status)], [elapsed]);
+      return null;
+    }
+    const body = await readCappedText(r, INFO_BODY_CAP);
+    let height: unknown;
+    try { height = body === null ? undefined : (JSON.parse(body) as { height?: unknown }).height; } catch { height = undefined; }
+    const ok = safeCount(height);
+    emit('gateway_call', ['info', host, ok ? '2xx' : 'invalid_response'], [elapsed]);
+    return ok ? (height as number) : null;
+  } catch (e) {
+    emit('gateway_call', ['info', host, classifyThrow(e)], [performance.now() - started]);
+    return null;
+  }
+}
+
+/**
+ * GET `<origin>/block/hash/<indep_hash>` → the block's height, or `null`
+ * unless the body is a 200 whose `indep_hash` EQUALS the requested hash (the
+ * same binding rule as `readTxJson`: the answer must be about the question).
+ * The anchor of a transaction is such a hash (`/tx_anchor`); its height is
+ * the other half of the expiry rule. A 404 is `null` too — an anchor a
+ * gateway does not know is not proof of anything.
+ */
+export async function readBlockHeightByHash(origin: string, indepHash: string, emit: Emit): Promise<number | null> {
+  if (!BLOCK_HASH_RE.test(indepHash)) return null;
+  const host = new URL(origin).host;
+  const started = performance.now();
+  try {
+    const r = await fetch(`${origin}/block/hash/${indepHash}`, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
+    const elapsed = performance.now() - started;
+    if (r.status !== 200) {
+      emit('gateway_call', ['block', host, classifyStatus(r.status)], [elapsed]);
+      return null;
+    }
+    const body = await readCappedText(r, BLOCK_BODY_CAP);
+    let parsed: { indep_hash?: unknown; height?: unknown } | null = null;
+    try { parsed = body === null ? null : (JSON.parse(body) as { indep_hash?: unknown; height?: unknown }); } catch { parsed = null; }
+    const ok = parsed !== null && parsed.indep_hash === indepHash && safeCount(parsed.height);
+    emit('gateway_call', ['block', host, ok ? '2xx' : 'invalid_response'], [elapsed]);
+    return ok ? (parsed!.height as number) : null;
+  } catch (e) {
+    emit('gateway_call', ['block', host, classifyThrow(e)], [performance.now() - started]);
+    return null;
+  }
+}
