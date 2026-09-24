@@ -5,7 +5,7 @@ import {
   ALARM_BATCH, RECOVERY_AGE_GUARD_MS, RECOVERY_BACKOFF_BASE_MS, RECOVERY_COUNT_KEY, backoffMs, casOf, parseSignedTx, signedAction, toPosted,
   type RecoveryRecord,
 } from '../src/recovery';
-import { SPEND_CODES } from '../src/spend-ledger';
+import { LATE_LANDING_BOUND_MS, SPEND_CODES } from '../src/spend-ledger';
 import { spendKeyFor } from '../src/spend-saga';
 import { setupOutboundMock, STATUS_ORIGINS, statusUrlRe } from './helpers/outbound-mock';
 import {
@@ -60,9 +60,22 @@ async function seed(env: unknown, pkB64: string, noteId: string, record: Recover
 async function note(stub: DurableObjectStub, noteId: string) {
   return runInDurableObject(stub, (_i, state) => state.storage.get<RecoveryRecord & { status: string; postedAt?: number }>(`note:${noteId}`));
 }
-async function recoveryStatus(stub: DurableObjectStub) {
+type MoneyRow = { txId: string; dueAt: number; attempts: number; postedAt: number; watching?: boolean };
+type RecoveryStatus = { recoveryCount: number; alarm: number | null; due: Record<string, number>; money: Record<string, MoneyRow> };
+async function recoveryStatus(stub: DurableObjectStub): Promise<RecoveryStatus> {
   const res = await stub.fetch('http://do/recovery-status', { method: 'POST', body: '{}' });
-  return (await res.json()) as { recoveryCount: number; alarm: number | null; due: Record<string, number>; money: Record<string, { txId: string; dueAt: number; attempts: number; postedAt: number }> };
+  return (await res.json()) as RecoveryStatus;
+}
+/** The money entries of one note (`money:<noteId>:<txId>` — a redrop keeps
+ *  the dead txId under watch next to the new one, review #4 H2). */
+function moneyRows(rs: RecoveryStatus, noteId: string): MoneyRow[] {
+  return Object.entries(rs.money).filter(([k]) => k.startsWith(`${noteId}:`)).map(([, v]) => v);
+}
+/** The ONE money entry of a note (the test asserts there is exactly one). */
+function moneyOf(rs: RecoveryStatus, noteId: string): MoneyRow {
+  const rows = moneyRows(rs, noteId);
+  expect(rows).toHaveLength(1);
+  return rows[0];
 }
 async function runNow(stub: DurableObjectStub, now = Date.now()) {
   return runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).runRecovery(now));
@@ -144,8 +157,8 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     expect(rs.due).toEqual({});
     // The MONEY of this txId is still pending in the guard: the note moved
     // to the money index, and the alarm follows it (review #2, H4).
-    expect(rs.money[noteId]).toMatchObject({ txId: record.txId, attempts: 0 });
-    expect(rs.alarm).toBe(rs.money[noteId].dueAt);
+    expect(moneyOf(rs, noteId)).toMatchObject({ txId: record.txId, attempts: 0 });
+    expect(rs.alarm).toBe(moneyOf(rs, noteId).dueAt);
   });
 
   it('(H1) a run that lost the record to a concurrent phase 1 is stripped of the right to send: terminal activate → discarded, no POST; and the DO refuses the permit of a released reservation for everyone', async () => {
@@ -232,10 +245,10 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     // The guard is DOWN during the reconciliation step.
     const down = { idFromName: () => ({}), get: () => ({ fetch: async () => { throw new Error('guard down'); } }) } as unknown as DurableObjectNamespace;
     await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, SPEND_GUARD: down } as Parameters<RateLimiter['useEnvForTests']>[0]));
-    let entry = (await recoveryStatus(stub)).money[noteId];
+    let entry = moneyOf(await recoveryStatus(stub), noteId);
     confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
     await runNow(stub, entry.dueAt);
-    entry = (await recoveryStatus(stub)).money[noteId];
+    entry = moneyOf(await recoveryStatus(stub), noteId);
     expect(entry).toMatchObject({ txId: r.body.txId, attempts: 1 });
     expect((await status()).ledger.pending).toBe('10');
     // The guard answers 503 spend_send_in_flight (a live lease on the permit).
@@ -243,7 +256,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, SPEND_GUARD: busy } as Parameters<RateLimiter['useEnvForTests']>[0]));
     confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
     await runNow(stub, entry.dueAt);
-    entry = (await recoveryStatus(stub)).money[noteId];
+    entry = moneyOf(await recoveryStatus(stub), noteId);
     expect(entry.attempts).toBe(2);
     // The real guard: settled → the entry leaves.
     await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
@@ -277,11 +290,11 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     expect(r.body.committed).toBe(true);
     expect((await note(stub, noteId))?.status).toBe('committed');
     const rs = await recoveryStatus(stub);
-    expect(rs.money[noteId]).toMatchObject({ txId: r.body.txId, attempts: 0 });
-    expect(rs.alarm).toBe(rs.money[noteId].dueAt);
+    expect(moneyOf(rs, noteId)).toMatchObject({ txId: r.body.txId, attempts: 0 });
+    expect(rs.alarm).toBe(moneyOf(rs, noteId).dueAt);
     await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
     confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
-    await runNow(stub, rs.money[noteId].dueAt);
+    await runNow(stub, moneyOf(rs, noteId).dueAt);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     expect((await recoveryStatus(stub)).money).toEqual({});
   });
@@ -296,25 +309,25 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
     await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
     let rs = await recoveryStatus(stub);
-    expect(rs.money[noteId]).toMatchObject({ txId: r.body.txId, attempts: 0 });
-    expect(rs.alarm).toBe(rs.money[noteId].dueAt);
+    expect(moneyOf(rs, noteId)).toMatchObject({ txId: r.body.txId, attempts: 0 });
+    expect(rs.alarm).toBe(moneyOf(rs, noteId).dueAt);
     expect((await status()).ledger.pending).toBe('10');
     // Not yet mined: pending on both → backoff, entry kept.
     STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, r.body.txId!), 202, 'Pending'));
-    let due = rs.money[noteId].dueAt;
+    let due = moneyOf(rs, noteId).dueAt;
     expect(await runNow(stub, due)).toEqual({ processed: 0, remaining: 0, money: 1 });
     rs = await recoveryStatus(stub);
-    expect(rs.money[noteId].attempts).toBe(1);
-    expect(rs.money[noteId].dueAt).toBe(due + backoffMs(1));
+    expect(moneyOf(rs, noteId).attempts).toBe(1);
+    expect(moneyOf(rs, noteId).dueAt).toBe(due + backoffMs(1));
     // A weak 200 is not money: still pending.
     mockRoute('GET', statusUrlRe('https://arweave.net', r.body.txId!), 200, statusBody(5000, 1));
     mockRoute('GET', statusUrlRe('https://g2.test', r.body.txId!), 503, 'down');
-    due = rs.money[noteId].dueAt;
+    due = moneyOf(rs, noteId).dueAt;
     await runNow(stub, due);
     expect((await status()).ledger.pending).toBe('10');
     // The money quorum → spent, entry gone, alarm gone (nothing else scheduled).
     confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
-    due = (await recoveryStatus(stub)).money[noteId].dueAt;
+    due = moneyOf(await recoveryStatus(stub), noteId).dueAt;
     await runNow(stub, due);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     rs = await recoveryStatus(stub);
@@ -328,10 +341,21 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     expect(rb.status).toBe(200);
     expect((await status()).ledger.pending).toBe('7');
     deadOnAll(mockRoute, rb.body.txId!);
-    const entry = (await recoveryStatus(stub)).money[noteB];
+    const entry = moneyOf(await recoveryStatus(stub), noteB);
     await runNow(stub, entry.postedAt + RECOVERY_AGE_GUARD_MS + 1);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    // Released — but NOT gone: the txId had a permit, and a dead verdict is a
+    // snapshot. The entry stays under watch until the network can no longer
+    // accept the bytes (review #4 H2); then, still dead, it leaves.
+    const watch = moneyOf(await recoveryStatus(stub), noteB);
+    expect(watch).toMatchObject({ txId: rb.body.txId, watching: true });
+    deadOnAll(mockRoute, rb.body.txId!);
+    await runNow(stub, watch.dueAt); // still inside the bound: dead, but kept
+    expect(moneyOf(await recoveryStatus(stub), noteB)).toMatchObject({ watching: true, attempts: 2 });
+    deadOnAll(mockRoute, rb.body.txId!);
+    await runNow(stub, entry.postedAt + LATE_LANDING_BOUND_MS); // beyond the bound and still dead → gone
     expect((await recoveryStatus(stub)).money).toEqual({});
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
 
     // A pre-D10 posted record (no permit): unknown to the guard → the entry
     // is dropped without touching the ledger.
@@ -340,7 +364,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
       await state.storage.put(`note:${noteC}`, { status: 'reserved', token: 'tk', gen: 0, reservedAt: Date.now(), fp: await fpOf(noteC) });
     });
     expect((await (await stub.fetch('http://do/mark-posted', { method: 'POST', body: JSON.stringify({ noteId: noteC, txId: 'OLD'.padEnd(43, 'o'), token: 'tk' }) })).json() as { ok: boolean }).ok).toBe(true);
-    const entryC = (await recoveryStatus(stub)).money[noteC];
+    const entryC = moneyOf(await recoveryStatus(stub), noteC);
     expect(entryC).toMatchObject({ txId: 'OLD'.padEnd(43, 'o') });
     confirmedOnAll(mockRoute, 'OLD'.padEnd(43, 'o'), 100, 60);
     await runNow(stub, entryC.dueAt);
@@ -430,7 +454,10 @@ describe('the two-phase redrop', () => {
     expect(r).toMatchObject({ status: 'redrop_pending', deadTxId: record.txId, txId: record.txId, signedTx: bytes.signedTx, attempts: 0 });
     const rs = await recoveryStatus(stub);
     expect(rs.recoveryCount).toBe(1); // capacity is NOT released
-    expect(rs.alarm).toBe(r!.dueAt);  // due now: phase 2 on the next pass
+    // Due now: phase 2 on the next pass — and the dead txId is under watch in
+    // the money index (review #4 H2); the alarm is the earlier of the two.
+    expect(moneyOf(rs, noteId)).toMatchObject({ txId: record.txId, attempts: 0 });
+    expect(rs.alarm).toBe(Math.min(r!.dueAt, moneyOf(rs, noteId).dueAt));
     expect((await status()).ledger.pending).toBe('0'); // the old reservation was released
     const gstub = ns.get(ns.idFromName('global'));
     expect(await runInDurableObject(gstub, (_i, s) => s.storage.get<{ state: string }>(`res:${spendKey}`))).toMatchObject({ state: 'released' });
@@ -483,6 +510,114 @@ describe('the two-phase redrop', () => {
     await seed(env, id.pkB64, noteB, { ...b.record, status: 'redrop_pending', deadTxId: b.record.txId, dueAt: FAR });
     await runNow(stub, FAR); // no anchor/price/post routes: any signing attempt would throw
     expect(await note(stub, noteB)).toMatchObject({ status: 'redrop_pending', attempts: 1, signedTx: other.signedTx });
+  });
+});
+
+describe('the send protocol, review 24.09 #4 — three counterexamples closed', () => {
+  it('(H1) one executor per txId: a writer\'s send that never reported keeps the resend OUT — permit refused spend_send_in_flight, no POST, rescheduled; after the report the resend goes through under its own lease', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r4-h1', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    // permitted, NOT reported: the writer's executor is (or crashed) mid-POST.
+    const { record, bytes } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { sendDone: false });
+    const stub = await seed(env, id.pkB64, noteId, record);
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, record.txId), 503, 'down')); // → resend path
+    const post = mockRoute('POST', /^https:\/\/arweave\.net(?::443)?\/tx$/, 200, 'OK');
+    await runNow(stub, FAR);
+    expect(post.calls).toBe(0);
+    expect(await note(stub, noteId)).toMatchObject({ status: 'signed', txId: record.txId, attempts: 1 });
+    expect((await status()).ledger.pending).toBe('10');
+    // The writer's executor reports at last (its token never expires).
+    const permit = await runInDurableObject(ns.get(ns.idFromName('global')), (_i, s) => s.storage.get<{ sending?: { token: string } }>(`permit:${record.txId}`));
+    expect((await guardCall(ns, '/send-done', { txId: record.txId, sendToken: permit!.sending!.token })).body.cleared).toBe(true);
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, record.txId), 503, 'down'));
+    await runNow(stub, FAR + backoffMs(1));
+    expect(post.calls).toBe(1);
+    expect((JSON.parse(post.lastBody!) as { id: string }).id).toBe(bytes.txId);
+    expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
+  });
+
+  it('(H2) a late landing after the release is re-booked: phase 1 puts the dead txId under WATCH in the money index next to the new one; when the old transaction confirms after all, the lattice books `released → spent` — spent = 10, not 0', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r4-h2', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record, spendKey } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000 });
+    const stub = await seed(env, id.pkB64, noteId, record);
+    // Phase 1: dead → redrop_pending, the old reservation released, and the
+    // dead txId enters the money index in the SAME transaction.
+    deadOnAll(mockRoute, record.txId);
+    await runNow(stub, FAR);
+    let r = await note(stub, noteId);
+    expect(r).toMatchObject({ status: 'redrop_pending', deadTxId: record.txId });
+    expect(moneyOf(await recoveryStatus(stub), noteId)).toMatchObject({ txId: record.txId, attempts: 0 });
+    expect((await status()).ledger.pending).toBe('0');
+    // Next pass: the money step sees dead + age guard → `released` (a no-op,
+    // phase 1 did it) → the entry turns into a watch; phase 2 signs the new
+    // generation and posts it → a SECOND entry for the new txId.
+    deadOnAll(mockRoute, record.txId);
+    const { post } = paidLegs(mockRoute, { price: '12' });
+    await runNow(stub, Math.max(r!.dueAt, moneyOf(await recoveryStatus(stub), noteId).dueAt));
+    r = await note(stub, noteId);
+    expect(r!.status).toBe('posted');
+    expect(r!.txId).not.toBe(record.txId);
+    expect(post!.calls).toBe(1);
+    const rows = moneyRows(await recoveryStatus(stub), noteId);
+    expect(rows.map(x => [x.txId, x.watching === true]).sort()).toEqual([[r!.txId, false], [record.txId, true]].sort());
+    expect((await status()).ledger).toMatchObject({ pending: '12', spent: '0' });
+    // The reviewer's counterexample: the OLD bytes land after all (a late
+    // POST, a slow gateway). The watch catches the money quorum and the
+    // lattice books the conflict: spent += 10, the old entry leaves.
+    const oldWatch = rows.find(x => x.txId === record.txId)!;
+    confirmedOnAll(mockRoute, record.txId, 5000, 60);
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, r!.txId), 202, 'Pending'));
+    await runNow(stub, oldWatch.dueAt);
+    expect((await status()).ledger).toMatchObject({ pending: '12', spent: '10' });
+    const gstub = ns.get(ns.idFromName('global'));
+    expect(await runInDurableObject(gstub, (_i, s) => s.storage.get<{ state: string }>(`res:${spendKey}`))).toMatchObject({ state: 'spent' });
+    const left = moneyRows(await recoveryStatus(stub), noteId);
+    expect(left.map(x => x.txId)).toEqual([r!.txId]);
+  });
+
+  it('(H3, phase 2) `spent_is_final` is not «released»: a redrop_pending whose old money was BOOKED by a concurrent confirmation signs nothing and posts nothing — the record becomes posted with the OLD txId', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r4-h3', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record, spendKey } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000 });
+    // Phase 1 already ran; meanwhile a recheck confirmed the old transaction
+    // and settled its reservation `spent` (the reviewer's interleaving).
+    await seed(env, id.pkB64, noteId, { ...record, status: 'redrop_pending', deadTxId: record.txId, dueAt: FAR });
+    expect((await guardCall(ns, '/settle', { spendKey, outcome: 'spent', height: 5000 })).body).toMatchObject({ state: 'spent' });
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    // No anchor / price / POST routes: a phase 2 that went ahead would throw
+    // at the anchor and leave the record `redrop_pending`, rescheduled.
+    await runNow(stub, FAR);
+    expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
+    const rs = await recoveryStatus(stub);
+    expect(rs.recoveryCount).toBe(0);
+    expect(rs.due).toEqual({});
+    // No second reservation, no new pending: the old publication stands.
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    const gstub = ns.get(ns.idFromName('global'));
+    expect(await runInDurableObject(gstub, (_i, s) => s.storage.get(`res:${spendKey.slice(0, spendKey.lastIndexOf(':'))}:g2`))).toBeUndefined();
+    // The money entry of the old txId reconciles to a no-op and leaves.
+    confirmedOnAll(mockRoute, record.txId, 5000, 60);
+    await runNow(stub, moneyOf(rs, noteId).dueAt);
+    expect((await recoveryStatus(stub)).money).toEqual({});
+  });
+
+  it('(H3, phase 1) the same at phase 1: dead by the status quorum but SPENT in the guard → no redrop_pending, the record becomes posted with the old txId', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-r4-h3a', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record, spendKey } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk, { ageMs: RECOVERY_AGE_GUARD_MS + 1000 });
+    const stub = await seed(env, id.pkB64, noteId, record);
+    expect((await guardCall(ns, '/settle', { spendKey, outcome: 'spent', height: 5000 })).body).toMatchObject({ state: 'spent' });
+    deadOnAll(mockRoute, record.txId); // the pool lags behind the guard's quorum
+    await runNow(stub, FAR);
+    expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
+    expect((await recoveryStatus(stub)).recoveryCount).toBe(0);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
   });
 });
 
@@ -571,8 +706,8 @@ describe('scheduler mechanics', () => {
     expect((await note(stub, noteId))?.status).toBe('posted');
     const after = await recoveryStatus(stub);
     expect(after).toMatchObject({ recoveryCount: 0, due: {} });
-    expect(after.money[noteId]).toMatchObject({ txId: record.txId });
-    expect(after.alarm).toBe(after.money[noteId].dueAt);
+    expect(moneyOf(after, noteId)).toMatchObject({ txId: record.txId });
+    expect(after.alarm).toBe(moneyOf(after, noteId).dueAt);
   });
 
   it('the recovery cap: recoveryCount = quota → a NEW upload is refused 503 recovery_capacity before anything is signed; a recheck of a recovering note nudges one step and answers 503 recovery_in_progress', async () => {

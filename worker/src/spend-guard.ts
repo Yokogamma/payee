@@ -21,8 +21,8 @@
  */
 
 import {
-  PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SEND_LEASE_MS, SPEND_CODES,
-  activateOutcome, addToBucket, available, creditDeposit, initTransition, permitDecision, prepareDecision,
+  PREPARED_LEASE_MS, PRICE_QUOTE_TTL_MS, SPEND_CODES,
+  activateOutcome, addToBucket, available, creditDeposit, initTransition, leaseOpen, permitDecision, prepareDecision,
   reinit, settle, spentLast24h,
   type CycleLedger, type FreezeState, type InitEvent, type InitRecord, type PermitKind, type PermitRecord,
   type Reservation, type SpendCode, type SpendLimits,
@@ -212,12 +212,17 @@ export class SpendGuard implements DurableObject {
         { txId, kind, cycle, spendKey: typeof body.spendKey === 'string' ? body.spendKey : undefined },
       );
       if (!decision.granted) return refuse(decision.code, 503);
-      // The permit is a LEASE on the money: from here until `/send-done` (or
-      // SEND_LEASE_MS) the reservation cannot be released — a sender whose
-      // answer is slow and a releaser deciding the redrop cannot both win.
-      const sending = decision.existing && decision.permit.sending && now - decision.permit.sending.since < SEND_LEASE_MS
-        ? decision.permit.sending
-        : { token: crypto.randomUUID(), since: now };
+      // The permit is an EXCLUSIVE lease on the bytes and on the money: from
+      // here until `/send-done` nobody else may send this txId and the
+      // reservation cannot be released. A shared token would let the first
+      // executor's report clear the lease while the second still posts
+      // (review 24.09 #4, high 1); so a second request meets a refusal, not a
+      // copy of the lease. The refusal ends only with the report — or once
+      // the network can no longer accept the bytes (LATE_LANDING_BOUND_MS).
+      if (decision.existing && leaseOpen(decision.permit.sending, now)) {
+        return refuse(SPEND_CODES.sendInFlight, 503, { txId, since: decision.permit.sending!.since });
+      }
+      const sending = { token: crypto.randomUUID(), since: now };
       const permit: PermitRecord = { ...decision.permit, sending };
       await txn.put<PermitRecord>(K.permit(txId), permit);
       if (decision.permit.spendKey) {
@@ -230,7 +235,8 @@ export class SpendGuard implements DurableObject {
   }
 
   /** The sender reports the end of its POST (any outcome): the lease is
-   *  cleared under the token it was handed. Idempotent. */
+   *  cleared under the token it was handed — however late the report is (a
+   *  token never expires; only the OTHER side's refusals do). Idempotent. */
   private async sendDone(body: Record<string, unknown>): Promise<Response> {
     const txId = String(body.txId ?? ''); const token = String(body.sendToken ?? '');
     if (!txId || !token) return new Response('bad request', { status: 400 });
@@ -599,12 +605,15 @@ export class SpendGuard implements DurableObject {
     {
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
       if (!existing) return new Response('unknown reservation', { status: 404 });
-      // `released` under a live send lease is refused: the bytes may be on
-      // their way to the network right now (review 24.09 #3, high 1).
+      // `released` under an open send lease is refused: the bytes may be on
+      // their way to the network right now, and the passing of time is not a
+      // report (review 24.09 #3 high 1, #4 high 2). The hold ends with the
+      // executor's `/send-done`, or once the anchor rule has made the bytes
+      // unacceptable to every node (LATE_LANDING_BOUND_MS) — never earlier.
       if (outcome === 'released' && existing.state === 'active' && existing.permitTxId) {
         const permit = await txn.get<PermitRecord>(K.permit(existing.permitTxId));
-        if (permit?.sending && now - permit.sending.since < SEND_LEASE_MS) {
-          return refuse(SPEND_CODES.sendInFlight, 503, { txId: existing.permitTxId, since: permit.sending.since });
+        if (leaseOpen(permit?.sending, now)) {
+          return refuse(SPEND_CODES.sendInFlight, 503, { txId: existing.permitTxId, since: permit!.sending!.since });
         }
       }
       const r = settle({ state: existing.state, reward: BigInt(existing.reward), revision: existing.revision, activatedBy: existing.activatedBy }, outcome);

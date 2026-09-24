@@ -1707,11 +1707,24 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const sent = await permittedPost(guard, arweave, signedTx,
     { txId: candidateTxId, kind: permitKind, cycle: activated.cycle, spendKey }, transportDeps);
   if (sent.sent === false) {
+    const code = sent.refusal.code;
+    emit('permit_refused', [code], []);
+    if (code === SPEND_CODES.sendInFlight) {
+      // A permit for this txId EXISTS and its executor has not reported: the
+      // bytes may be on the network. That is the «durable recovery» branch of
+      // §4.0, not the abort — nothing is released; the reservation is settled
+      // by the quorum (the money index). Unreachable for a fresh txId of the
+      // current format; kept for the protocol's sake (review 24.09 #4, high 1).
+      await safeRelease(reserveToken);
+      console.error('ARWEAVE_POST_IN_FLIGHT_ELSEWHERE', noteId, candidateTxId);
+      emit('upload_outcome', ['post_unknown', declaredVersion], []);
+      return settle('post_unknown',
+        uploadError(502, 'arweave_post_unknown', 'A send of this transaction is in progress elsewhere', { txId: candidateTxId }),
+        { paidResult: 'unknown', txId: candidateTxId });
+    }
     // No permit was ever issued for this txId — provably never sent (§4.0):
     // frozen / not initialised / the guard did not answer. The record stays
     // consistent: aborted, released, and answered with the guard's code.
-    const code = sent.refusal.code;
-    emit('permit_refused', [code], []);
     const aborted = await abortBeforeSend(code);
     return settle(aborted ? 'audit_aborted' : code, uploadError(503, code, 'Spend guard refused the send'));
   }
