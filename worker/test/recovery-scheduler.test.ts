@@ -62,7 +62,7 @@ async function note(stub: DurableObjectStub, noteId: string) {
 }
 async function recoveryStatus(stub: DurableObjectStub) {
   const res = await stub.fetch('http://do/recovery-status', { method: 'POST', body: '{}' });
-  return (await res.json()) as { recoveryCount: number; alarm: number | null; due: Record<string, number> };
+  return (await res.json()) as { recoveryCount: number; alarm: number | null; due: Record<string, number>; money: Record<string, { txId: string; dueAt: number; attempts: number; postedAt: number }> };
 }
 async function runNow(stub: DurableObjectStub, now = Date.now()) {
   return runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).runRecovery(now));
@@ -129,13 +129,111 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     // A weak confirmation moves the RECORD (liveness), not the money.
     mockRoute('GET', statusUrlRe('https://arweave.net', record.txId), 200, statusBody(100, 0));
     mockRoute('GET', statusUrlRe('https://g2.test', record.txId), 503, 'down');
-    expect(await runNow(stub, FAR)).toEqual({ processed: 1, remaining: 0 });
+    expect(await runNow(stub, FAR)).toEqual({ processed: 1, remaining: 0, money: 0 });
     expect(await note(stub, noteId)).toMatchObject({ status: 'posted', txId: record.txId });
     expect((await status()).ledger).toMatchObject({ pending: '10', spent: '0' });
     const rs = await recoveryStatus(stub);
     expect(rs.recoveryCount).toBe(0);
-    expect(rs.alarm).toBeNull();
     expect(rs.due).toEqual({});
+    // The MONEY of this txId is still pending in the guard: the note moved
+    // to the money index, and the alarm follows it (review #2, H4).
+    expect(rs.money[noteId]).toMatchObject({ txId: record.txId, attempts: 0 });
+    expect(rs.alarm).toBe(rs.money[noteId].dueAt);
+  });
+
+  it('(H1) a run that lost the record to a concurrent phase 1 is stripped of the right to send: terminal activate → discarded, no POST; and the DO refuses the permit of a released reservation for everyone', async () => {
+    const { env, ns, status, wallet } = await sagaEnv('rec-stale', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    const { record, spendKey } = await writerSigned(ns, id.pkB64, noteId, wallet.jwk);
+    const stub = await seed(env, id.pkB64, noteId, record);
+    // While run A is between the quorum and the send (its `/activate` call is
+    // the hook), phase 1 happens: the record becomes redrop_pending and the
+    // old reservation is released.
+    const { guardWithHook } = await import('./helpers/spend-saga');
+    let fired = false;
+    // The money effect of the concurrent phase 1 (the other run's second
+    // call) lands while A is past its quorum and about to activate.
+    const hooked = guardWithHook(ns, '/activate', async () => {
+      if (fired) return; fired = true;
+      await guardCall(ns, '/settle', { spendKey, outcome: 'released' });
+    }, 'before');
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests({ ...env, SPEND_GUARD: hooked } as Parameters<RateLimiter['useEnvForTests']>[0]));
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, record.txId), 503, 'down')); // → resend path
+    const run = await runNow(stub, FAR); // no POST route: a send would throw → post_unknown
+    expect(fired).toBe(true);
+    expect(run.processed).toBe(1);
+    // Discarded BEFORE the send: the terminal activate (released) stripped
+    // this run of the right to send — no POST, no reschedule, record untouched.
+    expect(await note(stub, noteId)).toMatchObject({ status: 'signed', txId: record.txId, attempts: 0 });
+    expect((await status()).ledger.pending).toBe('0');
+    // The durable lever: even a permit that was already issued is refused
+    // once its reservation is released.
+    const p = await guardCall(ns, '/permit-send', { txId: record.txId, kind: 'resend', cycle: 1, spendKey });
+    expect(p.status).toBe(503);
+    expect(p.body.code).toBe(SPEND_CODES.reservationReleased);
+  });
+
+  it('(H4) the money index: a fresh upload schedules the reconciliation of its reservation independently of the client; the alarm settles it as spent under a money quorum, or released after a dead verdict past the age guard, and leaves a pre-D10 txId alone', async () => {
+    const { env, status } = await sagaEnv('rec-money-idx', { deposit: '1000' });
+    const id = await makeIdentity();
+    const noteId = uuidV4();
+    paidLegs(mockRoute, { price: '10' });
+    const r = await upload(await uploadRequest(id, noteId), env);
+    expect(r.status).toBe(200);
+    const stub = RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64));
+    await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).useEnvForTests(env as Parameters<RateLimiter['useEnvForTests']>[0]));
+    let rs = await recoveryStatus(stub);
+    expect(rs.money[noteId]).toMatchObject({ txId: r.body.txId, attempts: 0 });
+    expect(rs.alarm).toBe(rs.money[noteId].dueAt);
+    expect((await status()).ledger.pending).toBe('10');
+    // Not yet mined: pending on both → backoff, entry kept.
+    STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, r.body.txId!), 202, 'Pending'));
+    let due = rs.money[noteId].dueAt;
+    expect(await runNow(stub, due)).toEqual({ processed: 0, remaining: 0, money: 1 });
+    rs = await recoveryStatus(stub);
+    expect(rs.money[noteId].attempts).toBe(1);
+    expect(rs.money[noteId].dueAt).toBe(due + backoffMs(1));
+    // A weak 200 is not money: still pending.
+    mockRoute('GET', statusUrlRe('https://arweave.net', r.body.txId!), 200, statusBody(5000, 1));
+    mockRoute('GET', statusUrlRe('https://g2.test', r.body.txId!), 503, 'down');
+    due = rs.money[noteId].dueAt;
+    await runNow(stub, due);
+    expect((await status()).ledger.pending).toBe('10');
+    // The money quorum → spent, entry gone, alarm gone (nothing else scheduled).
+    confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
+    due = (await recoveryStatus(stub)).money[noteId].dueAt;
+    await runNow(stub, due);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    rs = await recoveryStatus(stub);
+    expect(rs.money).toEqual({});
+    expect(rs.alarm).toBeNull();
+
+    // A second note: dead past the age guard → released.
+    const noteB = uuidV4();
+    paidLegs(mockRoute, { price: '7' });
+    const rb = await upload(await uploadRequest(id, noteB), env);
+    expect(rb.status).toBe(200);
+    expect((await status()).ledger.pending).toBe('7');
+    deadOnAll(mockRoute, rb.body.txId!);
+    const entry = (await recoveryStatus(stub)).money[noteB];
+    await runNow(stub, entry.postedAt + RECOVERY_AGE_GUARD_MS + 1);
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
+    expect((await recoveryStatus(stub)).money).toEqual({});
+
+    // A pre-D10 posted record (no permit): unknown to the guard → the entry
+    // is dropped without touching the ledger.
+    const noteC = uuidV4();
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put(`note:${noteC}`, { status: 'reserved', token: 'tk', gen: 0, reservedAt: Date.now(), fp: await fpOf(noteC) });
+    });
+    expect((await (await stub.fetch('http://do/mark-posted', { method: 'POST', body: JSON.stringify({ noteId: noteC, txId: 'OLD'.padEnd(43, 'o'), token: 'tk' }) })).json() as { ok: boolean }).ok).toBe(true);
+    const entryC = (await recoveryStatus(stub)).money[noteC];
+    expect(entryC).toMatchObject({ txId: 'OLD'.padEnd(43, 'o') });
+    confirmedOnAll(mockRoute, 'OLD'.padEnd(43, 'o'), 100, 60);
+    await runNow(stub, entryC.dueAt);
+    expect((await recoveryStatus(stub)).money).toEqual({});
+    expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
   });
 
   it('confirmed with a MONEY quorum → posted AND spent at the max agreed height', async () => {
@@ -298,7 +396,7 @@ describe('scheduler mechanics', () => {
     // Everything due answers confirmed: five advance, one remains due → alarm now.
     for (const { txId } of records) confirmedOnAll(mockRoute, txId, 100, 1);
     const run = await runNow(stub, t0);
-    expect(run).toEqual({ processed: ALARM_BATCH, remaining: 1 });
+    expect(run).toEqual({ processed: ALARM_BATCH, remaining: 1, money: 0 });
     rs = await recoveryStatus(stub);
     expect(rs.recoveryCount).toBe(2);
     // The remainder got an IMMEDIATE alarm (`setAlarm(now)` in the finally);
@@ -307,10 +405,12 @@ describe('scheduler mechanics', () => {
     expect(Object.keys(rs.due).sort()).toEqual([records[ALARM_BATCH].noteId, far].sort());
     // The far record's schedule survived; one more run drains the remainder.
     const run2 = await runNow(stub, t0);
-    expect(run2).toEqual({ processed: 1, remaining: 0 });
+    expect(run2).toEqual({ processed: 1, remaining: 0, money: 0 });
     rs = await recoveryStatus(stub);
     expect(rs.recoveryCount).toBe(1);
-    expect(rs.alarm).toBe(t0 + 10_000_000);
+    // The alarm is now the earliest of the far record and the six money entries.
+    expect(rs.alarm).toBeLessThanOrEqual(t0 + 10_000_000);
+    expect(Object.keys(rs.money)).toHaveLength(ALARM_BATCH + 1);
   });
 
   it('self-healing: a backlog without an alarm gets it back on the next /check-and-reserve; a note in recovery answers `recovering`', async () => {
@@ -353,10 +453,14 @@ describe('scheduler mechanics', () => {
       const rs = await recoveryStatus(stub);
       expect(rs, fault).toEqual(before.rs);
     }
-    // Without the fault the same transition lands whole.
+    // Without the fault the same transition lands whole (and hands the
+    // money over to the money index).
     await runInDurableObject(stub, (instance) => (instance as unknown as RateLimiter).casRecovery(noteId, casOf(record), toPosted(record, FAR)));
     expect((await note(stub, noteId))?.status).toBe('posted');
-    expect(await recoveryStatus(stub)).toEqual({ recoveryCount: 0, alarm: null, due: {} });
+    const after = await recoveryStatus(stub);
+    expect(after).toMatchObject({ recoveryCount: 0, due: {} });
+    expect(after.money[noteId]).toMatchObject({ txId: record.txId });
+    expect(after.alarm).toBe(after.money[noteId].dueAt);
   });
 
   it('the recovery cap: recoveryCount = quota → a NEW upload is refused 503 recovery_capacity before anything is signed; a recheck of a recovering note nudges one step and answers 503 recovery_in_progress', async () => {

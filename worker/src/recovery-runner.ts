@@ -47,6 +47,10 @@ export interface RecoveryEnv extends MetricsEnv {
 export interface RecoveryHost {
   /** Apply `next` only if the record still matches `expected`. */
   cas(noteId: string, expected: RecoveryCas, next: RecoveryRecord | PostedRecord): Promise<boolean>;
+  /** Is the record still the one this run read? Asked right BEFORE a send:
+   *  a run that lost the record to a concurrent phase 1 must not post
+   *  (review 24.09 #2, high 1). */
+  stillMine(noteId: string, expected: RecoveryCas): Promise<boolean>;
   now(): number;
 }
 
@@ -120,6 +124,15 @@ async function stepSigned(noteId: string, record: RecoveryRecord, env: RecoveryE
       emit('recovery_refused', ['activate', activated.refusal.code], []);
       return (await host.cas(noteId, expected, rescheduled(record, now))) ? 'rescheduled' : 'discarded';
     }
+    // POST is allowed only after the outcome `active` (plan §6): a terminal
+    // no-op means the money of this txId is settled — released by a phase 1
+    // that overtook this run, or spent — and nothing may be sent for it.
+    if (activated.state !== 'active') {
+      emit('recovery_refused', ['activate', `terminal_${activated.state}`], []);
+      return 'discarded';
+    }
+    // The last look before the network: the record must still be ours.
+    if (!(await host.stillMine(noteId, expected))) return 'discarded';
     const sent = await permittedPost(guard, getArweave(), parsed.raw as object, { txId: record.txId, kind: 'resend', cycle: activated.cycle, spendKey: record.spendKey }, transport(emit));
     if (sent.sent === true && (sent.status === 200 || sent.status === 202 || sent.status === 208)) {
       emit('post_accepted', [ARWEAVE_HOST], []);
@@ -214,6 +227,11 @@ async function stepRedropPending(noteId: string, record: RecoveryRecord, env: Re
     await host.cas(noteId, signedCas, rescheduled(nextSigned, host.now()));
     return 'signed';
   }
+  if (activated.state !== 'active') {
+    emit('recovery_refused', ['activate', `terminal_${activated.state}`], []);
+    return 'signed';
+  }
+  if (!(await host.stillMine(noteId, signedCas))) return 'discarded';
   const sent = await permittedPost(guard, getArweave(), tx, { txId: tx.id, kind: 'redrop2', cycle: activated.cycle, spendKey: newSpendKey }, deps);
   if (sent.sent === true && (sent.status === 200 || sent.status === 202 || sent.status === 208)) {
     emit('post_accepted', [ARWEAVE_HOST], []);

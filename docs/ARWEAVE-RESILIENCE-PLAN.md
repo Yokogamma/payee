@@ -1662,10 +1662,11 @@ Reader-релиз этим не блокируется: он не создаёт
   permit-send непосредственно перед `postSignedTx`); статический гейт «нет
   POST вне permit-send» — следующий шаг (сага загрузки).
 - Закрытие множества `L` (§4.0 п. 2–5) — **зависимость** `closeLegacySet`;
-  производственное значение до реализации — «множество не закрыто» →
-  `init` отвечает `503 spend_init_legacy_open` (fail-closed, не заглушка
-  «закрыто»). Тождество операторов (`operatorOf`) — из карты PR-4
-  (`STATUS_OPERATORS`) после её мержа; до того каждый origin — свой оператор.
+  до шага 5 производственное значение было «множество не закрыто»
+  (`503 spend_init_legacy_open`); с шага 5 (ниже) — реализация
+  `worker/src/legacy-closure.ts`. Тождество операторов (`operatorOf`) — из
+  карты PR-4 (`STATUS_OPERATORS`) после её мержа; до того каждый origin —
+  свой оператор.
 - `credit-deposit { txId }`: `/tx/<id>` (равенство `id`) и статус у каждого
   origin; свидетель — origin с `target` = кошелёк воркера, отправитель ≠
   кошелёк воркера, `confirmed ≥ MIN_DEPOSIT_CONFIRMATIONS`; ≥ 2 операторов,
@@ -1759,6 +1760,47 @@ Reader-релиз этим не блокируется: он не создаёт
   далёкий `dueAt` и ведут прогон явно `runRecovery(now)`); DO видит env
   биндингов — сьют передаёт изолированный guard и подписываемый кошелёк
   через seam `useEnvForTests`; один инстант `now` на весь прогон.
+- **Ревью 24.09 #2 (4 high, 1 medium) внесено:** (H1) устаревший исполнитель
+  теряет право отправки: `activate` с терминальным no-op (`released`/`spent`)
+  → POST запрещён (сага и планировщик), перечитывание записи `stillMine`
+  непосредственно перед отправкой, и durable-рычаг в DO — `permit-send` по
+  txId, чья резервация `released`, отвечает `503 spend_reservation_released`
+  всем; (H2) закрытие множества: любой сбой или неполный ответ DO
+  (`/list-keys`, `/legacy-keys`, `/legacy-list`, `/open-permits`, страница
+  `/ops`) → `open` с причиной, никаких пустых значений по умолчанию;
+  (H3) L₁ только сообщается, не регистрируется — деньги разрешения уже
+  удерживает его резервация (перенесённая `reinit` в pending), учёт по одной
+  записи; (H4) отдельный долговечный индекс денежной реконсиляции
+  `money:<noteId>` в RateLimiter: заводится на `mark-posted` (обычный путь)
+  и на recovery → posted, alarm = min по обоим индексам, шаг = кворум →
+  `settle-by-tx spent` / `dead` + age guard → `released` / backoff, выход
+  только по терминальному ответу guard; (M) smoke считает исходом последний
+  ответ `init` (`done`/`waiting` — успех, иначе отказ).
+
+**Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
+ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**
+
+- `worker/src/legacy-closure.ts` — `closeLegacySet`: (1) ключи — `InviteManager
+  /list-keys` (публичные ключи всех использованных `invite:*`, включая
+  отозванные, ∪ живые `pk:*`; инвайты старого формата без ключа считаются
+  `unknownLegacyInvites`) ∪ ключи, зарегистрированные оператором
+  (`/admin/spend/init-legacy-keys { publicKeys, acknowledgeLegacyInvites }`,
+  durable в `SpendGuard`); `unknownLegacyInvites > acknowledged` →
+  `503 spend_init_keys_unknown`; (2) `L₁` — `SpendGuard /open-permits`: разрешения
+  (не маркер) без терминального исхода резервации, награда — из резервации;
+  (3) `L₂` — журналы `/ops` каждого ключа за глубину хранения журнала: `posting`,
+  `finished` с `paidResult unknown`, `finished(accepted)` без денежного кворума
+  (`moneyQuorum` по пулу статусов); (4) награда `L₂` — только из заголовка
+  `/tx/<id>` у payload-origin, проверенного `verifyHeader` (равенство id,
+  подпись RSA-PSS, владелец из `TRUSTED_OWNERS`); недоступно у всех →
+  `503 spend_init_legacy_reward_unknown { txId }`; (5) уже зарегистрированные
+  (`/legacy-list`) не возвращаются — повторный вызов идемпотентен. Регистрация
+  — `/init-legacy` с `registeredAt`.
+- Разрешение удержанных после `done` (§4.0 п. 6) — на каждом `init` в
+  состоянии `done` (рычаг оператора), пачкой ≤ 20: денежный кворум выше
+  `h_init` → `spent`, на/ниже → `dropped`, unanimous `dead` старше 30 мин от
+  `registeredAt` → `dropped`, иначе `held` (без TTL); ответ `legacy:
+  { held, spent, dropped, kept }`.
 
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 
