@@ -103,7 +103,10 @@ async function stepSigned(noteId: string, record: RecoveryRecord, env: RecoveryE
     // is released (idempotent; repeated at every phase-2 attempt as well).
     const ok = await host.cas(noteId, expected, toRedropPending(record, crypto.randomUUID(), now));
     if (!ok) return 'discarded';
-    await releaseSpend(guard, record.spendKey);
+    // A refused release (a send still in flight under the permit's lease, or
+    // the guard down) is not an error: phase 2 repeats it before it signs.
+    const rel = await releaseSpend(guard, record.spendKey);
+    if (rel !== 'released' && rel !== 'terminal') emit('recovery_refused', ['release', rel], []);
     return 'redrop_pending';
   }
   if (action === 'reschedule') {
@@ -165,8 +168,15 @@ async function stepRedropPending(noteId: string, record: RecoveryRecord, env: Re
     return (await host.cas(noteId, expected, rescheduled(record, now))) ? 'corrupt' : 'discarded';
   }
   // The second call of the phase-1 order, repeated idempotently (a crash
-  // between the two calls is healed here).
-  await releaseSpend(guard, record.spendKey);
+  // between the two calls is healed here). Phase 2 signs ONLY once the old
+  // money is provably free: a send still in flight under the old permit's
+  // lease, or a guard that does not answer, postpones the new signature
+  // (review 24.09 #3, high 1 — the durable half of the send protocol).
+  const rel = await releaseSpend(guard, record.spendKey);
+  if (rel === 'in_flight' || rel === 'unavailable') {
+    emit('recovery_refused', ['release', rel], []);
+    return (await host.cas(noteId, expected, rescheduled(record, now))) ? 'rescheduled' : 'discarded';
+  }
 
   const limits = readSpendLimits(env);
   if (limits === null) {

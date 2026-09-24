@@ -62,6 +62,11 @@ export const SPEND_CODES = {
    *  redrop was decided): no executor may send those bytes any more
    *  (review 24.09 #2, high 1 — a stale run is stripped of its right to send). */
   reservationReleased: 'spend_reservation_released',
+  /** `released` was asked for a reservation whose permit is SENDING (a
+   *  granted permit whose outcome was not reported yet, within the lease):
+   *  the money cannot be freed under a send that may still land (review
+   *  24.09 #3, high 1). */
+  sendInFlight: 'spend_send_in_flight',
   windowCap: 'spend_window_cap',
   floor: 'spend_floor',
 } as const;
@@ -205,7 +210,20 @@ export type PermitKind = 'upload' | 'resend' | 'redrop2' | 'marker';
 
 export interface FreezeState { active: boolean; epoch: number; since?: number }
 
-export interface PermitRecord { txId: string; kind: PermitKind; cycle: number; issuedAt: number; spendKey?: string }
+export interface PermitRecord {
+  txId: string; kind: PermitKind; cycle: number; issuedAt: number; spendKey?: string;
+  /** The send lease (review 24.09 #3, high 1): set when the permit is handed
+   *  out, cleared by `/send-done` with the token. While it is set and younger
+   *  than SEND_LEASE_MS, `released` is refused for the reservation. */
+  sending?: { token: string; since: number };
+}
+
+/** How long a granted permit blocks `released` without a `/send-done`: the
+ *  bound for a sender that crashed mid-POST. A POST has no timeout of its own
+ *  (arweave-transport), so this is deliberately generous; a POST that outlives
+ *  it lands on a released reservation and is re-booked by the lattice
+ *  (`released → spent` dominates, `spend_conflict`). */
+export const SEND_LEASE_MS = 30 * 60_000;
 
 export type PermitDecision =
   | { granted: true; permit: PermitRecord; existing: boolean }

@@ -541,16 +541,22 @@ export class RateLimiter implements DurableObject {
     }
 
     const now = Date.now();
-    const w = await this.window(this.state.storage, now);
-    let committedGen = record.gen;
-    if (record.gen === w.resetAt) {
-      if (w.inFlight > 0) await this.state.storage.put('inFlight', w.inFlight - 1);
-      await this.state.storage.put('count', w.count + 1);
-      committedGen = w.resetAt;
-    }
-    await this.state.storage.put<NoteRecord>(`note:${noteId}`, withFp({
-      status: 'committed', token, gen: committedGen, txId, committedAt: now,
-    }, record.fp)); // carried, never re-derived
+    await this.state.storage.transaction(async (txn) => {
+      const w = await this.window(txn, now);
+      let committedGen = record.gen;
+      if (record.gen === w.resetAt) {
+        if (w.inFlight > 0) await txn.put('inFlight', w.inFlight - 1);
+        await txn.put('count', w.count + 1);
+        committedGen = w.resetAt;
+      }
+      await txn.put<NoteRecord>(`note:${noteId}`, withFp({
+        status: 'committed', token, gen: committedGen, txId, committedAt: now,
+      }, record.fp)); // carried, never re-derived
+      // `reserved → committed` (mark-posted lost three times) is a POSTed txId
+      // too: its reservation is reconciled by the money index like any other
+      // (review 24.09 #3, high 3). Idempotent for `posted → committed`.
+      await this.scheduleMoneyInTxn(txn, noteId, txId, record.postedAt ?? now);
+    });
     return Response.json({ ok: true });
   }
 
@@ -819,8 +825,11 @@ export class RateLimiter implements DurableObject {
     if (outcome !== null) {
       const r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
       emit('money_reconcile', [outcome, r], [entry.attempts]);
-      terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'refused';
-      result = terminal ? `${outcome}:${r}` : 'unavailable';
+      // Only a CONFIRMED final state ends the entry; a guard that did not
+      // answer, or refused for now (`spend_send_in_flight`), keeps it for
+      // the next pass (review 24.09 #3, high 2).
+      terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
+      result = terminal ? `${outcome}:${r}` : 'retry';
     } else {
       emit('money_reconcile', ['wait', 'pending'], [entry.attempts]);
     }
