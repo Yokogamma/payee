@@ -6,6 +6,8 @@ import {
   EXPECTED_STATUS_CSV,
   INDEX_SOURCES as PINNED_INDEX_SOURCES,
 } from './gateway-pins.mjs';
+import { STATUS_OPERATORS as PINNED_OPERATORS } from './gateway-pins.mjs';
+import { parseOperatorMap as parseOperatorMapJs } from './gateways-parse.mjs';
 
 // Ранний конфиг-гейт §1.7: наличие/непустота несекретных variables + сверка
 // с закоммиченными ожиданиями. Токен скрипту не передаётся ПРИНЦИПИАЛЬНО
@@ -123,5 +125,37 @@ describe('gateway sets are pinned EXACTLY, not merely present', () => {
     for (const name of ['VITE_STATUS_GATEWAYS', 'VITE_PAYLOAD_GATEWAYS', 'VITE_INDEX_SOURCES']) {
       expect(checkDeployConfig({ ...GOOD, [name]: '' }).ok).toBe(false);
     }
+  });
+});
+
+describe('VITE_STATUS_OPERATORS — optional, and when present it is the pin (PR-4 / D11)', () => {
+  const base = () => ({ ...GOOD });
+  it('absent → no problem (the client default is the same pin)', () => {
+    const env = base(); delete env.VITE_STATUS_OPERATORS;
+    expect(checkDeployConfig(env).ok).toBe(true);
+  });
+  it('present and equal to the pin (with noise) → ok', () => {
+    const env = base();
+    env.VITE_STATUS_OPERATORS = PINNED_OPERATORS.split(',').map(e => ' ' + e.replace('=', '/=')).join(',');
+    expect(checkDeployConfig(env).ok).toBe(true);
+  });
+  it('a status origin without an operator fails the gate', () => {
+    const env = base();
+    env.VITE_STATUS_OPERATORS = PINNED_OPERATORS.split(',').slice(1).join(',');
+    const out = checkDeployConfig(env);
+    expect(out.ok).toBe(false);
+    expect(out.problems.join('|')).toMatch(/no operator for a configured status origin/);
+  });
+  it('one operator behind every origin fails the gate', () => {
+    const env = base();
+    env.VITE_STATUS_OPERATORS = PINNED_OPERATORS.split(',').map(e => e.split('=')[0] + '=one').join(',');
+    const out = checkDeployConfig(env);
+    expect(out.ok).toBe(false);
+    expect(out.problems.join('|')).toMatch(/fewer than two distinct operators/);
+  });
+  it('the pin itself covers every pinned status origin with distinct operators', () => {
+    const map = parseOperatorMapJs(PINNED_OPERATORS);
+    for (const origin of EXPECTED_STATUS_CSV.split(',')) expect(map.has(origin)).toBe(true);
+    expect(new Set(map.values()).size).toBe(EXPECTED_STATUS_CSV.split(',').length);
   });
 });

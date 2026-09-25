@@ -30,11 +30,12 @@
 
 import { AUTO_ALLOWED_WORKER_ORIGINS } from '../worker/scripts/smoke-target.mjs';
 import { parseTrustedOwners } from './trusted-owners-parse.mjs';
-import { parseIndexSources, parseOriginList } from './gateways-parse.mjs';
+import { parseIndexSources, parseOperatorMap, parseOriginList } from './gateways-parse.mjs';
 import {
   EXPECTED_PAYLOAD_CSV,
   EXPECTED_STATUS_CSV,
   INDEX_SOURCES as EXPECTED_INDEX_SOURCES,
+  STATUS_OPERATORS as EXPECTED_STATUS_OPERATORS,
 } from './gateway-pins.mjs';
 
 export const DEPLOY_VARS = [
@@ -87,6 +88,22 @@ export const EXPECTED = {
  */
 export function checkDeployConfig(env, required = DEPLOY_VARS) {
   const problems = [];
+
+  // OPTIONAL override of the operator map (PR-4 / D11). Absent → the client's
+  // built-in default, which is this same pin. Present → it must BE the pin,
+  // cover every status origin, and name at least two distinct operators —
+  // otherwise the age quorum silently loses its independence guarantee.
+  const operatorsRaw = env.VITE_STATUS_OPERATORS;
+  if (operatorsRaw !== undefined && operatorsRaw !== null && String(operatorsRaw).trim() !== '') {
+    const actual = parseOperatorMap(String(operatorsRaw));
+    const wanted = parseOperatorMap(EXPECTED_STATUS_OPERATORS);
+    const same = actual.size === wanted.size && [...wanted].every(([o, op]) => actual.get(o) === op);
+    if (!same) problems.push(`VITE_STATUS_OPERATORS does not match the repo-pinned operator map: ${EXPECTED_STATUS_OPERATORS}`);
+    for (const origin of parseOriginList(String(env.VITE_STATUS_GATEWAYS ?? ''))) {
+      if (!actual.has(origin)) problems.push(`VITE_STATUS_OPERATORS has no operator for a configured status origin (${origin})`);
+    }
+    if (new Set(actual.values()).size < 2) problems.push('VITE_STATUS_OPERATORS names fewer than two distinct operators');
+  }
 
   for (const name of required) {
     const value = env[name];

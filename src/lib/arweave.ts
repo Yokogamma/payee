@@ -21,7 +21,8 @@ import {
 } from './crypto';
 import { TRUSTED_OWNERS, assertTrustedOwners } from './config';
 import { BACKUP_IMPORT_ENABLED } from './flags';
-import { INDEX_QUERY_URL, PAYLOAD_GATEWAYS, QUORUM_POLICY_ID, STATUS_GATEWAYS } from './gateways';
+import { INDEX_SOURCES, PAYLOAD_GATEWAYS, QUORUM_POLICY_ID, STATUS_GATEWAYS, operatorOf } from './gateways';
+import { ageProvenByQuorum, selectPresenceProbes, unionSweeps, type IndexEdge, type SourceSweep } from './index-union';
 import { serializeStatusOrigins } from './gateways-parse';
 import { statusVerdict, toTxStatusKind, type StatusVote } from './status-quorum';
 import {
@@ -322,7 +323,7 @@ const STATUS_BODY_CAP_BYTES = 1024;
 
 /** One origin's answer, mapped onto the shared vote vocabulary.
  *  NOTHING here decides the verdict — that is `statusVerdict`'s job alone. */
-async function probeStatus(origin: string, txId: string): Promise<StatusVote> {
+async function probeStatus(origin: string, txId: string, signal?: AbortSignal): Promise<StatusVote> {
   try {
     const response = await fetch(`${origin}/tx/${txId}/status`, {
       method: 'GET',
@@ -331,7 +332,7 @@ async function probeStatus(origin: string, txId: string): Promise<StatusVote> {
       // opinion of ONE host — and unanimity over the pool is exactly what
       // authorizes a paid redrop. A redirect is not an answer.
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
+      signal: requestSignal(10000, signal),
     });
     if (response.status === 202) return { origin, kind: 'pending' };
     if (response.status === 404) return { origin, kind: 'dead404' };
@@ -788,6 +789,9 @@ interface ArweaveEdge {
   node: {
     id: string;
     tags: { name: string; value: string }[];
+    /** The index's own, UNSIGNED block height — null while unmined or not yet
+     *  indexed. Orders candidates in multi-source mode and does nothing else. */
+    height: number | null;
   };
 }
 
@@ -802,6 +806,7 @@ function requestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
 }
 
 async function fetchPage(
+  indexUrl: string,
   ownerHash: string,
   after: string | null,
   signal?: AbortSignal
@@ -830,7 +835,7 @@ async function fetchPage(
     ) {
       edges {
         cursor
-        node { id, tags { name, value } }
+        node { id, tags { name, value }, block { height } }
       }
       pageInfo { hasNextPage }
     }
@@ -843,11 +848,9 @@ async function fetchPage(
     after: after,
   };
 
-  // The index endpoint is configuration now (INDEX_SOURCES, D8). PR-3a still
-  // queries ONE index — the union across logical sources is PR-4 — so this is
-  // the first URL of the first source, which defaults to arweave.net/graphql
-  // and keeps the single-index edge order byte-identical.
-  const response = await fetch(INDEX_QUERY_URL, {
+  // The endpoint is one TRANSPORT of one logical source (INDEX_SOURCES, D8);
+  // which one is the walker's decision (sweepSource), not this function's.
+  const response = await fetch(indexUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
@@ -888,7 +891,16 @@ function parseGraphQLPage(text: string): { edges: ArweaveEdge[]; hasNextPage: bo
       const tg = tag as { name?: unknown; value?: unknown };
       if (typeof tg?.name !== 'string' || typeof tg.value !== 'string') return null;
     }
-    edges.push({ cursor: edge.cursor, node: { id: edge.node.id, tags: edge.node.tags as { name: string; value: string }[] } });
+    // `block` is nullable BY CONTRACT (unmined / not yet indexed) and absent on
+    // an index that predates the field; anything else must be a safe height.
+    const block = (edge.node as { block?: unknown }).block;
+    let height: number | null = null;
+    if (block !== undefined && block !== null) {
+      const h = (block as { height?: unknown }).height;
+      if (!isSafeCount(h)) return null;
+      height = h;
+    }
+    edges.push({ cursor: edge.cursor, node: { id: edge.node.id, tags: edge.node.tags as { name: string; value: string }[], height } });
   }
   return { edges, hasNextPage: t.pageInfo.hasNextPage };
 }
@@ -948,6 +960,27 @@ export interface FetchAllNotesResult {
    *  the gap is recorded rather than papered over with a client beacon. Absent
    *  when nothing failed. */
   gatewayMismatches?: Readonly<Record<string, number>>;
+  /** What the index walk saw (PR-4). LOCAL DIAGNOSTIC ONLY, like the field
+   *  above — D5 keeps telemetry server-side, so the plan's
+   *  `index_presence_disagreement` / `index_metadata_conflict` metrics exist
+   *  here as counts the caller may log, never as a beacon. */
+  indexDiagnostics?: IndexSweepDiagnostics;
+}
+
+export interface IndexSweepDiagnostics {
+  /** One entry per logical source of `INDEX_SOURCES`, in order. `transport` is
+   *  the URL that produced the edges kept (null when nothing was read). */
+  sources: readonly { complete: boolean; transport: string | null }[];
+  /** txIds returned by one COMPLETE source and omitted by another (D11). */
+  presenceDisagreements: number;
+  /** txIds whose signed-field metadata differed between sources. */
+  metadataConflicts: number;
+  /** How many disagreements were checked against the status quorum, how many
+   *  proved older than any honest lag (each of those set `incomplete`), and
+   *  whether the per-sweep probe budget cut the check short. */
+  presenceProbes: number;
+  presenceAgeProven: number;
+  presenceBudgetExhausted: boolean;
 }
 
 /** How many note payloads are fetched+decrypted concurrently during restore.
@@ -1113,6 +1146,108 @@ function createPayloadPool(ownerAddresses: readonly string[]) {
 }
 
 /**
+ * Walk ONE logical index source through its transports.
+ *
+ * Pages are read sequentially from the primary URL. If the primary fails
+ * (a page could not be fetched — not an abort, not a bound), the walk is
+ * RESTARTED from the first page on the next transport: the `after` cursor is
+ * opaque and not portable between transports, so the PAGINATION of two
+ * transports is never mixed. Two things are kept apart on purpose (review
+ * 24.09, high): the CANDIDATES and the PROOF OF COMPLETENESS. Every txId any
+ * transport returned stays in the source's edge set — a txId is never
+ * un-found, each candidate still passes D9 + decrypt, so keeping it can only
+ * add safety — while `complete` is claimed only when ONE transport was read
+ * to its end. A transport that hit a walk bound (pages, candidates, deadline)
+ * is NOT restarted elsewhere: the fallback would walk the same index into the
+ * same bound and only spend the deadline.
+ *
+ * `firstPageFailed` = no transport of this source ever answered its first
+ * page (the input to ArweaveIndexUnavailableError, decided across sources).
+ */
+async function sweepSource(
+  source: number,
+  urls: readonly string[],
+  ownerHash: string,
+  signal: AbortSignal | undefined,
+  deadlineAt: number,
+): Promise<SourceSweep & { firstPageFailed: boolean; transport: string | null; merged: boolean }> {
+  let anyFirstPage = false;
+  // Union of everything any transport returned for this source, keyed by txId.
+  const found = new Map<string, IndexEdge>();
+  let lastTransport: string | null = null;
+  let transportsThatFound = 0;
+  for (const url of urls) {
+    if (signal?.aborted) break;
+    const edges: IndexEdge[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    let outcome: 'complete' | 'failed' | 'bounded';
+    while (true) {
+      // Every bound ends the walk as INCOMPLETE rather than looping: a partial
+      // sweep is a state the UI already explains; a hung one is not.
+      if (pages >= INDEX_MAX_PAGES || edges.length >= INDEX_MAX_CANDIDATES || Date.now() > deadlineAt) {
+        outcome = 'bounded';
+        break;
+      }
+      let page: { edges: ArweaveEdge[]; hasNextPage: boolean };
+      try {
+        page = await fetchPage(url, ownerHash, cursor, signal);
+      } catch {
+        outcome = 'failed';
+        break;
+      }
+      if (cursor === null) { anyFirstPage = true; lastTransport = url; }
+      for (const edge of page.edges) {
+        const noteIdTag = edge.node.tags.find(t => t.name === 'Note-Id');
+        const appNameTag = edge.node.tags.find(t => t.name === 'App-Name');
+        const versionTag = edge.node.tags.find(t => t.name === 'App-Version');
+        // Skip: wrong app, missing noteId, incompatible version. Duplicates by
+        // Note-Id are NOT dropped here — the id is CLAIMED only after a
+        // successful decrypt (truth after decryption), so a replay/garbage
+        // candidate can't shadow the real note; the sentinel rule is applied
+        // by the caller over the ORDERED union.
+        if (!appNameTag || appNameTag.value !== APP_NAME) continue;
+        if (!versionTag || !SUPPORTED_VERSIONS.has(versionTag.value)) continue;
+        if (!noteIdTag) continue;
+        const candidate: IndexEdge = { txId: edge.node.id, noteId: noteIdTag.value, version: versionTag.value, height: edge.node.height };
+        edges.push(candidate);
+        if (!found.has(candidate.txId)) found.set(candidate.txId, candidate);
+      }
+      if (page.edges.length === 0 || !page.hasNextPage) { outcome = 'complete'; break; }
+      pages++;
+      const next = page.edges[page.edges.length - 1].cursor;
+      // An index that hands back the cursor it was given would page forever.
+      if (next === cursor) { outcome = 'bounded'; break; }
+      cursor = next;
+    }
+    if (edges.length > 0) transportsThatFound++;
+    if (outcome === 'complete') {
+      // The completing transport's pages come first (its own HEIGHT_DESC
+      // order, byte-identical in single-transport mode); anything a failed
+      // transport found that this one did not list is appended — still a
+      // candidate, still verified (D9), just without a position claim.
+      const ordered = [...edges];
+      const listed = new Set(edges.map(e => e.txId));
+      for (const [txId, edge] of found) if (!listed.has(txId)) ordered.push(edge);
+      // Appended finds make this list no single HEIGHT_DESC stream: say so, and
+      // the union applies its total order before any sentinel decision
+      // (review 24.09 #2: an appended NEWER candidate must not sit below a
+      // sentinel of the same Note-Id and be dropped before D9).
+      return { source, complete: true, edges: ordered, firstPageFailed: false, transport: url, merged: ordered.length !== edges.length };
+    }
+    if (outcome === 'bounded') break;
+  }
+  return {
+    source,
+    complete: false,
+    edges: [...found.values()],
+    firstPageFailed: !anyFirstPage,
+    transport: lastTransport,
+    merged: transportsThatFound > 1,
+  };
+}
+
+/**
  * Fetch all encrypted notes from Arweave for a given owner hash.
  * Pagination is sequential (cursors), payload download + decryption runs in a
  * bounded-parallel pool. Deduplicated by Note-Id, version-gated.
@@ -1133,78 +1268,88 @@ export async function fetchAllNotes(
 
   let incomplete = false;
 
-  // Phase 1: sequential cursor pagination — collect candidate TXs.
+  // Phase 1: walk EVERY logical index source (in parallel; pages within one
+  // transport sequential), union the candidates, order them, then apply the
+  // sentinel rules — in that order, because the two sentinel optimizations
+  // (drop below a known txId, claim by position) presume ONE height-ordered
+  // stream, which a union of indexes does not have until it is sorted.
+  const indexDeadline = Date.now() + INDEX_DEADLINE_MS;
+  const sweeps = await Promise.all(
+    INDEX_SOURCES.map((urls, i) => sweepSource(i, urls, ownerHash, signal, indexDeadline)),
+  );
+  // FIRST page failed at EVERY transport of EVERY source + the caller still
+  // wants the answer → the index is simply unreachable and NOTHING was
+  // collected. Hard failure, not «partial»; the abort check keeps a lock/reset
+  // on the old silent path (see ArweaveIndexUnavailableError).
+  if (sweeps.every(s => s.firstPageFailed) && !signal?.aborted) throw new ArweaveIndexUnavailableError();
+  // Strict completeness by LOGICAL source: every source read to its end through
+  // some transport of its own. A failed fallback beside a complete primary (or
+  // the reverse) costs nothing — a fallback cannot lower availability.
+  if (sweeps.some(s => !s.complete)) incomplete = true;
+
+  const union = unionSweeps(sweeps);
+
   const candidates: RestoreCandidate[] = [];
   // Note-Ids already claimed by a collected sentinel. Anything with the same id
-  // BELOW a sentinel (pages arrive HEIGHT_DESC) would lose the phase-3 claim to
-  // it with certainty — the sentinel is known-good — so it is dropped here and
-  // never fetched. Ids above a sentinel are unaffected: they are collected
-  // before the sentinel is seen.
+  // BELOW a sentinel (the ordered stream is height-descending) would lose the
+  // phase-3 claim to it with certainty — the sentinel is known-good — so it is
+  // dropped here and never fetched. Ids above a sentinel are unaffected: they
+  // are collected before the sentinel is seen. In single-source mode this is
+  // the index's own edge order, byte-identical to the pre-union walk.
   const sentinelIds = new Set<string>();
-  let cursor: string | null = null;
-  let pages = 0;
-  const indexDeadline = Date.now() + INDEX_DEADLINE_MS;
-  while (true) {
-    // Every bound below ends the walk as INCOMPLETE rather than looping: a
-    // partial sweep is a state the UI already explains; a hung one is not.
-    if (pages >= INDEX_MAX_PAGES || candidates.length >= INDEX_MAX_CANDIDATES || Date.now() > indexDeadline) {
-      incomplete = true;
-      break;
-    }
-    let edges: ArweaveEdge[];
-    let hasNextPage: boolean;
+  for (const c of union.ordered) {
+    // A candidate whose tag identity the sources disagreed about is neither
+    // dropped below a sentinel nor ever known: its Note-Id is not trusted, and
+    // the verified header (D9) will say what it is. More work, never less.
+    if (!c.metadataConflict && sentinelIds.has(c.noteId)) continue;
+    // A txId counts as known only when the whole identity lines up: the tag
+    // must repeat the sync record's noteId and the version class must match
+    // its kind. Anything else is treated as unknown and goes through the
+    // full fetch+decrypt pipeline (fail open towards MORE work, never less).
+    const knownRec = known?.get(c.txId);
+    const candidateKind: KnownTxRecord['kind'] = c.version === '4' ? 'safebox' : 'note';
+    const isKnown = !c.metadataConflict
+      && knownRec !== undefined
+      && knownRec.noteId === c.noteId
+      && knownRec.kind === candidateKind;
+    if (isKnown) sentinelIds.add(c.noteId);
+    candidates.push({ txId: c.txId, version: c.version, noteId: c.noteId, known: isKnown });
+  }
 
-    try {
-      const page = await fetchPage(ownerHash, cursor, signal);
-      edges = page.edges;
-      hasNextPage = page.hasNextPage;
-    } catch {
-      // FIRST page + the caller still wants the answer → the index is simply
-      // unreachable and NOTHING was collected. Hard failure, not «partial».
-      // `cursor === null` identifies the first iteration; the abort check keeps
-      // a lock/reset on the old silent path (see ArweaveIndexUnavailableError).
-      if (cursor === null && !signal?.aborted) throw new ArweaveIndexUnavailableError();
-      incomplete = true; // pagination failed — remaining pages unreachable
-      break;
-    }
-
-    if (edges.length === 0) break;
-
-    for (const edge of edges) {
-      const noteIdTag = edge.node.tags.find(t => t.name === 'Note-Id');
-      const appNameTag = edge.node.tags.find(t => t.name === 'App-Name');
-      const versionTag = edge.node.tags.find(t => t.name === 'App-Version');
-
-      // Skip: wrong app, missing noteId, incompatible version
-      if (!appNameTag || appNameTag.value !== APP_NAME) continue;
-      if (!versionTag || !SUPPORTED_VERSIONS.has(versionTag.value)) continue;
-      if (!noteIdTag) continue;
-      // NOTE: duplicates by Note-Id are NOT dropped here — the id is CLAIMED
-      // only after a successful decrypt (truth after decryption), so a
-      // replay/garbage candidate can't shadow the real note. The ONE exception
-      // is a candidate below a sentinel (see sentinelIds above): the sentinel
-      // already decrypted once through the full pipeline, so the claim outcome
-      // is certain and the fetch would be pure waste.
-      if (sentinelIds.has(noteIdTag.value)) continue;
-      // A txId counts as known only when the whole identity lines up: the tag
-      // must repeat the sync record's noteId and the version class must match
-      // its kind. Anything else is treated as unknown and goes through the
-      // full fetch+decrypt pipeline (fail open towards MORE work, never less).
-      const knownRec = known?.get(edge.node.id);
-      const candidateKind: KnownTxRecord['kind'] = versionTag.value === '4' ? 'safebox' : 'note';
-      const isKnown = knownRec !== undefined
-        && knownRec.noteId === noteIdTag.value
-        && knownRec.kind === candidateKind;
-      if (isKnown) sentinelIds.add(noteIdTag.value);
-      candidates.push({ txId: edge.node.id, version: versionTag.value, noteId: noteIdTag.value, known: isKnown });
-    }
-
-    if (!hasNextPage) break;
-    pages++;
-    const next = edges[edges.length - 1].cursor;
-    // An index that hands back the cursor it was given would page forever.
-    if (next === cursor) { incomplete = true; break; }
-    cursor = next;
+  // D11: a txId one COMPLETE source returned and another COMPLETE source
+  // omitted is a disagreement about PRESENCE. The union already kept it — the
+  // note is restored regardless — so the only question is whether the omission
+  // is honest lag or silence. That is decided by the STATUS quorum alone: the
+  // txId must be provably older than any lag, per >=2 independent operators.
+  // Nothing an index said in `block` takes part (v15 M2). The check runs under
+  // the sweep's deadline and abort signal, and under a per-sweep probe budget;
+  // whatever is not proven leaves the metric and never the flag.
+  const diagnostics: IndexSweepDiagnostics = {
+    sources: sweeps.map(s => ({ complete: s.complete, transport: s.transport })),
+    presenceDisagreements: union.presenceDisagreements.length,
+    metadataConflicts: union.metadataConflicts,
+    presenceProbes: 0,
+    presenceAgeProven: 0,
+    presenceBudgetExhausted: false,
+  };
+  if (union.presenceDisagreements.length > 0) {
+    const { probe, budgetExhausted } = selectPresenceProbes(union.presenceDisagreements);
+    diagnostics.presenceBudgetExhausted = budgetExhausted;
+    let nextProbe = 0;
+    const probeWorker = async () => {
+      while (true) {
+        if (signal?.aborted || Date.now() > indexDeadline) return;
+        const i = nextProbe++;
+        if (i >= probe.length) return;
+        const votes = await Promise.all(STATUS_GATEWAYS.map(origin => probeStatus(origin, probe[i], signal)));
+        diagnostics.presenceProbes++;
+        if (ageProvenByQuorum(votes, operatorOf)) {
+          diagnostics.presenceAgeProven++;
+          incomplete = true;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(RESTORE_CONCURRENCY, probe.length) }, probeWorker));
   }
 
   const pool = createPayloadPool(TRUSTED_OWNERS);
@@ -1315,7 +1460,17 @@ export async function fetchAllNotes(
   if (gatewayMismatches) {
     console.warn('arweave: payload verification failures by gateway', gatewayMismatches);
   }
-  return { notes: restored, safeboxEntries: restoredSafebox, incomplete, gatewayMismatches };
+  // Same discipline for the index walk (D11 metrics are local counts, D5).
+  if (diagnostics.presenceDisagreements > 0 || diagnostics.metadataConflicts > 0) {
+    console.warn('arweave: index sources disagreed', {
+      presenceDisagreements: diagnostics.presenceDisagreements,
+      metadataConflicts: diagnostics.metadataConflicts,
+      presenceProbes: diagnostics.presenceProbes,
+      presenceAgeProven: diagnostics.presenceAgeProven,
+      presenceBudgetExhausted: diagnostics.presenceBudgetExhausted,
+    });
+  }
+  return { notes: restored, safeboxEntries: restoredSafebox, incomplete, gatewayMismatches, indexDiagnostics: diagnostics };
 }
 
 function isSafeboxResult(r: RestoredNote | RestoredSafeboxEntry): r is RestoredSafeboxEntry {
