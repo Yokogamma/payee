@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { useNotes, VaultMismatchError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
@@ -33,7 +33,12 @@ export function Onboarding() {
    *  (`window is not defined`) and failed the whole root run. Same fix as
    *  Main's toast timers. */
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
+  // A LAYOUT effect, not a passive one: its cleanup runs in the same commit
+  // that removes the DOM. A passive cleanup lands in a later scheduler task
+  // when the unmount comes from a non-sync lane (a screen switch out of a
+  // resolved promise), and a clipboard write settling in that gap would still
+  // see «mounted». Same choice as Main.
+  useLayoutEffect(() => {
     // The ref OBJECTS are copied, not their values: the cleanup wants the live
     // timer id, not a snapshot from mount time.
     const mounted = mountedRef;

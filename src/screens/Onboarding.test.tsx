@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { useState } from 'react';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
 
 // Seed-copy honesty (round-11 MEDIUM): «✓ Скопировано» must appear ONLY after
@@ -87,6 +88,7 @@ describe('Onboarding — seed copy honesty', () => {
     // Faked only AFTER the seed is on screen: revealSeed() waits via findBy*,
     // whose polling runs on the very setTimeout the fake clock would swallow.
     const fakeTimers = () => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const nextTask = () => new Promise<void>(res => setImmediate(res));
     afterEach(() => { vi.useRealTimers(); });
 
     it('hides the toast after 2 s', async () => {
@@ -153,6 +155,51 @@ describe('Onboarding — seed copy honesty', () => {
       await act(async () => { release(); });
       expect(vi.getTimerCount()).toBe(before);
       expect(() => vi.runAllTimers()).not.toThrow();
+    });
+
+    // Review of #220 (medium): the mounted flag must flip in the SAME commit
+    // that removes the DOM. A passive-effect cleanup runs in a later scheduler
+    // task when the unmount comes from a non-sync lane (a screen switch out of
+    // a resolved promise is exactly that), so a clipboard write settling in
+    // that gap would still see «mounted», setState into a dead tree and arm a
+    // timer. Reproduced outside act(): act would flush the effects itself.
+    it('a write that settles between DOM removal and the effect flush arms no timer', async () => {
+      let release!: () => void;
+      stubClipboard(vi.fn(() => new Promise<void>(res => { release = res; })));
+      let hide!: () => void;
+      function Host() {
+        const [show, setShow] = useState(true);
+        hide = () => setShow(false);
+        return show ? <Onboarding /> : null;
+      }
+      render(<Host />);
+      fireEvent.click(screen.getByText('Создать хранилище'));
+      fireEvent.click(await screen.findByText('Нажмите, чтобы показать фразу'));
+      await screen.findByText('alpha');
+      fakeTimers();
+      const before = vi.getTimerCount();
+      fireEvent.click(screen.getByText('Копировать')); // write pending
+
+      const g = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+      const actEnv = g.IS_REACT_ACT_ENVIRONMENT;
+      g.IS_REACT_ACT_ENVIRONMENT = false;
+      try {
+        hide(); // DefaultLane update outside any event → passive effects deferred
+        // React 19 picks the root up in a microtask and renders in a Scheduler
+        // task (setImmediate here, not faked) — so the commit lands on the
+        // SECOND task, not the first.
+        await nextTask();
+        await nextTask();
+        expect(screen.queryByText('Копировать')).toBeNull(); // DOM is gone…
+        release(); // …and the write settles before the effect flush
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+        expect(vi.getTimerCount()).toBe(before);
+        await nextTask(); // let the deferred effect flush run
+        expect(vi.getTimerCount()).toBe(before);
+        expect(() => vi.runAllTimers()).not.toThrow();
+      } finally {
+        g.IS_REACT_ACT_ENVIRONMENT = actEnv;
+      }
     });
   });
 });
