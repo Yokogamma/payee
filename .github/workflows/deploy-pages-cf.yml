@@ -117,7 +117,9 @@ jobs:
       # Both halves authenticate the SAME on-chain history, so their trusted
       # owner sets must agree — and both must contain every wallet the project
       # has ever posted under (scripts/owner-pins.mjs). A narrowed set does not
-      # fail loudly: it makes healthy old publications unverifiable.
+      # fail loudly: it makes healthy old publications unverifiable. Staging's
+      # own wallet (STAGING_ONLY_OWNERS) is set aside for the comparison and
+      # refused anywhere in the client — it never ships to users.
       - run: node scripts/check-trusted-owners.mjs
         env:
           VITE_TRUSTED_OWNERS: ${{ vars.VITE_TRUSTED_OWNERS }}

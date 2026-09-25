@@ -71,3 +71,24 @@ export const NEVER_REMOVE = Object.freeze([
 
 /** Canonical CSV spelling, for messages and for the wrangler.toml pin. */
 export const HISTORICAL_OWNERS_CSV = HISTORICAL_OWNERS.join(',');
+
+/**
+ * Wallets the STAGING worker — and nothing else — may trust IN ADDITION to the
+ * production set: a separate staging wallet (worker/wrangler.toml, staging
+ * prerequisite 2(b)). Empty while staging shares the dev wallet.
+ *
+ * Deliberately NOT part of `HISTORICAL_OWNERS`: that registry is what the
+ * CLIENT must contain, and a test wallet in the shipped client's
+ * `VITE_TRUSTED_OWNERS` would make restore accept publications signed by a key
+ * that lives in a second worker's secrets. `scripts/check-trusted-owners.mjs`
+ * therefore holds three rules at once:
+ *
+ *   - production `TRUSTED_OWNERS` equals the client's set (the dev contour and
+ *     the client authenticate the same history);
+ *   - both tables contain every `HISTORICAL_OWNERS` entry;
+ *   - staging may add ONLY addresses listed here, and none of them may appear
+ *     in production, in the client or in the historical registry.
+ *
+ * Adding one is a reviewed pull request, together with the staging table.
+ */
+export const STAGING_ONLY_OWNERS = Object.freeze([]);

@@ -27,6 +27,14 @@
  *  3. CLIENT/WORKER AGREEMENT — the two halves must trust the same set. Both
  *     verify the same on-chain history, and a divergence means one half
  *     accepts what the other refuses.
+ *  4. CONTOUR SEPARATION — staging may run on its OWN wallet (runbook P11)
+ *     without that test wallet reaching the shipped client. So agreement is
+ *     per contour: production must EQUAL the client; staging must equal the
+ *     client once its own wallets (`STAGING_ONLY_OWNERS`, pinned in
+ *     owner-pins.mjs) are set aside, and may add nothing else. A staging-only
+ *     wallet in production, in the client or in the historical registry is
+ *     refused outright — adding it there «to make the gate pass» is exactly
+ *     the move this rule exists to stop.
  *
  * Containment, never equality: after a rotation the deployed sets legitimately
  * carry addresses the registry has not caught up with yet, and demanding
@@ -42,7 +50,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseTrustedOwners } from './trusted-owners-parse.mjs';
 import { readTomlString } from './toml-scan.mjs';
-import { HISTORICAL_OWNERS, NEVER_REMOVE, HISTORICAL_OWNERS_CSV } from './owner-pins.mjs';
+import { HISTORICAL_OWNERS, NEVER_REMOVE, HISTORICAL_OWNERS_CSV, STAGING_ONLY_OWNERS } from './owner-pins.mjs';
 import { candidateLacksVar } from './historical-candidates.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -75,9 +83,17 @@ function missingFrom(have, required) {
  * Returns `{ ok, problems }`. Owner addresses are PUBLIC — they are on chain
  * and compiled into the client bundle — so naming them in a message leaks
  * nothing and is what makes a refusal diagnosable.
+ *
+ * `stagingOnly` defaults to the pin and exists so tests can exercise a
+ * provisioned staging wallet before one is pinned.
  */
-export function checkTrustedOwners(clientCsv, toml, { repoOnly = false, candidate = null } = {}) {
+export function checkTrustedOwners(
+  clientCsv,
+  toml,
+  { repoOnly = false, candidate = null, stagingOnly = STAGING_ONLY_OWNERS } = {},
+) {
   const problems = [];
+  const stagingOnlySet = new Set(stagingOnly);
 
   // ── 1. The registry itself ──
   const registryGaps = missingFrom(HISTORICAL_OWNERS, NEVER_REMOVE);
@@ -90,6 +106,14 @@ export function checkTrustedOwners(clientCsv, toml, { repoOnly = false, candidat
   }
   if (HISTORICAL_OWNERS.length === 0) {
     problems.push('owner-pins.mjs: HISTORICAL_OWNERS is empty — D9 would have nothing to check against');
+  }
+  const registeredStaging = HISTORICAL_OWNERS.filter((a) => stagingOnlySet.has(a));
+  if (registeredStaging.length > 0) {
+    problems.push(
+      `owner-pins.mjs: ${registeredStaging.join(', ')} is both a staging-only wallet and a HISTORICAL ` +
+        'owner. The registry is what the shipped client must contain, so this would force the ' +
+        'staging wallet into restore. A staging wallet belongs in STAGING_ONLY_OWNERS alone.',
+    );
   }
 
   // ── 2. Worker coverage, per block ──
@@ -140,6 +164,38 @@ export function checkTrustedOwners(clientCsv, toml, { repoOnly = false, candidat
     workerSets.set(label, owners);
   }
 
+  // ── 2b. Contour separation (question 4 above) — both modes: every side of
+  // it is in the repository, so CI refuses it before any deploy does ──
+  const production = workerSets.get('production');
+  const staging = workerSets.get('staging');
+  if (production) {
+    const leaked = production.filter((a) => stagingOnlySet.has(a));
+    if (leaked.length > 0) {
+      problems.push(
+        `production: TRUSTED_OWNERS contains the staging-only wallet ${leaked.join(', ')}. The dev ` +
+          'contour must equal the shipped client, so this would put a test wallet into restore.',
+      );
+    }
+  }
+  if (production && staging) {
+    const prodSet = new Set(production);
+    const stagingSet = new Set(staging);
+    const unpinned = staging.filter((a) => !prodSet.has(a) && !stagingOnlySet.has(a));
+    if (unpinned.length > 0) {
+      problems.push(
+        `staging: TRUSTED_OWNERS adds ${unpinned.join(', ')} beyond the production set. Staging may ` +
+          'add only its own wallet, pinned in STAGING_ONLY_OWNERS (scripts/owner-pins.mjs).',
+      );
+    }
+    const dropped = production.filter((a) => !stagingSet.has(a));
+    if (dropped.length > 0) {
+      problems.push(
+        `staging: TRUSTED_OWNERS lacks ${dropped.join(', ')}, which production trusts. Staging is the ` +
+          'production set plus, at most, its own wallet.',
+      );
+    }
+  }
+
   // ── 3. Client/worker agreement ──
   if (!repoOnly) {
     let client;
@@ -160,14 +216,25 @@ export function checkTrustedOwners(clientCsv, toml, { repoOnly = false, candidat
           `(${HISTORICAL_OWNERS_CSV}) — notes posted under those wallets would not restore.`,
       );
     }
+    const clientStaging = client.filter((a) => stagingOnlySet.has(a));
+    if (clientStaging.length > 0) {
+      problems.push(
+        `VITE_TRUSTED_OWNERS contains the staging-only wallet ${clientStaging.join(', ')} — the ` +
+          'shipped client must never trust the staging wallet.',
+      );
+    }
+    const sortedClient = [...new Set(client)].sort().join(',');
     for (const [label, owners] of workerSets) {
-      const sortedWorker = [...owners].sort().join(',');
-      const sortedClient = [...client].sort().join(',');
+      // Staging is compared with its own wallets set aside (rule 4); what
+      // remains must be exactly the client's set, like production.
+      const compared = label === 'staging' ? owners.filter((a) => !stagingOnlySet.has(a)) : owners;
+      const sortedWorker = [...new Set(compared)].sort().join(',');
       if (sortedWorker !== sortedClient) {
         problems.push(
-          `${label}: worker and client trusted-owner sets differ (worker: ${sortedWorker}; ` +
-            `client: ${sortedClient}). Both halves authenticate the SAME on-chain history, ` +
-            'so a divergence means one accepts a publication the other refuses.',
+          `${label}: worker and client trusted-owner sets differ (worker` +
+            `${label === 'staging' && compared.length !== owners.length ? ' without its staging-only wallet' : ''}: ` +
+            `${sortedWorker}; client: ${sortedClient}). Both halves authenticate the SAME on-chain ` +
+            'history, so a divergence means one accepts a publication the other refuses.',
         );
       }
     }

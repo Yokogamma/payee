@@ -240,8 +240,11 @@ binding = "CF_VERSION_METADATA"
 #          isolates the AR balance from the soak budget and keeps one key out
 #          of two workers' secrets. It is NOT ruled out by anything here; it
 #          simply costs an extra step — its address MUST be added to
-#          `env.staging.TRUSTED_OWNERS` below, or staging refuses every upload
-#          — plus real AR to fund it.
+#          `env.staging.TRUSTED_OWNERS` below, or staging refuses every upload,
+#          AND to `STAGING_ONLY_OWNERS` in scripts/owner-pins.mjs in the same
+#          PR — never to HISTORICAL_OWNERS, the production [vars] table or
+#          VITE_TRUSTED_OWNERS (check-trusted-owners.mjs refuses each) —
+#          plus real AR to fund it.
 #
 #      The trade-off, stated rather than hidden: (a) shares a key and a balance
 #      across contours; (b) buys isolation for funding and an edit. Revisit
@@ -327,7 +330,9 @@ MAX_TX_REWARD_WINSTON = "15000000000"
 # Source of truth for what it must CONTAIN is scripts/owner-pins.mjs; the
 # deploy gate (scripts/check-trusted-owners.mjs) refuses a set that drops any
 # of it, and refuses a set that disagrees with the client's
-# VITE_TRUSTED_OWNERS. Empty or malformed = /upload answers 503 (fail-closed).
+# VITE_TRUSTED_OWNERS once staging's own wallet is set aside: this table is the
+# production set plus, at most, the wallet(s) pinned in STAGING_ONLY_OWNERS —
+# nothing else. Empty or malformed = /upload answers 503 (fail-closed).
 #
 # Rotation order, and it is not symmetric: add the new address HERE and to the
 # client FIRST, deploy both, and only THEN switch ARWEAVE_JWK. The worker

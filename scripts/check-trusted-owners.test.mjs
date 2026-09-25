@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkTrustedOwners, readWorkerOwners } from './check-trusted-owners.mjs';
-import { HISTORICAL_OWNERS, NEVER_REMOVE, HISTORICAL_OWNERS_CSV } from './owner-pins.mjs';
+import { HISTORICAL_OWNERS, NEVER_REMOVE, HISTORICAL_OWNERS_CSV, STAGING_ONLY_OWNERS } from './owner-pins.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -133,6 +133,88 @@ describe('client/worker agreement (deploy mode)', () => {
     // itself would prove nothing.
     expect(checkTrustedOwners(undefined, toml(), { repoOnly: true }).ok).toBe(true);
     expect(checkTrustedOwners(undefined, toml()).ok).toBe(false);
+  });
+});
+
+/**
+ * A separate staging wallet (runbook P11, review 25.09 H1). Before this rule
+ * the Pages gate compared BOTH worker tables with the shipped client, so the
+ * only way to give staging its own wallet was to put that test wallet into
+ * the production client too. Three rules now hold together: production equals
+ * the client; both tables keep the historical owners; staging adds only its
+ * pinned own wallet.
+ */
+describe('contour separation — staging on its own wallet', () => {
+  const S = 'SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'; // the staging wallet
+  const pinned = { stagingOnly: [S] };
+
+  it('the Pages gate passes: staging trusts its wallet, the shipped client does not', () => {
+    const cfg = toml({ prod: A, staging: `${A},${S}` });
+    expect(checkTrustedOwners(A, cfg, pinned)).toEqual({ ok: true, problems: [], skippedWorkerCoverage: false });
+    expect(checkTrustedOwners(undefined, cfg, { ...pinned, repoOnly: true }).ok).toBe(true);
+  });
+
+  it('the same staging table is refused while the wallet is NOT pinned', () => {
+    const cfg = toml({ prod: A, staging: `${A},${S}` });
+    for (const opts of [{}, { repoOnly: true }]) {
+      const verdict = checkTrustedOwners(A, cfg, { ...opts, stagingOnly: [] });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.problems.join('\n')).toMatch(/staging: TRUSTED_OWNERS adds S+ beyond the production set/);
+    }
+  });
+
+  it('refuses the staging wallet in the shipped client — the move the old gate forced', () => {
+    const verdict = checkTrustedOwners(`${A},${S}`, toml({ prod: `${A},${S}`, staging: `${A},${S}` }), pinned);
+    expect(verdict.ok).toBe(false);
+    const text = verdict.problems.join('\n');
+    expect(text).toMatch(/VITE_TRUSTED_OWNERS contains the staging-only wallet S+/);
+    expect(text).toMatch(/production: TRUSTED_OWNERS contains the staging-only wallet S+/);
+  });
+
+  it('refuses the staging wallet in production even in repo-only mode (CI, worker deploy)', () => {
+    const verdict = checkTrustedOwners(undefined, toml({ prod: `${A},${S}`, staging: `${A},${S}` }), { ...pinned, repoOnly: true });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('\n')).toMatch(/production: TRUSTED_OWNERS contains the staging-only wallet/);
+  });
+
+  it('refuses a staging wallet that is also a HISTORICAL owner — it would be forced into the client', () => {
+    const verdict = checkTrustedOwners(A, toml(), { stagingOnly: [A] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('\n')).toMatch(/is both a staging-only wallet and a HISTORICAL owner/);
+  });
+
+  it('removing a historical owner is still refused — from staging, production or the client', () => {
+    const fromStaging = checkTrustedOwners(A, toml({ prod: A, staging: S }), pinned);
+    expect(fromStaging.ok).toBe(false);
+    expect(fromStaging.problems.join('\n')).toMatch(/staging: worker TRUSTED_OWNERS is missing/);
+
+    const fromProduction = checkTrustedOwners(A, toml({ prod: C, staging: `${A},${S}` }), pinned);
+    expect(fromProduction.ok).toBe(false);
+    expect(fromProduction.problems.join('\n')).toMatch(/production: worker TRUSTED_OWNERS is missing/);
+
+    const fromClient = checkTrustedOwners(B, toml({ prod: A, staging: `${A},${S}` }), pinned);
+    expect(fromClient.ok).toBe(false);
+    expect(fromClient.problems.join('\n')).toMatch(/VITE_TRUSTED_OWNERS is missing/);
+  });
+
+  it('dev diverging from the client is still refused, with or without a staging wallet', () => {
+    const verdict = checkTrustedOwners(A, toml({ prod: `${A},${B}`, staging: `${A},${B},${S}` }), pinned);
+    expect(verdict.ok).toBe(false);
+    const text = verdict.problems.join('\n');
+    expect(text).toMatch(/production: worker and client trusted-owner sets differ/);
+    expect(text).toMatch(/staging: worker and client trusted-owner sets differ \(worker without its staging-only wallet/);
+  });
+
+  it('refuses staging that drops an owner production trusts — staging is production PLUS its wallet', () => {
+    const verdict = checkTrustedOwners(undefined, toml({ prod: `${A},${B}`, staging: `${A},${S}` }), { ...pinned, repoOnly: true });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.problems.join('\n')).toMatch(/staging: TRUSTED_OWNERS lacks B+, which production trusts/);
+  });
+
+  it('the pinned STAGING_ONLY_OWNERS is well-formed, de-duplicated and disjoint from the registry', () => {
+    for (const owner of STAGING_ONLY_OWNERS) expect(owner).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(new Set(STAGING_ONLY_OWNERS).size).toBe(STAGING_ONLY_OWNERS.length);
+    for (const owner of STAGING_ONLY_OWNERS) expect(HISTORICAL_OWNERS).not.toContain(owner);
   });
 });
 
