@@ -23,6 +23,7 @@ import { parseOriginList } from '../../src/lib/gateways-parse';
 import { ARWEAVE_HOST } from './arweave-transport';
 import { readWalletBalance } from './gateway-reads';
 import type { Emit } from './metrics';
+import { operatorOfEnv, type OperatorOf } from './operators';
 import { spendLimitsWire } from './spend-admin';
 import { BALANCE_CACHE_TTL_MS, MIN_BALANCE_SOURCES, SPEND_CODES, type SpendLimits } from './spend-ledger';
 
@@ -173,11 +174,22 @@ export type SettleByTxResult = 'settled' | 'noop' | 'unknown' | 'terminal_refusa
 export async function settleByTx(
   guard: DurableObjectStub,
   args: { txId: string; outcome: 'spent' | 'released'; height?: number },
+  emit?: Emit,
 ): Promise<SettleByTxResult> {
   const r = await guardPost(guard, '/settle-by-tx', { txId: args.txId, outcome: args.outcome, ...(args.height !== undefined ? { height: args.height } : {}) });
   if ('unavailable' in r) return 'retry';
   if (r.status === 404) return 'unknown';
-  if (isOk(r)) return bodyOf(r).noop === true ? 'noop' : 'settled';
+  if (isOk(r)) {
+    // «Money left after all» (§7, `released → spent`): the lattice booked a
+    // spend for a reservation that had been released — a late landing. The
+    // DO audits it; this is the OBSERVABLE counter the soak's strict zero
+    // reads (`spend_conflict`, spec §11.9; runbook review 25.09 M2).
+    if (bodyOf(r).conflict === true) {
+      console.error('SPEND_CONFLICT', args.txId, args.outcome);
+      emit?.('spend_conflict', [args.outcome], []);
+    }
+    return bodyOf(r).noop === true ? 'noop' : 'settled';
+  }
   if (r.body.code === SPEND_CODES.sendInFlight) return 'in_flight';
   if (r.status === 409 || r.status === 400) { console.error('SPEND_SETTLE_BY_TX_REFUSED', args.txId, args.outcome, why(r)); return 'terminal_refusal'; }
   console.error('SPEND_SETTLE_BY_TX_RETRY', args.txId, args.outcome, why(r));
@@ -209,23 +221,24 @@ export type BalanceRefresh = 'cached' | 'refreshed' | 'inert' | 'unavailable';
  * balance NEVER raises `available`; it can only stop `prepare`.
  */
 export async function refreshBalanceIfStale(
-  env: { STATUS_GATEWAYS?: string },
+  env: { STATUS_GATEWAYS?: string; STATUS_OPERATORS?: string },
   guard: DurableObjectStub,
   address: string,
   emit: Emit,
-  opts: { now?: number; operatorOf?: (origin: string) => string } = {},
+  opts: { now?: number; operatorOf?: OperatorOf } = {},
 ): Promise<BalanceRefresh> {
   const now = opts.now ?? Date.now();
   const last = balanceReadAt.get(address);
   if (last !== undefined && now - last < BALANCE_CACHE_TTL_MS) return 'cached';
   const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
   const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
-  const operatorOf = opts.operatorOf ?? ((o: string) => o);
+  const operatorOf = opts.operatorOf ?? operatorOfEnv(env);
   const answers = await Promise.all(origins.map(async origin => ({ origin, value: await readWalletBalance(origin, address, emit) })));
   const byOperator = new Map<string, bigint>();
   for (const { origin, value } of answers) {
     if (value === null) continue;
     const op = operatorOf(origin);
+    if (op === null) continue; // no known operator, no voice (fail-closed)
     if (!byOperator.has(op)) byOperator.set(op, BigInt(value));
   }
   let observedMin: bigint | null = null;

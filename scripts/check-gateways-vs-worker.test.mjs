@@ -1,22 +1,31 @@
 import { describe, it, expect } from 'vitest';
-import { checkGateways, readWorkerStatusGateways } from './check-gateways-vs-worker.mjs';
-import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { checkGateways, checkOperatorMap, readWorkerStatusGateways, readWorkerStatusOperators } from './check-gateways-vs-worker.mjs';
+import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS, STATUS_OPERATORS } from './gateway-pins.mjs';
+import { parseOperatorMap } from './gateways-parse.mjs';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const toml = (
   prod = EXPECTED_STATUS_CSV,
   staging = EXPECTED_STATUS_CSV,
-  { payloadProd = EXPECTED_PAYLOAD_CSV, payloadStaging = EXPECTED_PAYLOAD_CSV } = {},
+  { payloadProd = EXPECTED_PAYLOAD_CSV, payloadStaging = EXPECTED_PAYLOAD_CSV, operatorsProd = STATUS_OPERATORS, operatorsStaging = STATUS_OPERATORS } = {},
 ) => `
 name = "eternal-notes-proxy"
 
 [vars]
 ALLOWED_ORIGINS = "https://notes.example"
 STATUS_GATEWAYS = "${prod}"
+STATUS_OPERATORS = "${operatorsProd}"
 PAYLOAD_GATEWAYS = "${payloadProd}"
 UPLOADS_ENABLED = "true"
 
 [[analytics_engine_datasets]]
 binding = "METRICS"
+
+[[durable_objects.bindings]]
+name = "SPEND_GUARD"
+class_name = "SpendGuard"
 
 [env.staging]
 name = "eternal-notes-proxy-staging"
@@ -24,6 +33,7 @@ name = "eternal-notes-proxy-staging"
 [env.staging.vars]
 ALLOWED_ORIGINS = "http://localhost:5173"
 STATUS_GATEWAYS = "${staging}"
+STATUS_OPERATORS = "${operatorsStaging}"
 PAYLOAD_GATEWAYS = "${payloadStaging}"
 UPLOADS_ENABLED = "true"
 `;
@@ -188,5 +198,57 @@ UPLOADS_ENABLED = "true"
     const r = checkGateways(EXPECTED_STATUS_CSV, toml(), { candidate: MODERN });
     expect(r.ok).toBe(true);
     expect(r.skippedPayloadPool).toBe(false);
+  });
+});
+
+describe('the operator map (D10/D11, reader release) — pinned, complete, and at least two operators', () => {
+  const pinMap = parseOperatorMap(STATUS_OPERATORS);
+  const origins = EXPECTED_STATUS_CSV.split(',');
+
+  it('passes when both blocks carry the pinned map', () => {
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [], skippedPayloadPool: false });
+  });
+
+  it('the worker built-in default equals the pin (operators.ts) — one map, three copies, one truth', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'worker', 'src', 'operators.ts'), 'utf8');
+    const m = /DEFAULT_STATUS_OPERATORS =\s*((?:'[^']*'\s*\+?\s*)+);/.exec(src);
+    expect(m).not.toBeNull();
+    const value = [...m[1].matchAll(/'([^']*)'/g)].map(x => x[1]).join('');
+    expect([...parseOperatorMap(value)]).toEqual([...pinMap]);
+  });
+
+  it('refuses a map that drifts from the pin, separately per block', () => {
+    const drift = STATUS_OPERATORS.replace('=arweave', '=someone-else');
+    const prod = checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { operatorsProd: drift }));
+    expect(prod.ok).toBe(false);
+    expect(prod.problems.some(p => p.startsWith('production:') && p.includes('does not match the repo-pinned operator map'))).toBe(true);
+    const staging = checkGateways(EXPECTED_STATUS_CSV, toml(undefined, undefined, { operatorsStaging: drift }));
+    expect(staging.problems.some(p => p.startsWith('staging:') && p.includes('operator map'))).toBe(true);
+  });
+
+  it('refuses a status origin the map leaves out — on the worker it would cast NO money vote', () => {
+    const missing = STATUS_OPERATORS.split(',').filter(e => !e.startsWith('https://permagate.io')).join(',');
+    const problems = checkOperatorMap(missing, origins);
+    expect(problems.some(p => p.includes('no operator for the status origin https://permagate.io'))).toBe(true);
+  });
+
+  it('refuses a pool that maps to ONE operator — no money quorum could ever form', () => {
+    const one = origins.map(o => `${o}=same`).join(',');
+    const problems = checkOperatorMap(one, origins);
+    expect(problems.some(p => p.includes('1 distinct operator'))).toBe(true);
+  });
+
+  it('refuses a missing or empty STATUS_OPERATORS when the config carries the spend guard', () => {
+    const noVar = toml().replace(/STATUS_OPERATORS = "[^"]*"\n/, '');
+    const r = checkGateways(EXPECTED_STATUS_CSV, noVar);
+    expect(r.ok).toBe(false);
+    expect(r.problems.some(p => p.includes('STATUS_OPERATORS'))).toBe(true);
+    expect(checkOperatorMap('', origins)).toEqual(['STATUS_OPERATORS is empty or fully unparseable']);
+  });
+
+  it('is vacuous for a config WITHOUT the spend guard (a pre-D10 build has no money quorum)', () => {
+    const noGuard = toml().replace(/\[\[durable_objects\.bindings\]\]\nname = "SPEND_GUARD"\nclass_name = "SpendGuard"\n/, '').replace(/STATUS_OPERATORS = "[^"]*"\n/g, '');
+    expect(readWorkerStatusOperators(noGuard).error).toBeDefined();
+    expect(checkGateways(EXPECTED_STATUS_CSV, noGuard).ok).toBe(true);
   });
 });

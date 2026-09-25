@@ -1858,6 +1858,22 @@ Reader-релиз этим не блокируется: он не создаёт
   (путь: dead → redrop, не resend); `leaseOpen` = `sending` ∧ ¬`anchorExpired`
   (запись с обоими полями ничего не удерживает), повторный `/anchor-expired`
   снимает и такой lease (`leaseCleared`), факт записывается один раз.
+- **Карта операторов на Worker (решение владельца 25.09 — обязательное
+  условие reader-релиза; ветка `arweave/pr3b-operator-map` поверх PR-6,
+  подготовка ДО мержа PR-4 #209, объединение и финальная проверка ПОСЛЕ):**
+  парсер `parseOperatorMap` и пин `STATUS_OPERATORS` взяты из PR-4
+  байт-в-байт (общие файлы `src/lib/gateways-parse.ts`,
+  `scripts/gateways-parse.mjs`, `scripts/gateway-pins.mjs`); Worker получает
+  var `STATUS_OPERATORS` (оба блока `wrangler.toml`), `worker/src/operators.ts`
+  (`operatorOfEnv`: unset → пиненный дефолт, неизвестный origin → `null`),
+  `moneyQuorum` и все денежные пути — списание (recheck `liveOf`, денежный
+  индекс, планировщик), депозит (`verifyDeposit`), маркер (`markerQuorum`),
+  закрытие множества, доказательство истечения анкера, детектор баланса —
+  считают ОПЕРАТОРОВ; origin без оператора не голосует (fail-closed). Гейт
+  `check-gateways-vs-worker.mjs`: карта = пин, каждый status-origin покрыт,
+  ≥ 2 различных операторов; применим только к конфигу с биндингом
+  `SpendGuard`. `/health.statusOperatorsCount`. Отрицательный тест на всех
+  путях: два origin одного оператора — не кворум.
 
 **Уточнения реализации PR-3b — закрытие множества унаследованных (2026-09-24,
 ветка `arweave/pr3b-legacy-closure`, draft, поверх планировщика):**
