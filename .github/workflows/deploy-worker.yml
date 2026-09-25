@@ -267,7 +267,11 @@ jobs:
         env:
           VITE_STATUS_GATEWAYS: ${{ vars.VITE_STATUS_GATEWAYS }}
           WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
-      - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
+      # --contour=dev: this job ships `[vars]` alone, so the candidate's staging
+      # table is not required to carry staging wallets pinned AFTER it was cut
+      # (a historical rollback would otherwise be refused for a table it does
+      # not deploy). Every other owner rule still applies to both tables.
+      - run: node scripts/check-trusted-owners.mjs --repo-only --contour=dev --config=candidate/worker/wrangler.toml
         env:
           WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
       # D10 spend-guard limits (PR-6), over the CANDIDATE's config: applicable
