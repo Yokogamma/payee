@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
 
 // Seed-copy honesty (round-11 MEDIUM): «✓ Скопировано» must appear ONLY after
 // the clipboard write actually resolved — a rejected write shows an error and
@@ -76,6 +76,84 @@ describe('Onboarding — seed copy honesty', () => {
     expect(await screen.findByText('Скопировано')).toBeTruthy();
     expect(writeText).toHaveBeenCalledWith(MNEMONIC);
     expect(screen.getByText(/мастер-ключ/)).toBeTruthy();
+  });
+
+  // The copied-toast lives on a 2 s timer. Left running past the test it can
+  // fire after jsdom is torn down — `window is not defined` inside a React
+  // state setter, an unhandled error that fails the whole root run (the same
+  // flake PR #217 closed for Main's toasts). Fake timers make both halves
+  // deterministic.
+  describe('copied-toast timer', () => {
+    // Faked only AFTER the seed is on screen: revealSeed() waits via findBy*,
+    // whose polling runs on the very setTimeout the fake clock would swallow.
+    const fakeTimers = () => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('hides the toast after 2 s', async () => {
+      stubClipboard(vi.fn(async () => {}));
+      await revealSeed();
+      fakeTimers();
+      // The clipboard write settles on the microtask queue, not a timer —
+      // an async act flushes it without touching the fake clock.
+      await act(async () => { fireEvent.click(screen.getByText('Копировать')); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+
+      act(() => { vi.advanceTimersByTime(1999); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(screen.queryByText('Скопировано')).toBeNull();
+      expect(screen.getByText('Копировать')).toBeTruthy();
+    });
+
+    it('a repeat copy restarts the 2 s window', async () => {
+      stubClipboard(vi.fn(async () => {}));
+      await revealSeed();
+      fakeTimers();
+      await act(async () => { fireEvent.click(screen.getByText('Копировать')); });
+      act(() => { vi.advanceTimersByTime(1500); });
+      // Baseline with the first toast timer still armed: the repeat copy must
+      // clear it and arm a fresh one — net zero, not a second timer.
+      const before = vi.getTimerCount();
+      await act(async () => { fireEvent.click(screen.getByText('Скопировано')); });
+      expect(vi.getTimerCount()).toBe(before);
+
+      act(() => { vi.advanceTimersByTime(1999); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(screen.queryByText('Скопировано')).toBeNull();
+    });
+
+    it('unmount before the timer fires clears it (no setState into a dead tree)', async () => {
+      stubClipboard(vi.fn(async () => {}));
+      await revealSeed();
+      fakeTimers();
+      // Baseline right before the copy click: jsdom arms a timer of its own on
+      // focus (Selection._associateRange), which is not ours — so no «zero».
+      const before = vi.getTimerCount();
+      await act(async () => { fireEvent.click(screen.getByText('Копировать')); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+      expect(vi.getTimerCount()).toBe(before + 1); // the toast timer is armed
+
+      cleanup(); // unmounts the tree rendered by revealSeed()
+      // The toast timer went with the screen — nothing of ours is left to
+      // fire after the environment is torn down.
+      expect(vi.getTimerCount()).toBe(before);
+      expect(() => vi.runAllTimers()).not.toThrow();
+    });
+
+    it('a clipboard write that settles after unmount arms no timer', async () => {
+      let release!: () => void;
+      stubClipboard(vi.fn(() => new Promise<void>(res => { release = res; })));
+      await revealSeed();
+      fakeTimers();
+      const before = vi.getTimerCount();
+      fireEvent.click(screen.getByText('Копировать'));
+      cleanup(); // the screen is gone while the write is still pending
+
+      await act(async () => { release(); });
+      expect(vi.getTimerCount()).toBe(before);
+      expect(() => vi.runAllTimers()).not.toThrow();
+    });
   });
 });
 
