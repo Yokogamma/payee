@@ -290,7 +290,7 @@ discriminator).
 | `legacy_resolved` | event, outcome (`spent` / `dropped`) | — | `/admin/spend/init` in `done`, one per held item resolved by the quorum |
 | `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
 
-| `spend_conflict` | event, outcome (`spent`) | — | `settleByTx` (recheck path, money index, scheduler) when the guard answered `conflict: true` — the lattice booked `released → spent` for a reservation that had been released (a late landing, §7). The soak's strict zero for money conflicts reads THIS counter (the DO's `audit:*` records have no read route); a `SPEND_CONFLICT` log line accompanies it |
+| `spend_conflict` | event, outcome (`spent`) | — | `settleByTx` (recheck path, money index, scheduler) when the guard answered `conflict: true` — the lattice booked `released → spent` for a reservation that had been released (a late landing, §7); a `SPEND_CONFLICT` log line accompanies it. **An alert, not the evidence:** the answer can be lost and a retry is a no-op (`conflict: false`), and Analytics Engine may drop or sample a write. The soak's strict zero reads the DURABLE counter the DO writes in the same transaction as the booking — `/admin/spend/status` → `guard.conflicts { count, lastAt, lastSpendKey, lastOutcome }` (review 25.09) |
 
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
 `ledger_inconsistent` and the remaining gauges — they come with the writer.
