@@ -1,7 +1,14 @@
 # План: устойчивость доступа к Arweave (multi-gateway, метрики, restore.html)
 
-Статус: **v20 — PR-3a реализован (2026-08-29); §4.PR-3a «Реализация»
-фиксирует решения, принятые в коде.** Предыдущая редакция —
+Статус: **v21 — состав reader-релиза PR-3b уточнён (2026-09-23, ревью
+спецификации D10): предохранитель D10 `SpendGuard` едет в reader-релизе
+ЦЕЛИКОМ — DO, биндинг, пределы и сага `prepare/activate/settle/remap` на
+recovery-пути, включая новую подпись фазы 2 `redrop_pending`; writer добавляет
+только создание новых recovery-записей. Причина: reader обязан возобновлять
+фазу 2 (ревью 7), а фаза 2 = трата — откат writer → reader не должен снимать
+предохранитель с автономных трат.** Предыдущая редакция — **v20 — PR-3a
+реализован (2026-08-29); §4.PR-3a «Реализация» фиксирует решения, принятые в
+коде.** Ранее —
 **v19 — закрытие ревью по v18 (1 medium, 2026-08-22)**:
 
 **MEDIUM — терминальная идемпотентность `activate` после `settled`.**
@@ -1392,7 +1399,8 @@ reconciliation по кворуму статуса. Это снимает нео�
   `signedTx`; иначе откат writer→reader оставил бы запланированные
   recovery-записи без reconciliation. Reader отличается от writer ровно
   одним: НЕ создаёт НОВЫЙ `signed` для нового upload-а (возобновлять
-  существующие recovery-записи, включая фазу 2, он обязан).
+  существующие recovery-записи, включая фазу 2, он обязан — и фазу 2 он
+  проводит через сагу D10 `prepare → activate → settle`, v21).
 - **Истечение anchor:** подписанная tx с протухшим anchor (~50 блоков) на
   chain не попадёт. Пересоздание — только после подтверждения кворумом, что
   старый txId не alive. Это частный случай «доказанного окончательного
@@ -1411,7 +1419,11 @@ reconciliation по кворуму статуса. Это снимает нео�
 одновременный ложный `dead` по всем источникам — строгий N-of-N в этом
 сценарии не спасает, потому что его сила в независимости. Поэтому writer-релиз
 НЕ выпускается, пока в Worker нет предохранителя по протоколу ниже.
-Reader-релиз этим не блокируется: он не создаёт `signed` и не открывает фазу 2.
+Reader-релиз (v21) **несёт предохранитель целиком** — DO `SpendGuard`, биндинг,
+пределы и сагу на recovery-пути: он не создаёт `signed` для новых upload-ов, но
+обязан возобновлять существующие recovery-записи, а фаза 2 `redrop_pending` —
+новая подпись, то есть трата; писать без предохранителя reader не вправе.
+Writer-релиз добавляет только создание новых recovery-записей.
 
 **Предохранитель D10 — денежный протокол (v14, ревью 11 H2; нормативно):**
 
@@ -1654,7 +1666,9 @@ Reader-релиз этим не блокируется: он не создаёт
    verdict-таблица — ревью 5; транзакционная схема и self-healing alarm —
    ревью 6), но ещё НЕ создаёт `signed` для новых upload-ов. Совместим со
    старыми клиентами (новых обязательных полей запроса нет — resume
-   полностью server-side).
+   полностью server-side). **Несёт предохранитель D10 целиком** (v21): DO
+   `SpendGuard`, биндинг, пределы и сагу на recovery-пути, включая новую
+   подпись фазы 2.
 2. **Writer-релиз:** начинает создавать `signed`. После него — **hard
    rollback floor** (`worker-rN`): откат ниже reader-релиза запрещён.
 3. Внешний `/upload`-контракт остаётся совместим со старыми клиентами.
@@ -1729,6 +1743,11 @@ Reader-релиз этим не блокируется: он не создаёт
   txId без нового доказанного dead;
 - **откат writer→reader-floor при НЕСКОЛЬКИХ запланированных signed** —
   reader продолжает scheduler-обработку всех;
+- **откат writer→reader с деньгами (v21, обязательное свидетельство):** writer
+  создал recovery-запись (`signed` со `spendKey`; отдельно `redrop_pending`) →
+  откат на reader → продолжение (resend, фаза 2 с новой подписью,
+  `activate`/`settle`) соблюдает пределы `SpendGuard`; без сконфигурированного
+  предохранителя reader отказывает `503`, а не тратит;
 - **D10 (security):** баланс ниже floor → публикации нет (`503`) ДО подписания;
   превышен общий бюджет трат → `503` независимо от того, что per-key квота
   свободна; K ключей на своих лимитах упираются в общий потолок;
@@ -2216,7 +2235,8 @@ floor, платные staging-испытания) и не должен заде�
 6. Upload failover ТОЛЬКО с одним signed txId (PR-3b, предусловия: persist
    signed tx **и глобальный предохранитель кошелька D10 — до writer-релиза**;
    платные staging-испытания разрешены). Может идти параллельно с п.5 —
-   треки не пересекаются по коду. Reader-релиз предохранителем не блокируется.
+   треки не пересекаются по коду. Reader-релиз несёт предохранитель целиком
+   (v21, §4.PR-3b «Предусловие D10»).
 7. restore.html — file-mode (реш. 1): доверенный агент проверяет SHA-256 до
    исполнения; `Origin:null` CORS-acceptance по D7 (PR-5); release-кошелёк
    создаётся на этом шаге (§4.PR-5). Sandbox НЕ требуется для этого пути
@@ -2272,7 +2292,7 @@ floor, платные staging-испытания) и не должен заде�
 | PR-1 ADR | **ready** | trust-инвариант restore (checksum-before-exec), same-tx, остаточная полнота, failure-domain оговорка (§2.1) |
 | PR-2 метрики | **ready — полная реализационная спецификация в §4.PR-2 «Реализация» (v16); единственный незаблокированный кодовый шаг** | transport adapter (no hidden SDK req), 5 фактически пишущихся событий + `docs/METRICS.md` строго по написанному, отдельный `METRICS_ADMIN_SECRET`, `/admin/metrics` по контракту H2 ревью 15, dev-smoke гейт (§R6) |
 | PR-3a read | **РЕАЛИЗОВАН 2026-08-29** — см. §4.PR-3a «Реализация»; гейт D9 пройден по бюджету | **верификация `txId ↔ bytes` перед пулом payload + правка комментария F1 (security)**, строгий N-of-N (H1 ревью 4), `MIN_STATUS_ORIGINS=2`, dedup по типу (H5), payload-validation fallback, acceptance «редирект не ломает /raw» |
-| PR-3b write | спецификация завершена; **writer-релиз заблокирован предусловием D10 + ревью протокола** (reader — нет); ждёт своей очереди (§6 п.6) | **предохранитель кошелька в Winston: floor + бюджет + per-tx cap + идемпотентная сага `prepared/active/settled` по `spendKey = {publicKeyB64, noteId, gen}` с монотонным settle и 24-ч окном часовых бакетов (v16, ревью 13–16) + привязка `activate(spendKey, reward, revision)` CAS-ом к durable `signed` (v17) с единой таблицей переходов activate/remap (v18; терминальная идемпотентность `settled` — v19) + баланс-минимум / цена-медиана (security F5/R5, протокол v14–v19)**, согласованность alarm-теста/ADR/cap с durable-инвариантом (ревью 10), durable/postable-инвариант generation + `resign_violation` по durable-txId + `deadTxId`-lineage (ревью 9), durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
+| PR-3b write | спецификация завершена; **оба релиза заблокированы предусловием D10 + ревью протокола: reader несёт предохранитель целиком (v21), writer — создание новых записей**; ждёт своей очереди (§6 п.6) | **предохранитель кошелька в Winston: floor + бюджет + per-tx cap + идемпотентная сага `prepared/active/settled` по `spendKey = {publicKeyB64, noteId, gen}` с монотонным settle и 24-ч окном часовых бакетов (v16, ревью 13–16) + привязка `activate(spendKey, reward, revision)` CAS-ом к durable `signed` (v17) с единой таблицей переходов activate/remap (v18; терминальная идемпотентность `settled` — v19) + баланс-минимум / цена-медиана (security F5/R5, протокол v14–v19)**, согласованность alarm-теста/ADR/cap с durable-инвариантом (ревью 10), durable/postable-инвариант generation + `resign_violation` по durable-txId + `deadTxId`-lineage (ревью 9), durable-источник фазы 2 из сохранённого `signedTx` (ревью 8), durable `redrop_pending` + единый `recoveryCount`-cap (H1 ревью 7), `storage.transaction`-атомарность + try/finally + self-healing alarm (ревью 6), single-alarm scheduler + CAS + verdict-таблица (ревью 5), inline `signedTx` + cap (H2 ревью 4), `signed`/`redrop_pending` не подлежат release/TTL (ревью 3), reader-floor несёт scheduler + фазу 2 (H3/ревью 7), anchor expiry, staging paid-tx испытания → утверждение `UPLOAD_GATEWAYS` |
 | PR-4 union | risky; **v16: формула D11 однозначна — отсутствие только между `complete=true`, независимость по `operatorId` (fail-closed), пороги таблицей; подлежит ревью** | **D11: presence-расхождение → метрика, `incomplete` по порогу давности от кворума статусов; restore остаётся аддитивным (security F3/R3)**, логические `INDEX_SOURCES` (M1 ревью 4), single-index edge-order сохранён (M2), metadata-конфликт → арбитр header D9 + метрика (v15), nullable height, abort-backoff |
 | PR-5 restore | ready (программный hash-барьер v7) | копируемые команд-блоки с `&&`/`if` (M2 ревью 5), per-gateway `/raw` CORS-фиксация (M3 ревью 4), safe render, release-кошелёк (§4.PR-5) |
 | PR-6 CI/deploy | обязателен в каждом | `MIN_STATUS_ORIGINS=2`, **Worker rollback floor (H3)**, env/bindings везде |
@@ -2297,7 +2317,7 @@ medium; протоколы дописаны в v14 (§4.PR-3a «Верифика
 выпуска:** (а) **PR-3a**: пул payload-шлюзов не выпускается без верификации
 `txId ↔ bytes` (D9) — при нехватке бюджета бандла выпускается одиночный шлюз;
 (б) **PR-3b**: writer-релиз не выпускается без глобального предохранителя
-кошелька (D10) — reader-релиз этим не блокируется; (в) **PR-4**: presence-
+кошелька (D10) — reader-релиз несёт его целиком (v21); (в) **PR-4**: presence-
 расхождение индексов даёт метрику всегда и `incomplete` по порогу давности
 (D11), аддитивность restore закрепляется тестом; (г) отложенный ADR про
 подписанный high-water mark — §3 (единственная защита от downgrade на чистом
