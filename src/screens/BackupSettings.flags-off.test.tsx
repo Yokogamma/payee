@@ -4,13 +4,22 @@ import { render, cleanup } from '@testing-library/react';
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));
 vi.mock('../lib/store', () => ({ useNotes: () => h.store }));
+// Release 1 pair, MOCKED since the import flip (release 2): the real file no
+// longer ships both off. The shipped pair is asserted in
+// `src/lib/flags.shipped.test.ts`; this file keeps the client-floor state
+// (both off) under test, because a rollback to `client-b1` is that state.
+vi.mock('../lib/flags', async importOriginal => ({
+  ...(await importOriginal<typeof import('../lib/flags')>()),
+  BACKUP_EXPORT_ENABLED: false,
+  BACKUP_IMPORT_ENABLED: false,
+}));
 
 import { BackupSettings } from './BackupSettings';
 import { backupActions } from '../lib/backup-ui';
-import { BACKUP_EXPORT_ENABLED, BACKUP_IMPORT_ENABLED } from '../lib/flags';
 
 /**
- * The build as it ships — real flags, both off (release 1).
+ * The client-floor build — both flags off (release 1, `client-b1`), the
+ * rollback target of every later flip.
  *
  * The state §7 calls client-floor, and the reason it gets its own file: with
  * the flags off the block is ABSENT, not disabled and not greyed. That
@@ -22,12 +31,7 @@ import { BACKUP_EXPORT_ENABLED, BACKUP_IMPORT_ENABLED } from '../lib/flags';
 
 afterEach(cleanup);
 
-describe('the shipped flag pair', () => {
-  it('is the release-1 pair: both off', () => {
-    expect(BACKUP_EXPORT_ENABLED).toBe(false);
-    expect(BACKUP_IMPORT_ENABLED).toBe(false);
-  });
-
+describe('the release-1 flag pair', () => {
   it('offers nothing at all', () => {
     expect(backupActions()).toEqual({ canImport: false, canExport: false, anyVisible: false });
   });

@@ -636,6 +636,25 @@ Reverting a flip is a client redeploy of the previous tag. **Neither flip is a
 floor**: no schema change rides with them (the schema moved once, at
 `client-b1`).
 
+**Import flip — release 2 (`client-b2`).** This commit sets
+`BACKUP_IMPORT_ENABLED = true` (export stays `false`; the pair is legal for
+`scripts/check-backup-flags.mjs`). In application code it changes ONE literal.
+Alongside it: this note, and the tests that had asserted the release-1 pair
+against the real flags or depended on it (`BackupSettings.flags-off`,
+`backup-adapter.flags-off` — now mocked both off; the two legacy `committed`
+cases in `arweave.test` — pinned to import OFF; `SettingsSection.test` — backup
+store slice), plus the new `src/lib/flags.shipped.test.ts`, the one owner of
+the «build as it ships» assertion. Nothing else. It is publishable only after
+step 3 of «Order» above: the Pages gate reads
+the literal from the built checkout and runs in equality mode, so a dispatch
+with `WORKER_FLOOR_SHA` or `MINIMUM_FLOOR` still at `ff0954d` is refused before
+anything is published — that refusal is the design, not an incident. Deploy
+facts (Pages run, deployment id, bundle, viewer hash, the final `main` SHA
+frozen after this merge) are recorded by the release-lines PR after the
+dispatch, as for `client-b1`. Rollback target if import misbehaves: the
+`client-b1-hotfix1` deployment (`49e219de`) — import disappears from the UI,
+imported data stays; the worker is NOT rolled back (the floor).
+
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
 This release is not inert for existing users, and the runbook has to say so
