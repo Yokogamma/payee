@@ -28,6 +28,10 @@
  *
  * ── Rotation runbook (docs/ROLLBACK.md) ──────────────────────────────
  *
+ * For the project (dev) wallet — the one the client trusts. Staging's OWN
+ * wallet rotates differently and never reaches the client: see
+ * `STAGING_ONLY_OWNERS` below.
+ *
  *   1. add the NEW address here AND to both `TRUSTED_OWNERS` tables in
  *      worker/wrangler.toml AND to `VITE_TRUSTED_OWNERS`;
  *   2. deploy the worker and the client;
@@ -71,3 +75,41 @@ export const NEVER_REMOVE = Object.freeze([
 
 /** Canonical CSV spelling, for messages and for the wrangler.toml pin. */
 export const HISTORICAL_OWNERS_CSV = HISTORICAL_OWNERS.join(',');
+
+/**
+ * Every wallet the STAGING worker — and nothing else — has ever been given IN
+ * ADDITION to the production set: a separate staging wallet (worker/
+ * wrangler.toml, staging prerequisite 2(b)). Empty while staging shares the
+ * dev wallet. APPEND-ONLY, for the same reason as `HISTORICAL_OWNERS`: a
+ * staging publication signed by a dropped address stops authenticating (D9),
+ * and dropping it from this list would also lift the ban on it reaching the
+ * client.
+ *
+ * Deliberately NOT part of `HISTORICAL_OWNERS`: that registry is what the
+ * CLIENT must contain, and a test wallet in the shipped client's
+ * `VITE_TRUSTED_OWNERS` would make restore accept publications signed by a key
+ * that lives in a second worker's secrets. `scripts/check-trusted-owners.mjs`
+ * therefore holds these rules at once:
+ *
+ *   - production `TRUSTED_OWNERS` equals the client's set (the dev contour and
+ *     the client authenticate the same history);
+ *   - both tables contain every `HISTORICAL_OWNERS` entry;
+ *   - the staging table is EXACTLY the production set plus every address
+ *     listed here — it may drop none of them and add nothing else;
+ *   - none of them may appear in production, in the client or in the
+ *     historical registry.
+ *
+ * Rotating the staging wallet: APPEND the new address here and to
+ * `STAGING_NEVER_REMOVE`, and to `env.staging.TRUSTED_OWNERS` only, in one
+ * reviewed PR; deploy staging; only then switch staging's `ARWEAVE_JWK`. The
+ * old address stays.
+ */
+export const STAGING_ONLY_OWNERS = Object.freeze([]);
+
+/**
+ * The monotonicity floor of `STAGING_ONLY_OWNERS` — a SECOND literal, like
+ * `NEVER_REMOVE`, so shrinking the list is refused by the gate instead of
+ * resting on review alone. New staging wallets land here in the same PR that
+ * appends them above.
+ */
+export const STAGING_NEVER_REMOVE = Object.freeze([]);

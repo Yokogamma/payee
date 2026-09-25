@@ -1971,7 +1971,13 @@ notes unrecoverable for every client built without the old owner.
 >
 >  - `scripts/owner-pins.mjs` — the repo-pinned HISTORICAL registry. Append-only;
 >    `scripts/check-trusted-owners.mjs` refuses a deploy whose configured sets do
->    not contain all of it, and refuses a client/worker divergence.
+>    not contain all of it, and refuses a client/worker divergence — per
+>    contour: production equals the client; staging equals it plus EVERY
+>    wallet pinned in `STAGING_ONLY_OWNERS` (append-only; never in the
+>    registry, production or the client). The order below is for the project
+>    (dev) wallet; staging's OWN wallet is appended to `STAGING_ONLY_OWNERS` +
+>    `STAGING_NEVER_REMOVE` and to the staging table only, and the old one
+>    stays (`wrangler.toml`, staging `TRUSTED_OWNERS`).
 >  - `worker/wrangler.toml` — `TRUSTED_OWNERS` in **both** tables (`[vars]` and
 >    `[env.staging.vars]`; a named environment inherits nothing).
 >  - `VITE_TRUSTED_OWNERS` — the client build.
@@ -2465,7 +2471,8 @@ deploy. Neither is an Environment variable, so there is nothing to click:
 
 - `TRUSTED_OWNERS` — the historical wallet list D9 authenticates against.
   Contents pinned in `scripts/owner-pins.mjs`; `check-trusted-owners.mjs`
-  refuses a deploy that drops any of it or that disagrees with the client.
+  refuses a deploy that drops any of it or that disagrees with the client
+  (staging: the client's set plus every pinned staging wallet).
 - `PAYLOAD_GATEWAYS` — the pool `/tx/<id>` and `/raw/<id>` are read from,
   compared against the pin **in order** by `check-gateways-vs-worker.mjs`.
 
