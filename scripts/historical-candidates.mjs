@@ -2,8 +2,9 @@
  * Historical worker candidates — the ONE place a deploy gate may be told that a
  * release predates the thing the gate checks.
  *
- * Why this exists (2026-09-11, run 34598685134). The floor permits a rollback
- * to `ff0954d` — it IS the pinned minimum floor — and `seed-legacy` demands
+ * Why this exists (2026-09-11, run 34598685134). The floor permitted a rollback
+ * to `ff0954d` — it WAS the pinned minimum floor until the raise to the D2
+ * worker before the import flip (see the entry below) — and `seed-legacy` demands
  * exactly that build. But the config gates and the post-deploy smoke run from
  * the TRUSTED checkout, by design (PR #122), and they check for things that did
  * not exist yet at `ff0954d`: `PAYLOAD_GATEWAYS`, `TRUSTED_OWNERS` (both born
@@ -36,8 +37,15 @@ export const HISTORICAL_CANDIDATES = Object.freeze({
   // PR-3a: status quorum present (`all-configured-v1`), publication
   // fingerprinting absent, uploads ON. The only build `seed-legacy` accepts —
   // a note seeded on a fingerprinting worker is not legacy at all — and the
-  // pinned MINIMUM_FLOOR. Deployed for one purpose: seeding legacy fixtures
-  // ahead of a D2 soak window, after which the D2 candidate is deployed again.
+  // pinned MINIMUM_FLOOR until the floor was raised to the D2 worker `394156d`
+  // immediately before the import flip. Deployed for one purpose: seeding
+  // legacy fixtures ahead of a D2 soak window, after which the D2 candidate was
+  // deployed again. Since the raise this entry is HISTORY, kept on record and
+  // no longer deployable: the binding below still passes first, and
+  // `check-worker-floor.mjs` refuses the SHA second, before materialization.
+  // Seeding legacy fixtures is therefore impossible above a D2 floor, which is
+  // why the soak criterion `legacy_backfilled` was waived (docs/ROLLBACK.md,
+  // «Soak criteria — v2», 2026-09-22).
   ff0954d1799c2dc0534a4ab73c6d11d3e01645f1: Object.freeze({
     profile: 'pre-d2',
     lacksVars: Object.freeze(['PAYLOAD_GATEWAYS', 'TRUSTED_OWNERS']),
