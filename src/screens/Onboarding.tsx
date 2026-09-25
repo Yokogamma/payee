@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { useNotes, VaultMismatchError } from '../lib/store';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SECRET_PASSWORD_FIELD_PROPS } from '../components/secretFieldProps';
@@ -26,6 +26,30 @@ export function Onboarding() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [finishing, setFinishing] = useState(false);
   const inFlightRef = useRef(false);
+  const mountedRef = useRef(true);
+  /** The 2-second «Скопировано» timer. Cleared on unmount so a toast that
+   *  outlives the screen can't call a state setter into a torn-down tree —
+   *  in the jsdom suite that fired after the environment was gone
+   *  (`window is not defined`) and failed the whole root run. Same fix as
+   *  Main's toast timers. */
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A LAYOUT effect, not a passive one: its cleanup runs in the same commit
+  // that removes the DOM. A passive cleanup lands in a later scheduler task
+  // when the unmount comes from a non-sync lane (a screen switch out of a
+  // resolved promise), and a clipboard write settling in that gap would still
+  // see «mounted». Same choice as Main.
+  useLayoutEffect(() => {
+    // The ref OBJECTS are copied, not their values: the cleanup wants the live
+    // timer id, not a snapshot from mount time.
+    const mounted = mountedRef;
+    const copiedTimer = copiedTimerRef;
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+      copiedTimer.current = null;
+    };
+  }, []);
 
   async function handleGenerate() {
     const mn = await createNewWallet();
@@ -40,9 +64,19 @@ export function Onboarding() {
     setCopyError('');
     // For the SEED a false «copied» is dangerous: the user may believe a
     // backup exists that was never made. Only a resolved write counts.
-    if (await copyTextToClipboard(mnemonic)) {
+    const ok = await copyTextToClipboard(mnemonic);
+    // The screen may have gone away while the clipboard promise was pending —
+    // don't arm a timer the unmount cleanup has already run past.
+    if (!mountedRef.current) return;
+    if (ok) {
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      // A repeat copy restarts the 2 s window instead of letting the earlier
+      // timer hide the fresh toast early.
+      if (copiedTimerRef.current !== null) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => {
+        copiedTimerRef.current = null;
+        setCopied(false);
+      }, 2000);
     } else {
       setCopyError('Не удалось скопировать. Запишите фразу вручную или выделите слова и скопируйте сами.');
     }
