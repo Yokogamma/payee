@@ -23,6 +23,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseOriginList, serializeStatusOrigins } from '../../scripts/gateways-parse.mjs';
 import { readWorkerStatusGateways } from '../../scripts/check-gateways-vs-worker.mjs';
+import { HISTORICAL_POOLS } from '../../scripts/gateway-pins.mjs';
 import {
   AUTO_ALLOWED_WORKER_ORIGINS,
   DEPLOY_PROFILES,
@@ -179,6 +180,24 @@ export async function expectationsFromRepo(blockPrefix = '') {
 }
 
 /**
+ * The pool expectations for the release being smoked. A registered historical
+ * build (scripts/gateway-pins.mjs HISTORICAL_POOLS, full SHA) is expected to
+ * attest ITS OWN pool — a rollback to it across a pool change would otherwise
+ * fail the smoke after activation. Keyed by the release SHA the SAME smoke
+ * demands from the live /health, so naming a historical SHA cannot relax the
+ * check of any other build: that build would fail the releaseSha comparison.
+ * Every other release — and every staging smoke — is held to the repository.
+ */
+export async function expectationsFor({ blockPrefix = '', releaseSha } = {}) {
+  const entry = blockPrefix === '' && typeof releaseSha === 'string' ? HISTORICAL_POOLS[releaseSha] : undefined;
+  if (entry) {
+    const origins = parseOriginList(entry.status.join(','));
+    return { statusGatewaysHash: await statusGatewaysHash(origins), statusGatewaysCount: origins.length };
+  }
+  return expectationsFromRepo(blockPrefix);
+}
+
+/**
  * One attempt, under the SHARED deadline.
  *
  * The smoke has to honour the transport contract it is checking, or it is not
@@ -331,7 +350,7 @@ if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
 
   const expected = {
     profile,
-    ...(await expectationsFromRepo(blockPrefix)),
+    ...(await expectationsFor({ blockPrefix, releaseSha: process.env.EXPECT_RELEASE_SHA })),
     ...(process.env.EXPECT_RELEASE_SHA ? { releaseSha: process.env.EXPECT_RELEASE_SHA } : {}),
     ...(process.env.EXPECT_WORKER_VERSION_ID
       ? { workerVersionId: process.env.EXPECT_WORKER_VERSION_ID } : {}),

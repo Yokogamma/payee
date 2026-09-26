@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { checkGateways, checkOperatorMap, readWorkerStatusGateways, readWorkerStatusOperators } from './check-gateways-vs-worker.mjs';
-import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS, STATUS_OPERATORS } from './gateway-pins.mjs';
+import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, HISTORICAL_POOLS, MIN_STATUS_ORIGINS, STATUS_OPERATORS, poolsFor } from './gateway-pins.mjs';
 import { parseOperatorMap } from './gateways-parse.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -53,7 +53,7 @@ describe('readWorkerStatusGateways', () => {
 
 describe('checkGateways — client and worker must mean the same pool', () => {
   it('passes when both sides equal the pin', () => {
-    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [], skippedPayloadPool: false });
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [], skippedPayloadPool: false, historicalPool: false, clientOnCurrentAcrossRollback: false });
   });
 
   it('normalizes before comparing: a trailing slash is the same origin', () => {
@@ -92,7 +92,7 @@ describe('checkGateways — client and worker must mean the same pool', () => {
   });
 
   it('--repo-only checks the worker against the pin without any Environment', () => {
-    expect(checkGateways(undefined, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [], skippedPayloadPool: false });
+    expect(checkGateways(undefined, toml(), { repoOnly: true })).toEqual({ ok: true, problems: [], skippedPayloadPool: false, historicalPool: false, clientOnCurrentAcrossRollback: false });
     const drift = checkGateways(undefined, toml('https://arweave.net,https://b.example'), { repoOnly: true });
     expect(drift.ok).toBe(false);
   });
@@ -206,7 +206,7 @@ describe('the operator map (D10/D11, reader release) — pinned, complete, and a
   const origins = EXPECTED_STATUS_CSV.split(',');
 
   it('passes when both blocks carry the pinned map', () => {
-    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [], skippedPayloadPool: false });
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml())).toEqual({ ok: true, problems: [], skippedPayloadPool: false, historicalPool: false, clientOnCurrentAcrossRollback: false });
   });
 
   it('the worker built-in default equals the pin (operators.ts) — one map, three copies, one truth', () => {
@@ -250,5 +250,69 @@ describe('the operator map (D10/D11, reader release) — pinned, complete, and a
     const noGuard = toml().replace(/\[\[durable_objects\.bindings\]\]\nname = "SPEND_GUARD"\nclass_name = "SpendGuard"\n/, '').replace(/STATUS_OPERATORS = "[^"]*"\n/g, '');
     expect(readWorkerStatusOperators(noGuard).error).toBeDefined();
     expect(checkGateways(EXPECTED_STATUS_CSV, noGuard).ok).toBe(true);
+  });
+});
+
+/**
+ * The pool changed on 2026-09-27 (ar-io.dev removed — a testnet sandbox with a
+ * broken certificate). Review of that change, High: the gates compare the
+ * CANDIDATE's config with the pin, so the new pin alone would refuse the
+ * rollback to 394156d the runbook promises. That ONE build (full SHA,
+ * HISTORICAL_POOLS) is held to its own pools; every other candidate to the
+ * current pin.
+ */
+describe('a rollback across the pool change — 394156d is held to ITS pools, nothing else is', () => {
+  const H = '394156d5998dbaef5b1d273898ee8006104227f8';
+  const OLD_STATUS = HISTORICAL_POOLS[H].status.join(',');
+  const OLD_PAYLOAD = HISTORICAL_POOLS[H].payload.join(',');
+  /** What 394156d's wrangler.toml carries: the old pools in both blocks, no SpendGuard, no operator map. */
+  const historical = (status = OLD_STATUS, payload = OLD_PAYLOAD) => toml(status, status, { payloadProd: payload, payloadStaging: payload })
+    .replace(/\[\[durable_objects\.bindings\]\]\nname = "SPEND_GUARD"\nclass_name = "SpendGuard"\n/, '')
+    .replace(/STATUS_OPERATORS = "[^"]*"\n/g, '');
+
+  it('the pin no longer carries ar-io.dev; the historical entry keeps the five the live build attests', () => {
+    expect(EXPECTED_STATUS_CSV).not.toMatch(/ar-io\.dev/);
+    expect(EXPECTED_PAYLOAD_CSV).not.toMatch(/ar-io\.dev/);
+    expect(OLD_STATUS.split(',')).toHaveLength(5);
+    expect(OLD_STATUS).toMatch(/ar-io\.dev/);
+    expect(poolsFor(H)).toMatchObject({ historical: true, statusCsv: OLD_STATUS, payloadCsv: OLD_PAYLOAD });
+    for (const c of [null, '394156d', H.toUpperCase(), 'f'.repeat(40)]) expect(poolsFor(c).historical, String(c)).toBe(false);
+  });
+
+  it('the allowed rollback passes — the client still on the old pool, or already on the current one (reported)', () => {
+    const old = checkGateways(OLD_STATUS, historical(), { candidate: H });
+    expect(old).toMatchObject({ ok: true, historicalPool: true, clientOnCurrentAcrossRollback: false });
+    const moved = checkGateways(EXPECTED_STATUS_CSV, historical(), { candidate: H });
+    expect(moved).toMatchObject({ ok: true, historicalPool: true, clientOnCurrentAcrossRollback: true });
+    expect(checkGateways(undefined, historical(), { candidate: H, repoOnly: true }).ok).toBe(true);
+  });
+
+  it('a MODIFIED historical config is refused — the SHA admits its own pools, not a similar one', () => {
+    const minusOne = OLD_STATUS.split(',').slice(0, 4).join(',');
+    for (const cfg of [historical(minusOne), historical(EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV), historical(OLD_STATUS, OLD_PAYLOAD.split(',').reverse().join(','))]) {
+      const r = checkGateways(OLD_STATUS, cfg, { candidate: H });
+      expect(r.ok).toBe(false);
+      expect(r.problems.join('\n')).toMatch(/historical candidate's pinned/);
+    }
+  });
+
+  it('a client pool that is neither the historical nor the current one is refused', () => {
+    const r = checkGateways('https://arweave.net,https://frostor.xyz', historical(), { candidate: H });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join('\n')).toMatch(/matches neither this historical candidate's pool/);
+  });
+
+  it('a FOREIGN SHA (or no candidate) with the old pool is refused — only the registered build may carry it', () => {
+    for (const candidate of ['f'.repeat(40), null, H.slice(0, 7)]) {
+      const r = checkGateways(OLD_STATUS, historical(), { candidate });
+      expect(r.ok, String(candidate)).toBe(false);
+      expect(r.problems.join('\n')).toMatch(/does not match the repo-pinned set/);
+      expect(r.historicalPool).toBe(false);
+    }
+  });
+
+  it('a modern candidate (with SpendGuard) is held to the current pin and map', () => {
+    expect(checkGateways(EXPECTED_STATUS_CSV, toml(), { candidate: 'a'.repeat(40) }).ok).toBe(true);
+    expect(checkGateways(OLD_STATUS, toml(OLD_STATUS, OLD_STATUS), { candidate: 'a'.repeat(40) }).ok).toBe(false);
   });
 });

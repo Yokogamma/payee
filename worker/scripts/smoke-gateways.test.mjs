@@ -1,11 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { checkHealth, runAttempts } from './smoke-gateways.mjs';
+import { checkHealth, expectationsFor, expectationsFromRepo, runAttempts } from './smoke-gateways.mjs';
 import { DEPLOY_PROFILES, EXPECTED_VERSIONS } from './smoke-target.mjs';
 
 const HASH = 'ea0e6282b314266b';
 const SHA = 'f'.repeat(40);
 const VERSION_ID = '1e24e857-51da-43e7-99f6-d12f3f413d21';
 
+const expected0 = () => ({ profile: 'normal' });
 const expected = {
   profile: 'normal',
   statusGatewaysHash: HASH,
@@ -323,5 +324,35 @@ describe('the pre-d2 profile judges the seed-legacy build, and only that build',
   // disjoint, so a mislabelled dispatch cannot succeed either way.
   it('the ff0954d body FAILS the normal profile', () => {
     expect(checkHealth(ff0954d(), expected).ok).toBe(false);
+  });
+});
+
+// The pool changed on 2026-09-27 (ar-io.dev removed). A rollback to 394156d
+// must still pass the post-deploy smoke: that ONE build (HISTORICAL_POOLS,
+// full SHA) is expected to attest its own pool — the hash its live /health
+// reports today — while every other release is held to the repository.
+describe('expectationsFor — the pool a release must attest', () => {
+  const H = '394156d5998dbaef5b1d273898ee8006104227f8';
+
+  it('394156d: its own five-origin pool, the hash its live /health attests (ea0e6282b314266b)', async () => {
+    expect(await expectationsFor({ releaseSha: H })).toEqual({ statusGatewaysHash: 'ea0e6282b314266b', statusGatewaysCount: 5 });
+  });
+
+  it('any other release, an abbreviated SHA, no SHA, or a staging smoke — the repository pool', async () => {
+    const repo = await expectationsFromRepo('');
+    expect(repo.statusGatewaysCount).toBe(4);
+    expect(repo.statusGatewaysHash).not.toBe('ea0e6282b314266b');
+    for (const releaseSha of ['a'.repeat(40), H.slice(0, 7), undefined]) {
+      expect(await expectationsFor({ releaseSha })).toEqual(repo);
+    }
+    expect(await expectationsFor({ blockPrefix: 'env.staging.', releaseSha: H })).toEqual(await expectationsFromRepo('env.staging.'));
+  });
+
+  it('naming 394156d cannot relax the check of another build: the same expectations demand releaseSha 394156d', async () => {
+    const expected = { ...expected0(), ...(await expectationsFor({ releaseSha: H })), releaseSha: H, nonce: 'n' };
+    const modern = healthy({ nonce: 'n', statusGatewaysHash: 'ea0e6282b314266b', statusGatewaysCount: 5, releaseSha: 'b'.repeat(40) });
+    const r = checkHealth(modern, expected);
+    expect(r.ok).toBe(false);
+    expect(r.problems.join('\n')).toMatch(/releaseSha is "b{40}", expected the deployed candidate/);
   });
 });
