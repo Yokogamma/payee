@@ -132,7 +132,10 @@ describe('identity of the answering worker', () => {
   });
 
   it('releaseSha null is refused on every contour — dev and, since M6, staging deploy with RELEASE_SHA', () => {
-    for (const opts of [{}, { expectVersionId: VID }]) {
+    // The last option set is the reproduction of the #223 Low (null + the
+    // former allowance + a matching version id + an expected SHA used to
+    // pass); the retired `allowNullReleaseSha` is now simply not an option.
+    for (const opts of [{}, { expectVersionId: VID }, { allowNullReleaseSha: true, expectVersionId: VID, expectReleaseSha: SHA }]) {
       const v = judged((b) => { b.releaseSha = null; }, opts);
       expect(v.ok).toBe(false);
       expect(v.problems.join('\n')).toMatch(/releaseSha is null — every contour deploys with RELEASE_SHA/);
