@@ -151,6 +151,20 @@ export function checkHealth(body, expected) {
         'expected the version the deploy just activated',
     );
   }
+  // Optional (runbook reader release §6.9): below two independent operators
+  // no money quorum can form, and the D10 guard can book nothing. Asserted
+  // only when the caller names a floor — the dev deploy names it for a
+  // candidate that carries SpendGuard (scripts/operators-floor.mjs); a
+  // historical build has no such field.
+  if (expected.minOperators !== undefined) {
+    const n = body.statusOperatorsCount;
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < expected.minOperators) {
+      problems.push(
+        `statusOperatorsCount is ${JSON.stringify(n)}, expected at least ${expected.minOperators} ` +
+          'independent operators (no money quorum below that)',
+      );
+    }
+  }
 
   return { ok: problems.length === 0, problems };
 }
@@ -265,6 +279,16 @@ export async function runAttempts({
   return { ok: false, problems: last ?? ['no answer'] };
 }
 
+/** EXPECT_MIN_OPERATORS: a positive integer, or the smoke refuses to start —
+ *  a typo must not silently turn the check off. */
+function parseMinOperators(raw) {
+  if (!/^[1-9][0-9]*$/.test(raw)) {
+    console.error(`✗ EXPECT_MIN_OPERATORS must be a positive integer, got ${JSON.stringify(raw)}`);
+    process.exit(2);
+  }
+  return Number(raw);
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────
 if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
   const args = process.argv.slice(2);
@@ -311,6 +335,7 @@ if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
     ...(process.env.EXPECT_RELEASE_SHA ? { releaseSha: process.env.EXPECT_RELEASE_SHA } : {}),
     ...(process.env.EXPECT_WORKER_VERSION_ID
       ? { workerVersionId: process.env.EXPECT_WORKER_VERSION_ID } : {}),
+    ...(process.env.EXPECT_MIN_OPERATORS ? { minOperators: parseMinOperators(process.env.EXPECT_MIN_OPERATORS) } : {}),
   };
 
   // ONE budget for the whole smoke: per-attempt timeouts of their own would
