@@ -277,6 +277,10 @@ binding = "CF_VERSION_METADATA"
 #   npm run deploy:staging:check   (wrangler deploy --env staging --dry-run)
 #   — passes on the placeholder: it proves the config BUILDS, not that staging
 #     is ready.
+# The real deploy: SMOKE_STAGING_ORIGIN=<origin> npm run deploy:staging —
+#   refuses without the origin; runs the owners/limits/pool gates, requires
+#   clean worker/ + src/, passes RELEASE_SHA=<HEAD>, and smokes the live
+#   /health (SHA, version id, >= 2 operators). docs/ROLLBACK.md «staging».
 #
 # NOTE on origins: the workers.dev URL below is the API ENDPOINT, not a client
 # origin. CLI smoke sends no Origin header (CORS is not exercised); a browser

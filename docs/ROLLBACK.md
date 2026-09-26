@@ -302,7 +302,9 @@ users**, so the operator must provision staging before the v4-acceptor deploy:
 5. seed an invite via `/admin/seed-invite` and register the smoke key through
    `/register` (InviteManager is the source of truth — never hand-write `pk:`
    entries into KV);
-6. `npm --prefix worker run deploy:staging:check`, then `deploy:staging`.
+6. `npm --prefix worker run deploy:staging:check`, then
+   `SMOKE_STAGING_ORIGIN=<staging origin> npm --prefix worker run deploy:staging`
+   (mandatory gates, RELEASE_SHA and live smoke — below).
 
 A smoke against anything beyond the allow-listed worker origins is an
 **escape hatch that requires a separate, explicit operator decision** and must
@@ -323,6 +325,30 @@ next, different target, and the heuristic was fail-open —
 `wrangler deploy --env staging --dry-run` and runs no gate — treat it as a
 bundle check, not an admission. The gate fails with the checklist above while the
 KV placeholder is still in `wrangler.toml`.
+
+`worker/scripts/deploy-staging.mjs` then makes every rehearsal check
+MANDATORY (runbook reader release M6; rules in `staging-deploy-rules.mjs`,
+tested), in this order:
+
+0. `SMOKE_STAGING_ORIGIN=<bare https origin of the staging worker>` is
+   required — without it NOTHING is deployed (the live smoke is not optional);
+1. config gates, repo-only: status pool (`check-gateways-vs-worker`),
+   per-contour trusted owners (`check-trusted-owners`, full rules — staging
+   = production ∪ `STAGING_ONLY_OWNERS`), spend limits (`check-spend-limits`);
+   then the pinned Cloudflare account (`wrangler whoami`);
+2. clean DEPLOYED sources: no tracked change anywhere, no untracked file under
+   `worker/` or `src/` (the bundle imports `src/lib`) — an untracked module
+   would ship while being in no commit;
+3. deploy with `--var RELEASE_SHA:<HEAD of that clean tree>` — staging's
+   `/health.releaseSha` names the commit (it was `null` before);
+4. the activated version id from wrangler's NDJSON;
+5. live smoke (`smoke-gateways --staging --profile=normal`): `releaseSha` =
+   HEAD, `workerVersionId` = the activated version, `statusOperatorsCount`
+   ≥ 2 (`EXPECT_MIN_OPERATORS`; no money quorum below two operators).
+
+```bash
+SMOKE_STAGING_ORIGIN=https://<staging worker origin> npm --prefix worker run deploy:staging
+```
 
 ### The floor as a gate, not a discipline (D2a)
 

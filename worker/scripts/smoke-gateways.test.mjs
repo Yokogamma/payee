@@ -34,6 +34,24 @@ const never = () => new AbortController().signal;
 const already = () => AbortSignal.abort();
 const noSleep = () => Promise.resolve();
 
+// Runbook reader release M6: the staging smoke asserts the operator floor.
+// Optional — a caller that names no floor (the dev smoke of a historical
+// build without the field) is unaffected.
+describe('checkHealth — minOperators (optional)', () => {
+  it('not asked → not checked, even when the field is absent', () => {
+    expect(checkHealth(healthy({ nonce: 'n' }), { ...expected, nonce: 'n' }).ok).toBe(true);
+  });
+  it('asked → at least that many independent operators', () => {
+    expect(checkHealth(healthy({ nonce: 'n', statusOperatorsCount: 2 }), { ...expected, nonce: 'n', minOperators: 2 }).ok).toBe(true);
+    expect(checkHealth(healthy({ nonce: 'n', statusOperatorsCount: 5 }), { ...expected, nonce: 'n', minOperators: 2 }).ok).toBe(true);
+    for (const n of [1, 0, undefined, null, '2', 2.5]) {
+      const r = checkHealth(healthy({ nonce: 'n', statusOperatorsCount: n }), { ...expected, nonce: 'n', minOperators: 2 });
+      expect(r.ok, String(n)).toBe(false);
+      expect(r.problems.join('\n')).toMatch(/statusOperatorsCount is .*, expected at least 2 independent operators/);
+    }
+  });
+});
+
 describe('checkHealth', () => {
   it('accepts the release it was given', () => {
     expect(checkHealth(healthy({ nonce: 'abc' }), { ...expected, nonce: 'abc' }))
