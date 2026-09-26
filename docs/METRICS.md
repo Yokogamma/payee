@@ -223,6 +223,38 @@ the journal are defined in docs/ROLLBACK.md.
 curl -sS -X POST https://<worker>/admin/ops -H 'Content-Type: application/json' -H 'Authorization: Bearer <METRICS_ADMIN_SECRET>'   -d '{"ownerPk":"<canonical base64 pk>","from":1789000000000,"to":1789086400000,"limit":200}'
 ```
 
+## POST /admin/recovery-census — the rollback census (PR-3b reader)
+
+Read-only, bearer `METRICS_ADMIN_SECRET`, `no-store`, body `{}`. Answers
+whether EVERY key's recovery set is empty — the proof a rollback below the
+reader needs (docs/ROLLBACK.md «PR-3b reader release», «Rollback»). The key
+set is the legacy closure's: used invites incl. revoked ones, the live `pk:*`
+and the keys the operator registered with `/admin/spend/init-legacy-keys`;
+old-format invites that hide a key keep it incomplete until acknowledged. Per
+key three independent counts are read — the persistent `recoveryCount`, the
+`recovery:` index and a direct scan of the note records — so a drifted counter
+cannot read as empty. At most 200 keys per census (more → `too_many_keys`,
+fail-closed).
+
+The answer is a SUMMARY and nothing else — never a key, noteId or txId:
+`{workerVersionId, releaseSha, census: {complete, verdict: empty | not_empty |
+incomplete, keys: {listed, checked, failed}, legacyInvites: {unknown,
+acknowledged}, recovery: {count, due, records, keysWithRecovery}, reasons}}`,
+`reasons` ⊆ `list_keys_failed`, `legacy_keys_failed`,
+`legacy_invites_unacknowledged`, `too_many_keys`, `key_read_failed`,
+`recovery_present`, `counter_drift`. A failed or malformed read is
+`incomplete`, never empty.
+
+The operator reads it through `worker/scripts/recovery-census.mjs`
+(`npm run census:recovery`, target allowlist of the smoke scripts), which
+re-checks every field on its own: exit 0 only for complete + empty, 1 =
+refused, 2 = usage. `CENSUS_MIN_KEYS` (default 1) refuses a contour with users
+that suddenly lists no keys.
+
+```bash
+CENSUS_URL=https://<worker> METRICS_ADMIN_SECRET=<secret> npm --prefix worker run census:recovery
+```
+
 ## What PR-2 does NOT close (release-notes honesty, P0 r18)
 
 1. **The ambiguous POST exception.** A transaction ACCEPTED by the gateway

@@ -77,6 +77,7 @@ export default defineConfig({
       'test/rollback-reader-spend.test.ts',
       'test/recovery-scheduler.test.ts',
       'test/spend-guard.legacy.test.ts',
+      'test/recovery-census.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that

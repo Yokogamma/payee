@@ -73,6 +73,9 @@ export default defineConfig({
       'test/rollback-reader-spend.test.ts',
       'test/recovery-scheduler.test.ts',
       'test/spend-guard.legacy.test.ts',
+      // /admin/recovery-census: env overrides and wrapped namespaces
+      // (failure injection) — same isolation reasoning as above.
+      'test/recovery-census.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.
