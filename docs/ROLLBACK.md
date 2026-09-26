@@ -2130,10 +2130,19 @@ exception. `UPLOADS_ENABLED = "false"` remains the global lever (a deploy).
 - **Reader → the previous worker (394156d line):** allowed by the floor only
   while the writer has not shipped (the writer sets a hard floor at the
   reader). The `SpendGuard` DO and migration `v3` stay in the account unused;
-  its state is durable and resumes unchanged when the reader returns. Per-key
-  `signed` / `redrop_pending` records do not exist before the writer, so
-  nothing is stranded. `SPEND_ADMIN_SECRET` and the limits are inert on the
-  old worker.
+  its state is durable and resumes unchanged when the reader returns.
+  `SPEND_ADMIN_SECRET` and the limits are inert on the old worker.
+  **Admissible only on PROOF, not by construction:** the old worker does not
+  know `signed` / `redrop_pending` — its `/check-and-reserve` rewrites such a
+  record to `reserved`, losing the txId and the bytes (a second paid
+  publication). No reader route creates one, but the rollback needs the
+  census, not the argument: (1) `POST /admin/spend/freeze {"active":true}` and
+  wait for every issued permit to report; (2) `npm --prefix worker run
+  census:recovery` (`CENSUS_URL`, `METRICS_ADMIN_SECRET`; docs/METRICS.md
+  «POST /admin/recovery-census») must exit **0** — complete enumeration
+  (revoked keys included), counter, index and scanned records all zero;
+  (3) only then dispatch the rollback. Exit 1 = the rollback is NOT proven:
+  do not deploy it.
 - **Never** delete migration `v3` or the binding on a roll-forward; never
   edit the limits on the dashboard (the next deploy would silently restore
   the repo value).
