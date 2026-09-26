@@ -2072,6 +2072,52 @@ that carries SpendGuard, hands `EXPECT_MIN_OPERATORS=2` to the post-deploy
 smoke; a historical candidate without SpendGuard (e.g. `394156d`, whose
 `/health` has no such field) is not asked, so the rollback stays possible.
 
+### The pool change of 2026-09-27 — `ar-io.dev` removed (owner decision)
+
+Research (payee-private-docs `arweave-status-operators-independence-2026-09-27.md`)
+showed the five-operator map overstated independence, and that `ar-io.dev` is
+AR.IO's shared TESTNET SANDBOX (docs.ar.io/build/testnet: «a testbed rather
+than a production plane») whose certificate no longer matches the host. Under
+`all-configured-v1` a member that never answers makes `dead` unreachable for
+everyone — it disables redrop. The new composition (pin, both blocks, the
+worker default, CI):
+
+| | Before | From this change |
+|---|---|---|
+| Status pool | arweave.net, ar-io.dev, vilenarios.com, frostor.xyz, permagate.io | arweave.net, vilenarios.com, frostor.xyz, permagate.io |
+| Payload pool (ordered) | arweave.net, vilenarios.com, ar-io.dev, frostor.xyz | arweave.net, vilenarios.com, frostor.xyz |
+| Operator map | five ids (ar-io.dev and vilenarios.com as two voices) | `arweave` (Forward Research) · `ar-io` (vilenarios.com — AR.IO's founder) · `frostor` (Memetic Block) · `permagate` |
+
+«Four groups by the accepted model»: permagate.io's independence from AR.IO is
+an assumption the owner accepted, not a proof.
+
+**Release order (after T1 — `worker/` is frozen during the v3 window):**
+
+1. Update the `dev` Environment variables `VITE_STATUS_GATEWAYS` and
+   `VITE_PAYLOAD_GATEWAYS` to the new lists. Nothing live changes: an already
+   built client keeps the pool it was built with. The worker deploy needs
+   them first — its gateway gate compares the client variable with the
+   candidate's config.
+2. Deploy the worker (the reader release carries the change).
+3. The post-deploy smoke attests the new `statusGatewaysHash` / count (4).
+4. Deploy the client (its build and CSP now use the new pool). Enforced, not
+   only ordered: the Pages pre-publish smoke expects the CURRENT pool, so a
+   dispatch while the live worker is still `394156d` is refused before
+   publishing.
+
+**Rollback across the pool change.** `394156d` carries the OLD pool and is held
+to it: `HISTORICAL_POOLS` in `scripts/gateway-pins.mjs` (full SHA, one build)
+makes the gateway gate compare its config with its own pools, and the
+post-deploy smoke of the WORKER deploy expect its own hash
+(`ea0e6282b314266b`, five origins) — explicitly: `deploy-worker.yml` passes
+`--allow-historical-pool`, and no other caller does. Every other candidate is
+held to the current pin. The client variable may then be either pool — a
+client already on the new pool disagrees with the rolled-back worker about
+`dead` until the reader returns; accepted, the worker decides every payment.
+While the worker is rolled back below the pool change, the Pages workflow
+refuses (its smoke never admits a historical pool): a client release waits
+for the reader to return.
+
 ### `SPEND_ADMIN_SECRET`
 
 The ONLY bearer of `/admin/spend/*`; `METRICS_ADMIN_SECRET` and
