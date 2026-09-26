@@ -2060,7 +2060,12 @@ the pin, every `STATUS_GATEWAYS` origin covered, ≥ 2 distinct operators —
 applicable only to a config that carries the `SpendGuard` binding. Changing
 the composition = a reviewed PR to the pin AND both blocks (a var, so a new
 Worker version, never a dashboard edit). `/health` reports
-`statusOperatorsCount`: below 2 no money quorum can form — the smoke reads it.
+`statusOperatorsCount`: below 2 no money quorum can form. The dev deploy
+asserts it automatically (runbook §6.9, owner decision 2026-09-27):
+`scripts/operators-floor.mjs` reads the CANDIDATE's config and, for a build
+that carries SpendGuard, hands `EXPECT_MIN_OPERATORS=2` to the post-deploy
+smoke; a historical candidate without SpendGuard (e.g. `394156d`, whose
+`/health` has no such field) is not asked, so the rollback stays possible.
 
 ### `SPEND_ADMIN_SECRET`
 
