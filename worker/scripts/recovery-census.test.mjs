@@ -151,6 +151,13 @@ describe('identity of the answering worker', () => {
     expect(v.problems.join('\n')).toMatch(/not a full 40-hex SHA/);
   });
 
+  it('the allowance never outranks an expected SHA: null + allowance + matching version id + CENSUS_EXPECT_RELEASE_SHA → refused', () => {
+    // Review of #223 (Low), reproduced: this combination used to pass.
+    const v = judged((b) => { b.releaseSha = null; }, { allowNullReleaseSha: true, expectVersionId: VID, expectReleaseSha: SHA });
+    expect(v.ok).toBe(false);
+    expect(v.problems.join('\n')).toMatch(/releaseSha is null ≠ CENSUS_EXPECT_RELEASE_SHA/);
+  });
+
   it('CENSUS_EXPECT_RELEASE_SHA / CENSUS_EXPECT_VERSION_ID must match when set', () => {
     expect(judgeCensus(200, empty(), { expectReleaseSha: SHA, expectVersionId: VID }).ok).toBe(true);
     expect(judgeCensus(200, empty(), { expectReleaseSha: 'b'.repeat(40) }).problems.join('\n')).toMatch(/≠ CENSUS_EXPECT_RELEASE_SHA/);
@@ -184,5 +191,8 @@ describe('CLI', () => {
     const untied = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: '1' });
     expect(untied.status).toBe(2);
     expect(untied.stderr).toMatch(/requires CENSUS_EXPECT_VERSION_ID/);
+    const contradictory = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: '1', CENSUS_EXPECT_VERSION_ID: VID, CENSUS_EXPECT_RELEASE_SHA: SHA });
+    expect(contradictory.status).toBe(2);
+    expect(contradictory.stderr).toMatch(/contradicts CENSUS_EXPECT_RELEASE_SHA/);
   });
 });

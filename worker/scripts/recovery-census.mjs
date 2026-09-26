@@ -97,6 +97,11 @@ export function judgeCensus(status, body, {
     } else if (expectVersionId === null) {
       problems.push('releaseSha is null and CENSUS_EXPECT_VERSION_ID is not set — a null SHA must be tied to an expected version id');
     }
+    // The allowance never outranks an explicit expectation: a caller that
+    // named a SHA gets that SHA or a refusal (review of #223, Low).
+    if (expectReleaseSha !== null) {
+      problems.push(`releaseSha is null ≠ CENSUS_EXPECT_RELEASE_SHA ${expectReleaseSha}`);
+    }
   } else if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
     problems.push(`releaseSha is not a full 40-hex SHA (${JSON.stringify(sha) ?? 'undefined'})`);
   } else if (expectReleaseSha !== null && sha !== expectReleaseSha) {
@@ -145,6 +150,10 @@ if (process.argv[1]?.endsWith('recovery-census.mjs')) {
   const allowNullReleaseSha = rawAllowNull === '1';
   if (allowNullReleaseSha && expectVersionId === null) {
     console.error('CENSUS_ALLOW_NULL_RELEASE_SHA=1 requires CENSUS_EXPECT_VERSION_ID (a null SHA is tied by version id)');
+    process.exit(2);
+  }
+  if (allowNullReleaseSha && expectReleaseSha !== null) {
+    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA=1 contradicts CENSUS_EXPECT_RELEASE_SHA: a worker that has the expected SHA does not need a null allowance');
     process.exit(2);
   }
   const target = classifySmokeTarget(url, process.env.SMOKE_ALLOW_ORIGIN);
