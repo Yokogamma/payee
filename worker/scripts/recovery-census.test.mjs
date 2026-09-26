@@ -10,8 +10,10 @@ import { judgeCensus } from './recovery-census.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+const SHA = '394156d5998dbaef5b1d273898ee8006104227f8';
+const VID = '41773298-9b1e-47aa-b33b-a353a8c381db';
 const empty = () => ({
-  workerVersionId: 'v', releaseSha: 'r',
+  workerVersionId: VID, releaseSha: SHA,
   census: {
     complete: true, verdict: 'empty',
     keys: { listed: 3, checked: 3, failed: 0 },
@@ -95,6 +97,67 @@ describe('judgeCensus', () => {
   });
 });
 
+// Review of #223 (Low): an empty census without — or with mistyped — worker
+// identity was accepted. A census proves something only about the worker that
+// answered it.
+describe('identity of the answering worker', () => {
+  const judged = (mutate, opts) => { const b = empty(); mutate(b); return judgeCensus(200, b, opts); };
+
+  it('workerVersionId missing, null, empty, non-string or oversized → refused', () => {
+    for (const mutate of [
+      (b) => { delete b.workerVersionId; },
+      (b) => { b.workerVersionId = null; },
+      (b) => { b.workerVersionId = ''; },
+      (b) => { b.workerVersionId = 42; },
+      (b) => { b.workerVersionId = 'x'.repeat(129); },
+    ]) {
+      const v = judged(mutate);
+      expect(v.ok).toBe(false);
+      expect(v.problems.join('\n')).toMatch(/workerVersionId is missing or not a non-empty string/);
+    }
+  });
+
+  it('releaseSha missing, mistyped, short, upper-case or abbreviated → refused', () => {
+    for (const mutate of [
+      (b) => { delete b.releaseSha; },
+      (b) => { b.releaseSha = 394156; },
+      (b) => { b.releaseSha = '394156d'; },
+      (b) => { b.releaseSha = SHA.toUpperCase(); },
+      (b) => { b.releaseSha = `${SHA}0`; },
+    ]) {
+      const v = judged(mutate);
+      expect(v.ok).toBe(false);
+      expect(v.problems.join('\n')).toMatch(/releaseSha is not a full 40-hex SHA/);
+    }
+  });
+
+  it('releaseSha null is refused by default (dev always carries RELEASE_SHA)', () => {
+    const v = judged((b) => { b.releaseSha = null; });
+    expect(v.ok).toBe(false);
+    expect(v.problems.join('\n')).toMatch(/releaseSha is null — admissible only for a staging/);
+  });
+
+  it('null for a staging without RELEASE_SHA: only with the allowance AND a matching expected version id', () => {
+    const nullSha = (b) => { b.releaseSha = null; };
+    expect(judged(nullSha, { allowNullReleaseSha: true }).problems.join('\n')).toMatch(/must be tied to an expected version id/);
+    expect(judged(nullSha, { allowNullReleaseSha: true, expectVersionId: 'another-version' }).problems.join('\n'))
+      .toMatch(/≠ CENSUS_EXPECT_VERSION_ID/);
+    expect(judged(nullSha, { allowNullReleaseSha: true, expectVersionId: VID }).ok).toBe(true);
+  });
+
+  it('the allowance does not relax a present SHA: a malformed one is still refused', () => {
+    const v = judged((b) => { b.releaseSha = 'abc'; }, { allowNullReleaseSha: true, expectVersionId: VID });
+    expect(v.ok).toBe(false);
+    expect(v.problems.join('\n')).toMatch(/not a full 40-hex SHA/);
+  });
+
+  it('CENSUS_EXPECT_RELEASE_SHA / CENSUS_EXPECT_VERSION_ID must match when set', () => {
+    expect(judgeCensus(200, empty(), { expectReleaseSha: SHA, expectVersionId: VID }).ok).toBe(true);
+    expect(judgeCensus(200, empty(), { expectReleaseSha: 'b'.repeat(40) }).problems.join('\n')).toMatch(/≠ CENSUS_EXPECT_RELEASE_SHA/);
+    expect(judgeCensus(200, empty(), { expectVersionId: 'other' }).problems.join('\n')).toMatch(/≠ CENSUS_EXPECT_VERSION_ID/);
+  });
+});
+
 describe('CLI', () => {
   const run = (env) => spawnSync(process.execPath, [join(HERE, 'recovery-census.mjs')], {
     encoding: 'utf8',
@@ -108,5 +171,18 @@ describe('CLI', () => {
     const stranger = run({ CENSUS_URL: 'https://evil.example.com', METRICS_ADMIN_SECRET: 's' });
     expect(stranger.status).toBe(2);
     expect(stranger.stdout + stranger.stderr).not.toContain('Bearer');
+  });
+
+  it('exit 2 for identity options that cannot mean anything: a bad expected SHA, a vague allowance, an allowance without a version id', () => {
+    const base = { CENSUS_URL: 'https://eternal-notes-proxy.sopi-88c.workers.dev', METRICS_ADMIN_SECRET: 's' };
+    const badSha = run({ ...base, CENSUS_EXPECT_RELEASE_SHA: '394156d' });
+    expect(badSha.status).toBe(2);
+    expect(badSha.stderr).toMatch(/CENSUS_EXPECT_RELEASE_SHA must be a full 40-hex SHA/);
+    const vague = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: 'yes' });
+    expect(vague.status).toBe(2);
+    expect(vague.stderr).toMatch(/unset or exactly 1/);
+    const untied = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: '1' });
+    expect(untied.status).toBe(2);
+    expect(untied.stderr).toMatch(/requires CENSUS_EXPECT_VERSION_ID/);
   });
 });

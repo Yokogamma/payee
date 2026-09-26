@@ -2138,9 +2138,11 @@ exception. `UPLOADS_ENABLED = "false"` remains the global lever (a deploy).
   publication). No reader route creates one, but the rollback needs the
   census, not the argument: (1) `POST /admin/spend/freeze {"active":true}` and
   wait for every issued permit to report; (2) `npm --prefix worker run
-  census:recovery` (`CENSUS_URL`, `METRICS_ADMIN_SECRET`; docs/METRICS.md
-  «POST /admin/recovery-census») must exit **0** — complete enumeration
-  (revoked keys included), counter, index and scanned records all zero;
+  census:recovery` (`CENSUS_URL`, `METRICS_ADMIN_SECRET`,
+  `CENSUS_EXPECT_RELEASE_SHA=<the live reader SHA>`; docs/METRICS.md
+  «POST /admin/recovery-census») must exit **0** — the answer comes from that
+  reader, complete enumeration (revoked keys included), counter, index and
+  scanned records all zero;
   (3) only then dispatch the rollback. Exit 1 = the rollback is NOT proven:
   do not deploy it.
 - **Never** delete migration `v3` or the binding on a roll-forward; never
