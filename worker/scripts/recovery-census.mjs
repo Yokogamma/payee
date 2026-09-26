@@ -9,7 +9,7 @@
  *   CENSUS_URL=https://eternal-notes-proxy.sopi-88c.workers.dev \
  *   METRICS_ADMIN_SECRET=<metrics admin secret> \
  *   [CENSUS_MIN_KEYS=1] [CENSUS_EXPECT_RELEASE_SHA=<40-hex>] \
- *   [CENSUS_EXPECT_VERSION_ID=<worker version id>] [CENSUS_ALLOW_NULL_RELEASE_SHA=1] \
+ *   [CENSUS_EXPECT_VERSION_ID=<worker version id>] \
  *   [SMOKE_ALLOW_ORIGIN=<origin>] \
  *   npm run census:recovery
  *
@@ -22,19 +22,19 @@
  *   2  usage: a missing variable or a target outside the allowlist.
  *
  * CENSUS_MIN_KEYS (default 1) is the operator's own floor: a contour with
- * real users that suddenly lists zero keys is a misread, not an empty set.
- * Set it to 0 deliberately for a freshly provisioned staging.
+ * keys that suddenly lists zero is a misread, not an empty set. Set it to 0
+ * only deliberately, for a contour that has never registered a key.
  *
  * IDENTITY — a census is proof only about the worker that answered it, so
  * both fields are required and typed (review of #223, Low):
- *   - `workerVersionId`: a non-empty string, always (both contours bind
- *     CF_VERSION_METADATA);
- *   - `releaseSha`: a full 40-hex SHA. `null` is admissible ONLY for a
- *     staging not yet given RELEASE_SHA (deploy-staging.mjs, until the
- *     runbook's M6), and only deliberately: CENSUS_ALLOW_NULL_RELEASE_SHA=1
- *     together with CENSUS_EXPECT_VERSION_ID equal to the answer — staging
- *     is then tied by version id, as the runbook ties it (§3.1.1). dev always
- *     carries RELEASE_SHA (deploy-worker.yml `--var RELEASE_SHA`).
+ *   - `workerVersionId`: a non-empty string, always (CF_VERSION_METADATA is
+ *     bound);
+ *   - `releaseSha`: a full 40-hex SHA, always. `null` is refused: the reader
+ *     ships to dev only (owner decision 2026-09-27 — no staging contour), and
+ *     dev always carries RELEASE_SHA (deploy-worker.yml `--var`). (The
+ *     interim CENSUS_ALLOW_NULL_RELEASE_SHA, meant for a staging without
+ *     RELEASE_SHA, is retired — set, it is a usage error, so an operator
+ *     following old notes learns it.)
  *   - CENSUS_EXPECT_RELEASE_SHA / CENSUS_EXPECT_VERSION_ID, when set, must
  *     match the answer exactly.
  *
@@ -58,9 +58,7 @@ const REASONS = new Set([
  * `ok` only for a complete, empty census that passed every check —
  * including the identity of the worker that answered (see the header).
  */
-export function judgeCensus(status, body, {
-  minKeys = 1, expectReleaseSha = null, expectVersionId = null, allowNullReleaseSha = false,
-} = {}) {
+export function judgeCensus(status, body, { minKeys = 1, expectReleaseSha = null, expectVersionId = null } = {}) {
   const problems = [];
   if (status !== 200) return { ok: false, summary: null, problems: [`HTTP ${status} — no census`] };
   const c = body?.census;
@@ -92,16 +90,7 @@ export function judgeCensus(status, body, {
   }
   const sha = body.releaseSha;
   if (sha === null) {
-    if (!allowNullReleaseSha) {
-      problems.push('releaseSha is null — admissible only for a staging without RELEASE_SHA, with CENSUS_ALLOW_NULL_RELEASE_SHA=1 and CENSUS_EXPECT_VERSION_ID');
-    } else if (expectVersionId === null) {
-      problems.push('releaseSha is null and CENSUS_EXPECT_VERSION_ID is not set — a null SHA must be tied to an expected version id');
-    }
-    // The allowance never outranks an explicit expectation: a caller that
-    // named a SHA gets that SHA or a refusal (review of #223, Low).
-    if (expectReleaseSha !== null) {
-      problems.push(`releaseSha is null ≠ CENSUS_EXPECT_RELEASE_SHA ${expectReleaseSha}`);
-    }
+    problems.push('releaseSha is null — every contour deploys with RELEASE_SHA; a worker that reports none cannot be tied to a commit');
   } else if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
     problems.push(`releaseSha is not a full 40-hex SHA (${JSON.stringify(sha) ?? 'undefined'})`);
   } else if (expectReleaseSha !== null && sha !== expectReleaseSha) {
@@ -142,18 +131,8 @@ if (process.argv[1]?.endsWith('recovery-census.mjs')) {
     process.exit(2);
   }
   const expectVersionId = process.env.CENSUS_EXPECT_VERSION_ID || null;
-  const rawAllowNull = process.env.CENSUS_ALLOW_NULL_RELEASE_SHA ?? '';
-  if (rawAllowNull !== '' && rawAllowNull !== '1') {
-    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA must be unset or exactly 1');
-    process.exit(2);
-  }
-  const allowNullReleaseSha = rawAllowNull === '1';
-  if (allowNullReleaseSha && expectVersionId === null) {
-    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA=1 requires CENSUS_EXPECT_VERSION_ID (a null SHA is tied by version id)');
-    process.exit(2);
-  }
-  if (allowNullReleaseSha && expectReleaseSha !== null) {
-    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA=1 contradicts CENSUS_EXPECT_RELEASE_SHA: a worker that has the expected SHA does not need a null allowance');
+  if (process.env.CENSUS_ALLOW_NULL_RELEASE_SHA !== undefined) {
+    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA is retired: there is no contour without RELEASE_SHA (dev only, owner decision 2026-09-27), and a null SHA is always refused');
     process.exit(2);
   }
   const target = classifySmokeTarget(url, process.env.SMOKE_ALLOW_ORIGIN);
@@ -179,7 +158,7 @@ if (process.argv[1]?.endsWith('recovery-census.mjs')) {
     console.error(`✗ census read failed: ${e instanceof Error ? e.message : String(e)} — REFUSED (a failed read is not an empty set)`);
     process.exit(1);
   }
-  const verdict = judgeCensus(status, body, { minKeys: Number(rawMin), expectReleaseSha, expectVersionId, allowNullReleaseSha });
+  const verdict = judgeCensus(status, body, { minKeys: Number(rawMin), expectReleaseSha, expectVersionId });
   if (verdict.summary) console.log(verdict.summary);
   if (!verdict.ok) {
     console.error('✗ recovery census REFUSED — a rollback below the reader is NOT proven admissible:');

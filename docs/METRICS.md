@@ -252,10 +252,8 @@ refused, 2 = usage. `CENSUS_MIN_KEYS` (default 1) refuses a contour with users
 that suddenly lists no keys. Identity is part of the proof: `workerVersionId`
 must be a non-empty string and `releaseSha` a full 40-hex SHA;
 `CENSUS_EXPECT_RELEASE_SHA` / `CENSUS_EXPECT_VERSION_ID` pin them to the
-version the operator means. `releaseSha: null` is refused unless
-`CENSUS_ALLOW_NULL_RELEASE_SHA=1` AND a matching `CENSUS_EXPECT_VERSION_ID`
-are given — only for a staging not yet deployed with `RELEASE_SHA`
-(`deploy-staging.mjs` before the runbook's M6), tied by version id.
+version the operator means. `releaseSha: null` is always refused: the reader
+ships to dev only, and dev deploys with `RELEASE_SHA` (`deploy-worker.yml`).
 
 ```bash
 CENSUS_URL=https://<worker> METRICS_ADMIN_SECRET=<secret> npm --prefix worker run census:recovery
