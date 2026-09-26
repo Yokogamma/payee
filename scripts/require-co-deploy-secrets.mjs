@@ -18,9 +18,10 @@
  */
 
 /** The co-deploy registry — one entry per `CO_DEPLOY_<NAME>` env in the
- *  preparing step and per row in docs/SECRETS.md. Kept in sync by
+ *  preparing step (with its `--arg`, its key in the jq program and its
+ *  `env -u`) and per row in docs/SECRETS.md. Kept in sync by
  *  check-workflow-invariants.test.mjs. */
-export const CO_DEPLOY_REGISTRY = Object.freeze(['CF_ANALYTICS_TOKEN']);
+export const CO_DEPLOY_REGISTRY = Object.freeze(['CF_ANALYTICS_TOKEN', 'SPEND_ADMIN_SECRET']);
 
 const NAME_RE = /^[A-Z][A-Z0-9_]*$/;
 

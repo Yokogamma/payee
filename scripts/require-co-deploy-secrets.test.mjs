@@ -56,6 +56,29 @@ describe('checkRequiredSecrets', () => {
   });
 
   it('the registry is the single list the workflow may require from', () => {
-    expect(CO_DEPLOY_REGISTRY).toEqual(['CF_ANALYTICS_TOKEN']);
+    expect(CO_DEPLOY_REGISTRY).toEqual(['CF_ANALYTICS_TOKEN', 'SPEND_ADMIN_SECRET']);
+  });
+});
+
+// Runbook reader-release rev. 7, review H2: before the registry knew it, a
+// dispatch with required_secrets=SPEND_ADMIN_SECRET was refused as «not in the
+// co-deploy registry» — the reader deploy could not carry its own admin key.
+describe('SPEND_ADMIN_SECRET (D10 reader) is co-deployable', () => {
+  it('required and NOT set in the Environment — refused before the deploy, naming the secret', () => {
+    const r = checkRequiredSecrets('SPEND_ADMIN_SECRET', ['CF_ANALYTICS_TOKEN']);
+    expect(r.ok).toBe(false);
+    expect(r.problems).toEqual([expect.stringMatching(/SPEND_ADMIN_SECRET is not set in the Environment/)]);
+    expect(r.problems.join(' ')).not.toMatch(/not in the co-deploy registry/);
+  });
+
+  it('required and set — accepted, alone or together with the analytics token', () => {
+    expect(checkRequiredSecrets('SPEND_ADMIN_SECRET', ['SPEND_ADMIN_SECRET'])).toEqual({ ok: true, required: ['SPEND_ADMIN_SECRET'], problems: [] });
+    expect(checkRequiredSecrets('CF_ANALYTICS_TOKEN,SPEND_ADMIN_SECRET', ['CF_ANALYTICS_TOKEN', 'SPEND_ADMIN_SECRET']).ok).toBe(true);
+  });
+
+  it('one of two required missing — refused for that one only', () => {
+    const r = checkRequiredSecrets('CF_ANALYTICS_TOKEN,SPEND_ADMIN_SECRET', ['CF_ANALYTICS_TOKEN']);
+    expect(r.ok).toBe(false);
+    expect(r.problems).toEqual([expect.stringMatching(/SPEND_ADMIN_SECRET is not set/)]);
   });
 });
