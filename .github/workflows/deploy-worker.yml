@@ -91,7 +91,7 @@ on:
       # rotation names the secrets it requires here and the job stops BEFORE
       # any upload when one of them is missing.
       required_secrets:
-        description: 'Comma-separated worker secret names that MUST be present in the co-deploy file (e.g. CF_ANALYTICS_TOKEN); empty for an ordinary deploy'
+        description: 'Comma-separated worker secret names that MUST be present in the co-deploy file (e.g. CF_ANALYTICS_TOKEN, SPEND_ADMIN_SECRET); empty for an ordinary deploy'
         required: false
         default: ''
         type: string
@@ -318,17 +318,21 @@ jobs:
       # every deploy did before this step existed.
       #
       # Registry of co-deployed secrets (docs/SECRETS.md «Co-deployed
-      # secrets»): CF_ANALYTICS_TOKEN. Adding one = one more `env:` line and
-      # one more `--arg` here, plus its row in the registry.
+      # secrets»): CF_ANALYTICS_TOKEN, SPEND_ADMIN_SECRET. Adding one = its
+      # name in CO_DEPLOY_REGISTRY (scripts/require-co-deploy-secrets.mjs),
+      # one more `env:` line, one more `--arg` + jq branch and one more
+      # `env -u` here, plus its row in the registry — the invariants test
+      # refuses any of them missing.
       - name: Prepare the co-deployed secrets file
         id: cosecrets
         run: |
           set +x
           umask 077
           FILE="$RUNNER_TEMP/co-deploy-secrets.json"
-          jq -n --arg cf_analytics_token "$CO_DEPLOY_CF_ANALYTICS_TOKEN" '
+          jq -n --arg cf_analytics_token "$CO_DEPLOY_CF_ANALYTICS_TOKEN" --arg spend_admin_secret "$CO_DEPLOY_SPEND_ADMIN_SECRET" '
             {}
             | if ($cf_analytics_token | length) > 0 then . + { CF_ANALYTICS_TOKEN: $cf_analytics_token } else . end
+            | if ($spend_admin_secret | length) > 0 then . + { SPEND_ADMIN_SECRET: $spend_admin_secret } else . end
           ' > "$FILE"
           COUNT=$(jq 'length' "$FILE")
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
@@ -341,12 +345,13 @@ jobs:
           # variable is removed from its environment (`env -u`), so the value
           # is not merely unread but absent from that process.
           PRESENT_SECRET_NAMES="$(jq -c 'keys' "$FILE")"
-          if ! env -u CO_DEPLOY_CF_ANALYTICS_TOKEN PRESENT_SECRET_NAMES="$PRESENT_SECRET_NAMES" node scripts/require-co-deploy-secrets.mjs; then
+          if ! env -u CO_DEPLOY_CF_ANALYTICS_TOKEN -u CO_DEPLOY_SPEND_ADMIN_SECRET PRESENT_SECRET_NAMES="$PRESENT_SECRET_NAMES" node scripts/require-co-deploy-secrets.mjs; then
             rm -f "$FILE"
             exit 1
           fi
         env:
           CO_DEPLOY_CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+          CO_DEPLOY_SPEND_ADMIN_SECRET: ${{ secrets.SPEND_ADMIN_SECRET }}
           REQUIRED_SECRETS: ${{ inputs.required_secrets }}
       # A candidate whose own wrangler does not know the flag would fail AFTER
       # the previous version was already replaced? No — it would fail at

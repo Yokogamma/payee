@@ -184,11 +184,15 @@ NAME (`test-candidate` in `deploy-worker.yml`): no `environment:` and no
 list is a review question, not a static failure.
 
 **Registry of co-deployed secrets** (one Environment secret per row; adding one
-= an `env:` line + a `--arg` in the preparing step + a row here):
+= its name in `CO_DEPLOY_REGISTRY` (`scripts/require-co-deploy-secrets.mjs`) +
+an `env:` line, a `--arg` with its jq branch and an `env -u` in the preparing
+step + a row here; `check-workflow-invariants.test.mjs` refuses any of them
+missing):
 
 | Environment secret (`dev`) | Worker secret | Owner / consumer |
 |---|---|---|
 | `CF_ANALYTICS_TOKEN` | `CF_ANALYTICS_TOKEN` | the worker's `/admin/metrics` upstream — and NOTHING else (see the ownership rule below) |
+| `SPEND_ADMIN_SECRET` | `SPEND_ADMIN_SECRET` | the worker's `/admin/spend/*` (D10); the operator holds the same bearer to call those routes — keep that copy BEFORE writing the Environment secret, which cannot be read back |
 
 `ARWEAVE_JWK`, `ADMIN_SECRET`, `RECOVERY_HMAC_SECRET`, `METRICS_ADMIN_SECRET`
 stay on their existing procedures for now; moving one into the registry is a
@@ -275,9 +279,12 @@ afterwards.
 soak window (any activation resets it) and never while an `init` is between
 `signed` and `done` on the operator's side (the next `init` simply continues
 by state with the new bearer — the record is durable, the bearer is not part
-of it): `wrangler secret put SPEND_ADMIN_SECRET` (and `--env staging`), update
-the operator's stored value, verify with `POST /admin/spend/status` → 200.
-Co-deploy is the preferred path once the registry above lists it.
+of it). **dev — co-deployed** (registry above): update the operator's stored
+value, then the `dev` Environment secret, then dispatch the deploy with
+`required_secrets = SPEND_ADMIN_SECRET` — one activation, refused before any
+upload if the secret is unset; never `wrangler secret put` on dev (a second
+activation). **staging** — `wrangler secret put SPEND_ADMIN_SECRET --env staging`.
+Verify with `POST /admin/spend/status` → 200.
 
 **`METRICS_ADMIN_SECRET` (PR-2)** — rotate freely:
 `wrangler secret put METRICS_ADMIN_SECRET` (and `--env staging` where

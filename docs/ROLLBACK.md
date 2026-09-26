@@ -2070,16 +2070,26 @@ Worker version, never a dashboard edit). `/health` reports
 
 ### `SPEND_ADMIN_SECRET`
 
-`wrangler secret put SPEND_ADMIN_SECRET` (prod and `--env staging`; generate
-`openssl rand -base64 32`) — the ONLY bearer of `/admin/spend/*`;
-`METRICS_ADMIN_SECRET` and `ADMIN_SECRET` answer `403 wrong_scope` there,
-an unset secret answers `503 spend_admin_unconfigured`. Blast radius and
-rotation: `docs/SECRETS.md`.
+The ONLY bearer of `/admin/spend/*`; `METRICS_ADMIN_SECRET` and
+`ADMIN_SECRET` answer `403 wrong_scope` there, an unset secret answers
+`503 spend_admin_unconfigured`. Generate `openssl rand -base64 32` and keep
+the operator's copy first (a GitHub Environment secret cannot be read back).
+
+- **dev** — CO-DEPLOYED, never `wrangler secret put` (that is an activation of
+  its own): put the value into the `dev` Environment secret
+  `SPEND_ADMIN_SECRET` and dispatch the reader deploy with
+  `required_secrets = SPEND_ADMIN_SECRET` — the job then refuses BEFORE any
+  upload if the secret is not set, and code and secret arrive as ONE version.
+- **staging** — `wrangler secret put SPEND_ADMIN_SECRET --env staging` (the
+  staging path does not co-deploy; staging has no soak window).
+
+Blast radius and rotation: `docs/SECRETS.md`.
 
 ### Bringing the guard into service (spec §4.3 — the ONLY order)
 
 1. Deploy the reader with `UPLOADS_ENABLED = "false"` (every paid path
-   refuses; nothing new can be signed).
+   refuses; nothing new can be signed), dispatched with
+   `required_secrets = SPEND_ADMIN_SECRET` (see `SPEND_ADMIN_SECRET` above).
 2. `POST /admin/spend/freeze {"active":true}`.
 3. `POST /admin/spend/init` — repeat until `step: "done"`. The first call
    closes the legacy set (keys ∪ open permits ∪ journals, rewards from
