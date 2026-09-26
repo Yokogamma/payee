@@ -76,13 +76,14 @@ export const INDEX_QUERY_URL: string = INDEX_SOURCES[0][0];
  * The age of a txId that one index returned and another omitted is established
  * ONLY by status origins run by DIFFERENT operators — two origins of one
  * operator are one voice. Pinned at build time like the lists themselves; the
- * default covers the approved composition (§2.1: five origins, five operators).
+ * default covers the approved composition (four origins, four operator groups
+ * by the accepted model since 2026-09-27 — scripts/gateway-pins.mjs).
  * An origin missing from the map casts NO age vote (fail-closed), so a list
  * extended without extending the map cannot loosen the rule — it can only fail
  * to tighten it, and `scripts/check-deploy-config.mjs` refuses that build.
  */
 const DEFAULT_STATUS_OPERATORS =
-  'https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,'
+  'https://arweave.net=arweave,https://vilenarios.com=ar-io,'
   + 'https://frostor.xyz=frostor,https://permagate.io=permagate';
 
 export const STATUS_OPERATORS: ReadonlyMap<string, string> = (() => {
