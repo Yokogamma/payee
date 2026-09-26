@@ -214,7 +214,10 @@ binding = "CF_VERSION_METADATA"
 #   freeze, init (marker), reinit, credit-deposit, status, init-legacy-keys.
 #   NOT METRICS_ADMIN_SECRET (read-only) and NOT ADMIN_SECRET (invites): a
 #   bearer of either answers 403 wrong_scope there. 503 while missing.
-#   Generate: `openssl rand -base64 32`; prod AND staging (co-deploy, PR-6).
+#   Generate: `openssl rand -base64 32`. dev: CO-DEPLOYED by deploy-worker.yml
+#   (registry: scripts/require-co-deploy-secrets.mjs; dispatch the first
+#   deploy with required_secrets=SPEND_ADMIN_SECRET), never `secret put`;
+#   staging: `wrangler secret put SPEND_ADMIN_SECRET --env staging`.
 
 # ─── Staging environment ─────────────────────────────────────────────
 # Fully isolated stand-in for the mandatory pre-W3 signed v3 smoke
