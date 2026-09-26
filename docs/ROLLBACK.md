@@ -2100,15 +2100,23 @@ an assumption the owner accepted, not a proof.
    candidate's config.
 2. Deploy the worker (the reader release carries the change).
 3. The post-deploy smoke attests the new `statusGatewaysHash` / count (4).
-4. Deploy the client (its build and CSP now use the new pool).
+4. Deploy the client (its build and CSP now use the new pool). Enforced, not
+   only ordered: the Pages pre-publish smoke expects the CURRENT pool, so a
+   dispatch while the live worker is still `394156d` is refused before
+   publishing.
 
 **Rollback across the pool change.** `394156d` carries the OLD pool and is held
 to it: `HISTORICAL_POOLS` in `scripts/gateway-pins.mjs` (full SHA, one build)
-makes the gateway gate compare its config with its own pools and the smoke
-expect its own hash (`ea0e6282b314266b`, five origins); every other candidate
-is held to the current pin. The client variable may then be either pool — a
+makes the gateway gate compare its config with its own pools, and the
+post-deploy smoke of the WORKER deploy expect its own hash
+(`ea0e6282b314266b`, five origins) — explicitly: `deploy-worker.yml` passes
+`--allow-historical-pool`, and no other caller does. Every other candidate is
+held to the current pin. The client variable may then be either pool — a
 client already on the new pool disagrees with the rolled-back worker about
 `dead` until the reader returns; accepted, the worker decides every payment.
+While the worker is rolled back below the pool change, the Pages workflow
+refuses (its smoke never admits a historical pool): a client release waits
+for the reader to return.
 
 ### `SPEND_ADMIN_SECRET`
 

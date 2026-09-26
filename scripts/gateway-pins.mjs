@@ -100,10 +100,12 @@ export const EXPECTED_PAYLOAD_CSV = PAYLOAD_GATEWAYS.join(',');
  * hash and count on the live /health.
  *
  * For a listed SHA the gates hold the candidate to ITS pools (in order, for
- * payload) and the smoke expects ITS hash; every other candidate is held to
- * the current pin. Deliberately NOT a profile: the rollback to 394156d runs
- * under `normal` (runbook §5.1), and its /health reports the same profile
- * fields as any modern build.
+ * payload) and the WORKER deploy's smoke — explicitly, with
+ * `--allow-historical-pool` — expects ITS hash; every other candidate is held
+ * to the current pin. The Pages pre-publish smoke never admits it: the client
+ * it publishes is built on the current pin. Deliberately NOT a profile: the
+ * rollback to 394156d runs under `normal` (runbook §5.1), and its /health
+ * reports the same profile fields as any modern build.
  */
 export const HISTORICAL_POOLS = Object.freeze({
   // The soak v3 candidate (worker 394156d, versionId 41773298…): live when the
