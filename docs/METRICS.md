@@ -249,7 +249,13 @@ The operator reads it through `worker/scripts/recovery-census.mjs`
 (`npm run census:recovery`, target allowlist of the smoke scripts), which
 re-checks every field on its own: exit 0 only for complete + empty, 1 =
 refused, 2 = usage. `CENSUS_MIN_KEYS` (default 1) refuses a contour with users
-that suddenly lists no keys.
+that suddenly lists no keys. Identity is part of the proof: `workerVersionId`
+must be a non-empty string and `releaseSha` a full 40-hex SHA;
+`CENSUS_EXPECT_RELEASE_SHA` / `CENSUS_EXPECT_VERSION_ID` pin them to the
+version the operator means. `releaseSha: null` is refused unless
+`CENSUS_ALLOW_NULL_RELEASE_SHA=1` AND a matching `CENSUS_EXPECT_VERSION_ID`
+are given — only for a staging not yet deployed with `RELEASE_SHA`
+(`deploy-staging.mjs` before the runbook's M6), tied by version id.
 
 ```bash
 CENSUS_URL=https://<worker> METRICS_ADMIN_SECRET=<secret> npm --prefix worker run census:recovery

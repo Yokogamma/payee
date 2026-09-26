@@ -8,7 +8,9 @@
  * Authorization header):
  *   CENSUS_URL=https://eternal-notes-proxy.sopi-88c.workers.dev \
  *   METRICS_ADMIN_SECRET=<metrics admin secret> \
- *   [CENSUS_MIN_KEYS=1] [SMOKE_ALLOW_ORIGIN=<origin>] \
+ *   [CENSUS_MIN_KEYS=1] [CENSUS_EXPECT_RELEASE_SHA=<40-hex>] \
+ *   [CENSUS_EXPECT_VERSION_ID=<worker version id>] [CENSUS_ALLOW_NULL_RELEASE_SHA=1] \
+ *   [SMOKE_ALLOW_ORIGIN=<origin>] \
  *   npm run census:recovery
  *
  * Exit codes — the ONLY thing a rollback decision may read:
@@ -23,6 +25,19 @@
  * real users that suddenly lists zero keys is a misread, not an empty set.
  * Set it to 0 deliberately for a freshly provisioned staging.
  *
+ * IDENTITY — a census is proof only about the worker that answered it, so
+ * both fields are required and typed (review of #223, Low):
+ *   - `workerVersionId`: a non-empty string, always (both contours bind
+ *     CF_VERSION_METADATA);
+ *   - `releaseSha`: a full 40-hex SHA. `null` is admissible ONLY for a
+ *     staging not yet given RELEASE_SHA (deploy-staging.mjs, until the
+ *     runbook's M6), and only deliberately: CENSUS_ALLOW_NULL_RELEASE_SHA=1
+ *     together with CENSUS_EXPECT_VERSION_ID equal to the answer — staging
+ *     is then tied by version id, as the runbook ties it (§3.1.1). dev always
+ *     carries RELEASE_SHA (deploy-worker.yml `--var RELEASE_SHA`).
+ *   - CENSUS_EXPECT_RELEASE_SHA / CENSUS_EXPECT_VERSION_ID, when set, must
+ *     match the answer exactly.
+ *
  * Run it under `freeze on`, after every issued permit has reported (runbook
  * §5.1 step 1) — the census is a snapshot, and the freeze is what keeps it
  * true until the rollback deploy.
@@ -31,6 +46,8 @@
 import { classifySmokeTarget } from './smoke-target.mjs';
 
 const isCount = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+const SHA_RE = /^[0-9a-f]{40}$/;
+const VERSION_ID_MAX = 128;
 const REASONS = new Set([
   'list_keys_failed', 'legacy_keys_failed', 'legacy_invites_unacknowledged', 'too_many_keys',
   'key_read_failed', 'recovery_present', 'counter_drift',
@@ -38,9 +55,12 @@ const REASONS = new Set([
 
 /**
  * Pure verdict over one HTTP answer. Returns `{ ok, summary, problems }`:
- * `ok` only for a complete, empty census that passed every check.
+ * `ok` only for a complete, empty census that passed every check —
+ * including the identity of the worker that answered (see the header).
  */
-export function judgeCensus(status, body, { minKeys = 1 } = {}) {
+export function judgeCensus(status, body, {
+  minKeys = 1, expectReleaseSha = null, expectVersionId = null, allowNullReleaseSha = false,
+} = {}) {
   const problems = [];
   if (status !== 200) return { ok: false, summary: null, problems: [`HTTP ${status} — no census`] };
   const c = body?.census;
@@ -61,6 +81,27 @@ export function judgeCensus(status, body, { minKeys = 1 } = {}) {
     `recovery count=${c.recovery.count} due=${c.recovery.due} records=${c.recovery.records} keysWithRecovery=${c.recovery.keysWithRecovery}` +
     (c.reasons.length ? ` reasons=${c.reasons.join(',')}` : '') +
     ` (worker ${body.workerVersionId ?? '?'} / ${body.releaseSha ?? '?'})`;
+
+  // Identity: the census proves something only about the worker that
+  // answered it.
+  const vid = body.workerVersionId;
+  if (typeof vid !== 'string' || vid.length === 0 || vid.length > VERSION_ID_MAX) {
+    problems.push(`workerVersionId is missing or not a non-empty string (${JSON.stringify(vid) ?? 'undefined'}) — the census cannot be tied to a version`);
+  } else if (expectVersionId !== null && vid !== expectVersionId) {
+    problems.push(`workerVersionId ${vid} ≠ CENSUS_EXPECT_VERSION_ID ${expectVersionId}`);
+  }
+  const sha = body.releaseSha;
+  if (sha === null) {
+    if (!allowNullReleaseSha) {
+      problems.push('releaseSha is null — admissible only for a staging without RELEASE_SHA, with CENSUS_ALLOW_NULL_RELEASE_SHA=1 and CENSUS_EXPECT_VERSION_ID');
+    } else if (expectVersionId === null) {
+      problems.push('releaseSha is null and CENSUS_EXPECT_VERSION_ID is not set — a null SHA must be tied to an expected version id');
+    }
+  } else if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
+    problems.push(`releaseSha is not a full 40-hex SHA (${JSON.stringify(sha) ?? 'undefined'})`);
+  } else if (expectReleaseSha !== null && sha !== expectReleaseSha) {
+    problems.push(`releaseSha ${sha} ≠ CENSUS_EXPECT_RELEASE_SHA ${expectReleaseSha}`);
+  }
 
   // Every condition is checked on its own — the worker's own verdict is one
   // input, not the decision.
@@ -90,6 +131,22 @@ if (process.argv[1]?.endsWith('recovery-census.mjs')) {
     console.error(`CENSUS_MIN_KEYS must be a non-negative integer, got "${rawMin}"`);
     process.exit(2);
   }
+  const expectReleaseSha = process.env.CENSUS_EXPECT_RELEASE_SHA || null;
+  if (expectReleaseSha !== null && !SHA_RE.test(expectReleaseSha)) {
+    console.error('CENSUS_EXPECT_RELEASE_SHA must be a full 40-hex SHA');
+    process.exit(2);
+  }
+  const expectVersionId = process.env.CENSUS_EXPECT_VERSION_ID || null;
+  const rawAllowNull = process.env.CENSUS_ALLOW_NULL_RELEASE_SHA ?? '';
+  if (rawAllowNull !== '' && rawAllowNull !== '1') {
+    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA must be unset or exactly 1');
+    process.exit(2);
+  }
+  const allowNullReleaseSha = rawAllowNull === '1';
+  if (allowNullReleaseSha && expectVersionId === null) {
+    console.error('CENSUS_ALLOW_NULL_RELEASE_SHA=1 requires CENSUS_EXPECT_VERSION_ID (a null SHA is tied by version id)');
+    process.exit(2);
+  }
   const target = classifySmokeTarget(url, process.env.SMOKE_ALLOW_ORIGIN);
   if (!target.ok) {
     console.error(`✗ ${target.reason}`);
@@ -113,7 +170,7 @@ if (process.argv[1]?.endsWith('recovery-census.mjs')) {
     console.error(`✗ census read failed: ${e instanceof Error ? e.message : String(e)} — REFUSED (a failed read is not an empty set)`);
     process.exit(1);
   }
-  const verdict = judgeCensus(status, body, { minKeys: Number(rawMin) });
+  const verdict = judgeCensus(status, body, { minKeys: Number(rawMin), expectReleaseSha, expectVersionId, allowNullReleaseSha });
   if (verdict.summary) console.log(verdict.summary);
   if (!verdict.ok) {
     console.error('✗ recovery census REFUSED — a rollback below the reader is NOT proven admissible:');
