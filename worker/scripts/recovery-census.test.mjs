@@ -131,24 +131,12 @@ describe('identity of the answering worker', () => {
     }
   });
 
-  it('releaseSha null is refused by default (dev always carries RELEASE_SHA)', () => {
-    const v = judged((b) => { b.releaseSha = null; });
-    expect(v.ok).toBe(false);
-    expect(v.problems.join('\n')).toMatch(/releaseSha is null — admissible only for a staging/);
-  });
-
-  it('null for a staging without RELEASE_SHA: only with the allowance AND a matching expected version id', () => {
-    const nullSha = (b) => { b.releaseSha = null; };
-    expect(judged(nullSha, { allowNullReleaseSha: true }).problems.join('\n')).toMatch(/must be tied to an expected version id/);
-    expect(judged(nullSha, { allowNullReleaseSha: true, expectVersionId: 'another-version' }).problems.join('\n'))
-      .toMatch(/≠ CENSUS_EXPECT_VERSION_ID/);
-    expect(judged(nullSha, { allowNullReleaseSha: true, expectVersionId: VID }).ok).toBe(true);
-  });
-
-  it('the allowance does not relax a present SHA: a malformed one is still refused', () => {
-    const v = judged((b) => { b.releaseSha = 'abc'; }, { allowNullReleaseSha: true, expectVersionId: VID });
-    expect(v.ok).toBe(false);
-    expect(v.problems.join('\n')).toMatch(/not a full 40-hex SHA/);
+  it('releaseSha null is refused on every contour — dev and, since M6, staging deploy with RELEASE_SHA', () => {
+    for (const opts of [{}, { expectVersionId: VID }]) {
+      const v = judged((b) => { b.releaseSha = null; }, opts);
+      expect(v.ok).toBe(false);
+      expect(v.problems.join('\n')).toMatch(/releaseSha is null — every contour deploys with RELEASE_SHA/);
+    }
   });
 
   it('CENSUS_EXPECT_RELEASE_SHA / CENSUS_EXPECT_VERSION_ID must match when set', () => {
@@ -173,16 +161,15 @@ describe('CLI', () => {
     expect(stranger.stdout + stranger.stderr).not.toContain('Bearer');
   });
 
-  it('exit 2 for identity options that cannot mean anything: a bad expected SHA, a vague allowance, an allowance without a version id', () => {
+  it('exit 2 for a bad expected SHA, and for the retired null allowance (whatever its value)', () => {
     const base = { CENSUS_URL: 'https://eternal-notes-proxy.sopi-88c.workers.dev', METRICS_ADMIN_SECRET: 's' };
     const badSha = run({ ...base, CENSUS_EXPECT_RELEASE_SHA: '394156d' });
     expect(badSha.status).toBe(2);
     expect(badSha.stderr).toMatch(/CENSUS_EXPECT_RELEASE_SHA must be a full 40-hex SHA/);
-    const vague = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: 'yes' });
-    expect(vague.status).toBe(2);
-    expect(vague.stderr).toMatch(/unset or exactly 1/);
-    const untied = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: '1' });
-    expect(untied.status).toBe(2);
-    expect(untied.stderr).toMatch(/requires CENSUS_EXPECT_VERSION_ID/);
+    for (const value of ['1', '', 'yes']) {
+      const retired = run({ ...base, CENSUS_ALLOW_NULL_RELEASE_SHA: value, CENSUS_EXPECT_VERSION_ID: VID });
+      expect(retired.status, value).toBe(2);
+      expect(retired.stderr).toMatch(/CENSUS_ALLOW_NULL_RELEASE_SHA is retired/);
+    }
   });
 });
