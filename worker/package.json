@@ -12,6 +12,7 @@
     "smoke:v3": "node scripts/smoke-v3.mjs",
     "smoke:v4": "node scripts/smoke-v4.mjs",
     "smoke:spend": "node scripts/smoke-spend.mjs",
+    "census:recovery": "node scripts/recovery-census.mjs",
     "soak:d2": "node scripts/soak-d2.mjs",
     "seed-invite": "wrangler dev --test-scheduled",
     "test": "vitest run && vitest run -c vitest.direct.config.mts",
