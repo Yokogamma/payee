@@ -13,7 +13,9 @@
  *   0. require SMOKE_STAGING_ORIGIN (a bare https origin) — the live smoke is
  *      not optional, so it is checked before anything is deployed;
  *   1. config gates in --repo-only mode (both sides live in the repository):
- *      status pool, per-contour trusted owners, spend limits;
+ *      status pool, per-contour trusted owners, spend limits — run WITHOUT
+ *      the variables that steer them (WORKER_CANDIDATE_SHA & co.), so a
+ *      historical candidate's exemptions never apply to the working tree;
  *   1b. the pinned Cloudflare account;
  *   2. refuse UNCLEAN deployed sources — tracked changes anywhere, untracked
  *      files under worker/ and src/ (what the bundle is built from) —
@@ -35,7 +37,7 @@ import { parseWranglerOutput } from '../../scripts/read-wrangler-version.mjs';
 import { ACCOUNT_ID, WORKER_NAME } from './smoke-target.mjs';
 import {
   DEPLOYED_SOURCE_ROOTS, STAGING_CONFIG_GATES,
-  releaseShaOf, stagingDeployArgs, stagingSmokeEnv, stagingSmokeOrigin, uncleanDeploySources,
+  releaseShaOf, stagingDeployArgs, stagingGateEnv, stagingSmokeEnv, stagingSmokeOrigin, uncleanDeploySources,
 } from './staging-deploy-rules.mjs';
 
 const WORKER_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -57,8 +59,12 @@ if (!smoke.ok) {
   process.exit(1);
 }
 
-// 1. Config gates — the same code the deploy workflow and CI run.
-for (const [script, ...args] of STAGING_CONFIG_GATES) run(process.execPath, [script, ...args]);
+// 1. Config gates — the same code the deploy workflow and CI run — with the
+// variables that steer them stripped: a WORKER_CANDIDATE_SHA left in this
+// shell would otherwise apply a historical candidate's exemptions to the
+// working tree (review of #224, Medium).
+const gateEnv = stagingGateEnv(process.env);
+for (const [script, ...args] of STAGING_CONFIG_GATES) run(process.execPath, [script, ...args], { env: gateEnv });
 
 // 1b. The account is pinned: credentials pointing somewhere else are exactly
 // what an identity check exists to catch, and whoami is where that shows up.

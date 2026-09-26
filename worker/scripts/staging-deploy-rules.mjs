@@ -25,6 +25,31 @@ export const STAGING_CONFIG_GATES = Object.freeze([
   Object.freeze(['scripts/check-spend-limits.mjs']),
 ]);
 
+/**
+ * Environment variables that STEER the gates — stripped before they run
+ * (review of #224, Medium). The gates are shared with the trusted dev deploy,
+ * where `WORKER_CANDIDATE_SHA` names the candidate being rolled back to; a
+ * value left in the operator's shell — say the full SHA of ff0954d — would
+ * make the staging run skip the owner coverage and the payload pool as for
+ * that historical build, and PASS a wrong config. Staging always deploys the
+ * working tree, never a historical candidate. The VITE_* client values and
+ * DEPLOY_PROFILE have no meaning here either. A test requires every
+ * environment variable the gates (and their local imports) read to be listed.
+ */
+export const STAGING_GATE_ENV_STRIP = Object.freeze([
+  'WORKER_CANDIDATE_SHA',
+  'DEPLOY_PROFILE',
+  'VITE_STATUS_GATEWAYS',
+  'VITE_TRUSTED_OWNERS',
+]);
+
+/** The gates' environment: the caller's, minus STAGING_GATE_ENV_STRIP
+ *  (case-insensitively — Windows environment names are). */
+export function stagingGateEnv(baseEnv) {
+  const strip = new Set(STAGING_GATE_ENV_STRIP);
+  return Object.fromEntries(Object.entries(baseEnv).filter(([k]) => !strip.has(k.toUpperCase())));
+}
+
 /** Roots the worker bundle is built from: its own tree and the shared
  *  `src/lib` modules it imports (`../../src/lib/*`). */
 export const DEPLOYED_SOURCE_ROOTS = Object.freeze(['worker', 'src']);

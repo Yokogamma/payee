@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  DEPLOYED_SOURCE_ROOTS, STAGING_CONFIG_GATES, STAGING_MIN_OPERATORS,
-  releaseShaOf, stagingDeployArgs, stagingSmokeEnv, stagingSmokeOrigin, uncleanDeploySources,
+  DEPLOYED_SOURCE_ROOTS, STAGING_CONFIG_GATES, STAGING_GATE_ENV_STRIP, STAGING_MIN_OPERATORS,
+  releaseShaOf, stagingDeployArgs, stagingGateEnv, stagingSmokeEnv, stagingSmokeOrigin, uncleanDeploySources,
 } from './staging-deploy-rules.mjs';
 
 // Runbook reader release M6 (review 25.09): the staging rehearsal's checks are
@@ -26,6 +26,60 @@ describe('config gates', () => {
     for (const s of scripts) expect(existsSync(join(ROOT, s)), s).toBe(true);
     const owners = STAGING_CONFIG_GATES.find(([s]) => s === 'scripts/check-trusted-owners.mjs');
     expect(owners.some(a => a.startsWith('--contour'))).toBe(false);
+  });
+});
+
+// Review of #224 (Medium): the gates are shared with the trusted dev deploy
+// and read WORKER_CANDIDATE_SHA from the environment. Inherited from the
+// operator's shell (say, the full SHA of ff0954d), it made the staging run
+// skip owner coverage as for that historical build and PASS a wrong config.
+describe('the gates run without the variables that steer them', () => {
+  const FF = 'ff0954d1799c2dc0534a4ab73c6d11d3e01645f1';
+
+  it('stagingGateEnv strips every steering variable, case-insensitively, and keeps the rest', () => {
+    const env = stagingGateEnv({
+      PATH: '/bin', WORKER_CANDIDATE_SHA: FF, worker_candidate_sha: FF, Deploy_Profile: 'emergency',
+      VITE_STATUS_GATEWAYS: 'x', VITE_TRUSTED_OWNERS: 'y', SMOKE_STAGING_ORIGIN: 'https://s.example',
+    });
+    expect(env).toEqual({ PATH: '/bin', SMOKE_STAGING_ORIGIN: 'https://s.example' });
+  });
+
+  it('every environment variable a gate (or a local module it imports) reads is stripped — a new lever cannot slip in', () => {
+    const seen = new Set();
+    const reads = new Set();
+    const visit = (file) => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const text = readFileSync(file, 'utf8');
+      expect(text, `${file}: bracket access to process.env hides the name`).not.toMatch(/process\.env\s*\[/);
+      for (const m of text.matchAll(/process\.env\.([A-Za-z0-9_]+)/g)) reads.add(m[1]);
+      for (const m of text.matchAll(/from '(\.\.?\/[^']+\.mjs)'/g)) visit(join(dirname(file), m[1]));
+    };
+    for (const [script] of STAGING_CONFIG_GATES) visit(join(ROOT, script));
+    expect(reads.size).toBeGreaterThan(0);
+    for (const name of reads) expect(STAGING_GATE_ENV_STRIP, `${name} steers a staging gate`).toContain(name);
+  });
+
+  it('reproduction: a wrong staging config PASSES with an inherited historical SHA, and is REFUSED under stagingGateEnv', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'staging-gate-env-'));
+    try {
+      const A = 'Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE';
+      const C = 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'; // an unpinned staging address
+      const toml = join(dir, 'wrangler.toml');
+      writeFileSync(toml, `[vars]\nTRUSTED_OWNERS = "${A}"\n\n[env.staging.vars]\nTRUSTED_OWNERS = "${A},${C}"\n`);
+      const gate = (env) => spawnSync(process.execPath, ['scripts/check-trusted-owners.mjs', '--repo-only', `--config=${toml}`], { cwd: ROOT, encoding: 'utf8', env });
+      const inherited = { ...process.env, WORKER_CANDIDATE_SHA: FF };
+
+      const raw = gate(inherited);
+      expect(raw.status).toBe(0);
+      expect(raw.stdout).toMatch(/SKIPPED/);
+
+      const stripped = gate(stagingGateEnv(inherited));
+      expect(stripped.status).toBe(1);
+      expect(stripped.stderr).toMatch(/staging: TRUSTED_OWNERS adds C+ beyond the production set/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -128,7 +182,8 @@ describe('deploy-staging.mjs applies every rule (static)', () => {
   });
 
   it('every config gate runs; the clean-sources check covers the bundle roots; the deploy carries RELEASE_SHA', () => {
-    expect(src).toMatch(/for \(const \[script, \.\.\.args\] of STAGING_CONFIG_GATES\) run\(/);
+    expect(src).toMatch(/const gateEnv = stagingGateEnv\(process\.env\);/);
+    expect(src).toMatch(/for \(const \[script, \.\.\.args\] of STAGING_CONFIG_GATES\) run\(process\.execPath, \[script, \.\.\.args\], \{ env: gateEnv \}\);/);
     expect(src).toMatch(/'--untracked-files=all', '--', \.\.\.DEPLOYED_SOURCE_ROOTS/);
     expect(src).toMatch(/uncleanDeploySources\(/);
     expect(src).toMatch(/\[WRANGLER_BIN, \.\.\.stagingDeployArgs\(sha\)\]/);
