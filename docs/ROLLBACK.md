@@ -631,6 +631,37 @@ reverted by accident.
    The rollback window of the worker is now CLOSED on purpose: a defect found
    after the import flip is fixed forward (`UPLOADS_ENABLED="false"` override →
    fix under `normal`), never by a deploy below this floor.
+   **IMPORT FLIP — `client-b2` = f8003aa, DEPLOYED 2026-10-02 10:17 UTC**
+   (head of main after #205, frozen from the merge to the dispatch; Pages run
+   [36994421617](https://github.com/Yokogamma/payee/actions/runs/36994421617),
+   deployment `247735a9.eternal-notes.pages.dev`, bundle
+   `assets/index-Cmo7B-Cc.js` 665.17 kB / gzip 203.62 kB, precache 24 entries
+   (1071.67 KiB), budget 210.5 KB gz of 300 KB), against the unchanged worker
+   `394156d…` / `41773298…` (run 35151788392, identity re-verified by the run),
+   floor `394156d` in both stages, gate in **equality** mode («WORKER_FLOOR_SHA
+   == MINIMUM_FLOOR == 394156d… == candidate»), green end to end. Before the
+   dispatch, on the same SHA: CI run 36992251622 green by exit code, the
+   deployable worker set byte-identical to `394156d` and `worker/` identical to
+   `79ac83d`. Both post-deploy smokes green in the run and again by hand against
+   `notes.matamata.dev` (`?v=`). Viewer unchanged: `be34dd60…`, 63978 bytes —
+   the registry row of `client-b1` covers this release, no new row. The
+   published artifact carries the import code: the import lock name
+   `eternal-notes-backup-import` is present in the live bundle and absent from
+   `49e219de`'s (the button labels exist in both bundles and prove nothing).
+   Mixed versions: an already-open `client-b1-hotfix1` tab shows no prompt by
+   itself — the client registers the service worker without a periodic update
+   check, so the browser checks on a navigation in scope; after one (a new tab
+   of the site) the old tab showed «Доступна новая версия приложения» →
+   «Обновить» → the new client; the installed PWA updated on consent; no
+   «Приложение обновилось» (`DB_VERSION` unchanged). Release note: «Релиз 2:
+   импорт резервной копии…» (owner-approved; full text in the release record).
+   `client-b2` is NOT a floor (neither flip is): the client floor stays
+   `client-b1`. Pages rollback target if import misbehaves: `49e219de`
+   (`client-b1-hotfix1`) — import disappears from the UI, imported data stays;
+   the worker is NOT rolled back (the floor). Not done at release time: the live
+   import with two paid publications (acceptance R2-C3), and the live rollback
+   to release 1 — not executed by owner decision 2026-09-22, a stated boundary
+   of the acceptance.
 4. Flip `BACKUP_EXPORT_ENABLED`.
 
 The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
@@ -671,6 +702,8 @@ frozen after this merge) are recorded by the release-lines PR after the
 dispatch, as for `client-b1`. Rollback target if import misbehaves: the
 `client-b1-hotfix1` deployment (`49e219de`) — import disappears from the UI,
 imported data stays; the worker is NOT rolled back (the floor).
+**Shipped 2026-10-02 10:17 UTC as `client-b2` = f8003aa** — the deploy facts
+are under «Order», step 3.
 
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
@@ -2724,6 +2757,13 @@ verdict: waive it for this window with that reason, or accept a longer window
 in the hope of a genuine DO fault — the script will not manufacture one.
 
 ### Emergency path AFTER the import flip — OWNER DECISION 2026-09-07: roll-forward, the switch is the lever
+
+> **In effect since 2026-10-02 10:17 UTC** — the import flip shipped
+> (`client-b2` = f8003aa, «Backup v1 … Order», step 3). The floor is
+> `394156d` in both stages (a descendant of the D2 release), so the rules
+> below apply as written: the lever is the `UPLOADS_ENABLED = "false"`
+> override, fixes go forward under `normal`, and the `emergency` profile is
+> retired.
 
 Why a decision was needed: once `WORKER_FLOOR_SHA` = `d65e352…`, every
 deployable commit is a descendant of the D2 release and answers
