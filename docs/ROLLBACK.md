@@ -368,8 +368,8 @@ flip is a **raise** rather than a first filling:
 | When | `WORKER_FLOOR_SHA` | Why |
 |---|---|---|
 | ~~2026-08-28 → 2026-08-29~~ | ~~`931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)~~ | superseded by the row below |
-| ~~2026-08-29 → ⟨F1⟩~~ | ~~`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` (PR-3a)~~ | superseded by the row below; below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation |
-| **in effect since ⟨F1: date/time UTC⟩** | **`394156d5998dbaef5b1d273898ee8006104227f8`** (D2 worker: semantic idempotency) | raised immediately before the import flip (D2a): a client with `BACKUP_IMPORT_ENABLED = true` stores a `txId` only under `semanticIdempotency: 1`, and below this SHA a re-post of the same note is a second PAID transaction. Justified by soak window v3 — `reconcile` ⟨T1: report file⟩ green. `MINIMUM_FLOOR` raised to the same SHA in this commit; ancestor refusal verified ⟨F3: run id / local output⟩ |
+| ~~2026-08-29 → 2026-10-02~~ | ~~`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` (PR-3a)~~ | superseded by the row below; below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation |
+| **in effect since 2026-10-02 08:51 UTC** | **`394156d5998dbaef5b1d273898ee8006104227f8`** (D2 worker: semantic idempotency) | raised immediately before the import flip (D2a): a client with `BACKUP_IMPORT_ENABLED = true` stores a `txId` only under `semanticIdempotency: 1`, and below this SHA a re-post of the same note is a second PAID transaction. Justified by soak window v3 — `reconcile --to 2026-09-29T12:05:00Z` green (report `reconcile-2026-10-02T08-29-59-831Z.json`, `matched=73`). `MINIMUM_FLOOR` raised to the same SHA in this commit; ancestor refusal verified locally on 2026-10-02 with this commit's `scripts/check-worker-floor.mjs` («NOT a descendant of the floor», exit 1) |
 
 **What only the operator can do** (no PR can, and none should pretend to):
 
@@ -614,15 +614,17 @@ reverted by accident.
    `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
    modes while the two differ), verify the worker gate now refuses the
    ancestor, then flip `BACKUP_IMPORT_ENABLED`.
-   **DONE ⟨F1/F2 date⟩** — target `394156d5998dbaef5b1d273898ee8006104227f8`
+   **DONE 2026-10-02** — target `394156d5998dbaef5b1d273898ee8006104227f8`
    (the live worker, versionId `41773298-9b1e-47aa-b33b-a353a8c381db`, run
    35151788392; NOT redeployed). Soak window v3: T0 `2026-09-22T12:04:32Z`,
-   closing `reconcile --to ⟨T1⟩` → green (⟨report file⟩; criteria «Soak
-   criteria — v2», `legacy_backfilled` waived 2026-09-22). Stage 1:
-   `WORKER_FLOOR_SHA` → this SHA in the `dev` Environment at ⟨F1 timestamp⟩
+   closing `reconcile --to 2026-09-29T12:05:00Z` → green
+   (`reconcile-2026-10-02T08-29-59-831Z.json`, `matched=73`, `settled_empty`;
+   criteria «Soak criteria — v2», `legacy_backfilled` waived 2026-09-22). Stage 1:
+   `WORKER_FLOOR_SHA` → this SHA in the `dev` Environment at 2026-10-02T08:51:32Z
    (operator). Stage 2: `MINIMUM_FLOOR` → this SHA in `scripts/check-worker-floor.mjs`
    (this commit). Ancestor refusal: `WORKER_CANDIDATE_SHA=ff0954d…` →
-   «candidate … is NOT a descendant of the floor …» (⟨F3: local output / run id⟩).
+   «candidate … is NOT a descendant of the floor …» (local, this commit's
+   checker, 2026-10-02: exit 1).
    `ff0954d` remains in `scripts/historical-candidates.mjs` and the release
    allowlist as HISTORY and is no longer deployable: the profile binding
    passes first, the floor gate refuses second, before materialization.
@@ -714,7 +716,7 @@ be trusted is the checksum sitting next to the file it describes.
      on the fail-closed `Invalid recovery token` behaviour. Client and Worker
      must be rolled back **as a compatible pair**, never the Worker alone below
      the recovery protocol.
-  - **Current floor (in effect since ⟨F1⟩): `WORKER_FLOOR_SHA = MINIMUM_FLOOR = 394156d5998dbaef5b1d273898ee8006104227f8`** — the D2 worker (semantic idempotency), raised immediately before
+  - **Current floor (in effect since 2026-10-02): `WORKER_FLOOR_SHA = MINIMUM_FLOOR = 394156d5998dbaef5b1d273898ee8006104227f8`** — the D2 worker (semantic idempotency), raised immediately before
     the import flip; see «Backup v1 … Order», step 3, and the table under «The
     floor as a gate». Everything below this line in this bullet is HISTORY.
   - On the first production deploy, tag it (e.g. `worker-r1`) and record it here.
@@ -2742,7 +2744,7 @@ to be re-cut after every release.
 
 ### The floor is NOT raised by this release
 
-> **Superseded ⟨F1/F2 date⟩:** the floor WAS raised to this worker's SHA
+> **Superseded 2026-10-02:** the floor WAS raised to this worker's SHA
 > immediately before the import flip, exactly as this section prescribes —
 > see «Backup v1 … Order», step 3. The text below is kept as the reasoning
 > that applied between the worker deploy (2026-09-16) and the raise.
