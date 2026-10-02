@@ -48,6 +48,16 @@ beforeEach(() => {
     changeSafeboxPin: vi.fn(async () => {}),
     deactivateSafebox: vi.fn(async () => {}),
     resetApp: vi.fn(),
+    // Backup slice — this file uses the REAL flags module, and since release 2
+    // (import on, export off) the block renders here. Sizing stays UNCALLED:
+    // it describes a file only the export release can produce.
+    readBackupFreshness: vi.fn(async () => ({})),
+    estimateBackupSize: vi.fn(async () => ({ expectedFileBytes: 1024, overCap: false })),
+    exportBackupFile: vi.fn(),
+    downloadBackupViewer: vi.fn(),
+    verifyBackupFile: vi.fn(),
+    prepareBackupImport: vi.fn(),
+    applyBackupImport: vi.fn(),
   };
 });
 afterEach(cleanup);

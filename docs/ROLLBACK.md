@@ -368,8 +368,8 @@ flip is a **raise** rather than a first filling:
 | When | `WORKER_FLOOR_SHA` | Why |
 |---|---|---|
 | ~~2026-08-28 → 2026-08-29~~ | ~~`931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)~~ | superseded by the row below |
-| **in effect since 2026-08-29** | **`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1`** (PR-3a) | below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation. `MINIMUM_FLOOR` was raised to the same SHA, so the variable can no longer be edited back down |
-| before the import flip (D2a) | the semantic-idempotency worker's SHA | the client stops accepting a `txId` without the capability marker |
+| ~~2026-08-29 → 2026-10-02~~ | ~~`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` (PR-3a)~~ | superseded by the row below; below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation |
+| **in effect since 2026-10-02 08:51 UTC** | **`394156d5998dbaef5b1d273898ee8006104227f8`** (D2 worker: semantic idempotency) | raised immediately before the import flip (D2a): a client with `BACKUP_IMPORT_ENABLED = true` stores a `txId` only under `semanticIdempotency: 1`, and below this SHA a re-post of the same note is a second PAID transaction. Justified by soak window v3 — `reconcile --to 2026-09-29T12:05:00Z` green (report `reconcile-2026-10-02T08-29-59-831Z.json`, `matched=73`). `MINIMUM_FLOOR` raised to the same SHA in this commit; ancestor refusal verified locally on 2026-10-02 with this commit's `scripts/check-worker-floor.mjs` («NOT a descendant of the floor», exit 1) |
 
 **What only the operator can do** (no PR can, and none should pretend to):
 
@@ -614,6 +614,60 @@ reverted by accident.
    `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
    modes while the two differ), verify the worker gate now refuses the
    ancestor, then flip `BACKUP_IMPORT_ENABLED`.
+   **DONE 2026-10-02** — target `394156d5998dbaef5b1d273898ee8006104227f8`
+   (the live worker, versionId `41773298-9b1e-47aa-b33b-a353a8c381db`, run
+   35151788392; NOT redeployed). Soak window v3: T0 `2026-09-22T12:04:32Z`,
+   closing `reconcile --to 2026-09-29T12:05:00Z` → green
+   (`reconcile-2026-10-02T08-29-59-831Z.json`, `matched=73`, `settled_empty`;
+   criteria «Soak criteria — v2», `legacy_backfilled` waived 2026-09-22). Stage 1:
+   `WORKER_FLOOR_SHA` → this SHA in the `dev` Environment at 2026-10-02T08:51:32Z
+   (operator). Stage 2: `MINIMUM_FLOOR` → this SHA in `scripts/check-worker-floor.mjs`
+   (this commit). Ancestor refusal: `WORKER_CANDIDATE_SHA=ff0954d…` →
+   «candidate … is NOT a descendant of the floor …» (local, this commit's
+   checker, 2026-10-02: exit 1).
+   `ff0954d` remains in `scripts/historical-candidates.mjs` and the release
+   allowlist as HISTORY and is no longer deployable: the profile binding
+   passes first, the floor gate refuses second, before materialization.
+   The rollback window of the worker is now CLOSED on purpose: a defect found
+   after the import flip is fixed forward (`UPLOADS_ENABLED="false"` override →
+   fix under `normal`), never by a deploy below this floor.
+   **IMPORT FLIP — `client-b2` = f8003aa, DEPLOYED 2026-10-02 10:17 UTC**
+   (head of main after #205, frozen from the merge to the dispatch; Pages run
+   [36994421617](https://github.com/Yokogamma/payee/actions/runs/36994421617),
+   deployment `247735a9.eternal-notes.pages.dev`, bundle
+   `assets/index-Cmo7B-Cc.js` 665.17 kB / gzip 203.62 kB, precache 24 entries
+   (1071.67 KiB), budget 210.5 KB gz of 300 KB), against the unchanged worker
+   `394156d…` / `41773298…` (run 35151788392, identity re-verified by the run),
+   floor `394156d` in both stages, gate in **equality** mode («WORKER_FLOOR_SHA
+   == MINIMUM_FLOOR == 394156d… == candidate»), green end to end. Before the
+   dispatch, on the same SHA: CI run 36992251622 green by exit code, the
+   deployable worker set byte-identical to `394156d` and `worker/` identical to
+   `79ac83d`. Both post-deploy smokes green in the run and again by hand against
+   `notes.matamata.dev` (`?v=`). Viewer unchanged: `be34dd60…`, 63978 bytes —
+   the registry row of `client-b1` covers this release, no new row. The
+   published artifact carries the import code: the import lock name
+   `eternal-notes-backup-import` is present in the live bundle and absent from
+   `49e219de`'s (the button labels exist in both bundles and prove nothing).
+   Mixed versions: an already-open `client-b1-hotfix1` tab shows no prompt by
+   itself — the client registers the service worker without a periodic update
+   check, so the browser checks on a navigation in scope; after one (a new tab
+   of the site) the old tab showed «Доступна новая версия приложения» →
+   «Обновить» → the new client; the installed PWA updated on consent; no
+   «Приложение обновилось» (`DB_VERSION` unchanged). Release note: «Релиз 2:
+   импорт резервной копии…» (owner-approved; full text in the release record).
+   `client-b2` is NOT a floor (neither flip is): the client floor stays
+   `client-b1`. Pages rollback target if import misbehaves: `49e219de`
+   (`client-b1-hotfix1`) — import disappears from the UI, imported data stays;
+   the worker is NOT rolled back (the floor). **Live import PASSED 2026-10-02**
+   (acceptance R2-C3, exactly two paid publications, on a fresh test vault
+   revoked afterwards): a note published BEFORE the export was deduplicated
+   after the import on the live client — `deduped`, the same txId, no payment —
+   and a note never published was published as a new transaction; the import
+   reported «Добавлено: 2, восстановлено: 0 … полностью»; the server journal
+   shows three operations, two paid, one deduplicated, none unfinished. A
+   tab hidden between the import preview and its confirmation cancels the
+   import (D15) — nothing is written. Not executed: the live rollback to
+   release 1 — owner decision 2026-09-22, a stated boundary of the acceptance.
 4. Flip `BACKUP_EXPORT_ENABLED`.
 
 The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
@@ -635,6 +689,27 @@ files.
 Reverting a flip is a client redeploy of the previous tag. **Neither flip is a
 floor**: no schema change rides with them (the schema moved once, at
 `client-b1`).
+
+**Import flip — release 2 (`client-b2`).** This commit sets
+`BACKUP_IMPORT_ENABLED = true` (export stays `false`; the pair is legal for
+`scripts/check-backup-flags.mjs`). In application code it changes ONE literal.
+Alongside it: this note, and the tests that had asserted the release-1 pair
+against the real flags or depended on it (`BackupSettings.flags-off`,
+`backup-adapter.flags-off` — now mocked both off; the two legacy `committed`
+cases in `arweave.test` — pinned to import OFF; `SettingsSection.test` — backup
+store slice), plus the new `src/lib/flags.shipped.test.ts`, the one owner of
+the «build as it ships» assertion. Nothing else. It is publishable only after
+step 3 of «Order» above: the Pages gate reads
+the literal from the built checkout and runs in equality mode, so a dispatch
+with `WORKER_FLOOR_SHA` or `MINIMUM_FLOOR` still at `ff0954d` is refused before
+anything is published — that refusal is the design, not an incident. Deploy
+facts (Pages run, deployment id, bundle, viewer hash, the final `main` SHA
+frozen after this merge) are recorded by the release-lines PR after the
+dispatch, as for `client-b1`. Rollback target if import misbehaves: the
+`client-b1-hotfix1` deployment (`49e219de`) — import disappears from the UI,
+imported data stays; the worker is NOT rolled back (the floor).
+**Shipped 2026-10-02 10:17 UTC as `client-b2` = f8003aa** — the deploy facts
+are under «Order», step 3.
 
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
@@ -699,6 +774,9 @@ be trusted is the checksum sitting next to the file it describes.
      on the fail-closed `Invalid recovery token` behaviour. Client and Worker
      must be rolled back **as a compatible pair**, never the Worker alone below
      the recovery protocol.
+  - **Current floor (in effect since 2026-10-02): `WORKER_FLOOR_SHA = MINIMUM_FLOOR = 394156d5998dbaef5b1d273898ee8006104227f8`** — the D2 worker (semantic idempotency), raised immediately before
+    the import flip; see «Backup v1 … Order», step 3, and the table under «The
+    floor as a gate». Everything below this line in this bullet is HISTORY.
   - On the first production deploy, tag it (e.g. `worker-r1`) and record it here.
     **Current floor (raised when the v4-acceptor shipped, 2026-08-12):**
     `WORKER_FLOOR_SHA = 931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)
@@ -2686,6 +2764,13 @@ in the hope of a genuine DO fault — the script will not manufacture one.
 
 ### Emergency path AFTER the import flip — OWNER DECISION 2026-09-07: roll-forward, the switch is the lever
 
+> **In effect since 2026-10-02 10:17 UTC** — the import flip shipped
+> (`client-b2` = f8003aa, «Backup v1 … Order», step 3). The floor is
+> `394156d` in both stages (a descendant of the D2 release), so the rules
+> below apply as written: the lever is the `UPLOADS_ENABLED = "false"`
+> override, fixes go forward under `normal`, and the `emergency` profile is
+> retired.
+
 Why a decision was needed: once `WORKER_FLOOR_SHA` = `d65e352…`, every
 deployable commit is a descendant of the D2 release and answers
 `statusQuorumPolicy = all-configured-v1` and `semanticIdempotency: 1`. The
@@ -2723,6 +2808,11 @@ to be re-cut after every release.
    restores its own vars); a red smoke stays a detector.
 
 ### The floor is NOT raised by this release
+
+> **Superseded 2026-10-02:** the floor WAS raised to this worker's SHA
+> immediately before the import flip, exactly as this section prescribes —
+> see «Backup v1 … Order», step 3. The text below is kept as the reasoning
+> that applied between the worker deploy (2026-09-16) and the raise.
 
 Deliberately, and it is the one instruction here that is easy to get backwards.
 `WORKER_FLOOR_SHA` rises **immediately before the import flip**, not now
