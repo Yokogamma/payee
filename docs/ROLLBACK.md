@@ -730,7 +730,14 @@ from the UI, nothing on the device changes (export mutates nothing); the worker
 is NOT rolled back (the floor). Acceptance of this release is the «clean
 device» protocol (export on A → clean profile B → import by seed → compare),
 and Milestone 1 «Backup v1 done» is claimed only with the operator evidence it
-lists.
+lists. Release 3 also ships #208 (the viewer: a failed open leaves nothing of
+the previously opened copy on screen), so the viewer's SHA-256 CHANGES: the
+expected value is taken from the CI build log of the final client SHA, checked
+against the Pages build log and the live `/backup-viewer`, and its D19 registry
+row (below and in `README.md`) is published BEFORE the viewer acceptance; the
+`client-b1` row stays. The mobile near-cap measurement that `client-b1`
+deferred «to before the export flip» is waived for the dev contour by owner
+decision 2026-10-02 and becomes a precondition of opening `.app`.
 
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
