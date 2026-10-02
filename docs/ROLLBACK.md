@@ -658,10 +658,16 @@ reverted by accident.
    `client-b2` is NOT a floor (neither flip is): the client floor stays
    `client-b1`. Pages rollback target if import misbehaves: `49e219de`
    (`client-b1-hotfix1`) — import disappears from the UI, imported data stays;
-   the worker is NOT rolled back (the floor). Not done at release time: the live
-   import with two paid publications (acceptance R2-C3), and the live rollback
-   to release 1 — not executed by owner decision 2026-09-22, a stated boundary
-   of the acceptance.
+   the worker is NOT rolled back (the floor). **Live import PASSED 2026-10-02**
+   (acceptance R2-C3, exactly two paid publications, on a fresh test vault
+   revoked afterwards): a note published BEFORE the export was deduplicated
+   after the import on the live client — `deduped`, the same txId, no payment —
+   and a note never published was published as a new transaction; the import
+   reported «Добавлено: 2, восстановлено: 0 … полностью»; the server journal
+   shows three operations, two paid, one deduplicated, none unfinished. A
+   tab hidden between the import preview and its confirmation cancels the
+   import (D15) — nothing is written. Not executed: the live rollback to
+   release 1 — owner decision 2026-09-22, a stated boundary of the acceptance.
 4. Flip `BACKUP_EXPORT_ENABLED`.
 
 The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
