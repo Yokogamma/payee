@@ -944,6 +944,7 @@ be trusted is the checksum sitting next to the file it describes.
   | Release tag | Date | SHA-256 of `backup-viewer.html` |
   |---|---|---|
   | `client-b1` (e3bdf0a) | 2026-09-16 | `be34dd60d3b591e825d6b63b9bb7704548f5ac16074cfbfb96d5a5a8b98cf936` (63978 bytes; from the build log of Pages run 35160292662) |
+  | `client-b3` (3b5a683) | 2026-10-02 | `234ebbf18bda979f50d315379056ef18787837cf8a432b77e198211765bda362` (64002 bytes; from the build log of Pages run 37008577492, the same value in the CI of that SHA, run 37008059585; carries #208 — a failed open leaves nothing of the previously opened copy on screen) |
 
   **Verification is done by a command, not by eye (D19).** Sixty-four hex
   characters compared by a human is a check that passes when it should fail —
