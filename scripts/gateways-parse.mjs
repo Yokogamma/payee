@@ -100,3 +100,18 @@ export function cspConnectOrigins({ status, payload, indexSources }) {
   }
   return [...origins].sort();
 }
+
+/** Mirror of `parseOperatorMap` in src/lib/gateways-parse.ts (parity test). */
+export function parseOperatorMap(raw) {
+  const out = new Map();
+  for (const part of String(raw ?? '').split(GROUP_SEPARATOR)) {
+    if (part.trim() === '') continue;
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const origin = canonicalOrigin(part.slice(0, eq));
+    const operator = part.slice(eq + 1).trim();
+    if (origin === null || operator === '' || out.has(origin)) continue;
+    out.set(origin, operator);
+  }
+  return out;
+}
