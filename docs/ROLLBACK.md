@@ -2323,15 +2323,18 @@ The floor is raised in TWO steps, and skipping the second leaves it lowerable:
    live `/health` immediately before publishing, and then runs the client
    floor gate (`scripts/check-client-floor-gate.mjs`) in the mode the released
    source demands — see «Which order applies» below. For a client whose
-   source has `BACKUP_IMPORT_ENABLED = true` that gate refuses unless BOTH
-   floors already equal that release (steps 3–4 done).
+   source has `BACKUP_IMPORT_ENABLED = true` that gate refuses unless both
+   floors agree, stand at the import-flip release `394156d` or later on its
+   line (steps 3–4 done), and the release is the floor or a descendant of it
+   (`d2-floor`; until 2026-10-05 it demanded that both floors EQUAL that
+   release).
 
 #### Which order applies: steps 3–4 before step 5, or after it
 
 The sequence above (raise, pin, then ship the client) was written for the
 PR-3a release, where the floor had to move to the quorum-reading worker before
-any client could rely on it. The Pages gate enforces that equality ONLY for a
-build whose source has `BACKUP_IMPORT_ENABLED = true` — a client that stores
+any client could rely on it. The Pages gate enforces its import-on rule ONLY
+for a build whose source has `BACKUP_IMPORT_ENABLED = true` — a client that stores
 txIds under semantic idempotency and therefore must never meet a worker below
 the release that introduced it. The backup track's own order (§«Order» above,
 and «The floor is NOT raised by this release» below) is different on purpose:
@@ -2340,10 +2343,12 @@ in it depends on semantic idempotency, and D2a keeps the worker's rollback
 window OPEN until the import flip — the floor is raised immediately BEFORE that
 flip (steps 3–4 happen then), not before `client-b1`.
 
-A future client that depends on some OTHER new worker capability while import
-is still off is not covered by this rule: the gate would admit it in ancestry
-mode. Such a release needs its own decision — either turn the dependency into a
-flag the gate reads, or raise the floor first and record why.
+A future client that depends on some OTHER new worker capability is not
+covered by either rule: the gate would admit it in ancestry mode with import
+off, and in `d2-floor` mode with import on as soon as the floor is the
+import-flip release or later — it knows about semantic idempotency, not about
+what came after it. Such a release needs its own decision — either turn the
+dependency into a flag the gate reads, or raise the floor first and record why.
 
 The Pages gate encodes both orders, and picks one from a PROPERTY OF THE
 BUILD, never from an input or an operator switch
@@ -2352,15 +2357,19 @@ the checkout being built, from the TypeScript AST — exactly one top-level
 `export const BACKUP_IMPORT_ENABLED` with a literal initializer; text in
 comments or strings is not a declaration, and anything else is a refusal):
 
-- `BACKUP_IMPORT_ENABLED = true` → **equality**: `WORKER_FLOOR_SHA ==
-  MINIMUM_FLOOR == worker_candidate`. «Candidate descends from the floor» is
-  satisfied by the OLD floor too, which is exactly the mistake equality exists
-  to catch.
+- `BACKUP_IMPORT_ENABLED = true` → **d2-floor**: `WORKER_FLOOR_SHA ==
+  MINIMUM_FLOOR`; that floor is the import-flip release `IMPORT_FLIP_FLOOR`
+  (`394156d`, a literal in the script — no input can lower it) or a
+  descendant of it; and `worker_candidate` is the floor or a descendant of
+  the floor. «Candidate descends from the floor» alone is satisfied by the OLD
+  floor too; the import-flip condition is what refuses it. A live worker
+  ABOVE the floor passes — the reader before the writer ships keeps its
+  planned rollback window to `394156d`.
 - `BACKUP_IMPORT_ENABLED = false` → **ancestry**: the candidate must be the
   floor or a descendant of it, and `WORKER_FLOOR_SHA == MINIMUM_FLOOR` (the two
   stages of a raise must agree); the floor itself stays where it is.
 
-Equality therefore returns automatically with the first build that turns
+The import-on rule therefore applies automatically to every build that turns
 import on — nobody has to remember to flip the gate. The checkout whose flags
 decide the mode is the one the run builds and publishes, and the job runs under
 the `dev` Environment whose deployment-branch policy admits only `main` (the
@@ -2371,6 +2380,33 @@ live `/health` must be that release under the `normal` profile, the candidate
 must be admissible, the floor must be a full SHA and equal to `MINIMUM_FLOOR`.
 Recorded 2026-09-15; decision record: payee-private-docs
 `decisions/2026-09-15-client-floor-release-order.md` (its status is kept there).
+
+**Import-on rule changed from equality to `d2-floor` — 2026-10-05.** Equality
+(`WORKER_FLOOR_SHA == MINIMUM_FLOOR == worker_candidate`) would have refused
+EVERY client from the moment a worker above the floor goes live: the release
+plan keeps the floor at `394156d` until the writer ships, so after the reader
+deploy neither the reader's own client step nor any other client could pass.
+What equality held, and what holds it now:
+
+- the floor never stays BELOW the release that introduced semantic idempotency
+  while clients store txIds under it — the import-flip condition
+  (`IMPORT_FLIP_FLOOR`, tested against the floor that preceded the flip);
+- no worker below that release is deployable while such clients exist — the
+  worker gate (`scripts/check-worker-floor.mjs`: `MINIMUM_FLOOR ⪯
+  WORKER_FLOOR_SHA ⪯ candidate` — the Environment floor may stand above the
+  pin, never below it — and the pin is now `394156d`);
+- no client is admitted while the two stages of a raise disagree — the Pages
+  gate requires `WORKER_FLOOR_SHA == MINIMUM_FLOOR` in both modes, unchanged.
+  During a two-stage raise the variable may legally stand above the pin (the
+  worker gate allows that); client deploys wait until the protected commit
+  catches up.
+
+From `D2 ⪯ floor ⪯ candidate` follows `D2 ⪯ candidate`; the Pages run still
+proves the candidate is the live worker (release identity + `/health` under
+`normal`). Releases 2 and 3 (2026-10-02) shipped under equality, as their
+records above state. Decision record: payee-private-docs
+`decisions/2026-10-05-phase3-gate-a-dependabot-split.md` (option A of
+`pages-gate-equality-vs-reader-floor-2026-10-02.md`).
 
 Both workflows share the `release-dev` concurrency group, so a worker deploy
 cannot land between the client's live check and its publish. Serialization is
@@ -2909,9 +2945,10 @@ stops the variable being edited back down.
 The Pages deploy does not contradict this: its client floor gate
 (`scripts/check-client-floor-gate.mjs`) runs in ancestry mode for a build whose
 source has `BACKUP_IMPORT_ENABLED = false`, so `client-b1` ships on top of the
-live worker with the floor unraised, and switches to equality by itself for the
-first build with import on — «Which order applies» under «Release order — and
-the two-stage floor raise».
+live worker with the floor unraised, and switches to its import-on rule
+(`d2-floor`, equality until 2026-10-05) by itself for the first build with
+import on — «Which order applies» under «Release order — and the two-stage
+floor raise».
 
 ### Rollback
 

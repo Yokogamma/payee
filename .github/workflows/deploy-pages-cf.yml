@@ -237,11 +237,15 @@ jobs:
       # The floor gate, in the mode the RELEASED SOURCE demands
       # (scripts/check-client-floor-gate.mjs, tested):
       #
-      #   * BACKUP_IMPORT_ENABLED = true  → EQUALITY: the floor must BE the release
-      #     this client ships on — «candidate descends from the floor» is satisfied
-      #     by the OLD floor too, which is exactly the mistake equality catches
-      #     (shipping a client with import on while WORKER_FLOOR_SHA still points
-      #     at the previous release).
+      #   * BACKUP_IMPORT_ENABLED = true  → D2-FLOOR: the floor must be the
+      #     import-flip release (IMPORT_FLIP_FLOOR in the script) or a later
+      #     release on its line, and the candidate the floor or a descendant of
+      #     it. «Candidate descends from the floor» alone is satisfied by the OLD
+      #     floor too; the import-flip condition is what refuses shipping a client
+      #     with import on while WORKER_FLOOR_SHA still points below that release.
+      #     A live worker above the floor (the reader before the writer ships)
+      #     passes — its planned rollback window stays open. Until 2026-10 this
+      #     mode was EQUALITY (floor == candidate).
       #   * BACKUP_IMPORT_ENABLED = false → ANCESTRY: nothing in such a client
       #     depends on semantic idempotency, and the plan (D2a) keeps the worker's
       #     rollback window open until the import flip — the floor rises
@@ -253,9 +257,10 @@ jobs:
       # `export const BACKUP_IMPORT_ENABLED` with a literal initializer (text in
       # comments or strings is not a declaration; anything else refuses). It is
       # deliberately not an input and not a
-      # switch: equality returns automatically with the first build that turns
-      # import on. In both modes the Environment floor must equal the
-      # repo-pinned MINIMUM_FLOOR (the two stages of a raise must agree).
+      # switch: the import-on rule applies automatically to every build that
+      # turns import on, and IMPORT_FLIP_FLOOR is a literal no input can lower.
+      # In both modes the Environment floor must equal the repo-pinned
+      # MINIMUM_FLOOR (the two stages of a raise must agree).
       - name: Verify the floor stands in the right relation to this release
         run: node scripts/check-client-floor-gate.mjs
         env:
