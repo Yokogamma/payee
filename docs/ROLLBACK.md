@@ -669,6 +669,57 @@ reverted by accident.
    import (D15) — nothing is written. Not executed: the live rollback to
    release 1 — owner decision 2026-09-22, a stated boundary of the acceptance.
 4. Flip `BACKUP_EXPORT_ENABLED`.
+   **EXPORT FLIP — `client-b3` = 3b5a683, DEPLOYED 2026-10-02 12:47 UTC**
+   (head of main after #208 and #230, frozen from the merge to the dispatch;
+   Pages run [37008577492](https://github.com/Yokogamma/payee/actions/runs/37008577492),
+   deployment `67e295b6.eternal-notes.pages.dev`, bundle
+   `assets/index-Cb3xchXu.js` 666.74 kB / gzip 204.04 kB, precache 24 entries
+   (1073.20 KiB), budget 210.9 KB gz of 300 KB), against the unchanged worker
+   `394156d…` / `41773298…` (run 35151788392), floor `394156d` in both stages,
+   gate in **equality** mode, green end to end. Before the dispatch, on the
+   same SHA: CI run 37008059585 green by exit code, the deployable worker set
+   byte-identical to `394156d` and `worker/` identical to `79ac83d`. Both
+   post-deploy smokes green in the run and again by hand against
+   `notes.matamata.dev`. Viewer CHANGED (#208): `backup-viewer.html` 64002
+   bytes, `234ebbf1…` — the same value in the CI of this SHA, in the Pages
+   build log and in the live `/backup-viewer` fetched as a download
+   (`Accept: */*`); its D19 row was published before the viewer acceptance
+   (#231), the `client-b1` row stays. A navigation to `/backup-viewer`
+   (`Accept: text/html`) currently returns 64369 bytes: Cloudflare Web
+   Analytics injects its beacon into HTML responses (blocked by the CSP) —
+   turn the automatic injection off before `.app`, so that a page saved from
+   the browser matches the registry too. Release note R3-A7 (export is
+   available; after a restore on a new device the safe PIN is set again;
+   close old tabs / update the PWA) — approved with the dispatch command.
+   `client-b3` is NOT a floor: the client floor stays `client-b1`. Pages
+   rollback target if export misbehaves: `247735a9` (`client-b2`) — export
+   disappears from the UI, nothing on the device changes; the worker is NOT
+   rolled back (the floor). **«Clean device» acceptance PASSED 2026-10-05**
+   (protocol variant 2, no payment): a container exported on a stand of this
+   very SHA was imported on the LIVE client in a fresh browser profile after a
+   restore by seed (store empty before the import: 0 / 0 / 0) — «Добавлено:
+   7, восстановлено: 0 … полностью»; all seven records byte-identical to the
+   source store; a second import added nothing; the safe opened with a new
+   PIN, passwords and both attachments equal to the source; an export from
+   the live client after the import equals the source container record by
+   record. The live «Скачать просмотрщик» returned `234ebbf1…`. The viewer
+   opened that export via `file://` with the network off in Chrome 154,
+   Firefox 157 and Edge 154 (summary, the current version of every chain,
+   markdown as source, attachments and both text exports byte-identical,
+   a foreign phrase and a damaged file refused, no request). Edge without
+   network leaves the FIRST download of a file unfinished (`.crdownload`,
+   complete bytes) and a retry completes — Edge's own download check, not
+   the viewer, whose download code is unchanged since `be34dd60`. After a
+   successful open the viewer hides its file form, so «a failed open on top
+   of an open copy» (#208) has no UI path; it is covered by #208's tests and
+   a scripted check. Mixed versions: accepted by equivalence (owner decision
+   2026-10-05) — the update path (service-worker registration, the prompt,
+   `DB_VERSION`) is unchanged from `client-b2`, where it passed (step 3); a
+   cached `client-b2` client was seen with this release's service worker
+   installed and WAITING for consent. Not executed: the live rollback to
+   release 2 — owner decision 2026-10-05, a stated boundary of the
+   acceptance. Milestone 1 «Backup v1 done» is claimed separately, with the
+   operator evidence the plan lists or recorded exceptions.
 
 The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
 rejects the build, and the UI treats it as fail-closed anyway (the whole block
@@ -738,6 +789,8 @@ row (below and in `README.md`) is published BEFORE the viewer acceptance; the
 `client-b1` row stays. The mobile near-cap measurement that `client-b1`
 deferred «to before the export flip» is waived for the dev contour by owner
 decision 2026-10-02 and becomes a precondition of opening `.app`.
+**Shipped 2026-10-02 12:47 UTC as `client-b3` = 3b5a683** — the deploy facts
+are under «Order», step 4.
 
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
