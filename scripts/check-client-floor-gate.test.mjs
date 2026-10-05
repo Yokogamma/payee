@@ -413,20 +413,47 @@ describe('this repository — the path the workflow executes', () => {
     expect(verdict.reason).toContain(`WORKER_FLOOR_SHA == MINIMUM_FLOOR == ${MINIMUM_FLOOR}`);
   });
 
-  it.skipIf(needsHistory && shallow)('the CLI reads the environment the workflow passes, reports the real mode, and exits non-zero on a refusal', () => {
-    const script = join(repoRoot, 'scripts', 'check-client-floor-gate.mjs');
-    // Deliberately NOT run from the repo root: flags, pin and git must resolve
-    // from the script's own location, whatever the process cwd is.
-    const run = env => spawnSync(process.execPath, [script], {
-      env: { ...process.env, ...env }, encoding: 'utf8', cwd: tmpdir(),
-    });
-    const refused = run({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: 'main' });
+  const script = join(repoRoot, 'scripts', 'check-client-floor-gate.mjs');
+  // Deliberately NOT run from the repo root: flags, pin and git must resolve
+  // from the script's own location, whatever the process cwd is.
+  const runCli = env => spawnSync(process.execPath, [script], {
+    env: { ...process.env, ...env }, encoding: 'utf8', cwd: tmpdir(),
+  });
+
+  // The refusal needs no history (the candidate is not even a SHA), so it is
+  // never skipped — a CLI that stopped exiting non-zero is caught in any clone.
+  it('the CLI exits non-zero on a refusal', () => {
+    const refused = runCli({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: 'main' });
     expect(refused.status).toBe(1);
     expect(refused.stderr).toMatch(/check-client-floor-gate: REFUSED/);
-    const passed = run({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: MINIMUM_FLOOR });
+  });
+
+  it.skipIf(needsHistory && shallow)('the CLI reads the environment the workflow passes and reports the real mode', () => {
+    const passed = runCli({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: MINIMUM_FLOOR });
     expect(passed.status).toBe(0);
     expect(passed.stdout).toContain(`client floor gate: ${expectedMode} mode`);
   });
+
+  it.skipIf(expectedMode !== 'd2-floor' || (needsHistory && shallow))(
+    'the import-flip release cannot be lowered from the environment — the CLI judges against the literal',
+    () => {
+      // Plausible names an operator (or a future workflow edit) might try. Were
+      // any of them honoured, the floor would be judged against an all-ones SHA
+      // this repository does not have, and git would refuse; the literal keeps
+      // the verdict a pass and names itself in the reason.
+      const bogus = '1'.repeat(40);
+      const passed = runCli({
+        WORKER_FLOOR_SHA: MINIMUM_FLOOR,
+        WORKER_CANDIDATE_SHA: MINIMUM_FLOOR,
+        IMPORT_FLIP_FLOOR: bogus,
+        IMPORT_FLIP_FLOOR_SHA: bogus,
+        INPUT_IMPORT_FLIP_FLOOR: bogus,
+      });
+      expect(passed.status).toBe(0);
+      expect(passed.stdout).toContain(`import-flip release ${IMPORT_FLIP_FLOOR}`);
+      expect(passed.stdout).not.toContain(bogus);
+    },
+  );
 });
 
 describe('the workflow cannot be talked out of the gate by the code it judges', () => {

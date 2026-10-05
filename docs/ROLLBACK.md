@@ -2392,10 +2392,14 @@ What equality held, and what holds it now:
   while clients store txIds under it — the import-flip condition
   (`IMPORT_FLIP_FLOOR`, tested against the floor that preceded the flip);
 - no worker below that release is deployable while such clients exist — the
-  worker gate (`scripts/check-worker-floor.mjs`: every worker candidate must
-  descend from `MINIMUM_FLOOR == WORKER_FLOOR_SHA`, and that floor is now at
-  or above `394156d`);
-- the two stages of a raise never disagree — unchanged in both modes.
+  worker gate (`scripts/check-worker-floor.mjs`: `MINIMUM_FLOOR ⪯
+  WORKER_FLOOR_SHA ⪯ candidate` — the Environment floor may stand above the
+  pin, never below it — and the pin is now `394156d`);
+- no client is admitted while the two stages of a raise disagree — the Pages
+  gate requires `WORKER_FLOOR_SHA == MINIMUM_FLOOR` in both modes, unchanged.
+  During a two-stage raise the variable may legally stand above the pin (the
+  worker gate allows that); client deploys wait until the protected commit
+  catches up.
 
 From `D2 ⪯ floor ⪯ candidate` follows `D2 ⪯ candidate`; the Pages run still
 proves the candidate is the live worker (release identity + `/health` under
