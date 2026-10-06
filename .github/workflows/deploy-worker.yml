@@ -270,6 +270,10 @@ jobs:
       - run: node scripts/check-trusted-owners.mjs --repo-only --config=candidate/worker/wrangler.toml
         env:
           WORKER_CANDIDATE_SHA: ${{ inputs.candidate }}
+      # D10 spend-guard limits (PR-6), over the CANDIDATE's config: applicable
+      # only when it carries the SpendGuard binding — a historical candidate
+      # without it passes here and is judged by the floor gate alone.
+      - run: node scripts/check-spend-limits.mjs --config=candidate/worker/wrangler.toml
       # ── Emergency preflight, BEFORE anything is activated ──
       #
       # An emergency release is defined by every upload switch being off, and

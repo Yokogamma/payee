@@ -18,6 +18,7 @@ provisioned» until then.
 | `RECOVERY_HMAC_SECRET` | secret, **stable by contract** | worker | forged recovery tokens; while missing, `/upload` = 503 |
 | `ADMIN_SECRET` | secret | worker: `/admin/seed-invite`, `/admin/revoke` | issuing invites and revoking access |
 | `METRICS_ADMIN_SECRET` | secret | worker: `/admin/metrics` (PR-2) | read-only metrics reports. DELIBERATELY separate from `ADMIN_SECRET` (least privilege): leaking the metrics bearer grants no invite/revoke rights, and a future dashboard never needs the admin secret |
+| `SPEND_ADMIN_SECRET` | secret | worker: `/admin/spend/*` (D10, PR-3b reader) | freezing and thawing the wallet's spend guard, starting the marker (a tiny paid transaction), crediting deposits, reinit, acknowledging legacy keys — i.e. control over WHETHER the worker may spend, never over how much the guard lets it (the limits are vars). DELIBERATELY separate from `METRICS_ADMIN_SECRET` (read-only) and `ADMIN_SECRET` (invites): each answers `403 wrong_scope` there |
 | `CF_ANALYTICS_TOKEN` | secret | worker: `/admin/metrics` upstream (Analytics Engine SQL API) | **honestly wider than one dataset:** the `Account → Account Analytics → Read` scope cannot be narrowed — the token reads analytics of the WHOLE account. Still read-only |
 | `CLOUDFLARE_API_TOKEN` | secret, **top category (transitively)** | GitHub Actions (Environment `dev`) | **equals the radius of `ARWEAVE_JWK`.** Deploy rights = the right to read every worker secret: an attacker deploys code that returns `env.ARWEAVE_JWK`, `env.RECOVERY_HMAC_SECRET`, `env.ADMIN_SECRET` — and, after PR-2, `env.METRICS_ADMIN_SECRET` and `env.CF_ANALYTICS_TOKEN` — on the first request. Money + forged recovery tokens + invite issuance + admin metrics + account-wide Analytics Read; with a shared Cloudflare account — in BOTH contours |
 | `CLOUDFLARE_ACCOUNT_ID` | identifier → Environment variable | GitHub Actions | harmless |
@@ -269,6 +270,14 @@ Compromise procedure (levers that exist in the code today):
 
 **`ADMIN_SECRET`, Cloudflare token** — rotate freely; a test deploy to dev
 afterwards.
+
+**`SPEND_ADMIN_SECRET` (PR-3b reader)** — rotate freely, but NEVER inside a
+soak window (any activation resets it) and never while an `init` is between
+`signed` and `done` on the operator's side (the next `init` simply continues
+by state with the new bearer — the record is durable, the bearer is not part
+of it): `wrangler secret put SPEND_ADMIN_SECRET` (and `--env staging`), update
+the operator's stored value, verify with `POST /admin/spend/status` → 200.
+Co-deploy is the preferred path once the registry above lists it.
 
 **`METRICS_ADMIN_SECRET` (PR-2)** — rotate freely:
 `wrangler secret put METRICS_ADMIN_SECRET` (and `--env staging` where

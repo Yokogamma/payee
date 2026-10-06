@@ -69,6 +69,23 @@ V3_UPLOADS_ENABLED = "true"
 # Verify after EVERY worker deploy:
 #   curl https://<worker>/health  →  "v4Uploads" matches the intended state.
 V4_UPLOADS_ENABLED = "true"
+# ── D10 spend guard limits (PR-3b reader release, PR-6) ──
+# The three operator limits of the wallet's spend guard, Winston as decimal
+# STRINGS (1 AR = 10^12 Winston). Read on EVERY request; any missing or
+# malformed value → 503 spend_guard_unconfigured on every paid path (fail
+# closed, never a default). Method and the quote they were derived from:
+# docs/ROLLBACK.md «Spend guard (D10)». Values below are the PROPOSAL of
+# 2026-09-24 (price/51200 = 3 295 552 823 W); the owner approves them there.
+# Gate: scripts/check-spend-limits.mjs (CI and the trusted deploy).
+#   WALLET_FLOOR_WINSTON     — the untouchable remainder of the CYCLE's
+#                              credited funds (7 days × ~3 publications × price).
+#   SPEND_WINDOW_CAP_WINSTON — sliding 24 h spend cap (21 publications × price × 2).
+#   MAX_TX_REWARD_WINSTON    — ceiling of ONE NEW transaction's reward
+#                              (price at MAX_BODY_BYTES × ~4.5); legacy
+#                              transactions are held at their SIGNED reward.
+WALLET_FLOOR_WINSTON = "70000000000"
+SPEND_WINDOW_CAP_WINSTON = "150000000000"
+MAX_TX_REWARD_WINSTON = "15000000000"
 # ── Trusted Arweave owners (D2/D9) ──
 # EVERY wallet address this project has ever posted under, comma separated.
 # The worker authenticates a publication before binding its txId to a payload
@@ -186,6 +203,11 @@ binding = "CF_VERSION_METADATA"
 #   cannot be narrowed to a single dataset — it honestly reads analytics of
 #   the WHOLE account (docs/SECRETS.md). Until it exists /admin/metrics
 #   answers 503; metric writes are unaffected.
+# SPEND_ADMIN_SECRET — the ONLY key to /admin/spend/* (D10, PR-3b reader):
+#   freeze, init (marker), reinit, credit-deposit, status, init-legacy-keys.
+#   NOT METRICS_ADMIN_SECRET (read-only) and NOT ADMIN_SECRET (invites): a
+#   bearer of either answers 403 wrong_scope there. 503 while missing.
+#   Generate: `openssl rand -base64 32`; prod AND staging (co-deploy, PR-6).
 
 # ─── Staging environment ─────────────────────────────────────────────
 # Fully isolated stand-in for the mandatory pre-W3 signed v3 smoke
@@ -280,6 +302,11 @@ RATE_LIMIT_PER_HOUR = "20"
 UPLOADS_ENABLED = "true"
 V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
+# D10 spend guard limits — declared explicitly for staging too (a named
+# environment inherits NOTHING); same values as production, same gate.
+WALLET_FLOOR_WINSTON = "70000000000"
+SPEND_WINDOW_CAP_WINSTON = "150000000000"
+MAX_TX_REWARD_WINSTON = "15000000000"
 # ── Trusted Arweave owners (D2/D9) ──
 # EVERY wallet address this project has ever posted under, comma separated.
 # The worker authenticates a publication before binding its txId to a payload
