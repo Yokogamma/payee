@@ -370,8 +370,8 @@ flip is a **raise** rather than a first filling:
 | When | `WORKER_FLOOR_SHA` | Why |
 |---|---|---|
 | ~~2026-08-28 → 2026-08-29~~ | ~~`931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)~~ | superseded by the row below |
-| **in effect since 2026-08-29** | **`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1`** (PR-3a) | below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation. `MINIMUM_FLOOR` was raised to the same SHA, so the variable can no longer be edited back down |
-| before the import flip (D2a) | the semantic-idempotency worker's SHA | the client stops accepting a `txId` without the capability marker |
+| ~~2026-08-29 → 2026-10-02~~ | ~~`ff0954d1799c2dc0534a4ab73c6d11d3e01645f1` (PR-3a)~~ | superseded by the row below; below it a lone gateway 404 authorizes a PAID re-post, and `/health` carries no attestation |
+| **in effect since 2026-10-02 08:51 UTC** | **`394156d5998dbaef5b1d273898ee8006104227f8`** (D2 worker: semantic idempotency) | raised immediately before the import flip (D2a): a client with `BACKUP_IMPORT_ENABLED = true` stores a `txId` only under `semanticIdempotency: 1`, and below this SHA a re-post of the same note is a second PAID transaction. Justified by soak window v3 — `reconcile --to 2026-09-29T12:05:00Z` green (report `reconcile-2026-10-02T08-29-59-831Z.json`, `matched=73`). `MINIMUM_FLOOR` raised to the same SHA in this commit; ancestor refusal verified locally on 2026-10-02 with this commit's `scripts/check-worker-floor.mjs` («NOT a descendant of the floor», exit 1) |
 
 **What only the operator can do** (no PR can, and none should pretend to):
 
@@ -616,7 +616,112 @@ reverted by accident.
    `MINIMUM_FLOOR`** to the same SHA (the Pages gate refuses in both of its
    modes while the two differ), verify the worker gate now refuses the
    ancestor, then flip `BACKUP_IMPORT_ENABLED`.
+   **DONE 2026-10-02** — target `394156d5998dbaef5b1d273898ee8006104227f8`
+   (the live worker, versionId `41773298-9b1e-47aa-b33b-a353a8c381db`, run
+   35151788392; NOT redeployed). Soak window v3: T0 `2026-09-22T12:04:32Z`,
+   closing `reconcile --to 2026-09-29T12:05:00Z` → green
+   (`reconcile-2026-10-02T08-29-59-831Z.json`, `matched=73`, `settled_empty`;
+   criteria «Soak criteria — v2», `legacy_backfilled` waived 2026-09-22). Stage 1:
+   `WORKER_FLOOR_SHA` → this SHA in the `dev` Environment at 2026-10-02T08:51:32Z
+   (operator). Stage 2: `MINIMUM_FLOOR` → this SHA in `scripts/check-worker-floor.mjs`
+   (this commit). Ancestor refusal: `WORKER_CANDIDATE_SHA=ff0954d…` →
+   «candidate … is NOT a descendant of the floor …» (local, this commit's
+   checker, 2026-10-02: exit 1).
+   `ff0954d` remains in `scripts/historical-candidates.mjs` and the release
+   allowlist as HISTORY and is no longer deployable: the profile binding
+   passes first, the floor gate refuses second, before materialization.
+   The rollback window of the worker is now CLOSED on purpose: a defect found
+   after the import flip is fixed forward (`UPLOADS_ENABLED="false"` override →
+   fix under `normal`), never by a deploy below this floor.
+   **IMPORT FLIP — `client-b2` = f8003aa, DEPLOYED 2026-10-02 10:17 UTC**
+   (head of main after #205, frozen from the merge to the dispatch; Pages run
+   [36994421617](https://github.com/Yokogamma/payee/actions/runs/36994421617),
+   deployment `247735a9.eternal-notes.pages.dev`, bundle
+   `assets/index-Cmo7B-Cc.js` 665.17 kB / gzip 203.62 kB, precache 24 entries
+   (1071.67 KiB), budget 210.5 KB gz of 300 KB), against the unchanged worker
+   `394156d…` / `41773298…` (run 35151788392, identity re-verified by the run),
+   floor `394156d` in both stages, gate in **equality** mode («WORKER_FLOOR_SHA
+   == MINIMUM_FLOOR == 394156d… == candidate»), green end to end. Before the
+   dispatch, on the same SHA: CI run 36992251622 green by exit code, the
+   deployable worker set byte-identical to `394156d` and `worker/` identical to
+   `79ac83d`. Both post-deploy smokes green in the run and again by hand against
+   `notes.matamata.dev` (`?v=`). Viewer unchanged: `be34dd60…`, 63978 bytes —
+   the registry row of `client-b1` covers this release, no new row. The
+   published artifact carries the import code: the import lock name
+   `eternal-notes-backup-import` is present in the live bundle and absent from
+   `49e219de`'s (the button labels exist in both bundles and prove nothing).
+   Mixed versions: an already-open `client-b1-hotfix1` tab shows no prompt by
+   itself — the client registers the service worker without a periodic update
+   check, so the browser checks on a navigation in scope; after one (a new tab
+   of the site) the old tab showed «Доступна новая версия приложения» →
+   «Обновить» → the new client; the installed PWA updated on consent; no
+   «Приложение обновилось» (`DB_VERSION` unchanged). Release note: «Релиз 2:
+   импорт резервной копии…» (owner-approved; full text in the release record).
+   `client-b2` is NOT a floor (neither flip is): the client floor stays
+   `client-b1`. Pages rollback target if import misbehaves: `49e219de`
+   (`client-b1-hotfix1`) — import disappears from the UI, imported data stays;
+   the worker is NOT rolled back (the floor). **Live import PASSED 2026-10-02**
+   (acceptance R2-C3, exactly two paid publications, on a fresh test vault
+   revoked afterwards): a note published BEFORE the export was deduplicated
+   after the import on the live client — `deduped`, the same txId, no payment —
+   and a note never published was published as a new transaction; the import
+   reported «Добавлено: 2, восстановлено: 0 … полностью»; the server journal
+   shows three operations, two paid, one deduplicated, none unfinished. A
+   tab hidden between the import preview and its confirmation cancels the
+   import (D15) — nothing is written. Not executed: the live rollback to
+   release 1 — owner decision 2026-09-22, a stated boundary of the acceptance.
 4. Flip `BACKUP_EXPORT_ENABLED`.
+   **EXPORT FLIP — `client-b3` = 3b5a683, DEPLOYED 2026-10-02 12:47 UTC**
+   (head of main after #208 and #230, frozen from the merge to the dispatch;
+   Pages run [37008577492](https://github.com/Yokogamma/payee/actions/runs/37008577492),
+   deployment `67e295b6.eternal-notes.pages.dev`, bundle
+   `assets/index-Cb3xchXu.js` 666.74 kB / gzip 204.04 kB, precache 24 entries
+   (1073.20 KiB), budget 210.9 KB gz of 300 KB), against the unchanged worker
+   `394156d…` / `41773298…` (run 35151788392), floor `394156d` in both stages,
+   gate in **equality** mode, green end to end. Before the dispatch, on the
+   same SHA: CI run 37008059585 green by exit code, the deployable worker set
+   byte-identical to `394156d` and `worker/` identical to `79ac83d`. Both
+   post-deploy smokes green in the run and again by hand against
+   `notes.matamata.dev`. Viewer CHANGED (#208): `backup-viewer.html` 64002
+   bytes, `234ebbf1…` — the same value in the CI of this SHA, in the Pages
+   build log and in the live `/backup-viewer` fetched as a download
+   (`Accept: */*`); its D19 row was published before the viewer acceptance
+   (#231), the `client-b1` row stays. A navigation to `/backup-viewer`
+   (`Accept: text/html`) currently returns 64369 bytes: Cloudflare Web
+   Analytics injects its beacon into HTML responses (blocked by the CSP) —
+   turn the automatic injection off before `.app`, so that a page saved from
+   the browser matches the registry too. Release note R3-A7 (export is
+   available; after a restore on a new device the safe PIN is set again;
+   close old tabs / update the PWA) — approved with the dispatch command.
+   `client-b3` is NOT a floor: the client floor stays `client-b1`. Pages
+   rollback target if export misbehaves: `247735a9` (`client-b2`) — export
+   disappears from the UI, nothing on the device changes; the worker is NOT
+   rolled back (the floor). **«Clean device» acceptance PASSED 2026-10-05**
+   (protocol variant 2, no payment): a container exported on a stand of this
+   very SHA was imported on the LIVE client in a fresh browser profile after a
+   restore by seed (store empty before the import: 0 / 0 / 0) — «Добавлено:
+   7, восстановлено: 0 … полностью»; all seven records byte-identical to the
+   source store; a second import added nothing; the safe opened with a new
+   PIN, passwords and both attachments equal to the source; an export from
+   the live client after the import equals the source container record by
+   record. The live «Скачать просмотрщик» returned `234ebbf1…`. The viewer
+   opened that export via `file://` with the network off in Chrome 154,
+   Firefox 157 and Edge 154 (summary, the current version of every chain,
+   markdown as source, attachments and both text exports byte-identical,
+   a foreign phrase and a damaged file refused, no request). Edge without
+   network leaves the FIRST download of a file unfinished (`.crdownload`,
+   complete bytes) and a retry completes — Edge's own download check, not
+   the viewer, whose download code is unchanged since `be34dd60`. After a
+   successful open the viewer hides its file form, so «a failed open on top
+   of an open copy» (#208) has no UI path; it is covered by #208's tests and
+   a scripted check. Mixed versions: accepted by equivalence (owner decision
+   2026-10-05) — the update path (service-worker registration, the prompt,
+   `DB_VERSION`) is unchanged from `client-b2`, where it passed (step 3); a
+   cached `client-b2` client was seen with this release's service worker
+   installed and WAITING for consent. Not executed: the live rollback to
+   release 2 — owner decision 2026-10-05, a stated boundary of the
+   acceptance. Milestone 1 «Backup v1 done» is claimed separately, with the
+   operator evidence the plan lists or recorded exceptions.
 
 The pair `export ON / import OFF` is **forbidden**: `scripts/check-backup-flags.mjs`
 rejects the build, and the UI treats it as fail-closed anyway (the whole block
@@ -637,6 +742,57 @@ files.
 Reverting a flip is a client redeploy of the previous tag. **Neither flip is a
 floor**: no schema change rides with them (the schema moved once, at
 `client-b1`).
+
+**Import flip — release 2 (`client-b2`).** This commit sets
+`BACKUP_IMPORT_ENABLED = true` (export stays `false`; the pair is legal for
+`scripts/check-backup-flags.mjs`). In application code it changes ONE literal.
+Alongside it: this note, and the tests that had asserted the release-1 pair
+against the real flags or depended on it (`BackupSettings.flags-off`,
+`backup-adapter.flags-off` — now mocked both off; the two legacy `committed`
+cases in `arweave.test` — pinned to import OFF; `SettingsSection.test` — backup
+store slice), plus the new `src/lib/flags.shipped.test.ts`, the one owner of
+the «build as it ships» assertion. Nothing else. It is publishable only after
+step 3 of «Order» above: the Pages gate reads
+the literal from the built checkout and runs in equality mode, so a dispatch
+with `WORKER_FLOOR_SHA` or `MINIMUM_FLOOR` still at `ff0954d` is refused before
+anything is published — that refusal is the design, not an incident. Deploy
+facts (Pages run, deployment id, bundle, viewer hash, the final `main` SHA
+frozen after this merge) are recorded by the release-lines PR after the
+dispatch, as for `client-b1`. Rollback target if import misbehaves: the
+`client-b1-hotfix1` deployment (`49e219de`) — import disappears from the UI,
+imported data stays; the worker is NOT rolled back (the floor).
+**Shipped 2026-10-02 10:17 UTC as `client-b2` = f8003aa** — the deploy facts
+are under «Order», step 3.
+
+**Export flip — release 3 (`client-b3`).** This commit sets
+`BACKUP_EXPORT_ENABLED = true` on top of the import flip, so the pair becomes
+both ON — the only direction `scripts/check-backup-flags.mjs` allows (export
+may never be on while import is off). In application code it changes ONE
+literal; alongside it: this note and `src/lib/flags.shipped.test.ts` (the one
+owner of the «build as it ships» assertion, now the release-3 pair). Nothing
+else: the export path, the size estimate and the viewer download have shipped
+dark since `client-b1` and were exercised on a `true/true` scratch build in the
+release-3 rehearsal. The Pages gate is already in equality mode (it switched on
+the import flip), so this build too is refused before publishing unless
+`WORKER_FLOOR_SHA == MINIMUM_FLOOR == worker_candidate`. Order: only after
+release 2 is dispatched AND its acceptance (R2-C, including the live import)
+is closed — the two flips are separate releases by decision E.8 (2026-09-22).
+Deploy facts are recorded by the release-lines PR after the dispatch. Rollback
+target if export misbehaves: the `client-b2` deployment — export disappears
+from the UI, nothing on the device changes (export mutates nothing); the worker
+is NOT rolled back (the floor). Acceptance of this release is the «clean
+device» protocol (export on A → clean profile B → import by seed → compare),
+and Milestone 1 «Backup v1 done» is claimed only with the operator evidence it
+lists. Release 3 also ships #208 (the viewer: a failed open leaves nothing of
+the previously opened copy on screen), so the viewer's SHA-256 CHANGES: the
+expected value is taken from the CI build log of the final client SHA, checked
+against the Pages build log and the live `/backup-viewer`, and its D19 registry
+row (below and in `README.md`) is published BEFORE the viewer acceptance; the
+`client-b1` row stays. The mobile near-cap measurement that `client-b1`
+deferred «to before the export flip» is waived for the dev contour by owner
+decision 2026-10-02 and becomes a precondition of opening `.app`.
+**Shipped 2026-10-02 12:47 UTC as `client-b3` = 3b5a683** — the deploy facts
+are under «Order», step 4.
 
 ### What changes for EVERYONE at `client-b1`, with both flags off
 
@@ -701,6 +857,9 @@ be trusted is the checksum sitting next to the file it describes.
      on the fail-closed `Invalid recovery token` behaviour. Client and Worker
      must be rolled back **as a compatible pair**, never the Worker alone below
      the recovery protocol.
+  - **Current floor (in effect since 2026-10-02): `WORKER_FLOOR_SHA = MINIMUM_FLOOR = 394156d5998dbaef5b1d273898ee8006104227f8`** — the D2 worker (semantic idempotency), raised immediately before
+    the import flip; see «Backup v1 … Order», step 3, and the table under «The
+    floor as a gate». Everything below this line in this bullet is HISTORY.
   - On the first production deploy, tag it (e.g. `worker-r1`) and record it here.
     **Current floor (raised when the v4-acceptor shipped, 2026-08-12):**
     `WORKER_FLOOR_SHA = 931949150f6145b6c79d36dbadc66b482c1cb6d1` (`worker-r3`)
@@ -840,6 +999,7 @@ be trusted is the checksum sitting next to the file it describes.
   | Release tag | Date | SHA-256 of `backup-viewer.html` |
   |---|---|---|
   | `client-b1` (e3bdf0a) | 2026-09-16 | `be34dd60d3b591e825d6b63b9bb7704548f5ac16074cfbfb96d5a5a8b98cf936` (63978 bytes; from the build log of Pages run 35160292662) |
+  | `client-b3` (3b5a683) | 2026-10-02 | `234ebbf18bda979f50d315379056ef18787837cf8a432b77e198211765bda362` (64002 bytes; from the build log of Pages run 37008577492, the same value in the CI of that SHA, run 37008059585; carries #208 — a failed open leaves nothing of the previously opened copy on screen) |
 
   **Verification is done by a command, not by eye (D19).** Sixty-four hex
   characters compared by a human is a check that passes when it should fail —
@@ -2347,15 +2507,18 @@ The floor is raised in TWO steps, and skipping the second leaves it lowerable:
    live `/health` immediately before publishing, and then runs the client
    floor gate (`scripts/check-client-floor-gate.mjs`) in the mode the released
    source demands — see «Which order applies» below. For a client whose
-   source has `BACKUP_IMPORT_ENABLED = true` that gate refuses unless BOTH
-   floors already equal that release (steps 3–4 done).
+   source has `BACKUP_IMPORT_ENABLED = true` that gate refuses unless both
+   floors agree, stand at the import-flip release `394156d` or later on its
+   line (steps 3–4 done), and the release is the floor or a descendant of it
+   (`d2-floor`; until 2026-10-05 it demanded that both floors EQUAL that
+   release).
 
 #### Which order applies: steps 3–4 before step 5, or after it
 
 The sequence above (raise, pin, then ship the client) was written for the
 PR-3a release, where the floor had to move to the quorum-reading worker before
-any client could rely on it. The Pages gate enforces that equality ONLY for a
-build whose source has `BACKUP_IMPORT_ENABLED = true` — a client that stores
+any client could rely on it. The Pages gate enforces its import-on rule ONLY
+for a build whose source has `BACKUP_IMPORT_ENABLED = true` — a client that stores
 txIds under semantic idempotency and therefore must never meet a worker below
 the release that introduced it. The backup track's own order (§«Order» above,
 and «The floor is NOT raised by this release» below) is different on purpose:
@@ -2364,10 +2527,12 @@ in it depends on semantic idempotency, and D2a keeps the worker's rollback
 window OPEN until the import flip — the floor is raised immediately BEFORE that
 flip (steps 3–4 happen then), not before `client-b1`.
 
-A future client that depends on some OTHER new worker capability while import
-is still off is not covered by this rule: the gate would admit it in ancestry
-mode. Such a release needs its own decision — either turn the dependency into a
-flag the gate reads, or raise the floor first and record why.
+A future client that depends on some OTHER new worker capability is not
+covered by either rule: the gate would admit it in ancestry mode with import
+off, and in `d2-floor` mode with import on as soon as the floor is the
+import-flip release or later — it knows about semantic idempotency, not about
+what came after it. Such a release needs its own decision — either turn the
+dependency into a flag the gate reads, or raise the floor first and record why.
 
 The Pages gate encodes both orders, and picks one from a PROPERTY OF THE
 BUILD, never from an input or an operator switch
@@ -2376,15 +2541,19 @@ the checkout being built, from the TypeScript AST — exactly one top-level
 `export const BACKUP_IMPORT_ENABLED` with a literal initializer; text in
 comments or strings is not a declaration, and anything else is a refusal):
 
-- `BACKUP_IMPORT_ENABLED = true` → **equality**: `WORKER_FLOOR_SHA ==
-  MINIMUM_FLOOR == worker_candidate`. «Candidate descends from the floor» is
-  satisfied by the OLD floor too, which is exactly the mistake equality exists
-  to catch.
+- `BACKUP_IMPORT_ENABLED = true` → **d2-floor**: `WORKER_FLOOR_SHA ==
+  MINIMUM_FLOOR`; that floor is the import-flip release `IMPORT_FLIP_FLOOR`
+  (`394156d`, a literal in the script — no input can lower it) or a
+  descendant of it; and `worker_candidate` is the floor or a descendant of
+  the floor. «Candidate descends from the floor» alone is satisfied by the OLD
+  floor too; the import-flip condition is what refuses it. A live worker
+  ABOVE the floor passes — the reader before the writer ships keeps its
+  planned rollback window to `394156d`.
 - `BACKUP_IMPORT_ENABLED = false` → **ancestry**: the candidate must be the
   floor or a descendant of it, and `WORKER_FLOOR_SHA == MINIMUM_FLOOR` (the two
   stages of a raise must agree); the floor itself stays where it is.
 
-Equality therefore returns automatically with the first build that turns
+The import-on rule therefore applies automatically to every build that turns
 import on — nobody has to remember to flip the gate. The checkout whose flags
 decide the mode is the one the run builds and publishes, and the job runs under
 the `dev` Environment whose deployment-branch policy admits only `main` (the
@@ -2395,6 +2564,33 @@ live `/health` must be that release under the `normal` profile, the candidate
 must be admissible, the floor must be a full SHA and equal to `MINIMUM_FLOOR`.
 Recorded 2026-09-15; decision record: payee-private-docs
 `decisions/2026-09-15-client-floor-release-order.md` (its status is kept there).
+
+**Import-on rule changed from equality to `d2-floor` — 2026-10-05.** Equality
+(`WORKER_FLOOR_SHA == MINIMUM_FLOOR == worker_candidate`) would have refused
+EVERY client from the moment a worker above the floor goes live: the release
+plan keeps the floor at `394156d` until the writer ships, so after the reader
+deploy neither the reader's own client step nor any other client could pass.
+What equality held, and what holds it now:
+
+- the floor never stays BELOW the release that introduced semantic idempotency
+  while clients store txIds under it — the import-flip condition
+  (`IMPORT_FLIP_FLOOR`, tested against the floor that preceded the flip);
+- no worker below that release is deployable while such clients exist — the
+  worker gate (`scripts/check-worker-floor.mjs`: `MINIMUM_FLOOR ⪯
+  WORKER_FLOOR_SHA ⪯ candidate` — the Environment floor may stand above the
+  pin, never below it — and the pin is now `394156d`);
+- no client is admitted while the two stages of a raise disagree — the Pages
+  gate requires `WORKER_FLOOR_SHA == MINIMUM_FLOOR` in both modes, unchanged.
+  During a two-stage raise the variable may legally stand above the pin (the
+  worker gate allows that); client deploys wait until the protected commit
+  catches up.
+
+From `D2 ⪯ floor ⪯ candidate` follows `D2 ⪯ candidate`; the Pages run still
+proves the candidate is the live worker (release identity + `/health` under
+`normal`). Releases 2 and 3 (2026-10-02) shipped under equality, as their
+records above state. Decision record: payee-private-docs
+`decisions/2026-10-05-phase3-gate-a-dependabot-split.md` (option A of
+`pages-gate-equality-vs-reader-floor-2026-10-02.md`).
 
 Both workflows share the `release-dev` concurrency group, so a worker deploy
 cannot land between the client's live check and its publish. Serialization is
@@ -2870,6 +3066,13 @@ in the hope of a genuine DO fault — the script will not manufacture one.
 
 ### Emergency path AFTER the import flip — OWNER DECISION 2026-09-07: roll-forward, the switch is the lever
 
+> **In effect since 2026-10-02 10:17 UTC** — the import flip shipped
+> (`client-b2` = f8003aa, «Backup v1 … Order», step 3). The floor is
+> `394156d` in both stages (a descendant of the D2 release), so the rules
+> below apply as written: the lever is the `UPLOADS_ENABLED = "false"`
+> override, fixes go forward under `normal`, and the `emergency` profile is
+> retired.
+
 Why a decision was needed: once `WORKER_FLOOR_SHA` = `d65e352…`, every
 deployable commit is a descendant of the D2 release and answers
 `statusQuorumPolicy = all-configured-v1` and `semanticIdempotency: 1`. The
@@ -2908,6 +3111,11 @@ to be re-cut after every release.
 
 ### The floor is NOT raised by this release
 
+> **Superseded 2026-10-02:** the floor WAS raised to this worker's SHA
+> immediately before the import flip, exactly as this section prescribes —
+> see «Backup v1 … Order», step 3. The text below is kept as the reasoning
+> that applied between the worker deploy (2026-09-16) and the raise.
+
 Deliberately, and it is the one instruction here that is easy to get backwards.
 `WORKER_FLOOR_SHA` rises **immediately before the import flip**, not now
 (D2a): until a client with `BACKUP_IMPORT_ENABLED=true` exists, nothing depends
@@ -2921,9 +3129,10 @@ stops the variable being edited back down.
 The Pages deploy does not contradict this: its client floor gate
 (`scripts/check-client-floor-gate.mjs`) runs in ancestry mode for a build whose
 source has `BACKUP_IMPORT_ENABLED = false`, so `client-b1` ships on top of the
-live worker with the floor unraised, and switches to equality by itself for the
-first build with import on — «Which order applies» under «Release order — and
-the two-stage floor raise».
+live worker with the floor unraised, and switches to its import-on rule
+(`d2-floor`, equality until 2026-10-05) by itself for the first build with
+import on — «Which order applies» under «Release order — and the two-stage
+floor raise».
 
 ### Rollback
 
