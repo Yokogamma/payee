@@ -116,6 +116,7 @@ npm run build
 | Релиз | Дата | SHA-256 `backup-viewer.html` |
 |---|---|---|
 | `client-b1` (e3bdf0a; тот же файл в `client-b1-hotfix1`) | 2026-09-16 | `be34dd60d3b591e825d6b63b9bb7704548f5ac16074cfbfb96d5a5a8b98cf936` |
+| `client-b3` (3b5a683) | 2026-10-02 | `234ebbf18bda979f50d315379056ef18787837cf8a432b77e198211765bda362` |
 
 Зеркала: `docs/ROLLBACK.md` и экран настроек приложения (там — сумма той сборки,
 которая у вас запущена).
