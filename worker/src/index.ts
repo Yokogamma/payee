@@ -14,10 +14,13 @@ import { readAllowCache } from './allowlist';
 // bundle picks them up as plain TypeScript. Precedent: worker/test/
 // client-parity.test.ts already imports src/lib/crypto.ts.
 import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
-import { QUORUM_POLICY_ID, statusVerdict, type StatusVote } from '../../src/lib/status-quorum';
+import { QUORUM_POLICY_ID, statusVerdict } from '../../src/lib/status-quorum';
 import { parseTrustedOwners } from '../../src/lib/trusted-owners';
 import { authenticatePublication, type ReadStage } from './publication-auth';
 import { metricsErrorCodes, metricsRay } from './metrics-diagnostics';
+import { verifyBearerSecret } from './admin-auth';
+import { probeStatusOrigin } from './gateway-reads';
+import { createSpendAdminHandler, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -28,8 +31,6 @@ import {
 import {
   ARWEAVE_HOST,
   assertStructurallyCompleteJwk,
-  classifyStatus,
-  classifyThrow,
   getAnchor,
   getArweave,
   getPrice,
@@ -56,9 +57,19 @@ interface Env {
   RATE_LIMITER: DurableObjectNamespace;
   INVITE_MANAGER: DurableObjectNamespace;
   IP_RATE_LIMITER: DurableObjectNamespace;
-  /** D10 SpendGuard (PR-3b): `idFromName('global')`. Not yet called from any
-   *  route — the upload saga wiring (§8) is the next step of the reader release. */
+  /** D10 SpendGuard (PR-3b): `idFromName('global')`. Reached by the operator
+   *  routes `/admin/spend/*` (spend-admin.ts); the upload saga wiring (§8) is
+   *  the next step of the reader release. */
   SPEND_GUARD: DurableObjectNamespace;
+  /** The ONLY key to `/admin/spend/*` (D10 §1): not METRICS_ADMIN_SECRET (a
+   *  read-only identity), not ADMIN_SECRET (invites). 503 while missing. */
+  SPEND_ADMIN_SECRET?: string;
+  /** The three D10 limits, Winston as decimal strings (spec §1, §10) — vars in
+   *  wrangler.toml with PR-6, fixed in docs/ROLLBACK.md. Read on every request;
+   *  any missing → 503 spend_guard_unconfigured on the paths that spend. */
+  WALLET_FLOOR_WINSTON?: string;
+  SPEND_WINDOW_CAP_WINSTON?: string;
+  MAX_TX_REWARD_WINSTON?: string;
   ALLOWLIST: KVNamespace;
   ALLOWED_ORIGINS: string;
   /** Comma-separated bare https origins for TX-status probes (D8/PR-3a).
@@ -298,6 +309,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (url.pathname === '/admin/ops' && request.method === 'POST') {
     return handleAdminOps(request, env);
   }
+  // D10 operator routes (spend-admin.ts): SPEND_ADMIN_SECRET only; the JSON
+  // Content-Type rule above applies (POST), no-store is attached centrally.
+  if (url.pathname.startsWith(SPEND_ADMIN_PREFIX)) {
+    return handleSpendAdmin(request, env);
+  }
 
   return new Response('Not found', { status: 404 });
 }
@@ -403,23 +419,8 @@ async function handleWalletAddress(request: Request, env: Env): Promise<Response
 
 // ─── Admin auth (L12) ───────────────────────────────────────────────
 
-/**
- * Constant-time bearer auth: SHA-256 both sides to a fixed 32 bytes, then
- * timingSafeEqual — no early exit on length mismatch and no crash on it
- * (timingSafeEqual itself throws on unequal input lengths; digests never are).
- * Generalised over WHICH secret (PR-2): /admin/metrics authenticates against
- * its own METRICS_ADMIN_SECRET without duplicating the cryptography.
- */
-async function verifyBearerSecret(expectedSecret: string | undefined, authHeader: string | null): Promise<boolean> {
-  if (!expectedSecret || !authHeader) return false;
-  const enc = new TextEncoder();
-  const [given, expected] = await Promise.all([
-    crypto.subtle.digest('SHA-256', enc.encode(authHeader)),
-    crypto.subtle.digest('SHA-256', enc.encode(`Bearer ${expectedSecret}`)),
-  ]);
-  return crypto.subtle.timingSafeEqual(new Uint8Array(given), new Uint8Array(expected));
-}
-
+// Constant-time bearer auth lives in admin-auth.ts (shared with the D10
+// spend-admin routes); the invite routes keep their one-line wrapper.
 async function verifyAdminSecret(env: Env, authHeader: string | null): Promise<boolean> {
   return verifyBearerSecret(env.ADMIN_SECRET, authHeader);
 }
@@ -2029,7 +2030,10 @@ function logTelemetryProbe(probeId: string): void {
  * question, and the metrics reader is the least-privilege identity that already
  * exists for telemetry (it holds no seed-invite or revoke rights).
  */
-const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops']);
+const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops', ...SPEND_ADMIN_PATHS]);
+
+/** `/admin/spend/*` with the production dependencies (D10 spend-admin.ts). */
+const handleSpendAdmin = createSpendAdminHandler();
 
 // ─── /admin/ops — the operation journal, projected ──────────────────
 
@@ -2138,90 +2142,8 @@ function payloadOriginReporter(emit: Emit) {
   };
 }
 
-/**
- * One origin's answer. Emits the per-host metrics PR-2 introduced — the `host`
- * label stays a BARE hostname (`arweave.net`), not the canonical origin, so the
- * historical time series is not split in half by this change.
- *
- * 400 is no longer `dead`: it is a non-404 outcome like any other, and under
- * the quorum it now BLOCKS dead instead of causing it.
- */
-async function probeStatusOrigin(origin: string, txId: string, emit: Emit): Promise<StatusVote> {
-  const host = new URL(origin).host;
-  const started = performance.now();
-  let r: Response;
-  try {
-    r = await fetch(`${origin}/tx/${txId}/status`, {
-      method: 'GET',
-      // NO REDIRECTS — and this is the half that spends money. `fetch` follows
-      // them by default, so a gateway answering 302 -> another gateway would
-      // give TWO configured origins carrying ONE host's opinion, and unanimity
-      // over the pool is exactly what authorizes a paid redrop. The client was
-      // fixed first; leaving the authoritative side unfixed fixed nothing.
-      //
-      // `'manual'`, NOT `'error'`: workerd rejects the latter with a TypeError
-      // before any I/O, which turned every probe into a `network` throw and
-      // pinned the quorum at `unavailable` — no gateway could ever vote. A 3xx
-      // now arrives as a response and falls to the `status !== 200` branch
-      // below (classifyStatus already buckets 3xx as `network`), so the vote
-      // is still `other` and the pool still gains no second opinion.
-      redirect: 'manual',
-      signal: AbortSignal.timeout(10_000),
-    });
-  } catch (e) {
-    emit('gateway_call', ['status', host, classifyThrow(e)], [performance.now() - started]);
-    emit('status_verdict', ['unavailable', host], [-1]);
-    return { origin, kind: 'other' };
-  }
-  const elapsed = performance.now() - started;
-
-  if (r.status === 202) {
-    emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
-    emit('status_verdict', ['alive', host], [-1]);
-    return { origin, kind: 'pending' };
-  }
-  if (r.status === 404) {
-    emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
-    emit('status_verdict', ['dead', host], [-1]);
-    return { origin, kind: 'dead404' };
-  }
-  if (r.status !== 200) {
-    emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
-    emit('status_verdict', ['unavailable', host], [-1]);
-    return { origin, kind: 'other' };
-  }
-
-  // A 200 must carry a body that satisfies the schema to count as alive. A
-  // malformed one is a PROTOCOL defect (`invalid_response`), never a verdict.
-  let confirmations = -1;
-  let blockHeight = -1;
-  try {
-    const text = await readCappedText(r, 1024);
-    if (text !== null) {
-      const doc: unknown = JSON.parse(text);
-      if (typeof doc === 'object' && doc !== null) {
-        const d = doc as { number_of_confirmations?: unknown; block_height?: unknown };
-        if (safeCount(d.number_of_confirmations) && safeCount(d.block_height)) {
-          confirmations = d.number_of_confirmations;
-          blockHeight = d.block_height;
-        }
-      }
-    }
-  } catch { /* stays −1 → invalid_response below */ }
-
-  if (confirmations < 0) {
-    emit('gateway_call', ['status', host, 'invalid_response'], [elapsed]);
-    emit('status_verdict', ['unavailable', host], [-1]);
-    return { origin, kind: 'other' };
-  }
-  emit('gateway_call', ['status', host, classifyStatus(r.status)], [elapsed]);
-  emit('status_verdict', ['alive', host], [confirmations]);
-  return { origin, kind: 'confirmed', confirmations, blockHeight };
-}
-
-function safeCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-}
+// `probeStatusOrigin` moved to gateway-reads.ts (shared with the D10 spend
+// guard: the marker quorum and the deposit verification ask the same question).
 
 /**
  * Per-IP baseline rate limit (D-baseline). Call at the START of protected

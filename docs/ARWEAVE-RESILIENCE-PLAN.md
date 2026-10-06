@@ -1642,6 +1642,38 @@ Reader-релиз этим не блокируется: он не создаёт
   (почта/вебхук) в Worker НЕ заводится — это операторский runbook в
   `docs/ROLLBACK.md`, а не код.
 
+**Уточнения реализации PR-3b — операторские маршруты D10 (2026-09-24, ветка
+`arweave/pr3b-spend-admin`, draft; спецификация — приватный репо
+`arweave-pr3b-d10-spendguard-spec-2026-09-23.md` рев. 10):**
+
+- `/admin/spend/freeze|init|reinit|credit-deposit|status` живут в
+  `worker/src/spend-admin.ts`; только `SPEND_ADMIN_SECRET` (bearer других
+  секретов → `403 wrong_scope`, свой не задан → `503 spend_admin_unconfigured`).
+  Константное сравнение — общий `worker/src/admin-auth.ts`.
+- `init` — идемпотентное «продолжить по состоянию»: `none`/просроченный
+  `signing` → anchor+price **до** `begin` (отказ котировки не оставляет
+  lease) → CAS `begin` → подпись → durable `signed` → **разрешение
+  `permit-send(kind: marker)`** → POST тех же байт → `posted` → кворум
+  (≥ 2 операторов, ≥ `MIN_DEPOSIT_CONFIRMATIONS`, высоты в `MAX_STATUS_HEIGHT_SKEW`)
+  → `done`; unanimous `dead` старше `MARKER_DEAD_AGE_MS` (30 мин) → `none`.
+  Порча durable-байт (id ≠ txId) → `503 spend_marker_corrupt`, ни resend, ни
+  новой подписи. `signing` с живым lease → `409 init_in_progress` до сети.
+- Единственный путь к POST — `worker/src/spend-send.ts` (`permittedPost`:
+  permit-send непосредственно перед `postSignedTx`); статический гейт «нет
+  POST вне permit-send» — следующий шаг (сага загрузки).
+- Закрытие множества `L` (§4.0 п. 2–5) — **зависимость** `closeLegacySet`;
+  производственное значение до реализации — «множество не закрыто» →
+  `init` отвечает `503 spend_init_legacy_open` (fail-closed, не заглушка
+  «закрыто»). Тождество операторов (`operatorOf`) — из карты PR-4
+  (`STATUS_OPERATORS`) после её мержа; до того каждый origin — свой оператор.
+- `credit-deposit { txId }`: `/tx/<id>` (равенство `id`) и статус у каждого
+  origin; свидетель — origin с `target` = кошелёк воркера, отправитель ≠
+  кошелёк воркера, `confirmed ≥ MIN_DEPOSIT_CONFIRMATIONS`; ≥ 2 операторов,
+  одна `quantity`, высоты в пределах skew, `depositHeight` = минимум; иначе
+  `503 deposit_unverified`.
+- Пробы статуса переехали в `worker/src/gateway-reads.ts` без изменения
+  поведения (маркер и депозит задают тот же вопрос, что recheck).
+
 **Rollback floor (ревью 2, H3) — reader-before-writer в ДВА Worker-релиза:**
 
 Старый Worker не знает статус `signed`: `check-and-reserve` примет его как
