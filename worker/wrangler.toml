@@ -6,7 +6,8 @@ compatibility_date = "2026-03-31"
 bindings = [
   { name = "RATE_LIMITER", class_name = "RateLimiter" },
   { name = "INVITE_MANAGER", class_name = "InviteManager" },
-  { name = "IP_RATE_LIMITER", class_name = "IpRateLimiter" }
+  { name = "IP_RATE_LIMITER", class_name = "IpRateLimiter" },
+  { name = "SPEND_GUARD", class_name = "SpendGuard" }
 ]
 
 [[migrations]]
@@ -16,6 +17,13 @@ new_sqlite_classes = ["RateLimiter", "InviteManager"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["IpRateLimiter"]
+
+# D10 SpendGuard (PR-3b reader release): the single global spend limit and the
+# only source of permissions to POST a transaction. Ships with PR-6 alongside
+# the three limits and SPEND_ADMIN_SECRET (spec §1, §9).
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SpendGuard"]
 
 # KV namespace for allowlist cache (fast lookup during /upload)
 # Source of truth = InviteManager DO. KV = read-through cache.
@@ -245,7 +253,8 @@ name = "eternal-notes-proxy-staging"
 bindings = [
   { name = "RATE_LIMITER", class_name = "RateLimiter" },
   { name = "INVITE_MANAGER", class_name = "InviteManager" },
-  { name = "IP_RATE_LIMITER", class_name = "IpRateLimiter" }
+  { name = "IP_RATE_LIMITER", class_name = "IpRateLimiter" },
+  { name = "SPEND_GUARD", class_name = "SpendGuard" }
 ]
 
 [[env.staging.migrations]]
@@ -255,6 +264,10 @@ new_sqlite_classes = ["RateLimiter", "InviteManager"]
 [[env.staging.migrations]]
 tag = "v2"
 new_sqlite_classes = ["IpRateLimiter"]
+
+[[env.staging.migrations]]
+tag = "v3"
+new_sqlite_classes = ["SpendGuard"]
 
 [[env.staging.kv_namespaces]]
 binding = "ALLOWLIST"

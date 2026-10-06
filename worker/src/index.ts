@@ -48,6 +48,7 @@ import {
 export { RateLimiter } from './rate-limiter';
 export { InviteManager } from './invite-manager';
 export { IpRateLimiter } from './ip-rate-limiter';
+export { SpendGuard } from './spend-guard';
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -55,6 +56,9 @@ interface Env {
   RATE_LIMITER: DurableObjectNamespace;
   INVITE_MANAGER: DurableObjectNamespace;
   IP_RATE_LIMITER: DurableObjectNamespace;
+  /** D10 SpendGuard (PR-3b): `idFromName('global')`. Not yet called from any
+   *  route — the upload saga wiring (§8) is the next step of the reader release. */
+  SPEND_GUARD: DurableObjectNamespace;
   ALLOWLIST: KVNamespace;
   ALLOWED_ORIGINS: string;
   /** Comma-separated bare https origins for TX-status probes (D8/PR-3a).
