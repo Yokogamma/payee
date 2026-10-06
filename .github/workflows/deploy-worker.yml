@@ -391,6 +391,14 @@ jobs:
         run: node scripts/read-wrangler-version.mjs "$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
         env:
           OUTPUT_FILE: ${{ runner.temp }}/wrangler-output.ndjson
+      # ── The operator floor of THIS candidate (runbook reader release §6.9) ──
+      # Decided by the candidate's own config (scripts/operators-floor.mjs, run
+      # from this trusted checkout): a build that carries SpendGuard books
+      # money only on a quorum of >= 2 independent operators, so its /health
+      # must show them; a historical candidate without SpendGuard is not asked
+      # (its /health has no such field) and a rollback stays possible.
+      - id: opfloor
+        run: node scripts/operators-floor.mjs --config=candidate/worker/wrangler.toml >> "$GITHUB_OUTPUT"
       # ── Post-deploy smoke against the live worker ──
       # Detector, not a rollback: Cloudflare activates the version before this
       # can answer. Recovery from a red smoke is roll-forward (docs/ROLLBACK.md).
@@ -402,6 +410,8 @@ jobs:
           PROFILE: ${{ inputs.profile }}
           EXPECT_RELEASE_SHA: ${{ inputs.candidate }}
           EXPECT_WORKER_VERSION_ID: ${{ steps.version.outputs.version_id }}
+          # Empty for a candidate without SpendGuard — then nothing is asserted.
+          EXPECT_MIN_OPERATORS: ${{ steps.opfloor.outputs.min_operators }}
           # Right after a deploy some edges still answer from the previous
           # version. That is propagation, not a bad release, so give the smoke
           # a minute to see the new one before it calls the release broken.

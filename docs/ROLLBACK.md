@@ -2194,15 +2194,20 @@ Winston as decimal strings in `worker/wrangler.toml` `[vars]` AND
 Gate: `scripts/check-spend-limits.mjs` (CI and the trusted deploy, over the
 candidate's config; not applicable to a candidate without the binding).
 
-| Limit | Value (PROPOSED 2026-09-24 — **owner approval pending**) | Method (spec §10) | Input |
+| Limit | Value (PROPOSED 2026-09-24 — **placeholder**: the owner approved the METHOD on 2026-09-27; the numbers are recomputed from the quote on the release day) | Method (spec §10) | Input |
 |---|---|---|---|
 | `MAX_TX_REWARD_WINSTON` | `15000000000` (0.015 AR) | price of one publication at `MAX_BODY_BYTES = 51200` × ~4.5 — the ceiling of ONE NEW transaction; legacy transactions are held at their SIGNED reward | `arweave.net/price/51200` = 3 295 552 823 W on 2026-09-24 10:50Z |
 | `SPEND_WINDOW_CAP_WINSTON` | `150000000000` (0.15 AR) | sliding 24 h cap = 21 publications/day (the soak budget) × ~3.3e9 × 2 | soak v3 volume (3–21 publications/day) |
 | `WALLET_FLOOR_WINSTON` | `70000000000` (0.07 AR) | 7 days × ~3 publications × ~3.3e9 — the untouchable remainder of the CYCLE's credited funds, so a trip leaves time to top up | the same price |
 
 Changing a limit = a reviewed PR + a deploy (they are vars, not a dashboard
-edit); record the new values and the quote here. Balance for reference:
-0.9741 AR on 2026-09-24 — the first cycle's `credit-deposit` must leave
+edit); record the new values and the quote here. **Release-day rule (owner
+decision 2026-09-27):** before the reader deploy, read `price/51200`, recompute
+all three by the method column (floor = 7 × 3 × price, cap = 21 × 2 × price,
+maxTx = price × 4.5), round UP, commit them to both blocks and record the
+quote here. (On 2026-09-25 the price had already moved +1.2 %: the floor
+formula gave 70.02e9 against the 70e9 placeholder.) The first cycle's
+`credit-deposit` (dev: ≈ 0.3 AR, owner decision 2026-09-27) must leave
 `available ≥ WALLET_FLOOR + margin`.
 
 ### `STATUS_OPERATORS` — the operator map (mandatory, review 25.09)
@@ -2220,7 +2225,12 @@ the pin, every `STATUS_GATEWAYS` origin covered, ≥ 2 distinct operators —
 applicable only to a config that carries the `SpendGuard` binding. Changing
 the composition = a reviewed PR to the pin AND both blocks (a var, so a new
 Worker version, never a dashboard edit). `/health` reports
-`statusOperatorsCount`: below 2 no money quorum can form — the smoke reads it.
+`statusOperatorsCount`: below 2 no money quorum can form. The dev deploy
+asserts it automatically (runbook §6.9, owner decision 2026-09-27):
+`scripts/operators-floor.mjs` reads the CANDIDATE's config and, for a build
+that carries SpendGuard, hands `EXPECT_MIN_OPERATORS=2` to the post-deploy
+smoke; a historical candidate without SpendGuard (e.g. `394156d`, whose
+`/health` has no such field) is not asked, so the rollback stays possible.
 
 ### `SPEND_ADMIN_SECRET`
 
@@ -2239,11 +2249,28 @@ the operator's copy first (a GitHub Environment secret cannot be read back).
 
 Blast radius and rotation: `docs/SECRETS.md`.
 
-### Bringing the guard into service (spec §4.3 — the ONLY order)
+### Bringing the guard into service (ONE deploy — owner decision 2026-09-27)
 
-1. Deploy the reader with `UPLOADS_ENABLED = "false"` (every paid path
-   refuses; nothing new can be signed), dispatched with
-   `required_secrets = SPEND_ADMIN_SECRET` (see `SPEND_ADMIN_SECRET` above).
+The spec's order (§4.3) deployed the reader with `UPLOADS_ENABLED = "false"`
+and needed a SECOND deploy to open uploads. The owner chose one deploy
+(runbook reader release §6.1): the paid path is already closed by the code
+until the guard is ready — `prepare` answers `503 spend_not_initialized`
+before `done`, `503 spend_frozen` under the freeze, and a POST happens only
+through `permit-send` (static gate) — while the free path (dedupe / recheck
+of already published notes) keeps working. The kill switch would have closed
+that too, for the hours `init` takes (two waits of ≥ 50 confirmations), and
+the soak window would have started on a second version the `init` never ran
+on. `UPLOADS_ENABLED = "false"` remains the emergency lever (below).
+
+No staging rehearsal for the reader (owner decision 2026-09-27, runbook
+§6.3/§6.7): the dev contour has no users, so the first real `init` runs on
+dev, under the freeze, with the dev wallet.
+
+1. Deploy the reader through **Deploy Worker (proxy) — dev** as usual
+   (`profile = normal`), dispatched with `required_secrets = SPEND_ADMIN_SECRET`
+   (see `SPEND_ADMIN_SECRET` above). The post-deploy smoke also asserts
+   `statusOperatorsCount ≥ 2` (operator map, above). From activation on every
+   paid upload answers `503 spend_not_initialized` — expected, not a failure.
 2. `POST /admin/spend/freeze {"active":true}`.
 3. `POST /admin/spend/init` — repeat until `step: "done"`. The first call
    closes the legacy set (keys ∪ open permits ∪ journals, rewards from
@@ -2254,23 +2281,36 @@ Blast radius and rotation: `docs/SECRETS.md`.
    backups and `POST /admin/spend/init-legacy-keys {"publicKeys":[…],
    "acknowledgeLegacyInvites":N}`; `spend_init_legacy_reward_unknown {txId}`
    → the header of that transaction is unreadable at every payload origin;
-   wait for the gateways, never guess a reward.
-4. (Optional, only now) move the pre-marker remainder to another address of
-   the owner — the reserve below the marker is not part of the cycle.
-5. Transfer the working sum INTO the worker wallet, then
-   `POST /admin/spend/credit-deposit {"txId":"<transfer id>"}` (verified at
-   ≥ 2 operators, ≥ 50 confirmations, height strictly above the marker).
-6. `POST /admin/spend/status` → `available ≥ WALLET_FLOOR + margin`; then
-   `freeze {"active":false}` (refused until `done`) and
-   `UPLOADS_ENABLED = "true"` (a deploy).
-7. Record here: the number and sum of the holds, the marker txId and
-   `h_init`, the deposit txIds and amounts, per cycle.
+   wait for the gateways, never guess a reward. In `done`, repeat `init`
+   until the legacy holds are resolved (`held − spent − dropped = 0`, or a
+   later answer with `held = 0`).
+4. (Only now — after `done`, before any deposit) move the pre-marker
+   remainder to another address of the owner. The reserve below the marker is
+   not part of the cycle, and a hot key in the worker's secrets should hold
+   only the cycle's money. For dev (owner decision 2026-09-27) the cycle's
+   working sum is taken from this remainder: move it out here, send the
+   working sum back in step 5.
+5. Transfer the working sum (dev: ≈ 0.3 AR, owner decision 2026-09-27) INTO
+   the worker wallet, then `POST /admin/spend/credit-deposit
+   {"txId":"<transfer id>"}` (verified at ≥ 2 operators, ≥ 50 confirmations,
+   height strictly above the marker).
+6. `POST /admin/spend/status` → `guard.available ≥ WALLET_FLOOR + margin`;
+   then `freeze {"active":false}` (refused until `done`). No second deploy.
+7. One paid publication by the owner → its money booked by the quorum
+   (`guard.ledger.spent` grows by its reward, `pending` back to 0). Only then
+   open the reader's soak window; record `guard.conflicts.count` at T0.
+8. Record here: the number and sum of the holds, the marker txId and
+   `h_init`, the withdrawal and deposit txIds and amounts, per cycle.
 
-Staging rehearsal (spec §9): `npm --prefix worker run smoke:spend` with
-`SMOKE_URL`/`SPEND_ADMIN_SECRET` (+ `SMOKE_SPEND_FREEZE=1`,
-`SMOKE_DEPOSIT_TXID`, `SMOKE_SPEND_THAW=1` as the steps require), then
-`smoke:v3` / `smoke:v4` for the paid cycle. The marker costs real AR on that
-contour's wallet.
+The three limits are recomputed from the quote ON THE RELEASE DAY (owner
+decision 2026-09-27; method in «Spend guard limits»: floor = 7 days × 3 ×
+price, cap = 21 × 2 × price, maxTx = price × 4.5, rounded up) and committed
+to `wrangler.toml` before the deploy (`check-spend-limits`).
+
+`npm --prefix worker run smoke:spend` (`SMOKE_URL` = the dev worker origin,
+`SPEND_ADMIN_SECRET`, `SMOKE_SPEND_FREEZE=1`, `SMOKE_DEPOSIT_TXID`,
+`SMOKE_SPEND_THAW=1` as the steps require) drives steps 2–6 and prints the
+guard's state at each; the marker costs real AR on the dev wallet.
 
 ### Kill lever
 
