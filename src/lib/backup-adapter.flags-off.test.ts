@@ -10,12 +10,22 @@ import {
   type BackupStorage,
   type BackupVault,
 } from './backup-adapter';
-import { BACKUP_EXPORT_ENABLED, BACKUP_IMPORT_ENABLED } from './flags';
 import type { ImportPlan } from './backup-plan';
 import type { VerifyReport } from './backup-actions';
 
+// Release 1 pair, MOCKED since the import flip (release 2). Until then this
+// file ran against the real flags and doubled as the «shipped pair» guard;
+// that guard now lives in `flags.shipped.test.ts`, and this file keeps the
+// client-floor state (both off) under test — the rollback target of every
+// later flip, and a long-lived tab can still be in it.
+vi.mock('./flags', async importOriginal => ({
+  ...(await importOriginal<typeof import('./flags')>()),
+  BACKUP_EXPORT_ENABLED: false,
+  BACKUP_IMPORT_ENABLED: false,
+}));
+
 /**
- * The build as it actually ships — real flags, not mocked ones.
+ * The client-floor build (release 1, `client-b1`) — both flags off.
  *
  * D16 puts the gate in the ACTIONS, not in the UI, and this file is why that
  * distinction is worth a test: a hidden button is a layout decision, and
@@ -48,15 +58,6 @@ const refuseEverything = (): BackupStorage => ({
 });
 
 const file = { size: 10, text: async () => '{}' };
-
-describe('the shipped flag pair', () => {
-  it('is the release-1 pair: both off', () => {
-    // If this ever fails it is either the release moving on (update the file)
-    // or a flag flipped by accident (do not).
-    expect(BACKUP_EXPORT_ENABLED).toBe(false);
-    expect(BACKUP_IMPORT_ENABLED).toBe(false);
-  });
-});
 
 describe('with the flags off, the actions refuse — in the action, not the markup', () => {
   it('export', async () => {

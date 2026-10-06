@@ -174,6 +174,48 @@ describe('Main — note card menu', () => {
     expect(screen.queryByText('Скопировано')).toBeNull();
     expect(screen.getByText('Копировать текст')).toBeTruthy(); // still open
   });
+
+  // The copied-toast lives on a 2 s timer. Left running past the test it
+  // fired after jsdom was torn down — `window is not defined` inside a React
+  // state setter, an unhandled error that failed the whole root run
+  // (Actions run 36031882845). Fake timers make both halves deterministic.
+  describe('copied-toast timer', () => {
+    beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('hides the toast after 2 s', async () => {
+      stubClipboard(vi.fn(async () => {}));
+      render(<Main theme="system" onThemeChange={vi.fn()} />);
+      fireEvent.click(screen.getByLabelText('Меню заметки'));
+      // The clipboard write settles on the microtask queue, not a timer —
+      // an async act flushes it without touching the fake clock.
+      await act(async () => { fireEvent.click(screen.getByText('Копировать текст')); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+
+      act(() => { vi.advanceTimersByTime(1999); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(screen.queryByText('Скопировано')).toBeNull();
+    });
+
+    it('unmount before the timer fires clears it (no setState into a dead tree)', async () => {
+      stubClipboard(vi.fn(async () => {}));
+      const { unmount } = render(<Main theme="system" onThemeChange={vi.fn()} />);
+      fireEvent.click(screen.getByLabelText('Меню заметки'));
+      // Baseline AFTER the menu opens: focusing a menu item makes jsdom arm a
+      // timer of its own (Selection._associateRange), which is not ours.
+      const before = vi.getTimerCount();
+      await act(async () => { fireEvent.click(screen.getByText('Копировать текст')); });
+      expect(screen.getByText('Скопировано')).toBeTruthy();
+      expect(vi.getTimerCount()).toBe(before + 1); // the toast timer is armed
+
+      unmount();
+      // The toast timer went with the screen — nothing of ours is left to
+      // fire after the environment is torn down.
+      expect(vi.getTimerCount()).toBe(before);
+      expect(() => vi.runAllTimers()).not.toThrow();
+    });
+  });
 });
 
 describe('Main — modal exclusivity + live badge (round 12)', () => {
