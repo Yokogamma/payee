@@ -23,7 +23,7 @@ import { probeStatusOrigin } from './gateway-reads';
 import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
 import { permittedPost } from './spend-send';
 import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
-import { moneyQuorum } from './spend-ledger';
+import { moneyQuorum, SPEND_CODES } from './spend-ledger';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -1383,6 +1383,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     attest('conflict', checkResult.txId);
     return settle('conflict', idPayloadConflict(checkResult.txId), { txId: checkResult.txId });
   }
+  if (checkResult.status === 'recovering') {
+    // PR-3b: the scheduler owns this note (`signed` / `redrop_pending`).
+    // Trigger (а) of the reconciliation: one step now, then a retryable 503 —
+    // the record moves only by resend of the same bytes or by the quorum,
+    // never by this request's payload. The DO closed the journal record
+    // itself; settle repeats the identical finish.
+    try { await doCall('/recover-now', { noteId }); } catch (e) { console.error('RECOVER_NOW_UNREACHABLE', noteId, e); }
+    return settle('recovery_in_progress', uploadError(503, 'recovery_in_progress', 'Publication is being recovered server-side, retry later', { txId: checkResult.txId }));
+  }
+  if (checkResult.status === 'recovery_capacity') {
+    // The recovery cap (MAX_RECOVERY_INFLIGHT = the hourly quota): refused
+    // BEFORE anything is signed, retryable once the backlog drains.
+    return settle('recovery_capacity', uploadError(503, 'recovery_capacity', 'Too many publications in recovery for this key, retry later'));
+  }
 
   let reserveToken: string;
   // True whenever the upcoming POST creates a NEW paid txId after a PROVEN
@@ -1677,6 +1691,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       uploadError(503, activated.refusal.code, 'Spend guard refused the activation', activated.refusal.detail));
   }
   if (activated.outcome === 'remap') emit('activate_remap', [], []);
+  if (activated.state !== 'active') {
+    // A terminal no-op (`spent` / `released` under our own activatedBy): the
+    // saga already ended elsewhere — POST is forbidden after a terminal
+    // activate (plan v19 «терминальный no-op», review 24.09 #2 H1).
+    emit('activate_conflict', ['terminal'], []);
+    const aborted = await abortBeforeSend(SPEND_CODES.activateConflict);
+    return settle(aborted ? 'audit_aborted' : SPEND_CODES.activateConflict,
+      uploadError(503, SPEND_CODES.activateConflict, 'Reservation already settled', { state: activated.state }));
+  }
 
   // Phase C. permit-send → the send, with nothing in between (spend-send.ts is
   // the ONLY path to POST /tx; worker/scripts/permit-send-static.test.mjs).
@@ -1684,11 +1707,24 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const sent = await permittedPost(guard, arweave, signedTx,
     { txId: candidateTxId, kind: permitKind, cycle: activated.cycle, spendKey }, transportDeps);
   if (sent.sent === false) {
+    const code = sent.refusal.code;
+    emit('permit_refused', [code], []);
+    if (code === SPEND_CODES.sendInFlight) {
+      // A permit for this txId EXISTS and its executor has not reported: the
+      // bytes may be on the network. That is the «durable recovery» branch of
+      // §4.0, not the abort — nothing is released; the reservation is settled
+      // by the quorum (the money index). Unreachable for a fresh txId of the
+      // current format; kept for the protocol's sake (review 24.09 #4, high 1).
+      await safeRelease(reserveToken);
+      console.error('ARWEAVE_POST_IN_FLIGHT_ELSEWHERE', noteId, candidateTxId);
+      emit('upload_outcome', ['post_unknown', declaredVersion], []);
+      return settle('post_unknown',
+        uploadError(502, 'arweave_post_unknown', 'A send of this transaction is in progress elsewhere', { txId: candidateTxId }),
+        { paidResult: 'unknown', txId: candidateTxId });
+    }
     // No permit was ever issued for this txId — provably never sent (§4.0):
     // frozen / not initialised / the guard did not answer. The record stays
     // consistent: aborted, released, and answered with the guard's code.
-    const code = sent.refusal.code;
-    emit('permit_refused', [code], []);
     const aborted = await abortBeforeSend(code);
     return settle(aborted ? 'audit_aborted' : code, uploadError(503, code, 'Spend guard refused the send'));
   }
@@ -1725,7 +1761,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   let anchored = false;
   for (let attempt = 0; attempt < 3 && !anchored; attempt++) {
     try {
-      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken });
+      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken, anchor: signedTx.last_tx });
       const body: { ok: boolean } = await resp.json();
       if (resp.ok && body.ok) anchored = true;
     } catch { /* retry */ }
@@ -1736,7 +1772,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   let committed = false;
   for (let attempt = 0; attempt < 3 && !committed; attempt++) {
     try {
-      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken });
+      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken, anchor: signedTx.last_tx });
       const commit: { ok: boolean; stale?: boolean } = await commitResp.json();
       if (commitResp.ok && commit.ok) committed = true;
       else if (commit.stale) break; // reservation superseded — do not keep retrying

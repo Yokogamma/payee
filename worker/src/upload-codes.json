@@ -158,6 +158,14 @@
     {
       "code": "spend_remap_refused",
       "status": 503
+    },
+    {
+      "code": "recovery_in_progress",
+      "status": 503
+    },
+    {
+      "code": "recovery_capacity",
+      "status": 503
     }
   ]
 }

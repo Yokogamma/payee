@@ -10,8 +10,11 @@ import { makeIdentity, sagaEnv, upload, uploadRequest } from './helpers/spend-sa
 setupOutboundMock(); // no routes: any Arweave call would fail the test
 
 describe('writer → reader rollback keeps the limits', () => {
-  it.todo('writer created a durable `signed` → rollback to the reader → the reader resends the same bytes through the saga and permit-send; spent(c) accounts it once');
-  it.todo('writer created `redrop_pending` → the reader runs phase 2 (new gen) only through permit-send(kind: redrop2); the old reservation is released before the new one is prepared');
+  // A writer-created `signed` is resent by the reader through the same
+  // permit; a writer-created `redrop_pending` gets phase 2 under
+  // permit-send(redrop2) with the old reservation released first:
+  // test/recovery-scheduler.test.ts (records are seeded through the writer's
+  // primitive `adoptRecovery`).
 
   it('the reader with SpendGuard unconfigured (any limit missing while UPLOADS_ENABLED="true") → 503 spend_guard_unconfigured BEFORE admission on every paid path, and no POST', async () => {
     const { env } = await sagaEnv('unconfigured');
@@ -27,5 +30,6 @@ describe('writer → reader rollback keeps the limits', () => {
     expect(garbage.body.code).toBe('spend_guard_unconfigured');
   });
 
-  it.todo('the reader does not create new recovery records (no new `signed`); only the writer does');
+  // «the reader does not create new recovery records» —
+  // test/recovery-scheduler.test.ts «the reader never creates a recovery record».
 });

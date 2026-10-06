@@ -277,6 +277,18 @@ discriminator).
 | `activate_conflict` | event, `activate_conflict` | — | `/upload` when the reservation under this operation's key belongs to someone else (incident: a protocol defect, not a path) |
 | `activate_remap` | event | — | `/upload` when `activate` re-reserved under the §5 checks (expired lease, changed reward) |
 | `observed_min_winston` | event | the minimum gateway balance handed to the detector (Winston, or −1 when not a safe integer) | `/upload` after a fresh balance read with a quorum (§3.4) |
+| `recovery_step` | event, state (`signed` / `redrop_pending`), action (`advance_posted` / `reschedule` / `resend` / `redrop` / `phase2`) | attempts so far | the per-key scheduler (RateLimiter alarm, or the recheck's nudge) at the start of one step |
+| `recovery_refused` | event, leg (`activate` / `permit` / `prepare` / `limits` / `release` / `recheck`), code | — | a step the guard or the configuration refused: the record is kept and rescheduled. `recheck` = phase 2 read the OLD txId again before anything else — before the release of its money and before a new signature — and the pool did not say dead (`pending` / `unavailable` / confirmations short of the quorum): nothing released, nothing signed (review 24.09 #6 H) |
+| `recovery_corrupt` | event, state | — | the stored bytes do not parse or are not the recorded txId: nothing sent, nothing signed |
+| `money_reconcile` | event, outcome (`spent` / `released` / `wait` / `watch`), result (`settled` / `noop` / `unknown` / `terminal_refusal` / `retry` / `in_flight` / `pending` / `expired` / `held` / `recheck_pending` / `stale`) | attempts so far | the per-key money index (review 24.09 #2 H4, #4 H2, #5 H1–H2): one step of settling a POSTed txId's reservation by the quorum, independent of client rechecks. `released` never ends the entry: it becomes a `watch` (the txId had a permit, so a late landing is still possible). A watch ends ONLY with the chain's proof that the anchor expired (`anchor_proof` below) AND a SECOND read of the full status set, taken after the proof, that still says dead (`watch`/`expired`); a dead read before the proof is not evidence (review #6 H: mined in between → the second read books `spent`; pending or short of the quorum → `watch`/`recheck_pending`, kept); no proof → `watch`/`held`. `in_flight` = `released` refused under an open send lease — the step fetched the proof and, with it accepted, read the pool AGAIN before asking: mined meanwhile → `spent`, dead again → `released`, anything else → `released`/`recheck_pending` (nothing freed). `stale` = the entry is older than `MONEY_STALE_MS` (7 d): escalated (a `MONEY_RECONCILE_STALE` log line), slowed to `MONEY_STALE_BACKOFF_MS` (6 h) — NEVER dropped (an obligation ends with a fact, not with age). A late money quorum on a watched txId is booked `released → spent` by this step (`spent`/`settled`, the lattice's `spend_conflict`) |
+| `anchor_proof` | event, kind (`expired` / `valid` / `unavailable`), reason (`ok` / `anchor_height` / `chain_height` / `anchor_disagreement` / `no_anchor`) | chain height − anchor height (−1 when unavailable) | `anchor-expiry.ts`: the chain facts behind the proof of expiry — the anchor block's height (must be AGREED by ≥ 2 operators) and the chain height (the MINIMUM over ≥ 2 operators); `no_anchor` = an entry older than the field, never provable, held |
+| `gateway_call` kind=`info` / `block` | event, kind, host, statusClass | latencyMs | the two reads of the proof of expiry (`/info` height, `/block/hash/<anchor>` height with `indep_hash` equality) |
+| `legacy_closure_failed` | event, where (the DO route that failed or answered an incomplete shape) | — | the closure of the legacy set stayed OPEN because an enumeration failed (never «closed, nothing to hold») |
+| `gateway_call` kind=`legacy_header` | event, `legacy_header`, host, statusClass (`invalid_response` = a header that does not verify: id ≠, signature, owner) | latencyMs | the legacy closure reading `/tx/<id>` of a pre-D10 transaction at a payload origin |
+| `legacy_reward_unknown` | event | — | the closure could not read a verified header at any origin: `init` refused |
+| `legacy_held_registered` | event | items registered | `/admin/spend/init` after the closure registered holds |
+| `legacy_resolved` | event, outcome (`spent` / `dropped`) | — | `/admin/spend/init` in `done`, one per held item resolved by the quorum |
+| `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
 
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
 `legacy_resolved{outcome}`, `ledger_inconsistent`, `spend_conflict` and the
@@ -287,7 +299,10 @@ The `/upload` answer codes the saga adds (`worker/src/upload-codes.json`):
 and, post-admission, `spend_guard_unavailable`, `spend_frozen`,
 `spend_not_initialized`, `spend_floor`, `spend_window_cap`,
 `spend_quote_mismatch`, `spend_ledger_inconsistent`, `activate_conflict`,
-`spend_remap_refused` — all 503, all BEFORE any POST.
+`spend_remap_refused` — all 503, all BEFORE any POST. The scheduler adds
+`recovery_in_progress` (the note is a `signed` / `redrop_pending` record the
+scheduler owns; the request nudged one step) and `recovery_capacity` (the
+per-key recovery cap, refused before signing) — both 503, retryable.
 
 ## What PR-3a deliberately does NOT measure
 

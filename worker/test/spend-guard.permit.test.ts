@@ -45,8 +45,10 @@ describe('D10 permit-send — the single path to the network', () => {
     expect(s.ledger.pending).toBe('0'); // active → released: provably never sent
   });
 
-  it.todo('(1б) review #9 H3: durable `signed` was POSTed, the answer was lost → freeze → permit-send(resend) refused → record, txId, signedTx and the hold are kept, no release/abort, quorum reconciliation continues (scheduler step)');
-  it.todo('(1в) durable `signed` that was never POSTed under freeze is not cancelled: it waits for the thaw and its first POST happens under a NEW permit (scheduler step)');
+  // (1б) and (1в) — a durable `signed` under freeze (POSTed with the answer
+  // lost, or never POSTed) keeps its record, bytes and hold and is only
+  // rescheduled: test/recovery-scheduler.test.ts «a frozen guard refuses the
+  // resend permit».
 
   it('(3) under freeze uploads are refused while the marker of the current cycle is the ONE exception (spend-guard.marker.test.ts); after the thaw the upload proceeds', async () => {
     const { env, ns } = await sagaEnv('thaw');

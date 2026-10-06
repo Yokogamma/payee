@@ -70,6 +70,7 @@ export default defineConfig({
       'test/spend-guard.permit.test.ts',
       'test/upload-spend-saga.test.ts',
       'test/rollback-reader-spend.test.ts',
+      'test/recovery-scheduler.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that

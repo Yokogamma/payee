@@ -58,6 +58,24 @@ export const SPEND_CODES = {
   /** A durable marker record whose bytes do not parse or do not match its
    *  txId: neither resent nor re-signed (plan «порча signedTx» — fail closed). */
   markerCorrupt: 'spend_marker_corrupt',
+  /** The permit names a reservation that is `released` (a dead txId whose
+   *  redrop was decided): no executor may send those bytes any more
+   *  (review 24.09 #2, high 1 — a stale run is stripped of its right to send). */
+  reservationReleased: 'spend_reservation_released',
+  /** A send lease is open on the txId: `released` was asked for its
+   *  reservation, or a SECOND executor asked `permit-send` for the same bytes
+   *  (review 24.09 #3 high 1, #4 high 1) — the money cannot be freed and the
+   *  right to send cannot be shared while a POST may still be in progress. */
+  sendInFlight: 'spend_send_in_flight',
+  /** `/anchor-expired` names an anchor other than the permit's, or the permit
+   *  recorded none (a proof must be about the permitted bytes). */
+  anchorMismatch: 'spend_anchor_mismatch',
+  /** `/anchor-expired` brought heights under which the anchor is still valid. */
+  anchorNotExpired: 'spend_anchor_not_expired',
+  /** `permit-send` for bytes whose anchor is PROVEN expired: the network
+   *  cannot accept them, and a lease on them could only wedge money (review
+   *  24.09 #6, medium). The record must go dead → redrop, not resend. */
+  anchorExpired: 'spend_anchor_expired',
   windowCap: 'spend_window_cap',
   floor: 'spend_floor',
 } as const;
@@ -201,7 +219,54 @@ export type PermitKind = 'upload' | 'resend' | 'redrop2' | 'marker';
 
 export interface FreezeState { active: boolean; epoch: number; since?: number }
 
-export interface PermitRecord { txId: string; kind: PermitKind; cycle: number; issuedAt: number; spendKey?: string }
+export interface PermitRecord {
+  txId: string; kind: PermitKind; cycle: number; issuedAt: number; spendKey?: string;
+  /** The `last_tx` of the permitted bytes (a block hash from `/tx_anchor`),
+   *  recorded at the first permit-send: the ONE fact a later proof of expiry
+   *  must be about (review 24.09 #5, high 1). */
+  anchor?: string;
+  /** The send lease (review 24.09 #3 high 1, #4 high 1–2, #5 high 1): ONE
+   *  executor at a time holds the right to POST these bytes. Set when the
+   *  permit is handed out; cleared by `/send-done` with the token — the
+   *  executor's own report that its POST ended — or by `/anchor-expired`, a
+   *  proof from the chain that the bytes can no longer be accepted. Never by
+   *  the clock. While it is set, `permit-send` for the same txId is refused
+   *  to everyone else and `released` is refused for the reservation. */
+  sending?: { token: string; since: number };
+  /** The chain facts that ended an unreported lease (`/anchor-expired`). */
+  anchorExpired?: { anchorHeight: number; chainHeight: number; at: number };
+}
+
+/** Is the lease binding: an executor holds it, has not reported, and the
+ *  anchor is not proven expired. Time is not an argument (review 24.09 #5,
+ *  high 1): a block interval has a target average and no upper bound, so no
+ *  wall-clock span proves an anchor stale. A permit whose anchor IS proven
+ *  expired binds nothing, whatever `sending` says (review #6, medium): its
+ *  bytes cannot land, so no lease on them may hold money. */
+export function leaseOpen(permit: Pick<PermitRecord, 'sending' | 'anchorExpired'> | undefined): boolean {
+  return permit !== undefined && permit.sending !== undefined && permit.anchorExpired === undefined;
+}
+
+/**
+ * The anchor rule of the network, as the ONE proof that permitted bytes can
+ * never land (review 24.09 #5, high 1): a transaction is mineable only while
+ * its `last_tx` names one of the last `ANCHOR_EXPIRY_BLOCKS` blocks. Once the
+ * chain's CONFIRMED height is at least `anchorHeight + ANCHOR_EXPIRY_BLOCKS +
+ * ANCHOR_EXPIRY_MARGIN_BLOCKS`, no block can include those bytes any more.
+ * Both heights are chain facts the worker reads from ≥ MIN_BALANCE_SOURCES
+ * operators (`anchor-expiry.ts`): the anchor's height must be AGREED
+ * (equal), the chain height is the MINIMUM (the conservative side — the
+ * chain is at least this far). The margin absorbs a short reorg and a
+ * gateway that runs a block ahead of the canonical tip.
+ */
+export const ANCHOR_EXPIRY_MARGIN_BLOCKS = 5;
+export function anchorExpired(anchorHeight: number, chainHeight: number): boolean {
+  if (!Number.isInteger(anchorHeight) || !Number.isInteger(chainHeight) || anchorHeight < 0 || chainHeight < 0) return false;
+  return chainHeight - anchorHeight >= ANCHOR_EXPIRY_BLOCKS + ANCHOR_EXPIRY_MARGIN_BLOCKS;
+}
+
+/** A block hash from `/tx_anchor` (43..64 base64url — see arweave-transport). */
+export const ANCHOR_RE = /^[A-Za-z0-9_-]{43,64}$/;
 
 export type PermitDecision =
   | { granted: true; permit: PermitRecord; existing: boolean }

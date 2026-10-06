@@ -125,9 +125,11 @@ describe('upload → spend saga, crash after each boundary', () => {
   });
 
   it.todo('crash after sign before durable signed → the ephemeral signature is dropped; resign_violation does NOT fire on an ephemeral signature (writer format)');
-  it.todo('crash after durable signed before activate → recovery activates (same {reward, revision}) and continues; a changed reward → remap under §5 checks (scheduler step)');
-  it.todo('crash between activate and permit-send → recovery asks permit-send first; under freeze it is refused and the record is kept (no release) (scheduler step)');
-  it.todo('crash after permit-send before POST → the same permit is returned and the same bytes are POSTed; one txId (scheduler step)');
+  // The durable-`signed` boundaries (after signed before activate; between
+  // activate and permit-send; after permit-send before POST) are the
+  // scheduler's resend path — test/recovery-scheduler.test.ts «pending →
+  // reschedule … unavailable → the SAME bytes are resent», «a frozen guard
+  // refuses the resend permit».
 
   it('crash after POST before settle (the answer was lost): the reservation stays `active` — never released by a timer — until the quorum confirms; a gateway 5xx keeps it too', async () => {
     const { env, status } = await sagaEnv('unknown');
@@ -154,7 +156,10 @@ describe('upload → spend saga, crash after each boundary', () => {
     const q = await guardCall(ns, '/refresh-price', { bytes: 100, reward: '10' });
     expect((await guardCall(ns, '/prepare', { spendKey: oldKey, reward: '10', revision: 0, quoteId: q.body.quoteId, bytes: 100, limits: { walletFloor: '0', windowCap: '1000000', maxTxReward: '1000' } })).status).toBe(200);
     expect((await guardCall(ns, '/activate', { spendKey: oldKey, reward: '10', revision: 0, activatedBy: '10:0' })).status).toBe(200);
-    expect((await guardCall(ns, '/permit-send', { txId: deadTx, kind: 'upload', cycle: 1, spendKey: oldKey })).status).toBe(200);
+    const oldPermit = await guardCall(ns, '/permit-send', { txId: deadTx, kind: 'upload', cycle: 1, spendKey: oldKey });
+    expect(oldPermit.status).toBe(200);
+    // …its send completed and reported (only the answer was lost).
+    expect((await guardCall(ns, '/send-done', { txId: deadTx, sendToken: oldPermit.body.sendToken })).body.cleared).toBe(true);
     expect((await status()).ledger.pending).toBe('10');
     // The per-key record: posted 31 min ago under deadTx, with this payload's fp.
     await runInDurableObject(RATE_LIMITER.get(RATE_LIMITER.idFromName(id.pkB64)), async (_i, state) => {
