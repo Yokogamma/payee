@@ -14,13 +14,16 @@ import { readAllowCache } from './allowlist';
 // bundle picks them up as plain TypeScript. Precedent: worker/test/
 // client-parity.test.ts already imports src/lib/crypto.ts.
 import { parseOriginList, serializeStatusOrigins } from '../../src/lib/gateways-parse';
-import { QUORUM_POLICY_ID, statusVerdict } from '../../src/lib/status-quorum';
+import { QUORUM_POLICY_ID, statusVerdict, type QuorumVerdict, type StatusVote } from '../../src/lib/status-quorum';
 import { parseTrustedOwners } from '../../src/lib/trusted-owners';
 import { authenticatePublication, type ReadStage } from './publication-auth';
 import { metricsErrorCodes, metricsRay } from './metrics-diagnostics';
 import { verifyBearerSecret } from './admin-auth';
 import { probeStatusOrigin } from './gateway-reads';
-import { createSpendAdminHandler, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
+import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
+import { permittedPost } from './spend-send';
+import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
+import { moneyQuorum } from './spend-ledger';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -34,7 +37,6 @@ import {
   getAnchor,
   getArweave,
   getPrice,
-  postSignedTx,
   readCappedText,
 } from './arweave-transport';
 import {
@@ -784,6 +786,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   if ((await walletTrust(env, trustedOwners)) === 'untrusted') {
     return uploadError(503, 'server_misconfigured', 'Server misconfigured');
   }
+  // D10 (PR-3b): the three spend limits are MANDATORY on every paid path
+  // (spec §1) — read here, on every request, never defaulted. Without them
+  // the guard could not decide `prepare`, so nothing is admitted.
+  if (readSpendLimits(env) === null) {
+    return uploadError(503, 'spend_guard_unconfigured', 'Spend guard limits are not configured');
+  }
 
   // Metrics emitter (PR-2). Telemetry is fail-closed / request path fail-open:
   // a noop unless METRICS_ENABLED === 'true' AND the binding exists.
@@ -1091,6 +1099,31 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   const opMode: OpMode = recoveryHint ? 'recovery' : wantsRecheck ? 'recheck' : 'plain';
 
+  // D10 (PR-3b): the GLOBAL spend guard — the only source of permits to POST.
+  const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
+
+  /**
+   * Status verdict + D10 reconciliation in one step. Liveness (the PR-3a
+   * verdict: one valid 200 is `alive`) answers the CLIENT; money is settled
+   * only under the guard's own quorum rule (`moneyQuorum`: ≥ 2 operators, each
+   * ≥ MIN_DEPOSIT_CONFIRMATIONS, heights within the skew — review 24.09,
+   * high: a single 200 with zero confirmations must not turn a hold into a
+   * final spend, nor lend its height to the marker classification). Until
+   * that quorum forms the reservation stays `pending`. Best effort — the
+   * scheduler is the authoritative reconciler; a refusal never changes the
+   * answer, and a txId without a permit (a pre-D10 publication) is simply
+   * unknown to the guard.
+   */
+  const liveOf = async (txId: string): Promise<'alive' | 'dead' | 'unavailable'> => {
+    const { live, votes } = await getTxVerdictWorker(txId, emit, env);
+    const q = moneyQuorum(votes, origin => origin);
+    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height });
+    return live;
+  };
+  /** The second call of the redrop order (§8): a PROVEN dead transaction
+   *  costs nothing — its reservation is released once the redrop is a fact. */
+  const releaseDead = (txId: string) => settleByTx(guard, { txId, outcome: 'released' });
+
   /**
    * The ONE exit for every answer after admission: closes the journal record
    * (`/op-finish`, before the answer leaves) and stamps the echo — the
@@ -1157,10 +1190,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
    *  ever called on the path BEFORE the POST (checked statically by
    *  worker/scripts/upload-codes-static.test.mjs): after a send, «unknown» is
    *  the truth and nothing may overwrite it. */
-  const opAbort = async (token: string): Promise<boolean> => {
+  const opAbort = async (token: string, reason: string): Promise<boolean> => {
     try {
       const b: { ok: boolean; reason?: string } =
-        await (await doCall('/op-abort', { id: opId, token, reason: 'audit_unconfirmed' })).json();
+        await (await doCall('/op-abort', { id: opId, token, reason })).json();
       if (!b.ok) console.error('OP_ABORT_REFUSED', opId, b.reason);
       return b.ok === true;
     } catch (e) {
@@ -1249,7 +1282,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // re-posted again, because the redrop path is only reachable once the
       // record is comparable. So the status quorum is asked, and only a
       // unanimous `dead` past the age guard opens the re-post.
-      const live = await getTxStatusWorker(snapshot.txId, emit, env);
+      const live = await liveOf(snapshot.txId);
       if (live === 'dead' && Date.now() - age > MIN_COMMITTED_AGE_MS) return { kind: 'dead' };
       // Alive-but-unfetchable, unavailable, or too recent: retryable, and
       // nothing is written.
@@ -1380,6 +1413,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     reserveToken = rd.token;
     viaRedrop = true;
     decision = 'legacy_dead_redrop';
+    await releaseDead(legacyRedrop.txId);
   } else if (checkResult.status === 'exists') {
     // Already committed. Without recheck this is the idempotent happy path.
     if (!wantsRecheck) {
@@ -1392,7 +1426,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     }
 
     // Recheck: is the committed TX still alive on-chain?
-    const live = await getTxStatusWorker(checkResult.txId!, emit, env);
+    const live = await liveOf(checkResult.txId!);
     if (live === 'alive') {
       attest('deduped');
       return settle('deduped', uploadAccepted({ txId: checkResult.txId, status: 'accepted', committed: true, deduped: true }), { txId: checkResult.txId });
@@ -1414,10 +1448,11 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     reserveToken = rd.token;
     viaRedrop = true;
     decision = 'recheck_dead_redrop';
+    await releaseDead(checkResult.txId!);
   } else if (checkResult.status === 'posted') {
     // POST succeeded but the commit was lost. Reconcile using the SERVER's txId
     // (never a client-supplied one), its CAS token, and the postedAt age guard.
-    const live = await getTxStatusWorker(checkResult.txId!, emit, env);
+    const live = await liveOf(checkResult.txId!);
     if (live === 'unavailable') return settle('status_unavailable', uploadError(503, 'status_unavailable', 'Arweave status unavailable'));
     if (live === 'alive') {
       try {
@@ -1449,6 +1484,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     reserveToken = rd.token;
     viaRedrop = true;
     decision = 'recheck_dead_redrop';
+    await releaseDead(checkResult.txId!);
   } else if (checkResult.status === 'reserved') {
     // The DO closed this record itself (DO_TERMINAL_VERDICTS); settle repeats
     // the identical finish, which is idempotent.
@@ -1472,7 +1508,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         // "Invalid recovery token" responses must carry the SAME code.
         return settle('recovery_invalid', recoveryInvalid());
       }
-      const live = await getTxStatusWorker(recoveryHint.txId, emit, env);
+      const live = await liveOf(recoveryHint.txId);
       if (live === 'unavailable') { await safeRelease(reserveToken); return settle('status_unavailable', uploadError(503, 'status_unavailable', 'Arweave status unavailable')); }
       if (live === 'alive') {
         // The token proves noteId, txId and postedAt — it says NOTHING about
@@ -1526,6 +1562,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       // from the security metric).
       viaRedrop = true;
       decision = 'recovery_dead_repost';
+      await releaseDead(recoveryHint.txId);
     }
   }
 
@@ -1548,6 +1585,10 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   //     deliberately still has NO timeout (a response lost to our own timeout
   //     would not prove the gateway rejected the TX — see postSignedTx).
   const transportDeps = { host: ARWEAVE_HOST, emit };
+  // D10 saga (§8): the limits are present (step-0 gate), the reservation key
+  // carries the tenant, this note and THIS operation as its generation.
+  const spendLimits = readSpendLimits(env)!;
+  const spendKey = await spendKeyFor(publicKeyB64, noteId, opId);
   let phase: 'prepare' | 'anchor_price' = 'prepare';
   let arweave!: ReturnType<typeof getArweave>;
   let signedTx!: Awaited<ReturnType<ReturnType<typeof getArweave>['createTransaction']>>;
@@ -1555,12 +1596,28 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     arweave = getArweave();
     const serverWallet = assertStructurallyCompleteJwk(env.ARWEAVE_JWK);
     phase = 'anchor_price';
+    // §3.4 detector input, cached per wallet: the minimum gateway balance can
+    // only STOP `prepare` (an unaccounted outflow), never raise `available`;
+    // an unreadable pool leaves the detector inert.
+    await refreshBalanceIfStale(env, guard, await getWalletAddress(env), emit);
     const last_tx = await getAnchor(transportDeps);
     // Exactly the byte count the SDK itself would price — the UTF-8 length of
     // the data string (arweave/node/common.js: stringToBuffer(data).byteLength).
     // An underpriced reward is a network-rejected transaction.
-    const reward = await getPrice(new TextEncoder().encode(data).byteLength, transportDeps);
+    const bytes = new TextEncoder().encode(data).byteLength;
+    const reward = await getPrice(bytes, transportDeps);
     phase = 'prepare';
+    // `prepare` BEFORE signing (plan «Порядок саги»): the quote bound to the
+    // size, then floor / window / ceiling, all fail-closed in the guard. The
+    // same `reward` is what the transaction is created with — a quote and a
+    // reservation that disagree cannot exist.
+    const prepared = await prepareSpend(guard, { spendKey, bytes, reward, limits: spendLimits });
+    if (!prepared.ok) {
+      await safeRelease(reserveToken);
+      emit('spend_prepare_refused', [prepared.refusal.code], []);
+      return settle(prepared.refusal.code,
+        uploadError(503, prepared.refusal.code, 'Spend guard refused the reservation', prepared.refusal.detail));
+    }
     signedTx = await arweave.createTransaction({ data, last_tx, reward }, serverWallet);
     for (const tag of tags) signedTx.addTag(tag.name, tag.value);
     await arweave.transactions.sign(signedTx, serverWallet);
@@ -1586,26 +1643,70 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   // fails too the record stays `posting`: red, resolved only by a human.
   const candidateTxId = signedTx.id;
   const posting = await opPosting(candidateTxId, decision, reserveToken);
-  if (posting !== 'ok') {
-    const aborted = posting === 'unconfirmed' ? await opAbort(reserveToken) : false;
+
+  /**
+   * The §4.0 «provably never sent» branch, the ONE place the pre-send abort
+   * happens: every txId of the current format is fresh per operation, so a
+   * refusal before the send proves the network never saw the bytes — the
+   * journal record is closed with the reason as its code, the per-key
+   * reservation and the guard's reservation are released.
+   */
+  const abortBeforeSend = async (reason: string): Promise<boolean> => {
+    const aborted = await opAbort(reserveToken, reason);
     await safeRelease(reserveToken);
+    await releaseSpend(guard, spendKey);
+    return aborted;
+  };
+
+  if (posting !== 'ok') {
+    let aborted = false;
+    if (posting === 'unconfirmed') aborted = await abortBeforeSend('audit_unconfirmed');
+    else await safeRelease(reserveToken);
     const code = posting === 'unconfirmed' ? 'audit_unconfirmed' : 'audit_unavailable';
     return settle(aborted ? 'audit_aborted' : code, uploadError(503, code, 'Audit record could not be written'));
   }
 
-  // Phase C. The send.
-  let response: { status: number };
-  try {
-    response = await postSignedTx(arweave, signedTx, transportDeps);
-  } catch (e) {
+  // Phase B′. D10 `activate(spendKey, reward, revision)` — the CAS table §6,
+  // with the reward OF THE SIGNED transaction. A conflict or a refused remap
+  // is a refusal BEFORE the send (the abort branch above).
+  const activated = await activateSpend(guard, { spendKey, reward: signedTx.reward, limits: spendLimits });
+  if (!activated.ok) {
+    emit(activated.refusal.code === 'activate_conflict' ? 'activate_conflict' : 'spend_prepare_refused', [activated.refusal.code], []);
+    const aborted = await abortBeforeSend(activated.refusal.code);
+    return settle(aborted ? 'audit_aborted' : activated.refusal.code,
+      uploadError(503, activated.refusal.code, 'Spend guard refused the activation', activated.refusal.detail));
+  }
+  if (activated.outcome === 'remap') emit('activate_remap', [], []);
+
+  // Phase C. permit-send → the send, with nothing in between (spend-send.ts is
+  // the ONLY path to POST /tx; worker/scripts/permit-send-static.test.mjs).
+  const permitKind = viaRedrop ? 'redrop2' : 'upload';
+  const sent = await permittedPost(guard, arweave, signedTx,
+    { txId: candidateTxId, kind: permitKind, cycle: activated.cycle, spendKey }, transportDeps);
+  if (sent.sent === false) {
+    // No permit was ever issued for this txId — provably never sent (§4.0):
+    // frozen / not initialised / the guard did not answer. The record stays
+    // consistent: aborted, released, and answered with the guard's code.
+    const code = sent.refusal.code;
+    emit('permit_refused', [code], []);
+    const aborted = await abortBeforeSend(code);
+    return settle(aborted ? 'audit_aborted' : code, uploadError(503, code, 'Spend guard refused the send'));
+  }
+  emit('permit_granted', [permitKind], []);
+  if (sent.sent === 'unknown') {
+    // The transaction MAY be accepted: the guard's reservation stays `active`
+    // (no TTL, §7) until the status quorum resolves it — never released here.
     await safeRelease(reserveToken);
-    console.error('ARWEAVE_POST_UNKNOWN', noteId, e);
+    console.error('ARWEAVE_POST_UNKNOWN', noteId, sent.error);
     emit('upload_outcome', ['post_unknown', declaredVersion], []);
     return settle('post_unknown',
       uploadError(502, 'arweave_post_unknown', 'Arweave POST outcome unknown', { txId: candidateTxId }),
       { paidResult: 'unknown', txId: candidateTxId });
   }
+  const response: { status: number } = { status: sent.status };
   if (response.status !== 200 && response.status !== 202) {
+    // A gateway refusal is not proof the network never saw the bytes: the
+    // guard's reservation stays `active` and is resolved by the quorum.
     await safeRelease(reserveToken);
     emit('upload_outcome', ['arweave_error', declaredVersion], []);
     return settle('arweave_error',
@@ -1904,15 +2005,17 @@ async function verifyRecovery(env: Env, noteId: string, txId: string, postedAt: 
 /**
  * Server-side liveness check for a committed TX (recheck path). Maps the gateway
  * contract to a coarse verdict: 200/202 → alive, 404 → dead, everything else
- * (400 included — see probeStatusOrigin) → unavailable.
+ * (400 included — see probeStatusOrigin) → unavailable — and hands back the
+ * quorum verdict itself, because the D10 reconciliation needs the confirmed
+ * height, not only the coarse liveness (handleUpload's `liveOf`).
  * PR-2 wraps the SAME fetch in a stopwatch and emits gateway_call(status) +
  * status_verdict; the verdict logic itself is unchanged (quorum is PR-3a).
  */
-async function getTxStatusWorker(
+async function getTxVerdictWorker(
   txId: string,
   emit: Emit,
   env: Env,
-): Promise<'alive' | 'dead' | 'unavailable'> {
+): Promise<{ live: 'alive' | 'dead' | 'unavailable'; verdict: QuorumVerdict; votes: StatusVote[] }> {
   const origins = statusOrigins(env);
   const votes = await Promise.all(origins.map(origin => probeStatusOrigin(origin, txId, emit)));
 
@@ -1930,7 +2033,7 @@ async function getTxStatusWorker(
         : 'unavailable';
   emit('status_verdict', [coarse, QUORUM_METRIC_HOST],
     [verdict.kind === 'confirmed' ? verdict.confirmations : -1]);
-  return coarse;
+  return { live: coarse, verdict, votes };
 }
 
 /** Sentinel host for the aggregated row (see getTxStatusWorker). */

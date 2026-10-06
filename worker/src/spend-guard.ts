@@ -98,6 +98,24 @@ export class SpendGuard implements DurableObject {
     this.state = state;
   }
 
+  /**
+   * The lease alarm: a `prepared` reservation whose signature never came
+   * back (crash after prepare, before sign — upload saga) is released when
+   * its lease ends. `prepare` arms the alarm for its lease end when none
+   * earlier is set; the alarm re-arms itself for the earliest lease still
+   * open. `active` has no TTL (§7) and is never touched here.
+   */
+  async alarm(): Promise<void> {
+    const res = await this.expireLeases(Date.now());
+    const body = (await res.json()) as { nextDueAt?: number | null };
+    if (typeof body.nextDueAt === 'number') await this.state.storage.setAlarm(body.nextDueAt);
+  }
+
+  private async armLeaseAlarm(dueAt: number): Promise<void> {
+    const current = await this.state.storage.getAlarm();
+    if (current === null || current > dueAt) await this.state.storage.setAlarm(dueAt);
+  }
+
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (request.method === 'GET' && path === '/status') return this.status();
@@ -127,6 +145,9 @@ export class SpendGuard implements DurableObject {
       case '/activate': return this.activate(body, now);
       case '/settle': return this.settle(body, now);
       case '/expire-leases': return this.expireLeases(now);
+      // §7 by the txId the permit named — the recheck path knows the txId,
+      // not the spendKey (upload saga).
+      case '/settle-by-tx': return this.settleByTx(body, now);
       default: return new Response('Not found', { status: 404 });
     }
   }
@@ -374,10 +395,13 @@ export class SpendGuard implements DurableObject {
     if (!spendKey || reward === null || !Number.isInteger(revision) || !quoteId || !Number.isInteger(bytes)) return new Response('bad request', { status: 400 });
     if (limits === null) return refuse(SPEND_CODES.guardUnconfigured, 503);
     return this.state.storage.transaction(async (txn) => {
+      // Ended leases first — they hold nothing (§ leases), and a lost alarm
+      // must not make them hold the budget against this request.
+      await this.expireLeasesInTxn(txn, now);
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
       const ledgerNow = await this.getLedger(txn);
       if (existing && existing.state === 'prepared' && existing.cycle === ledgerNow.cycle && existing.revision === revision && existing.reward === reward.toString()) {
-        return okJson({ state: 'prepared', idempotent: true });
+        return okJson({ state: 'prepared', idempotent: true, cycle: ledgerNow.cycle, revision, leaseUntil: existing.leaseUntil ?? null });
       }
       if (existing && existing.state !== 'released') return refuse(SPEND_CODES.activateConflict, 503, { state: existing.state });
       // The quote binds the price to the SIZE (§5, quoteId): unknown, expired
@@ -397,7 +421,16 @@ export class SpendGuard implements DurableObject {
       const next = { ...ledger, pending: ledger.pending + reward };
       await this.putLedger(txn, next);
       await this.audit(txn, 'prepare', { spendKey, reward: reward.toString(), revision, cycle: ledger.cycle });
-      return okJson({ state: 'prepared', available: available(next).toString(), leaseUntil: now + PREPARED_LEASE_MS });
+      return okJson({ state: 'prepared', available: available(next).toString(), leaseUntil: now + PREPARED_LEASE_MS, cycle: ledger.cycle, revision });
+    }).then(async (res) => {
+      // Outside the transaction: the alarm is a scheduling fact, not ledger
+      // state, and a failed setAlarm must not undo a prepared reservation
+      // (the next prepare, or the next alarm run, re-arms it).
+      if (res.ok) {
+        const body = (await res.clone().json()) as { leaseUntil?: number | null };
+        if (typeof body.leaseUntil === 'number') { try { await this.armLeaseAlarm(body.leaseUntil); } catch (e) { console.error('SPEND_GUARD_ALARM_NOT_ARMED', e); } }
+      }
+      return res;
     });
   }
 
@@ -412,7 +445,7 @@ export class SpendGuard implements DurableObject {
       const res: Reservation | undefined = existing ? { state: existing.state, reward: BigInt(existing.reward), revision: existing.revision, activatedBy: existing.activatedBy } : undefined;
       const outcome = activateOutcome(res, { reward, revision, activatedBy });
       if (outcome === 'conflict') return refuse(SPEND_CODES.activateConflict, 503, { state: existing?.state });
-      if (outcome === 'noop' || outcome === 'terminal-noop') return okJson({ state: existing!.state, outcome });
+      if (outcome === 'noop' || outcome === 'terminal-noop') return okJson({ state: existing!.state, outcome, cycle: existing!.cycle });
       if (outcome === 'remap') {
         // Re-run the §5 checks for the NEW reward in one step (the old pending,
         // if any, is replaced, never added); refusal rolls everything back.
@@ -420,8 +453,12 @@ export class SpendGuard implements DurableObject {
         // pending (reinit released it), so nothing is replaced for it.
         const limits = this.readLimits(body.limits);
         if (limits === null) return refuse(SPEND_CODES.guardUnconfigured, 503);
+        // Ended leases of OTHER keys first (same reason as in prepare); this
+        // key's own expired lease is what the remap replaces below.
+        await this.expireLeasesInTxn(txn, now);
+        const refreshed = await txn.get<StoredReservation>(K.res(spendKey));
         const ledger = await this.getLedger(txn);
-        const oldPending = existing && existing.state === 'prepared' && existing.cycle === ledger.cycle ? BigInt(existing.reward) : 0n;
+        const oldPending = refreshed && refreshed.state === 'prepared' && refreshed.cycle === ledger.cycle ? BigInt(refreshed.reward) : 0n;
         const base = { ...ledger, pending: ledger.pending - oldPending };
         const init = await this.getInit(txn);
         const balance = await txn.get<StoredBalance>(K.balance);
@@ -434,11 +471,11 @@ export class SpendGuard implements DurableObject {
         await this.putLedger(txn, { ...base, pending: base.pending + reward });
         await txn.put<StoredReservation>(K.res(spendKey), { state: 'active', reward: reward.toString(), revision, activatedBy, cycle: ledger.cycle });
         await this.audit(txn, 'activate-remap', { spendKey, reward: reward.toString(), revision });
-        return okJson({ state: 'active', outcome });
+        return okJson({ state: 'active', outcome, cycle: ledger.cycle });
       }
       await txn.put<StoredReservation>(K.res(spendKey), { ...existing!, state: 'active', activatedBy, leaseUntil: undefined });
       await this.audit(txn, 'activate', { spendKey, reward: reward.toString(), revision });
-      return okJson({ state: 'active', outcome });
+      return okJson({ state: 'active', outcome, cycle: existing!.cycle });
     });
   }
 
@@ -451,7 +488,27 @@ export class SpendGuard implements DurableObject {
     // reservation settled while the marker is not yet `done` is classified
     // against h_init later (see initStep); without it, `spent` is final.
     const settledHeight = typeof body.height === 'number' && Number.isInteger(body.height) ? body.height : undefined;
+    return this.state.storage.transaction(async (txn) => this.settleInTxn(txn, spendKey, outcome, settledHeight, now));
+  }
+
+  /** `settle` addressed by the txId a permit named (`permit:<txId>` →
+   *  `spendKey`). 404 when no permit exists for the txId (a pre-D10
+   *  publication — not an error for the caller); 400 for a marker permit
+   *  (its money is not a reservation). */
+  private async settleByTx(body: Record<string, unknown>, now: number): Promise<Response> {
+    const txId = String(body.txId ?? ''); const outcome = body.outcome;
+    if (!txId || (outcome !== 'spent' && outcome !== 'released')) return new Response('bad request', { status: 400 });
+    const settledHeight = typeof body.height === 'number' && Number.isInteger(body.height) ? body.height : undefined;
     return this.state.storage.transaction(async (txn) => {
+      const permit = await txn.get<PermitRecord>(K.permit(txId));
+      if (!permit) return new Response('unknown permit', { status: 404 });
+      if (permit.kind === 'marker' || !permit.spendKey) return new Response('not a reservation', { status: 400 });
+      return this.settleInTxn(txn, permit.spendKey, outcome, settledHeight, now);
+    });
+  }
+
+  private async settleInTxn(txn: Txn, spendKey: string, outcome: 'spent' | 'released', settledHeight: number | undefined, now: number): Promise<Response> {
+    {
       const existing = await txn.get<StoredReservation>(K.res(spendKey));
       if (!existing) return new Response('unknown reservation', { status: 404 });
       const r = settle({ state: existing.state, reward: BigInt(existing.reward), revision: existing.revision, activatedBy: existing.activatedBy }, outcome);
@@ -467,38 +524,61 @@ export class SpendGuard implements DurableObject {
       const next: CycleLedger = { ...ledger, spent: ledger.spent + r.spentDelta, pending: ledger.pending + r.pendingDelta };
       await this.putLedger(txn, next);
       if (r.spentDelta > 0n) await txn.put(K.buckets, fromBuckets(addToBucket(toBuckets(await txn.get(K.buckets)), now, r.spentDelta)));
+      // The height and the cycle are recorded by the settle that BOOKED the
+      // spend; a later confirmed recheck (a no-op on the lattice) must not
+      // move them — the classification at `done` reads the first one.
       await txn.put<StoredReservation>(K.res(spendKey), {
         ...existing,
         state: r.state,
         ...(r.spentDelta > 0n ? { settledCycle: ledger.cycle } : {}),
-        ...(settledHeight !== undefined && r.state === 'spent' ? { settledHeight } : {}),
+        ...(r.spentDelta > 0n && settledHeight !== undefined ? { settledHeight } : {}),
       });
-      await this.audit(txn, 'settle', { spendKey, outcome, conflict: r.conflict, reward: existing.reward, settledHeight: settledHeight ?? null });
-      return okJson({ state: r.state, conflict: r.conflict, available: available(next).toString() });
-    });
+      const noop = r.spentDelta === 0n && r.pendingDelta === 0n && r.state === existing.state;
+      if (!noop) await this.audit(txn, 'settle', { spendKey, outcome, conflict: r.conflict, reward: existing.reward, settledHeight: settledHeight ?? null });
+      return okJson({ state: r.state, conflict: r.conflict, noop, available: available(next).toString() });
+    }
   }
 
   // ─── leases ─────────────────────────────────────────────────────────────
 
   private async expireLeases(now: number): Promise<Response> {
     return this.state.storage.transaction(async (txn) => {
-      const all = await txn.list<StoredReservation>({ prefix: 'res:' });
-      const current = (await this.getLedger(txn)).cycle;
-      let released = 0n; let count = 0;
-      for (const [key, res] of all) {
-        // A prepared lease of an older cycle was released by reinit; anything
-        // still tagged with an older cycle is never charged to this one.
-        if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) > now) continue;
-        await txn.put<StoredReservation>(key, { ...res, state: 'released' });
-        released += BigInt(res.reward); count++;
-      }
-      if (count > 0) {
-        const ledger = await this.getLedger(txn);
-        await this.putLedger(txn, { ...ledger, pending: ledger.pending - released });
-        await this.audit(txn, 'expire-leases', { count, released: released.toString() });
-      }
-      return okJson({ expired: count, released: released.toString() });
+      const r = await this.expireLeasesInTxn(txn, now);
+      return okJson({ expired: r.count, released: r.released.toString(), nextDueAt: r.nextDueAt });
     });
+  }
+
+  /**
+   * Release every `prepared` lease of the current cycle that has ended.
+   * Called by the alarm AND, before the budget checks, by `prepare` and by
+   * an `activate` remap (review 24.09, medium): the alarm is only an
+   * accelerator — a lost `setAlarm` must never let an ended lease hold the
+   * budget against the next request, which is exactly when the request is
+   * refused `spend_floor` and could not arm an alarm itself.
+   */
+  private async expireLeasesInTxn(txn: Txn, now: number): Promise<{ count: number; released: bigint; nextDueAt: number | null }> {
+    const all = await txn.list<StoredReservation>({ prefix: 'res:' });
+    const current = (await this.getLedger(txn)).cycle;
+    let released = 0n; let count = 0;
+    for (const [key, res] of all) {
+      // A prepared lease of an older cycle was released by reinit; anything
+      // still tagged with an older cycle is never charged to this one.
+      if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) > now) continue;
+      await txn.put<StoredReservation>(key, { ...res, state: 'released' });
+      released += BigInt(res.reward); count++;
+    }
+    if (count > 0) {
+      const ledger = await this.getLedger(txn);
+      await this.putLedger(txn, { ...ledger, pending: ledger.pending - released });
+      await this.audit(txn, 'expire-leases', { count, released: released.toString() });
+    }
+    // The earliest lease still open (for the alarm to re-arm on).
+    let nextDueAt: number | null = null;
+    for (const res of all.values()) {
+      if (res.state !== 'prepared' || res.cycle !== current || (res.leaseUntil ?? 0) <= now) continue;
+      if (nextDueAt === null || res.leaseUntil! < nextDueAt) nextDueAt = res.leaseUntil!;
+    }
+    return { count, released, nextDueAt };
   }
 
   // ─── status ─────────────────────────────────────────────────────────────

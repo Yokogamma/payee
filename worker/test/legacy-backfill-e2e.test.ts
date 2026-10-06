@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { spendGuardReady } from './helpers/spend-guard-ready';
 import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
 import { addressOfJwk } from '../test-stubs/wallet-address';
 // The signing harness PR-3a built for the client's D9 suite: real RSA
@@ -26,6 +27,9 @@ const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }
 const baseEnv = env as unknown as Record<string, unknown>;
 
 const { mockRoute } = setupOutboundMock();
+// D10 (PR-3b): the paid path needs an initialised, funded SpendGuard —
+// the fixture brings the shared one to `done` once, idempotently.
+beforeAll(() => spendGuardReady());
 
 // RSA-4096 keygen for the harness wallets runs ONCE per process and is paid by
 // whichever test asks first — under CPU contention (a parallel client suite)

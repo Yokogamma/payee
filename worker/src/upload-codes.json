@@ -1,36 +1,163 @@
 {
-  "$comment": "Closed lists of machine-readable /upload answer codes. `preAdmission` = every answer the handler can give BEFORE /check-and-reserve admitted the operation (no X-Operation-Id echo). `postAdmission` = every answer given after admission (always echoed). A code may appear in both lists: the echo, not the code, tells the two apart. The soak driver reads this same file; worker/scripts/upload-codes-static.test.mjs checks every call site in src/index.ts against it.",
+  "$comment": "Closed lists of machine-readable /upload answer codes. `preAdmission` = every answer the handler can give BEFORE /check-and-reserve admitted the operation (no X-Operation-Id echo). `postAdmission` = every answer given after admission (always echoed). A code may appear in both lists: the echo, not the code, tells the two apart. The soak driver reads this same file; worker/scripts/upload-codes-static.test.mjs checks every call site in src/index.ts against it. D10 (PR-3b): `spend_guard_unconfigured` is a step-0 refusal (limits missing); the `spend_*` / `activate_conflict` post-admission codes are the guard's refusals of prepare / activate / permit-send, answered with the DO's own code (spend-saga.ts SPEND_UPLOAD_CODES keeps this list closed).",
   "preAdmission": [
-    { "code": "unsupported_media_type", "status": 415 },
-    { "code": "ip_rate_limited", "status": 429 },
-    { "code": "rate_limiter_unavailable", "status": 503 },
-    { "code": "uploads_disabled", "status": 503 },
-    { "code": "server_misconfigured", "status": 503 },
-    { "code": "body_too_large", "status": 413 },
-    { "code": "auth_failed", "status": 401 },
-    { "code": "validation_failed", "status": 400 },
-    { "code": "recovery_invalid", "status": 400 },
-    { "code": "not_registered", "status": 403 },
-    { "code": "v3_uploads_disabled", "status": 503 },
-    { "code": "v4_uploads_disabled", "status": 503 },
-    { "code": "operation_id_reused", "status": 409 },
-    { "code": "audit_unavailable", "status": 503 },
-    { "code": "audit_unconfirmed", "status": 503 }
+    {
+      "code": "unsupported_media_type",
+      "status": 415
+    },
+    {
+      "code": "ip_rate_limited",
+      "status": 429
+    },
+    {
+      "code": "rate_limiter_unavailable",
+      "status": 503
+    },
+    {
+      "code": "uploads_disabled",
+      "status": 503
+    },
+    {
+      "code": "server_misconfigured",
+      "status": 503
+    },
+    {
+      "code": "body_too_large",
+      "status": 413
+    },
+    {
+      "code": "auth_failed",
+      "status": 401
+    },
+    {
+      "code": "validation_failed",
+      "status": 400
+    },
+    {
+      "code": "recovery_invalid",
+      "status": 400
+    },
+    {
+      "code": "not_registered",
+      "status": 403
+    },
+    {
+      "code": "v3_uploads_disabled",
+      "status": 503
+    },
+    {
+      "code": "v4_uploads_disabled",
+      "status": 503
+    },
+    {
+      "code": "operation_id_reused",
+      "status": 409
+    },
+    {
+      "code": "audit_unavailable",
+      "status": 503
+    },
+    {
+      "code": "audit_unconfirmed",
+      "status": 503
+    },
+    {
+      "code": "spend_guard_unconfigured",
+      "status": 503
+    }
   ],
   "postAdmission": [
-    { "code": "id_payload_conflict", "status": 409 },
-    { "code": "upload_in_progress", "status": 409 },
-    { "code": "rate_limited", "status": 429 },
-    { "code": "record_reconciling", "status": 503 },
-    { "code": "status_unavailable", "status": 503 },
-    { "code": "recheck_deferred", "status": 503 },
-    { "code": "publication_unproven", "status": 503 },
-    { "code": "recovery_invalid", "status": 400 },
-    { "code": "audit_unavailable", "status": 503 },
-    { "code": "audit_unconfirmed", "status": 503 },
-    { "code": "arweave_internal", "status": 502 },
-    { "code": "arweave_gateway_unavailable", "status": 502 },
-    { "code": "arweave_post_unknown", "status": 502 },
-    { "code": "arweave_rejected", "status": 502 }
+    {
+      "code": "id_payload_conflict",
+      "status": 409
+    },
+    {
+      "code": "upload_in_progress",
+      "status": 409
+    },
+    {
+      "code": "rate_limited",
+      "status": 429
+    },
+    {
+      "code": "record_reconciling",
+      "status": 503
+    },
+    {
+      "code": "status_unavailable",
+      "status": 503
+    },
+    {
+      "code": "recheck_deferred",
+      "status": 503
+    },
+    {
+      "code": "publication_unproven",
+      "status": 503
+    },
+    {
+      "code": "recovery_invalid",
+      "status": 400
+    },
+    {
+      "code": "audit_unavailable",
+      "status": 503
+    },
+    {
+      "code": "audit_unconfirmed",
+      "status": 503
+    },
+    {
+      "code": "arweave_internal",
+      "status": 502
+    },
+    {
+      "code": "arweave_gateway_unavailable",
+      "status": 502
+    },
+    {
+      "code": "arweave_post_unknown",
+      "status": 502
+    },
+    {
+      "code": "arweave_rejected",
+      "status": 502
+    },
+    {
+      "code": "spend_guard_unavailable",
+      "status": 503
+    },
+    {
+      "code": "spend_frozen",
+      "status": 503
+    },
+    {
+      "code": "spend_not_initialized",
+      "status": 503
+    },
+    {
+      "code": "spend_floor",
+      "status": 503
+    },
+    {
+      "code": "spend_window_cap",
+      "status": 503
+    },
+    {
+      "code": "spend_quote_mismatch",
+      "status": 503
+    },
+    {
+      "code": "spend_ledger_inconsistent",
+      "status": 503
+    },
+    {
+      "code": "activate_conflict",
+      "status": 503
+    },
+    {
+      "code": "spend_remap_refused",
+      "status": 503
+    }
   ]
 }

@@ -271,12 +271,23 @@ discriminator).
 | `init_state` | event, state (`signed` / `done` / `dead`) | — | `/admin/spend/init` after the DO accepted the transition |
 | `deposit_credited` | event | amount (Winston, or −1 when not a safe integer) | `/admin/spend/credit-deposit` when the DO credited a NEW transfer |
 | `deposit_refused` | event, reason (`unverified` / a DO code such as `deposit_before_marker` / `unavailable`) | — | `/admin/spend/credit-deposit` on any refusal |
-| `spend_prepare_refused` | event, reason (`spend_quote_mismatch` for the marker's own quote) | — | `/admin/spend/init` when the marker quote exceeds `MAX_TX_REWARD_WINSTON` |
+| `spend_prepare_refused` | event, reason (a `spend_*` code: `spend_floor`, `spend_window_cap`, `spend_quote_mismatch`, `spend_ledger_inconsistent`, `spend_frozen`, `spend_not_initialized`, `spend_guard_unavailable`, `spend_remap_refused`) | — | `/upload` when `prepare` or `activate` refuses (the saga, spend-saga.ts); `/admin/spend/init` when the marker quote exceeds `MAX_TX_REWARD_WINSTON` |
+| `permit_granted` | event, kind (`upload` / `redrop2`) | — | `/upload` right after `permit-send` granted, before the POST |
+| `permit_refused` | event, reason (`spend_frozen` / `spend_not_initialized` / `spend_guard_unavailable`) | — | `/upload` when `permit-send` refused — no POST followed (the record is aborted with that code) |
+| `activate_conflict` | event, `activate_conflict` | — | `/upload` when the reservation under this operation's key belongs to someone else (incident: a protocol defect, not a path) |
+| `activate_remap` | event | — | `/upload` when `activate` re-reserved under the §5 checks (expired lease, changed reward) |
+| `observed_min_winston` | event | the minimum gateway balance handed to the detector (Winston, or −1 when not a safe integer) | `/upload` after a fresh balance read with a quorum (§3.4) |
 
-Reserved for the upload saga (§8) and listed in the spec §11.9, NOT written yet:
-`permit_granted{kind}`, `permit_refused{reason}`, `freeze_active`,
-`legacy_held_winston`, `legacy_resolved{outcome}`, `ledger_inconsistent`,
-`activate_remap`, `activate_conflict`, `spend_conflict` and the gauges.
+Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
+`legacy_resolved{outcome}`, `ledger_inconsistent`, `spend_conflict` and the
+remaining gauges — they come with the scheduler and the closure of the legacy set.
+
+The `/upload` answer codes the saga adds (`worker/src/upload-codes.json`):
+`spend_guard_unconfigured` (step 0, pre-admission — the limits are missing)
+and, post-admission, `spend_guard_unavailable`, `spend_frozen`,
+`spend_not_initialized`, `spend_floor`, `spend_window_cap`,
+`spend_quote_mismatch`, `spend_ledger_inconsistent`, `activate_conflict`,
+`spend_remap_refused` — all 503, all BEFORE any POST.
 
 ## What PR-3a deliberately does NOT measure
 

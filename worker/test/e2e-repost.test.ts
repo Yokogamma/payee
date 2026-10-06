@@ -1,7 +1,8 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { spendGuardReady } from './helpers/spend-guard-ready';
 import { setupOutboundMock, b64, sha256, STATUS_ORIGINS, statusUrlRe } from './helpers/outbound-mock';
 import { computePublicationFp } from '../src/publication-fp';
 import { withTrustedWallet } from '../test-stubs/wallet-address';
@@ -25,6 +26,9 @@ const baseEnv = env as unknown as WorkerEnv;
 // Outbound Arweave HTTP mock — shared harness, see helpers/outbound-mock.ts
 // (single-use routes; unconsumed or duplicate paid requests fail the test).
 const { mockRoute } = setupOutboundMock();
+// D10 (PR-3b): the paid path needs an initialised, funded SpendGuard —
+// the fixture brings the shared one to `done` once, idempotently.
+beforeAll(() => spendGuardReady());
 
 const NOTE_ID = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
 const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
