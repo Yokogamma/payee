@@ -46,6 +46,7 @@ import {
   type FreezeState, type InitRecord, type SpendCode, type SpendLimits,
 } from './spend-ledger';
 import { permittedPost } from './spend-send';
+import { operatorOfEnv, type OperatorEnv, type OperatorOf } from './operators';
 import {
   closeLegacySet as closeLegacySetReal,
   type CloseLegacySetContext, type LegacyClosure, type LegacyClosureEnv, type LegacyItem,
@@ -105,20 +106,23 @@ export interface SpendAdminDeps {
    *  marker. Refuses (`open`) rather than guesses. */
   closeLegacySet: (ctx: CloseLegacySetContext) => Promise<LegacyClosure>;
   /** Operator identity of a status origin (D11): two origins of one operator
-   *  are ONE voice. The identity map ships with PR-4 (`STATUS_OPERATORS`);
-   *  until it is merged every origin counts as its own operator. */
-  operatorOf: (origin: string) => string;
+   *  are ONE voice, an unknown origin is no voice. Absent → the map of the
+   *  request's env (`STATUS_OPERATORS`, operators.ts); a test may pin one. */
+  operatorOf?: OperatorOf;
   now: () => number;
 }
 
-/** The closure of the legacy set (legacy-closure.ts), under the handler's
- *  operator map and clock. */
-export const closeLegacySetDefault: SpendAdminDeps['closeLegacySet'] = ctx => closeLegacySetReal(ctx, { operatorOf: DEFAULT_OPERATOR_OF, now: () => Date.now() });
-const DEFAULT_OPERATOR_OF = (origin: string) => origin;
+/** The operator identity a handler runs under: the test's pin, or the env's map. */
+export function operatorOfDeps(deps: Pick<SpendAdminDeps, 'operatorOf'>, env: OperatorEnv): OperatorOf {
+  return deps.operatorOf ?? operatorOfEnv(env);
+}
+
+/** The closure of the legacy set (legacy-closure.ts), under the env's
+ *  operator map and the handler's clock. */
+export const closeLegacySetDefault: SpendAdminDeps['closeLegacySet'] = ctx => closeLegacySetReal(ctx, { operatorOf: operatorOfEnv(ctx.env), now: () => Date.now() });
 
 export const DEFAULT_SPEND_ADMIN_DEPS: SpendAdminDeps = {
   closeLegacySet: closeLegacySetDefault,
-  operatorOf: DEFAULT_OPERATOR_OF,
   now: () => Date.now(),
 };
 
@@ -312,7 +316,8 @@ export async function verifyDeposit(
     if (BigInt(tx.quantity) <= 0n) { reasons.push(`${origin}: quantity is zero`); continue; }
     if (vote.kind !== 'confirmed') { reasons.push(`${origin}: status ${vote.kind}`); continue; }
     if (vote.confirmations < MIN_DEPOSIT_CONFIRMATIONS) { reasons.push(`${origin}: ${vote.confirmations} confirmations < ${MIN_DEPOSIT_CONFIRMATIONS}`); continue; }
-    const operator = deps.operatorOf(origin);
+    const operator = operatorOfDeps(deps, env)(origin);
+    if (operator === null) { reasons.push(`${origin}: no known operator`); continue; } // fail-closed
     if (byOperator.has(operator)) continue; // one voice per operator
     byOperator.set(operator, { operator, origin, quantity: tx.quantity, height: vote.blockHeight, confirmations: vote.confirmations });
   }
@@ -493,7 +498,7 @@ async function stepSign(
 async function markerQuorum(env: SpendAdminEnv, emit: Emit, deps: SpendAdminDeps, txId: string) {
   const origins = statusOrigins(env);
   const votes: StatusVote[] = await Promise.all(origins.map(origin => probeStatusOrigin(origin, txId, emit)));
-  return { quorum: moneyQuorum(votes, deps.operatorOf), verdict: statusVerdict(origins, votes) };
+  return { quorum: moneyQuorum(votes, operatorOfDeps(deps, env)), verdict: statusVerdict(origins, votes) };
 }
 
 /** `posted` (idempotent) → `done` with the agreed heights. */

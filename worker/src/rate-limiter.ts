@@ -32,6 +32,7 @@ import {
   type MoneyEntry, type PostedRecord, type RecoveryCas, type RecoveryRecord,
 } from './recovery';
 import { proveAnchorExpired } from './anchor-expiry';
+import { operatorOfEnv } from './operators';
 import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
 import { statusVerdict } from '../../src/lib/status-quorum';
 import { parseOriginList } from '../../src/lib/gateways-parse';
@@ -847,7 +848,7 @@ export class RateLimiter implements DurableObject {
     const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
     const probe = async () => {
       const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
-      return { money: moneyQuorum(votes, o => o), dead: statusVerdict(origins, votes).kind === 'dead' };
+      return { money: moneyQuorum(votes, operatorOfEnv(env)), dead: statusVerdict(origins, votes).kind === 'dead' };
     };
     const { money, dead } = await probe();
     const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
@@ -863,7 +864,7 @@ export class RateLimiter implements DurableObject {
       return p === 'expired' || p === 'unknown' ? 'expired' : 'held';
     };
     if (outcome !== null) {
-      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) }, emit);
       let asked: 'spent' | 'released' = outcome;
       if (outcome === 'released' && r === 'in_flight' && (await proveExpiry()) === 'expired') {
         // The proof took time; the dead verdict that led here is stale
@@ -873,9 +874,9 @@ export class RateLimiter implements DurableObject {
         const again = await probe();
         if (again.money.ok) {
           asked = 'spent';
-          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height }, emit);
         } else if (again.dead) {
-          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' });
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' }, emit);
         } else {
           emit('money_reconcile', ['released', 'recheck_pending'], [entry.attempts]);
           r = 'retry';
@@ -906,7 +907,7 @@ export class RateLimiter implements DurableObject {
       } else {
         const again = await probe();
         if (again.money.ok) {
-          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height }, emit);
           emit('money_reconcile', ['spent', r], [entry.attempts]);
           terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
           result = terminal ? `spent:${r}` : 'retry';

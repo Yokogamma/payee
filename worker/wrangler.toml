@@ -114,6 +114,13 @@ TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# The operator behind each status origin (D11 / D10 money quorums): two
+# origins of one operator are ONE voice, an origin missing here is NO voice
+# (fail-closed). Must equal the pin in scripts/gateway-pins.mjs
+# (STATUS_OPERATORS) and the client default; every STATUS_GATEWAYS origin must
+# have an operator and there must be >= 2 distinct operators. Gate:
+# scripts/check-gateways-vs-worker.mjs (CI and the trusted deploy).
+STATUS_OPERATORS = "https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,https://frostor.xyz=frostor,https://permagate.io=permagate"
 # ── Payload gateways (D2/D9) ──
 # Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
 # tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
@@ -336,6 +343,13 @@ TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
 STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+# The operator behind each status origin (D11 / D10 money quorums): two
+# origins of one operator are ONE voice, an origin missing here is NO voice
+# (fail-closed). Must equal the pin in scripts/gateway-pins.mjs
+# (STATUS_OPERATORS) and the client default; every STATUS_GATEWAYS origin must
+# have an operator and there must be >= 2 distinct operators. Gate:
+# scripts/check-gateways-vs-worker.mjs (CI and the trusted deploy).
+STATUS_OPERATORS = "https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,https://frostor.xyz=frostor,https://permagate.io=permagate"
 # ── Payload gateways (D2/D9) ──
 # Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
 # tried in sequence, and this sequence is the one approved in §2.1 (arweave.net

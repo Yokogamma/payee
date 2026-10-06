@@ -21,6 +21,7 @@ import { parseOriginList } from '../../src/lib/gateways-parse';
 import { ARWEAVE_HOST } from './arweave-transport';
 import { readBlockHeightByHash, readChainHeight } from './gateway-reads';
 import type { Emit } from './metrics';
+import { operatorOfEnv, type OperatorOf } from './operators';
 import { MIN_BALANCE_SOURCES, SPEND_CODES, anchorExpired } from './spend-ledger';
 import { guardPost } from './spend-saga';
 
@@ -31,10 +32,10 @@ export type AnchorProof =
 
 /** Read the two chain facts and apply the rule. Network only, no guard. */
 export async function readAnchorProof(
-  env: { STATUS_GATEWAYS?: string },
+  env: { STATUS_GATEWAYS?: string; STATUS_OPERATORS?: string },
   anchor: string,
   emit: Emit,
-  operatorOf: (origin: string) => string = (o) => o,
+  operatorOf: OperatorOf = operatorOfEnv(env),
 ): Promise<AnchorProof> {
   const parsed = parseOriginList(env.STATUS_GATEWAYS ?? '');
   const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
@@ -47,6 +48,7 @@ export async function readAnchorProof(
   const chainByOp = new Map<string, number>();
   for (const a of answers) {
     const op = operatorOf(a.origin);
+    if (op === null) continue; // no known operator, no voice (fail-closed)
     if (a.anchorHeight !== null && !anchorByOp.has(op)) anchorByOp.set(op, a.anchorHeight);
     if (a.chainHeight !== null && !chainByOp.has(op)) chainByOp.set(op, a.chainHeight);
   }
@@ -72,11 +74,11 @@ export type ProveResult = 'expired' | 'valid' | 'unavailable' | 'refused' | 'unk
  * for it); `unknown` — no permit names the txId.
  */
 export async function proveAnchorExpired(
-  env: { STATUS_GATEWAYS?: string },
+  env: { STATUS_GATEWAYS?: string; STATUS_OPERATORS?: string },
   guard: DurableObjectStub,
   emit: Emit,
   args: { txId: string; anchor: string },
-  operatorOf?: (origin: string) => string,
+  operatorOf?: OperatorOf,
 ): Promise<ProveResult> {
   const proof = await readAnchorProof(env, args.anchor, emit, operatorOf);
   emit('anchor_proof', [proof.kind, proof.kind === 'unavailable' ? proof.reason : 'ok'], [proof.kind === 'unavailable' ? -1 : proof.chainHeight - proof.anchorHeight]);

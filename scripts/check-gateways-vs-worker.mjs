@@ -23,10 +23,11 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseOriginList } from './gateways-parse.mjs';
+import { parseOperatorMap, parseOriginList } from './gateways-parse.mjs';
 import { readTomlString } from './toml-scan.mjs';
-import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS, STATUS_OPERATORS } from './gateway-pins.mjs';
 import { candidateLacksVar } from './historical-candidates.mjs';
+import { carriesSpendGuard } from './check-spend-limits.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -55,6 +56,38 @@ export function readWorkerStatusGateways(toml, blockPrefix = '') {
 
 export function readWorkerPayloadGateways(toml, blockPrefix = '') {
   return readTomlVar(toml, blockPrefix, 'PAYLOAD_GATEWAYS');
+}
+
+export function readWorkerStatusOperators(toml, blockPrefix = '') {
+  return readTomlVar(toml, blockPrefix, 'STATUS_OPERATORS');
+}
+
+/** Money quorums need this many DISTINCT operators (worker MIN_BALANCE_SOURCES). */
+export const MIN_MONEY_OPERATORS = 2;
+
+/**
+ * The operator map of ONE block against the pin and against that block's own
+ * status pool (D10/D11, reader release): equal to the pin, every status
+ * origin covered, ≥ MIN_MONEY_OPERATORS distinct operators. An origin the map
+ * leaves out casts NO money vote on the worker (fail-closed), so a missing
+ * entry cannot loosen a quorum — but it can make one unreachable, and that
+ * is exactly what this refuses to ship.
+ */
+export function checkOperatorMap(raw, statusOrigins) {
+  const problems = [];
+  const map = parseOperatorMap(raw ?? '');
+  const pin = parseOperatorMap(STATUS_OPERATORS);
+  if (map.size === 0) { problems.push('STATUS_OPERATORS is empty or fully unparseable'); return problems; }
+  const same = map.size === pin.size && [...pin].every(([o, op]) => map.get(o) === op);
+  if (!same) problems.push(`STATUS_OPERATORS does not match the repo-pinned operator map (${STATUS_OPERATORS})`);
+  for (const origin of statusOrigins) {
+    if (!map.has(origin)) problems.push(`STATUS_OPERATORS has no operator for the status origin ${origin} — it would cast no money vote`);
+  }
+  const distinct = new Set(statusOrigins.map(o => map.get(o)).filter(op => op !== undefined)).size;
+  if (distinct < MIN_MONEY_OPERATORS) {
+    problems.push(`the status pool maps to ${distinct} distinct operator(s), need ${MIN_MONEY_OPERATORS}: no money quorum could ever form`);
+  }
+  return problems;
 }
 
 /**
@@ -134,6 +167,16 @@ export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = n
         `${label}: worker and client status pools differ — the dead formula ` +
           'would not mean the same thing on the two halves',
       );
+    }
+    // The operator map of this block, against the pin and against this
+    // block's own pool (reader release: a mandatory condition). Applicable
+    // only to a config that carries the spend guard — the money quorums the
+    // map serves arrived with it (D10); a candidate without the binding (the
+    // soak build, a rollback target) has no code that reads the map.
+    if (carriesSpendGuard(toml) && !candidateLacksVar(candidate, 'STATUS_OPERATORS')) {
+      const ops = readWorkerStatusOperators(toml, prefix);
+      if (ops.error) problems.push(`${label}: ${ops.error}`);
+      else for (const p of checkOperatorMap(ops.value, worker)) problems.push(`${label}: ${p}`);
     }
   }
 
