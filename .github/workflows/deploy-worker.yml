@@ -405,7 +405,13 @@ jobs:
       - name: Smoke the live worker
         # The profile goes through env: — no `${{ }}` inside run: anywhere
         # (§1.7): the expression expands TEXTUALLY before the shell starts.
-        run: node worker/scripts/smoke-gateways.mjs --profile="$PROFILE"
+        #
+        # --allow-historical-pool: THIS step alone may expect a registered
+        # historical build's own pool (scripts/gateway-pins.mjs
+        # HISTORICAL_POOLS, full SHA — a rollback across a pool change). The
+        # Pages pre-publish smoke never passes it: the client it publishes is
+        # built on the current pool, so the worker under it must be too.
+        run: node worker/scripts/smoke-gateways.mjs --profile="$PROFILE" --allow-historical-pool
         env:
           PROFILE: ${{ inputs.profile }}
           EXPECT_RELEASE_SHA: ${{ inputs.candidate }}

@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load } from 'js-yaml';
 import { operatorsFloorFor } from './operators-floor.mjs';
+import { expectedFromCli } from '../worker/scripts/smoke-gateways.mjs';
 
 // Runbook reader release §6.9 (owner decision 2026-09-27: automatic): after a
 // dev deploy the smoke asserts statusOperatorsCount >= 2 — but only for a
@@ -69,10 +70,12 @@ describe('deploy-worker.yml wires the floor into the post-deploy smoke', () => {
     expect(steps[floorIndex].run).toMatch(/^node scripts\/operators-floor\.mjs --config=candidate\/worker\/wrangler\.toml >> "\$GITHUB_OUTPUT"$/m);
   });
 
-  it('the smoke receives it as EXPECT_MIN_OPERATORS (empty for a candidate without SpendGuard → nothing asserted)', () => {
+  it('the smoke receives it as EXPECT_MIN_OPERATORS (empty for a candidate without SpendGuard → nothing asserted)', async () => {
     expect(steps[smokeIndex].env.EXPECT_MIN_OPERATORS).toBe('${{ steps.opfloor.outputs.min_operators }}');
-    // The smoke treats an empty value as «not asked» — the rollback path.
-    const smoke = readFileSync(join(ROOT, 'worker/scripts/smoke-gateways.mjs'), 'utf8');
-    expect(smoke).toMatch(/\.\.\.\(process\.env\.EXPECT_MIN_OPERATORS \? \{ minOperators: parseMinOperators\(process\.env\.EXPECT_MIN_OPERATORS\) \} : \{\}\)/);
+    // The smoke treats an empty value as «not asked» — the rollback path —
+    // and a floor as a demand; asked of the smoke's own CLI decision.
+    const identity = { EXPECT_RELEASE_SHA: 'a'.repeat(40), EXPECT_WORKER_VERSION_ID: 'v' };
+    expect(await expectedFromCli(['--profile=normal'], { ...identity, EXPECT_MIN_OPERATORS: '' })).not.toHaveProperty('minOperators');
+    expect(await expectedFromCli(['--profile=normal'], { ...identity, EXPECT_MIN_OPERATORS: '2' })).toHaveProperty('minOperators', 2);
   });
 });

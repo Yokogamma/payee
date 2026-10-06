@@ -29,7 +29,7 @@ import { parseOperatorMap } from '../../src/lib/gateways-parse';
 /** The pinned map (must equal `scripts/gateway-pins.mjs` STATUS_OPERATORS —
  *  `scripts/check-gateways-vs-worker.test.mjs` holds the two together). */
 export const DEFAULT_STATUS_OPERATORS =
-  'https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,'
+  'https://arweave.net=arweave,https://vilenarios.com=ar-io,'
   + 'https://frostor.xyz=frostor,https://permagate.io=permagate';
 
 export interface OperatorEnv { STATUS_OPERATORS?: string }
