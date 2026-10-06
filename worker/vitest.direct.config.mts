@@ -67,6 +67,7 @@ export default defineConfig({
       'test/upload-spend-saga.test.ts',
       'test/rollback-reader-spend.test.ts',
       'test/recovery-scheduler.test.ts',
+      'test/spend-guard.legacy.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.

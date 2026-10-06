@@ -23,17 +23,15 @@ async function frozen(name: string) {
 }
 
 describe('D10 marker automaton on durable storage', () => {
-  it('preconditions: not frozen → spend_init_not_frozen; limits missing → spend_guard_unconfigured; the legacy set not closed → spend_init_legacy_open (the production default) — no network, no state', async () => {
+  it('preconditions: not frozen → spend_init_not_frozen; limits missing → spend_guard_unconfigured; an open legacy set refuses with its code — no network, no state', async () => {
     const wallet = await freshWallet();
     const env = spendEnv(isolatedGuard('pre'), wallet);
     expect((await viaHandler(handler, 'init', env)).body.code).toBe(SPEND_CODES.initNotFrozen);
     await viaHandler(handler, 'freeze', env, { active: true });
     expect((await viaHandler(handler, 'init', { ...env, WALLET_FLOOR_WINSTON: undefined })).body.code).toBe(SPEND_CODES.guardUnconfigured);
-    // The production handler (default deps): the closure is NOT carried yet.
-    const { viaWorker } = await import('./helpers/spend-admin');
-    const prod = await viaWorker('init', env);
-    expect(prod.status).toBe(503);
-    expect(prod.body.code).toBe(SPEND_CODES.initLegacyOpen);
+    const open = await viaHandler(handlerWith({ closeLegacySet: async () => ({ kind: 'open', code: SPEND_CODES.initLegacyOpen }) }), 'init', env);
+    expect(open.status).toBe(503);
+    expect(open.body.code).toBe(SPEND_CODES.initLegacyOpen);
     const unknown = await viaHandler(handlerWith({ closeLegacySet: async () => ({ kind: 'open', code: SPEND_CODES.initLegacyRewardUnknown }) }), 'init', env);
     expect(unknown.body.code).toBe(SPEND_CODES.initLegacyRewardUnknown);
     expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('none');
