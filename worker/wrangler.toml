@@ -74,8 +74,10 @@ V4_UPLOADS_ENABLED = "true"
 # STRINGS (1 AR = 10^12 Winston). Read on EVERY request; any missing or
 # malformed value → 503 spend_guard_unconfigured on every paid path (fail
 # closed, never a default). Method and the quote they were derived from:
-# docs/ROLLBACK.md «Spend guard (D10)». Values below are the PROPOSAL of
-# 2026-09-24 (price/51200 = 3 295 552 823 W); the owner approves them there.
+# docs/ROLLBACK.md «Spend guard (D10)». Values below: the owner's numbers of
+# 2026-10-07 — the method of 2026-09-27 over price/51200 = 3 420 714 175 W,
+# rounded UP to a step of 0.01 AR (owner decision 2026-10-07); re-quoted on
+# the release day, a change is a new commit here and in ROLLBACK.
 # Gate: scripts/check-spend-limits.mjs (CI and the trusted deploy).
 #   WALLET_FLOOR_WINSTON     — the untouchable remainder of the CYCLE's
 #                              credited funds (7 days × ~3 publications × price).
@@ -83,9 +85,9 @@ V4_UPLOADS_ENABLED = "true"
 #   MAX_TX_REWARD_WINSTON    — ceiling of ONE NEW transaction's reward
 #                              (price at MAX_BODY_BYTES × ~4.5); legacy
 #                              transactions are held at their SIGNED reward.
-WALLET_FLOOR_WINSTON = "70000000000"
+WALLET_FLOOR_WINSTON = "80000000000"
 SPEND_WINDOW_CAP_WINSTON = "150000000000"
-MAX_TX_REWARD_WINSTON = "15000000000"
+MAX_TX_REWARD_WINSTON = "20000000000"
 # ── Trusted Arweave owners (D2/D9) ──
 # EVERY wallet address this project has ever posted under, comma separated.
 # The worker authenticates a publication before binding its txId to a payload
@@ -314,9 +316,9 @@ V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
 # D10 spend guard limits — declared explicitly for staging too (a named
 # environment inherits NOTHING); same values as production, same gate.
-WALLET_FLOOR_WINSTON = "70000000000"
+WALLET_FLOOR_WINSTON = "80000000000"
 SPEND_WINDOW_CAP_WINSTON = "150000000000"
-MAX_TX_REWARD_WINSTON = "15000000000"
+MAX_TX_REWARD_WINSTON = "20000000000"
 # ── Trusted Arweave owners (D2/D9) ──
 # EVERY wallet address this project has ever posted under, comma separated.
 # The worker authenticates a publication before binding its txId to a payload
