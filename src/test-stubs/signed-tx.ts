@@ -120,6 +120,9 @@ export interface EdgeSpec {
   txId: string;
   cursor?: string;
   tags: { name: string; value: string }[];
+  /** The index's `block.height` for this edge; `null` = unmined / not indexed;
+   *  omitted = the index does not report the field (PR-4 treats both as null). */
+  height?: number | null;
 }
 
 export interface GatewayMockOptions {
@@ -132,8 +135,15 @@ export interface GatewayMockOptions {
   onHeader?: (origin: string, txId: string) => Response | undefined;
   /** Intercept `GET <origin>/raw/<id>` the same way. */
   onRaw?: (origin: string, txId: string) => Response | undefined;
-  /** Intercept the GraphQL POST; `undefined` serves the pages above. */
-  onGraphql?: (call: number) => Response | undefined;
+  /** Intercept the GraphQL POST; `undefined` serves the pages above. `call`
+   *  counts POSTs to THAT url (per-transport), `url` is the endpoint hit. */
+  onGraphql?: (call: number, url: string) => Response | undefined;
+  /** PR-4: pages per index URL (a multi-source sweep hits several endpoints).
+   *  When set, `pages` is the default for any URL not listed here. */
+  pagesByUrl?: Readonly<Record<string, readonly (readonly EdgeSpec[])[]>>;
+  /** Intercept `GET <origin>/tx/<id>/status` (D11 age probes). Without it a
+   *  status request is answered 500 — an `other` vote, never an age vote. */
+  onStatus?: (origin: string, txId: string) => Response | undefined;
 }
 
 const json = (body: unknown, status = 200) =>
@@ -166,25 +176,38 @@ export function edgeFor(tx: SignedTx, overrides: Partial<EdgeSpec> = {}): EdgeSp
  */
 export function gatewayFetchMock(options: GatewayMockOptions): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
   const byId = new Map(options.txs.map(tx => [tx.txId, tx]));
-  const pages = options.pages ?? [options.txs.map(tx => edgeFor(tx))];
-  let graphqlCalls = 0;
+  const defaultPages = options.pages ?? [options.txs.map(tx => edgeFor(tx))];
+  const graphqlCalls = new Map<string, number>();
 
   return async (input: RequestInfo | URL): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 
     if (url.endsWith('/graphql')) {
-      const call = graphqlCalls++;
-      const override = options.onGraphql?.(call);
+      const call = graphqlCalls.get(url) ?? 0;
+      graphqlCalls.set(url, call + 1);
+      const override = options.onGraphql?.(call, url);
       if (override) return override;
+      const pages = options.pagesByUrl?.[url] ?? defaultPages;
       const edges = pages[call] ?? [];
       return json({
         data: {
           transactions: {
-            edges: edges.map(e => ({ cursor: e.cursor ?? e.txId, node: { id: e.txId, tags: e.tags } })),
+            edges: edges.map(e => ({
+              cursor: e.cursor ?? e.txId,
+              node: { id: e.txId, tags: e.tags, block: e.height === undefined || e.height === null ? null : { height: e.height } },
+            })),
             pageInfo: { hasNextPage: call + 1 < pages.length },
           },
         },
       });
+    }
+
+    const status = /^(https:\/\/[^/]+)\/tx\/([^/]+)\/status$/.exec(url);
+    if (status) {
+      const [, origin, txId] = status;
+      const override = options.onStatus?.(origin, txId);
+      if (override) return override;
+      return new Response('no status configured', { status: 500 });
     }
 
     const header = /^(https:\/\/[^/]+)\/tx\/([^/]+)$/.exec(url);
