@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import {
   buildSignedTx,
   edgeFor,
@@ -21,6 +21,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
 });
+
+// EVERY RSA-4096 key this file signs with is generated HERE, never in a test
+// body. Keygen time is a lottery — the prime search is random — and CPU
+// contention (the rest of the suite running in parallel) stretches it further.
+// The wallets are lazy, so a key was paid by whichever test asked first, out
+// of that test's default 5 s budget — and this file went red on such a
+// timeout in the full run while passing in isolation. Both wallets are
+// memoized on globalThis (see signed-tx.ts), so the tests below reuse exactly
+// these keys. One key per hook, each with its own budget (hooks run one after
+// another).
+const KEYGEN_BUDGET_MS = 60_000;
+beforeAll(async () => { await testWallet(); }, KEYGEN_BUDGET_MS);
+// The rotation and «correctly signed by an attacker» tests need a real,
+// DIFFERENT wallet.
+beforeAll(async () => { await otherWallet(); }, KEYGEN_BUDGET_MS);
 
 async function anyKey(): Promise<CryptoKey> {
   return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);

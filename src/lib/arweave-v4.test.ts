@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import { buildSignedTx, gatewayFetchMock, notesTags, testWallet } from '../test-stubs/signed-tx';
 
 // §4 (B3) + §8: the v4 half of restore and the v4 wire contract.
@@ -12,6 +12,17 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
 });
+
+// The RSA-4096 key every transaction here is signed with is generated HERE,
+// never in a test body. Keygen time is a lottery — the prime search is random
+// — and CPU contention (the rest of the suite running in parallel) stretches
+// it further. The wallet is lazy, so the key was paid by whichever test first
+// reached stubGateway(), out of that test's default 5 s budget — and this file
+// went red on such a timeout in the full run while passing in isolation. The
+// wallet is memoized on globalThis (see signed-tx.ts), so stubGateway() reuses
+// exactly this key.
+const KEYGEN_BUDGET_MS = 60_000;
+beforeAll(async () => { await testWallet(); }, KEYGEN_BUDGET_MS);
 
 async function safeboxKeyring() {
   const { generateMnemonic, deriveKey, deriveSafeboxMetaKey, deriveSafeboxSecretKey } = await import('./crypto');
