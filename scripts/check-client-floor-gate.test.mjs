@@ -9,6 +9,7 @@ import {
   checkClientFloorGate,
   checkClientFloorGateHere,
   gateModeFor,
+  IMPORT_FLIP_FLOOR,
   readFlagExactlyOnce,
 } from './check-client-floor-gate.mjs';
 import { gitIn, MINIMUM_FLOOR, SHA_RE } from './check-worker-floor.mjs';
@@ -18,8 +19,9 @@ import { readFlag } from './check-backup-flags.mjs';
  * The client floor gate (D2a) in its two modes.
  *
  * Three things are worth a failing build, and they are separate:
- *   1. the RULES — equality once import is on, ancestry while it is off, and
- *      «could not tell» is a refusal in both;
+ *   1. the RULES — d2-floor once import is on (the floor is the import-flip
+ *      release or later on its line, the candidate is the floor or later),
+ *      ancestry while it is off, and «could not tell» is a refusal in both;
  *   2. that the MODE comes from the released source's DECLARATION and from
  *      nowhere else — text in comments or strings is not a declaration; a
  *      computed, missing, duplicated, non-exported or non-const flag is a
@@ -53,10 +55,10 @@ const decide = over =>
   checkClientFloorGate({ floor: FLOOR, candidate: DESCENDANT, minimumFloor: FLOOR, flagsSource: IMPORT_OFF, git: fakeGit(), ...over });
 
 describe('the mode is a property of the released source', () => {
-  it('import off → ancestry; import on → equality', () => {
+  it('import off → ancestry; import on → d2-floor', () => {
     expect(gateModeFor(IMPORT_OFF)).toBe('ancestry');
-    expect(gateModeFor(IMPORT_ON)).toBe('equality');
-    expect(gateModeFor(flags(true, true))).toBe('equality');
+    expect(gateModeFor(IMPORT_ON)).toBe('d2-floor');
+    expect(gateModeFor(flags(true, true))).toBe('d2-floor');
   });
 
   it('a computed flag is a REFUSAL, not a guess', () => {
@@ -84,17 +86,17 @@ describe('the mode is a property of the released source', () => {
     // ON. The AST reader sees one statement, exported, const, literal true.
     const reviewersCase = '/* Example:\nexport const BACKUP_IMPORT_ENABLED: boolean = false;\n*/\n export const BACKUP_IMPORT_ENABLED: boolean = true;\n';
     expect(readFlagExactlyOnce(reviewersCase, 'BACKUP_IMPORT_ENABLED')).toBe(true);
-    expect(gateModeFor(reviewersCase)).toBe('equality');
+    expect(gateModeFor(reviewersCase)).toBe('d2-floor');
     expect(decide({ flagsSource: reviewersCase, candidate: DESCENDANT }).ok).toBe(false);
   });
 
   it('a declaration spelled inside a multi-line string is not a declaration either', () => {
     const inTemplate = 'const doc = `\nexport const BACKUP_IMPORT_ENABLED: boolean = false;\n`;\nexport const BACKUP_IMPORT_ENABLED: boolean = true;\n';
-    expect(gateModeFor(inTemplate)).toBe('equality');
+    expect(gateModeFor(inTemplate)).toBe('d2-floor');
     const inString = 'const doc = "export const BACKUP_IMPORT_ENABLED: boolean = false;";\n' + IMPORT_ON;
-    expect(gateModeFor(inString)).toBe('equality');
+    expect(gateModeFor(inString)).toBe('d2-floor');
     const inLineComment = '// export const BACKUP_IMPORT_ENABLED: boolean = false;\n' + IMPORT_ON;
-    expect(gateModeFor(inLineComment)).toBe('equality');
+    expect(gateModeFor(inLineComment)).toBe('d2-floor');
   });
 
   it('two real declarations, a nested one, a non-exported or non-const one, or a negated initializer are refusals', () => {
@@ -114,26 +116,118 @@ describe('the mode is a property of the released source', () => {
   });
 });
 
-describe('equality mode — a client with import on', () => {
-  it('passes only when the candidate IS the floor, and needs no git to say so', () => {
-    const ok = decide({ flagsSource: IMPORT_ON, candidate: FLOOR, git: fakeGit({ undecided: true }) });
-    expect(ok).toMatchObject({ ok: true, mode: 'equality' });
+/*
+ * The d2-floor line used below, oldest first:
+ *
+ *   OLD ── FLOOR (the import-flip release) ── RAISED ── DESCENDANT
+ *     └── STRANGER (a side branch: descends from OLD, not from FLOOR)
+ *
+ * OLD plays the floor the import flip left behind (ff0954d in production),
+ * FLOOR plays IMPORT_FLIP_FLOOR (394156d), RAISED a floor raised later on the
+ * same line (the writer era), DESCENDANT a live worker above the floor (the
+ * reader before the writer ships).
+ */
+const OLD = '0'.repeat(40);
+const RAISED = 'e'.repeat(40);
+const line = (over = {}) => fakeGit({
+  ancestors: {
+    [OLD]: [FLOOR, RAISED, DESCENDANT, STRANGER],
+    [FLOOR]: [RAISED, DESCENDANT],
+    [RAISED]: [DESCENDANT],
+  },
+  ...over,
+});
+const decideOn = over => checkClientFloorGate({
+  floor: FLOOR, candidate: FLOOR, minimumFloor: FLOOR, importFlipFloor: FLOOR,
+  flagsSource: IMPORT_ON, git: line(), ...over,
+});
+
+describe('d2-floor mode — a client with import on', () => {
+  it('passes when the floor IS the import-flip release and the candidate IS the floor, with no git at all', () => {
+    const ok = decideOn({ git: line({ undecided: true }) });
+    expect(ok).toMatchObject({ ok: true, mode: 'd2-floor' });
     expect(ok.reason).toMatch(/WORKER_FLOOR_SHA == MINIMUM_FLOOR == /);
+    expect(ok.reason).toMatch(/the floor is the import-flip release/);
+    expect(ok.reason).toMatch(/is the floor itself/);
   });
 
-  it('refuses a candidate that merely descends from the floor', () => {
-    // Descent is satisfied by the OLD floor too — exactly the mistake equality
-    // exists to catch: shipping a client with import on while the floor still
-    // points at the previous worker release.
-    const verdict = decide({ flagsSource: IMPORT_ON, candidate: DESCENDANT });
-    expect(verdict).toMatchObject({ ok: false, mode: 'equality' });
-    expect(verdict.reason).toMatch(/equality mode/);
-    expect(verdict.reason).toMatch(/ships against/);
+  it('passes a live worker ABOVE the floor — the reader before the writer ships', () => {
+    const verdict = decideOn({ candidate: DESCENDANT });
+    expect(verdict).toMatchObject({ ok: true, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/descends from the floor/);
   });
 
-  it('never consults git — the refusal does not depend on ancestry', () => {
-    const verdict = decide({ flagsSource: IMPORT_ON, candidate: DESCENDANT, git: fakeGit({ undecided: true }) });
-    expect(verdict).toMatchObject({ ok: false, mode: 'equality' });
+  it('passes a floor raised above the import-flip release: flip → floor → candidate', () => {
+    const verdict = decideOn({ floor: RAISED, minimumFloor: RAISED, candidate: DESCENDANT });
+    expect(verdict).toMatchObject({ ok: true, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/the floor descends from the import-flip release/);
+  });
+
+  it('passes a raised floor that IS the candidate: candidate == floor > flip', () => {
+    const verdict = decideOn({ floor: RAISED, minimumFloor: RAISED, candidate: RAISED });
+    expect(verdict).toMatchObject({ ok: true, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/is the floor itself/);
+  });
+
+  it('(2) refuses the floor the flip left behind — the mistake the old equality rule existed to catch', () => {
+    // «Candidate descends from the floor» alone holds here: FLOOR descends from
+    // OLD. Only the import-flip condition refuses it.
+    const verdict = decideOn({ floor: OLD, minimumFloor: OLD, candidate: FLOOR });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/neither the import-flip release .* nor a descendant of it/);
+  });
+
+  it('(2) refuses a floor on a side branch of the import-flip release', () => {
+    const verdict = decideOn({ floor: STRANGER, minimumFloor: STRANGER, candidate: STRANGER });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/neither the import-flip release/);
+  });
+
+  it('(3) refuses a candidate below the floor', () => {
+    const verdict = decideOn({ floor: RAISED, minimumFloor: RAISED, candidate: FLOOR });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/does not descend from the floor/);
+  });
+
+  it('(3) refuses a candidate off the line', () => {
+    const verdict = decideOn({ candidate: STRANGER });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/does not descend from the floor/);
+  });
+
+  it('(1) refuses floors whose two stages disagree, before any ancestry question', () => {
+    const verdict = decideOn({ floor: RAISED, minimumFloor: FLOOR, candidate: RAISED, git: line({ undecided: true }) });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toMatch(/WORKER_FLOOR_SHA \(.*\) ≠ MINIMUM_FLOOR/);
+  });
+
+  it('an undecided git is a refusal in the import-flip question (2)', () => {
+    const verdict = decideOn({ floor: RAISED, minimumFloor: RAISED, candidate: RAISED, git: line({ undecided: true }) });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/could not decide whether the floor .* descends from the import-flip release/);
+  });
+
+  it('an undecided git is a refusal in the candidate question (3)', () => {
+    const verdict = decideOn({ candidate: DESCENDANT, git: line({ undecided: true }) });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/could not decide whether .* descends from the floor/);
+  });
+
+  it('an import-flip release that is not a full SHA is a refusal, not a pass', () => {
+    const verdict = decideOn({ importFlipFloor: 'worker-r4' });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toMatch(/not a full 40-character commit SHA/);
+  });
+
+  it('defaults to the production import-flip release when the caller passes none', () => {
+    // FLOOR is not the production release: without the fixture override the
+    // floor is judged against IMPORT_FLIP_FLOOR — and git (from the line map)
+    // does not know it, so the gate refuses rather than guess.
+    const verdict = checkClientFloorGate({
+      floor: FLOOR, candidate: FLOOR, minimumFloor: FLOOR, flagsSource: IMPORT_ON, git: line(),
+    });
+    expect(verdict).toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(verdict.reason).toContain(IMPORT_FLIP_FLOOR);
   });
 });
 
@@ -164,18 +258,20 @@ describe('ancestry mode — a client with import off (client-b1)', () => {
     expect(verdict.reason).toMatch(/could not decide/);
   });
 
-  it('a regression that switched to ancestry with import ON would be caught', () => {
-    // Same inputs as the accepting ancestry case, only the source flips import
-    // on: the verdict MUST flip to a refusal.
-    expect(decide({ candidate: DESCENDANT, flagsSource: IMPORT_OFF }).ok).toBe(true);
-    expect(decide({ candidate: DESCENDANT, flagsSource: IMPORT_ON }).ok).toBe(false);
+  it('a regression that judged an import-on build in ancestry mode would be caught', () => {
+    // Same inputs, only the source flips import on: a floor left BELOW the
+    // import-flip release is fine for ancestry (the candidate descends from it)
+    // and MUST be a refusal for d2-floor.
+    const same = { floor: OLD, minimumFloor: OLD, candidate: DESCENDANT, importFlipFloor: FLOOR, git: line() };
+    expect(decide({ ...same, flagsSource: IMPORT_OFF })).toMatchObject({ ok: true, mode: 'ancestry' });
+    expect(decide({ ...same, flagsSource: IMPORT_ON })).toMatchObject({ ok: false, mode: 'd2-floor' });
   });
 });
 
 describe('the floor itself, in both modes', () => {
   it.each([
     ['ancestry', IMPORT_OFF],
-    ['equality', IMPORT_ON],
+    ['d2-floor', IMPORT_ON],
   ])('%s: the Environment floor must equal MINIMUM_FLOOR', (_mode, flagsSource) => {
     const half = decide({ flagsSource, floor: DESCENDANT, candidate: DESCENDANT, minimumFloor: FLOOR });
     expect(half.ok).toBe(false);
@@ -208,6 +304,7 @@ describe('against a real repository', () => {
   let repo;
   let first;
   let second;
+  let third;
   let offBranch;
 
   beforeAll(() => {
@@ -226,6 +323,7 @@ describe('against a real repository', () => {
     run('config', 'commit.gpgsign', 'false');
     first = commit('first — the floor');
     second = commit('second — a later worker release');
+    third = commit('third — a release above it on the same line');
     run('checkout', '-q', '-b', 'unmerged', first);
     offBranch = commit('off the line — not a descendant of second');
     run('checkout', '-q', 'main');
@@ -239,8 +337,8 @@ describe('against a real repository', () => {
     checkClientFloorGate({ floor: first, minimumFloor: first, flagsSource: IMPORT_OFF, git: gitIn(repo), ...over });
 
   it('the fixture is what the tests think it is', () => {
-    for (const sha of [first, second, offBranch]) expect(SHA_RE.test(sha)).toBe(true);
-    expect(new Set([first, second, offBranch]).size).toBe(3);
+    for (const sha of [first, second, third, offBranch]) expect(SHA_RE.test(sha)).toBe(true);
+    expect(new Set([first, second, third, offBranch]).size).toBe(4);
   });
 
   it('ancestry: a later release on the line passes, a commit off the line does not', () => {
@@ -250,9 +348,30 @@ describe('against a real repository', () => {
     expect(verdict).toMatchObject({ ok: false, mode: 'ancestry' });
   });
 
-  it('equality: the same later release is refused once import is on', () => {
-    expect(real({ flagsSource: IMPORT_ON, candidate: second })).toMatchObject({ ok: false, mode: 'equality' });
-    expect(real({ flagsSource: IMPORT_ON, candidate: first })).toMatchObject({ ok: true, mode: 'equality' });
+  // d2-floor, with `second` playing the import-flip release.
+  const onFlip = over => real({ flagsSource: IMPORT_ON, importFlipFloor: second, ...over });
+
+  it('d2-floor: the floor the flip left behind is refused once import is on — even though the candidate descends from it', () => {
+    expect(real({ candidate: second })).toMatchObject({ ok: true, mode: 'ancestry' });
+    expect(onFlip({ candidate: second })).toMatchObject({ ok: false, mode: 'd2-floor' });
+  });
+
+  it('d2-floor: a candidate above a floor that IS the import-flip release passes', () => {
+    expect(onFlip({ floor: second, minimumFloor: second, candidate: third })).toMatchObject({ ok: true, mode: 'd2-floor' });
+    expect(onFlip({ floor: second, minimumFloor: second, candidate: second })).toMatchObject({ ok: true, mode: 'd2-floor' });
+  });
+
+  it('d2-floor: a floor raised above the import-flip release passes, as the candidate itself too', () => {
+    expect(onFlip({ floor: third, minimumFloor: third, candidate: third })).toMatchObject({ ok: true, mode: 'd2-floor' });
+  });
+
+  it('d2-floor: a floor beside the import-flip release, or a candidate off the floor\'s line, is refused', () => {
+    expect(onFlip({ floor: offBranch, minimumFloor: offBranch, candidate: offBranch }))
+      .toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(onFlip({ floor: second, minimumFloor: second, candidate: offBranch }))
+      .toMatchObject({ ok: false, mode: 'd2-floor' });
+    expect(onFlip({ floor: third, minimumFloor: third, candidate: second }))
+      .toMatchObject({ ok: false, mode: 'd2-floor' });
   });
 });
 
@@ -264,30 +383,77 @@ describe('this repository — the path the workflow executes', () => {
   // workflow builds: a wiring that silently hard-coded import=false (ancestry
   // for a build with import ON) would disagree with this the day import flips,
   // and so would an AST reader that started reading the wrong declaration.
-  const expectedMode = readFlag(realFlags, 'BACKUP_IMPORT_ENABLED') ? 'equality' : 'ancestry';
+  const expectedMode = readFlag(realFlags, 'BACKUP_IMPORT_ENABLED') ? 'd2-floor' : 'ancestry';
   expect(readFlagExactlyOnce(realFlags, 'BACKUP_IMPORT_ENABLED')).toBe(readFlag(realFlags, 'BACKUP_IMPORT_ENABLED'));
 
-  it('checkClientFloorGateHere reads the real src/lib/flags.ts and the real pin', () => {
+  // The CI test job checks out SHALLOW (only the deploy workflows fetch full
+  // history, see «keeps the full history» below). While the pin IS the
+  // import-flip release, the real path is decided by equal SHAs alone and needs
+  // no history. Once the pin is raised above it, «does the pin descend from the
+  // flip?» needs history: those tests then run where it exists and are skipped
+  // in a shallow clone — the deploy run itself still answers that question.
+  const shallow = execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoRoot, encoding: 'utf8' }).trim() === 'true';
+  const needsHistory = expectedMode === 'd2-floor' && MINIMUM_FLOOR !== IMPORT_FLIP_FLOOR;
+
+  it('the import-flip release is a full SHA and the very one ROLLBACK records as the floor raised before the flip', () => {
+    expect(SHA_RE.test(IMPORT_FLIP_FLOOR)).toBe(true);
+    const rollback = readFileSync(join(repoRoot, 'docs', 'ROLLBACK.md'), 'utf8');
+    expect(rollback).toContain(`**DONE 2026-10-02** — target \`${IMPORT_FLIP_FLOOR}\``);
+  });
+
+  it.skipIf(needsHistory && shallow)('the real pin is the import-flip release or a later release on its line', () => {
+    if (MINIMUM_FLOOR === IMPORT_FLIP_FLOOR) return;
+    expect(gitIn(repoRoot).isAncestor(IMPORT_FLIP_FLOOR, MINIMUM_FLOOR)).toBe(true);
+  });
+
+  it.skipIf(needsHistory && shallow)('checkClientFloorGateHere reads the real src/lib/flags.ts and the real pin', () => {
     const verdict = checkClientFloorGateHere({ floor: MINIMUM_FLOOR, candidate: MINIMUM_FLOOR });
     expect(verdict.ok).toBe(true);
     expect(verdict.mode).toBe(expectedMode);
     expect(verdict.reason).toContain(`WORKER_FLOOR_SHA == MINIMUM_FLOOR == ${MINIMUM_FLOOR}`);
   });
 
-  it('the CLI reads the environment the workflow passes, reports the real mode, and exits non-zero on a refusal', () => {
-    const script = join(repoRoot, 'scripts', 'check-client-floor-gate.mjs');
-    // Deliberately NOT run from the repo root: flags, pin and git must resolve
-    // from the script's own location, whatever the process cwd is.
-    const run = env => spawnSync(process.execPath, [script], {
-      env: { ...process.env, ...env }, encoding: 'utf8', cwd: tmpdir(),
-    });
-    const refused = run({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: 'main' });
+  const script = join(repoRoot, 'scripts', 'check-client-floor-gate.mjs');
+  // Deliberately NOT run from the repo root: flags, pin and git must resolve
+  // from the script's own location, whatever the process cwd is.
+  const runCli = env => spawnSync(process.execPath, [script], {
+    env: { ...process.env, ...env }, encoding: 'utf8', cwd: tmpdir(),
+  });
+
+  // The refusal needs no history (the candidate is not even a SHA), so it is
+  // never skipped — a CLI that stopped exiting non-zero is caught in any clone.
+  it('the CLI exits non-zero on a refusal', () => {
+    const refused = runCli({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: 'main' });
     expect(refused.status).toBe(1);
     expect(refused.stderr).toMatch(/check-client-floor-gate: REFUSED/);
-    const passed = run({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: MINIMUM_FLOOR });
+  });
+
+  it.skipIf(needsHistory && shallow)('the CLI reads the environment the workflow passes and reports the real mode', () => {
+    const passed = runCli({ WORKER_FLOOR_SHA: MINIMUM_FLOOR, WORKER_CANDIDATE_SHA: MINIMUM_FLOOR });
     expect(passed.status).toBe(0);
     expect(passed.stdout).toContain(`client floor gate: ${expectedMode} mode`);
   });
+
+  it.skipIf(expectedMode !== 'd2-floor' || (needsHistory && shallow))(
+    'the import-flip release cannot be lowered from the environment — the CLI judges against the literal',
+    () => {
+      // Plausible names an operator (or a future workflow edit) might try. Were
+      // any of them honoured, the floor would be judged against an all-ones SHA
+      // this repository does not have, and git would refuse; the literal keeps
+      // the verdict a pass and names itself in the reason.
+      const bogus = '1'.repeat(40);
+      const passed = runCli({
+        WORKER_FLOOR_SHA: MINIMUM_FLOOR,
+        WORKER_CANDIDATE_SHA: MINIMUM_FLOOR,
+        IMPORT_FLIP_FLOOR: bogus,
+        IMPORT_FLIP_FLOOR_SHA: bogus,
+        INPUT_IMPORT_FLIP_FLOOR: bogus,
+      });
+      expect(passed.status).toBe(0);
+      expect(passed.stdout).toContain(`import-flip release ${IMPORT_FLIP_FLOOR}`);
+      expect(passed.stdout).not.toContain(bogus);
+    },
+  );
 });
 
 describe('the workflow cannot be talked out of the gate by the code it judges', () => {

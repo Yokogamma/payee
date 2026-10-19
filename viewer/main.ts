@@ -705,12 +705,30 @@ function openFailure(error: unknown, phrase: string): string {
  */
 function teardown(): void {
   epoch++;
-  opened = null;
   byId<HTMLTextAreaElement>('seed').value = '';
   byId<HTMLInputElement>('file').value = '';
+  byId('status').textContent = '';
+  closeView();
+}
+
+/**
+ * Drop the opened copy from state AND from the screen; leave the inputs and
+ * the status line alone.
+ *
+ * Shared by the teardown above and by a FAILED open. The second caller is the
+ * reason this exists: an open that fails on top of a copy already shown used
+ * to change nothing but the status line, so the cards, the summary and the
+ * export buttons of the PREVIOUS file stayed on screen under a message about
+ * the new one. A negative check performed that way — a wrong phrase, a damaged
+ * file — looked like a success with a footnote; the operator runbook had to
+ * demand «close the tab, reopen the file» before every such check. After a
+ * failure the page must be exactly what it was before any file was opened:
+ * no list, no summary, nothing to export.
+ */
+function closeView(): void {
+  opened = null;
   for (const id of ['notes', 'safebox', 'view-warnings']) clear(byId(id));
   byId('summary').textContent = '';
-  byId('status').textContent = '';
   byId('view').hidden = true;
   byId('entry').hidden = false;
 }
@@ -752,6 +770,10 @@ export function start(): void {
       } catch (error) {
         if (epoch !== myEpoch) return; // superseded or closed: nobody to tell
         if (error instanceof PageClosed) return;
+        // Whatever was open before this attempt is gone with it: the verdict
+        // below must be the only thing on screen, not a caption under the
+        // previous file's cards (see `closeView`).
+        closeView();
         status.textContent = openFailure(error, phrase);
         return;
       }

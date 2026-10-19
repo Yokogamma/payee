@@ -10,14 +10,22 @@
  * profile). This gate answers one more question: does the floor recorded in
  * `WORKER_FLOOR_SHA` stand in the right relation to that release?
  *
- *   EQUALITY  — the floor must BE the release the client ships on. Required
- *               the moment the released source has `BACKUP_IMPORT_ENABLED =
- *               true`: from then on a client stores txIds under semantic
- *               idempotency, so a worker below that release must be
- *               undeployable (docs/ROLLBACK.md «Release order — and the
- *               two-stage floor raise»). "Candidate is a descendant of the
- *               floor" would be satisfied by the OLD floor too, which is
- *               exactly the mistake equality exists to catch.
+ *   D2-FLOOR  — required the moment the released source has
+ *               `BACKUP_IMPORT_ENABLED = true`: from then on a client stores
+ *               txIds under semantic idempotency, so a worker below the
+ *               release that introduced it (D2) must be undeployable
+ *               (docs/ROLLBACK.md «Release order — and the two-stage floor
+ *               raise»). The floor must be that release — IMPORT_FLIP_FLOOR,
+ *               the SHA the floor was raised to right before the import flip —
+ *               or a later release on its line, and the candidate must be the
+ *               floor or a descendant of it. "Candidate descends from the
+ *               floor" alone would be satisfied by the OLD floor too; the
+ *               IMPORT_FLIP_FLOOR condition is what refuses it. The live worker
+ *               may stand ABOVE the floor (the reader before the writer ships):
+ *               that is the rollback window the release plan keeps open.
+ *               Until 2026-10 this mode required the floor to EQUAL the
+ *               candidate ("equality"); that froze every client release the
+ *               moment a worker above the floor went live.
  *
  *   ANCESTRY  — while the released source has `BACKUP_IMPORT_ENABLED = false`
  *               nothing in the client depends on semantic idempotency, and the
@@ -34,9 +42,11 @@
  * `main` — so the checkout whose flags are read is a protected-branch state,
  * and the mode inherits exactly the strength of that policy (docs/SECRETS.md).
  * A workflow input or an operator switch could be set to «relax» for a build
- * that has import on; a literal in the released source cannot. Equality
- * therefore comes back automatically with the first build that turns import
- * on — nobody has to remember to flip the gate.
+ * that has import on; a literal in the released source cannot. The import-on
+ * rule therefore applies automatically to every build that has import on —
+ * nobody has to remember to flip the gate. IMPORT_FLIP_FLOOR is a literal for
+ * the same reason, and it is NOT an input: neither the CLI nor the environment
+ * can lower it (the function parameter exists for the tests' fixtures only).
  *
  * The flag is read from the TypeScript AST, not from the text: exactly one
  * top-level `export const BACKUP_IMPORT_ENABLED` whose initializer is the
@@ -57,10 +67,24 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { checkFloorInputs, gitIn, MINIMUM_FLOOR } from './check-worker-floor.mjs';
+import { checkFloorInputs, gitIn, MINIMUM_FLOOR, SHA_RE } from './check-worker-floor.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const FLAGS_PATH = fileURLToPath(new URL('../src/lib/flags.ts', import.meta.url));
+
+/**
+ * The lowest floor a client with import on may EVER ship against: the worker
+ * release that brought semantic idempotency (D2), which both stages of the
+ * floor were raised to immediately before the import flip (docs/ROLLBACK.md
+ * «Backup v1 … Order», step 3, DONE 2026-10-02).
+ *
+ * Not the current floor — that is MINIMUM_FLOOR, and it will rise past this
+ * (the plan raises it with the writer release). A floor ABOVE this release on
+ * its line is fine; a floor below it or beside it is the mistake the import-on
+ * rule exists to catch. A literal in the protected branch, like the mode: no
+ * workflow input or operator switch can lower it.
+ */
+export const IMPORT_FLIP_FLOOR = '394156d5998dbaef5b1d273898ee8006104227f8';
 
 /**
  * The one declaration of a flag, or a throw — read from the AST.
@@ -110,7 +134,7 @@ export function readFlagExactlyOnce(source, name) {
 
 /** Which mode the released source demands. Throws when it cannot tell. */
 export function gateModeFor(flagsSource) {
-  return readFlagExactlyOnce(flagsSource, 'BACKUP_IMPORT_ENABLED') ? 'equality' : 'ancestry';
+  return readFlagExactlyOnce(flagsSource, 'BACKUP_IMPORT_ENABLED') ? 'd2-floor' : 'ancestry';
 }
 
 /**
@@ -118,11 +142,16 @@ export function gateModeFor(flagsSource) {
  *   - `isAncestor(a, b)` → boolean, and THROWS on anything that is neither a
  *     yes nor a no — an undecided gate must never read as a pass.
  *
+ * `importFlipFloor` defaults to IMPORT_FLIP_FLOOR and exists only so the tests
+ * can build their own git line; the CLI and the workflow never pass it.
+ *
  * Returns `{ ok, mode?, reason }`. `reason` explains the verdict either way,
  * naming the mode, what was compared and the floor/pin agreement, so the run
  * log carries the evidence of WHICH rule judged the release and why.
  */
-export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_FLOOR, flagsSource, git }) {
+export function checkClientFloorGate({
+  floor, candidate, minimumFloor = MINIMUM_FLOOR, importFlipFloor = IMPORT_FLIP_FLOOR, flagsSource, git,
+}) {
   const inputs = checkFloorInputs({ floor, candidate });
   if (!inputs.ok) return { ok: false, reason: inputs.reason };
   const { floor: floorSha, candidate: candidateSha } = inputs;
@@ -146,22 +175,80 @@ export function checkClientFloorGate({ floor, candidate, minimumFloor = MINIMUM_
     return { ok: false, reason: `cannot decide the gate mode from src/lib/flags.ts: ${error.message}` };
   }
 
-  if (mode === 'equality') {
-    if (candidateSha !== floorSha) {
+  if (mode === 'd2-floor') {
+    const flip = String(importFlipFloor ?? '').trim().toLowerCase();
+    if (!SHA_RE.test(flip)) {
       return {
         ok: false,
         mode,
-        reason: `client floor gate: equality mode — BACKUP_IMPORT_ENABLED=true in src/lib/flags.ts, so the `
-          + `floor must BE the release this client ships on. ${agreed}, but this client ships against `
-          + `${candidateSha}. Raise the Environment floor and MINIMUM_FLOOR to the smoked release before `
-          + 'publishing a client with import on (D2a).',
+        reason: `client floor gate: d2-floor mode — the import-flip release "${flip}" is not a full `
+          + '40-character commit SHA, so the floor cannot be judged against it.',
       };
     }
+
+    // (2) The floor is the import-flip release or a later release on its line.
+    // Equal SHAs need no git: the current path (floor == flip) is decided
+    // without history.
+    if (floorSha !== flip) {
+      let aboveFlip;
+      try {
+        aboveFlip = git.isAncestor(flip, floorSha);
+      } catch (error) {
+        return {
+          ok: false,
+          mode,
+          reason: `client floor gate: d2-floor mode — git could not decide whether the floor ${floorSha} `
+            + `descends from the import-flip release ${flip} (${error.message}). An undecided gate is a `
+            + 'refusal, not a pass; the workflow checks out with fetch-depth: 0 for exactly this reason.',
+        };
+      }
+      if (!aboveFlip) {
+        return {
+          ok: false,
+          mode,
+          reason: `client floor gate: d2-floor mode — BACKUP_IMPORT_ENABLED=true in src/lib/flags.ts, but the `
+            + `floor ${floorSha} is neither the import-flip release ${flip} nor a descendant of it. A client `
+            + 'with import on stores txIds under semantic idempotency and never ships against a floor below '
+            + 'that release: raise the Environment floor and MINIMUM_FLOOR first (D2a).',
+        };
+      }
+    }
+
+    // (3) The candidate is the floor or a descendant of it.
+    if (candidateSha !== floorSha) {
+      let descends;
+      try {
+        descends = git.isAncestor(floorSha, candidateSha);
+      } catch (error) {
+        return {
+          ok: false,
+          mode,
+          reason: `client floor gate: d2-floor mode — git could not decide whether ${candidateSha} descends `
+            + `from the floor ${floorSha} (${error.message}). An undecided gate is a refusal, not a pass; `
+            + 'the workflow checks out with fetch-depth: 0 for exactly this reason.',
+        };
+      }
+      if (!descends) {
+        return {
+          ok: false,
+          mode,
+          reason: `client floor gate: d2-floor mode — candidate ${candidateSha} does not descend from the `
+            + `floor ${floorSha}. A client never ships on a worker below the floor.`,
+        };
+      }
+    }
+
+    const floorVsFlip = floorSha === flip
+      ? `the floor is the import-flip release ${flip}`
+      : `the floor descends from the import-flip release ${flip}`;
+    const candidateVsFloor = candidateSha === floorSha
+      ? `candidate ${candidateSha} is the floor itself`
+      : `candidate ${candidateSha} descends from the floor`;
     return {
       ok: true,
       mode,
-      reason: `client floor gate: equality mode — BACKUP_IMPORT_ENABLED=true in src/lib/flags.ts; `
-        + `${agreed} == candidate.`,
+      reason: `client floor gate: d2-floor mode — BACKUP_IMPORT_ENABLED=true in src/lib/flags.ts; `
+        + `${agreed}; ${floorVsFlip}; ${candidateVsFloor}.`,
     };
   }
 

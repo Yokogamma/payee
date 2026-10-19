@@ -317,6 +317,12 @@ export function Main({ theme, onThemeChange }: MainProps) {
    */
   const editSessionRef = useRef(0);
   const mountedRef = useRef(true);
+  /** The two 2-second toast timers («Сохранено…», «Скопировано»). Cleared on
+   *  unmount so a toast that outlives the screen can't call a state setter
+   *  into a torn-down tree — in the jsdom suite that fired after the
+   *  environment was gone (`window is not defined`) and failed the whole run. */
+  const justSavedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useLayoutEffect(() => {
     // The ref OBJECTS are copied, not their values: the cleanup wants the live
     // counters, which is the opposite of the DOM-node case exhaustive-deps
@@ -324,11 +330,17 @@ export function Main({ theme, onThemeChange }: MainProps) {
     const mounted = mountedRef;
     const editSession = editSessionRef;
     const restoreOp = restoreOpRef;
+    const justSavedTimer = justSavedTimerRef;
+    const copyFeedbackTimer = copyFeedbackTimerRef;
     mounted.current = true;
     return () => {
       mounted.current = false;
       editSession.current++;
       restoreOp.current++;
+      if (justSavedTimer.current !== null) clearTimeout(justSavedTimer.current);
+      if (copyFeedbackTimer.current !== null) clearTimeout(copyFeedbackTimer.current);
+      justSavedTimer.current = null;
+      copyFeedbackTimer.current = null;
     };
   }, []);
 
@@ -629,8 +641,16 @@ export function Main({ theme, onThemeChange }: MainProps) {
     }
     setText('');
     clearDraft(); // don't wait out the debounce (also invalidates in-flight persists)
-    setJustSaved(true);
-    setTimeout(() => setJustSaved(false), 2000);
+    // `addNote` may resolve after the screen is gone — don't arm a timer the
+    // unmount cleanup has already run past.
+    if (mountedRef.current) {
+      setJustSaved(true);
+      if (justSavedTimerRef.current !== null) clearTimeout(justSavedTimerRef.current);
+      justSavedTimerRef.current = setTimeout(() => {
+        justSavedTimerRef.current = null;
+        setJustSaved(false);
+      }, 2000);
+    }
     setComposerOpen(false);
     userCollapsedRef.current = false; // saved, not dismissed
     // Same reason as «Свернуть»: the save button unmounts under the press.
@@ -645,8 +665,16 @@ export function Main({ theme, onThemeChange }: MainProps) {
    *  hand, and that needs the note still on screen. */
   async function handleCopyNote(noteText: string): Promise<void | false> {
     const ok = await copyTextToClipboard(noteText);
+    // The screen may have gone away while the clipboard promise was pending.
+    if (!mountedRef.current) return ok ? undefined : false;
     setCopyFeedback(ok ? 'ok' : 'fail');
-    setTimeout(() => setCopyFeedback(null), 2000);
+    // A repeat copy restarts the 2 s window instead of letting the earlier
+    // timer hide the fresh toast early.
+    if (copyFeedbackTimerRef.current !== null) clearTimeout(copyFeedbackTimerRef.current);
+    copyFeedbackTimerRef.current = setTimeout(() => {
+      copyFeedbackTimerRef.current = null;
+      setCopyFeedback(null);
+    }, 2000);
     return ok ? undefined : false;
   }
 

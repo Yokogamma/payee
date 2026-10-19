@@ -83,6 +83,22 @@ describe('client ↔ worker signature parity (src/lib/crypto vs worker verifySig
     expect(r.status).toBe(502);
   });
 
+  it('pinned: this seed phrase still derives the SAME key, owner hash and signature bytes', async () => {
+    // The tests above register whatever key the client derives right now, so
+    // they stay green if a dependency bump changed every key — and a changed
+    // key is a user locked out of their own allowlist entry, invite and notes.
+    // Ed25519 is deterministic: these are exact bytes, computed before the
+    // @noble/ed25519 3.1 → 3.2 bump (Dependabot triage 2026-09-18). Never
+    // regenerate them to make a run pass; the root suite pins the same values
+    // in src/lib/crypto.vectors.test.ts.
+    const { privateKey, publicKey } = await deriveSigningKeypair(MNEMONIC);
+    expect(bufferToBase64(publicKey)).toBe('kTaDSnuCTzUC81qpfQxPMTX9SQkxSB9ea6SCGrg/aMA=');
+    expect(await deriveOwnerHash(publicKey)).toBe('VdgVkmIJ08CGsstG1Lm5QsYQmba178KrNtnYTzaA50Q=');
+    const body = '{"publicKey":"kTaDSnuCTzUC81qpfQxPMTX9SQkxSB9ea6SCGrg/aMA=","timestamp":1700000000000}';
+    expect(await signPayload(privateKey, body))
+      .toBe('GfVOOKXMj/BsbEN/gKAw7qUWyNfUxKiHDQOWvEDUdBltIe2HypcYcDvk+aT1fo+eHlYJcIBiLiAy/Tb58L8YCw==');
+  });
+
   it('control: the same client signature over a TAMPERED body is rejected (401)', async () => {
     // Guards the guard: if worker-side verification ever started accepting
     // anything, the two green tests above would prove nothing.

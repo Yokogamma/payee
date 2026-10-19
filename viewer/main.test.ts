@@ -242,6 +242,74 @@ describe('failures are typed, and say different things', () => {
   });
 });
 
+describe('a failed open leaves NOTHING of the previous copy on screen', () => {
+  /** `clickOpen` returns as soon as the view is visible — which, over a copy
+   *  that is ALREADY open, is immediately. Wait for the verdict instead. */
+  async function clickOpenOverOpenCopy(seed = MNEMONIC): Promise<void> {
+    $<HTMLTextAreaElement>('seed').value = seed;
+    $<HTMLButtonElement>('open').click();
+    await vi.waitFor(() => { expect(status()).not.toBe('Открываем…'); });
+  }
+
+  async function corrupted(): Promise<string> {
+    const parsed = JSON.parse(await container({ notes: [await makeNote()] })) as {
+      body: { ciphertext: string };
+    };
+    const bytes = Uint8Array.from(atob(parsed.body.ciphertext), c => c.charCodeAt(0));
+    bytes[0] ^= 0xff;
+    parsed.body.ciphertext = bufferToBase64(bytes);
+    return JSON.stringify(parsed);
+  }
+
+  it('a damaged file over an open copy: the verdict is the only thing shown', async () => {
+    selectFile(await container({ notes: [await makeNote()] }));
+    await clickOpen();
+    expect($('view').hidden).toBe(false);
+    expect($('summary').textContent).not.toBe('');
+    expect($('notes').childElementCount).toBeGreaterThan(0);
+
+    selectFile(await corrupted());
+    await clickOpenOverOpenCopy();
+
+    expect(status()).toContain('другой seed-фразой');
+    expect($('view').hidden).toBe(true);
+    expect($('entry').hidden).toBe(false);
+    expect($('summary').textContent).toBe('');
+    expect($('notes').childElementCount).toBe(0);
+    expect($('safebox').childElementCount).toBe(0);
+    expect($('view-warnings').childElementCount).toBe(0);
+  });
+
+  it('a wrong phrase over an open copy: same — and the phrase stays for a retry', async () => {
+    selectFile(await container({ notes: [await makeNote()] }));
+    await clickOpen();
+    expect($('view').hidden).toBe(false);
+
+    // A VALID phrase that is not the fixture's (BIP-39 test vector).
+    const other = 'zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong';
+    await clickOpenOverOpenCopy(other);
+
+    expect(status()).toContain('другой seed-фразой');
+    expect($('view').hidden).toBe(true);
+    expect($('summary').textContent).toBe('');
+    expect($('notes').childElementCount).toBe(0);
+    // The failure is about THIS attempt, not a page close: the inputs are left
+    // for the user to correct, unlike `teardown`.
+    expect($<HTMLTextAreaElement>('seed').value).toBe(other);
+  });
+
+  it('the export of a copy that failed to reopen is not offered', async () => {
+    selectFile(await container({ notes: [await makeNote()] }));
+    await clickOpen();
+    selectFile('not json at all');
+    await clickOpenOverOpenCopy();
+
+    expect($('view').hidden).toBe(true);
+    $<HTMLButtonElement>('export-notes').click();
+    expect(clicks).toEqual([]);
+  });
+});
+
 describe('the compatibility flag is judged asymmetrically (D11a)', () => {
   it('a header claiming unsupported records shows NO warning when everything reads', async () => {
     // «Часть записей (0) не может быть показана» is worse than no warning: it
