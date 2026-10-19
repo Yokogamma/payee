@@ -4,17 +4,26 @@ import { authenticatePublication } from '../src/publication-auth';
 // client's D9 suite. Reusing it is the point — the worker must accept exactly
 // the transactions the client accepts, and a second harness would let the two
 // drift while both stayed green.
-import { buildSignedTx, newWallet, notesTags, testWallet } from '../../src/test-stubs/signed-tx';
+import { buildSignedTx, notesTags, otherWallet, testWallet } from '../../src/test-stubs/signed-tx';
 import { computePublicationFp } from '../src/publication-fp';
 import { assertSupportedRedirect } from './helpers/outbound-mock';
 
 const OWNER_HASH = 'owner-hash-under-test';
 
-// RSA-4096 keygen for the harness wallets runs ONCE per process and is paid by
-// whichever test asks first — under CPU contention (a parallel client suite)
-// that first test blew the default 5 s timeout. Pay it here, explicitly, with
-// a budget that says what it is.
-beforeAll(async () => { await testWallet(); await newWallet(); }, 60_000);
+// EVERY RSA-4096 key this file signs with is generated HERE, never in a test
+// body. Keygen time is a lottery — the prime search is random: under workerd a
+// key took anywhere from 0.3 s to 6.6 s on one idle machine, and CPU
+// contention (a parallel client suite) stretches that further. A key generated
+// inside a test is paid from that test's default 5 s budget, which is how the
+// «not ours» tests timed out. Both wallets here are memoized per process, so
+// the tests reuse exactly these keys — never call `newWallet()` in a test, it
+// is a fresh key on every call. One key per hook, each with its own budget
+// (hooks run one after another).
+const KEYGEN_BUDGET_MS = 60_000;
+beforeAll(async () => { await testWallet(); }, KEYGEN_BUDGET_MS);
+// The «correctly signed by an attacker» wallet: every check but the
+// trusted-owner one must pass, so it has to be a real, DIFFERENT wallet.
+beforeAll(async () => { await otherWallet(); }, KEYGEN_BUDGET_MS);
 const NOTE_ID = '77777777-2222-8333-8444-555555555555';
 const G1 = 'https://g1.test';
 const G2 = 'https://g2.test';
@@ -126,7 +135,7 @@ describe('«not ours» — sound, and none of our business', () => {
   it('a transaction signed by an UNTRUSTED wallet', async () => {
     // The precise failure the historical owner list exists to prevent in
     // reverse: an attacker posting their own well-formed transaction.
-    const stranger = await newWallet();
+    const stranger = await otherWallet();
     const tx = await buildSignedTx(
       payload(), notesTags({ version: '3', ownerHash: OWNER_HASH, noteId: NOTE_ID }), stranger,
     );
@@ -139,7 +148,7 @@ describe('«not ours» — sound, and none of our business', () => {
 
   it('stops the pool instead of asking every other gateway', async () => {
     // Every honest gateway would return the same bytes, so continuing is waste.
-    const stranger = await newWallet();
+    const stranger = await otherWallet();
     const tx = await buildSignedTx(
       payload(), notesTags({ version: '3', ownerHash: OWNER_HASH, noteId: NOTE_ID }), stranger,
     );
