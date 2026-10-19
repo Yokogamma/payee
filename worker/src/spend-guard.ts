@@ -67,7 +67,14 @@ const K = {
   quote: (id: string) => `quote:${id}`,
   archive: (cycle: number) => `cycle-archive:${cycle}`,
   auditRec: (seq: number) => `audit:${String(seq).padStart(12, '0')}`,
+  /** Durable evidence of money conflicts (`released → spent`), written in the
+   *  SAME transaction as the booking — a lost answer cannot lose it and a
+   *  retry (a no-op on the lattice) cannot double it (review 25.09, H). */
+  conflicts: 'conflicts',
 } as const;
+
+interface StoredConflicts { count: number; lastAt: number | null; lastSpendKey: string | null; lastOutcome: string | null }
+const NO_CONFLICTS: StoredConflicts = { count: 0, lastAt: null, lastSpendKey: null, lastOutcome: null };
 
 const DEFAULT_FREEZE: FreezeState = { active: false, epoch: 0 };
 const DEFAULT_INIT: InitRecord = { state: 'none', cycle: 1, attempts: 0 };
@@ -680,6 +687,14 @@ export class SpendGuard implements DurableObject {
       const next: CycleLedger = { ...ledger, spent: ledger.spent + r.spentDelta, pending: ledger.pending + r.pendingDelta };
       await this.putLedger(txn, next);
       if (r.spentDelta > 0n) await txn.put(K.buckets, fromBuckets(addToBucket(toBuckets(await txn.get(K.buckets)), now, r.spentDelta)));
+      // «Money left after all»: the durable counter the strict zero is read
+      // from (`/status` → `conflicts`). Same transaction as the booking, and
+      // only on the transition itself — a repeat is `noop` on the lattice
+      // (`conflict: false`) and never increments (review 25.09, H).
+      if (r.conflict) {
+        const c = (await txn.get<StoredConflicts>(K.conflicts)) ?? NO_CONFLICTS;
+        await txn.put<StoredConflicts>(K.conflicts, { count: c.count + 1, lastAt: now, lastSpendKey: spendKey, lastOutcome: outcome });
+      }
       // The height and the cycle are recorded by the settle that BOOKED the
       // spend; a later confirmed recheck (a no-op on the lattice) must not
       // move them — the classification at `done` reads the first one.
@@ -740,8 +755,9 @@ export class SpendGuard implements DurableObject {
   // ─── status ─────────────────────────────────────────────────────────────
 
   private async status(): Promise<Response> {
-    const [freeze, init, ledger, buckets, balance] = await Promise.all([
+    const [freeze, init, ledger, buckets, balance, conflicts] = await Promise.all([
       this.getFreeze(), this.getInit(), this.getLedger(), this.state.storage.get<Record<string, string>>(K.buckets), this.state.storage.get<StoredBalance>(K.balance),
+      this.state.storage.get<StoredConflicts>(K.conflicts),
     ]);
     const now = Date.now();
     return okJson({
@@ -752,6 +768,9 @@ export class SpendGuard implements DurableObject {
       spentLast24h: spentLast24h(toBuckets(buckets), now).toString(),
       observedMin: balance?.observedMin ?? null,
       observedAt: balance?.at ?? null,
+      // The durable money-conflict evidence (`released → spent`): the soak's
+      // strict zero reads THIS, not a metric that may be sampled or lost.
+      conflicts: conflicts ?? NO_CONFLICTS,
     });
   }
 }

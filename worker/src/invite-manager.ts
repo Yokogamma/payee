@@ -96,6 +96,7 @@ export class InviteManager implements DurableObject {
     if (url.pathname === '/refresh-allowed') return this.handleRefreshAllowed(request);
     if (url.pathname === '/seed-invite') return this.handleSeedInvite(request);
     if (url.pathname === '/revoke') return this.handleRevoke(request);
+    if (url.pathname === '/list-keys') return this.handleListKeys();
     return new Response('Not found', { status: 404 });
   }
 
@@ -308,6 +309,29 @@ export class InviteManager implements DurableObject {
       response = Response.json({ ok: true, wasAllowed: !!existing, inviteRevoked });
     });
     return response;
+  }
+
+  /**
+   * Every key that EVER held access (D10 §4.0 п. 2, review #9 M): the
+   * `publicKey` of every used invite — kept after a revoke — plus the live
+   * `pk:*` set. `unknownLegacyInvites` counts used invites of the old format
+   * (a bare `true`, or `used` without `publicKey`) whose key cannot be named
+   * here; the spend-guard closure stays open until the operator acknowledges
+   * them. Read-only.
+   */
+  private async handleListKeys(): Promise<Response> {
+    const keys = new Set<string>();
+    let unknownLegacyInvites = 0;
+    const invites = await this.state.storage.list<InviteRecord | true>({ prefix: 'invite:' });
+    for (const rec of invites.values()) {
+      if (rec === true) { unknownLegacyInvites++; continue; }
+      if (typeof rec !== 'object' || rec === null || !rec.used) continue;
+      if (typeof rec.publicKey === 'string' && rec.publicKey !== '') keys.add(rec.publicKey);
+      else unknownLegacyInvites++;
+    }
+    const pks = await this.state.storage.list({ prefix: 'pk:' });
+    for (const key of pks.keys()) keys.add(key.slice('pk:'.length));
+    return Response.json({ keys: [...keys], unknownLegacyInvites });
   }
 
   /**
