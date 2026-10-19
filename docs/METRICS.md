@@ -223,6 +223,42 @@ the journal are defined in docs/ROLLBACK.md.
 curl -sS -X POST https://<worker>/admin/ops -H 'Content-Type: application/json' -H 'Authorization: Bearer <METRICS_ADMIN_SECRET>'   -d '{"ownerPk":"<canonical base64 pk>","from":1789000000000,"to":1789086400000,"limit":200}'
 ```
 
+## POST /admin/recovery-census — the rollback census (PR-3b reader)
+
+Read-only, bearer `METRICS_ADMIN_SECRET`, `no-store`, body `{}`. Answers
+whether EVERY key's recovery set is empty — the proof a rollback below the
+reader needs (docs/ROLLBACK.md «PR-3b reader release», «Rollback»). The key
+set is the legacy closure's: used invites incl. revoked ones, the live `pk:*`
+and the keys the operator registered with `/admin/spend/init-legacy-keys`;
+old-format invites that hide a key keep it incomplete until acknowledged. Per
+key three independent counts are read — the persistent `recoveryCount`, the
+`recovery:` index and a direct scan of the note records — so a drifted counter
+cannot read as empty. At most 200 keys per census (more → `too_many_keys`,
+fail-closed).
+
+The answer is a SUMMARY and nothing else — never a key, noteId or txId:
+`{workerVersionId, releaseSha, census: {complete, verdict: empty | not_empty |
+incomplete, keys: {listed, checked, failed}, legacyInvites: {unknown,
+acknowledged}, recovery: {count, due, records, keysWithRecovery}, reasons}}`,
+`reasons` ⊆ `list_keys_failed`, `legacy_keys_failed`,
+`legacy_invites_unacknowledged`, `too_many_keys`, `key_read_failed`,
+`recovery_present`, `counter_drift`. A failed or malformed read is
+`incomplete`, never empty.
+
+The operator reads it through `worker/scripts/recovery-census.mjs`
+(`npm run census:recovery`, target allowlist of the smoke scripts), which
+re-checks every field on its own: exit 0 only for complete + empty, 1 =
+refused, 2 = usage. `CENSUS_MIN_KEYS` (default 1) refuses a contour with users
+that suddenly lists no keys. Identity is part of the proof: `workerVersionId`
+must be a non-empty string and `releaseSha` a full 40-hex SHA;
+`CENSUS_EXPECT_RELEASE_SHA` / `CENSUS_EXPECT_VERSION_ID` pin them to the
+version the operator means. `releaseSha: null` is always refused: the reader
+ships to dev only, and dev deploys with `RELEASE_SHA` (`deploy-worker.yml`).
+
+```bash
+CENSUS_URL=https://<worker> METRICS_ADMIN_SECRET=<secret> npm --prefix worker run census:recovery
+```
+
 ## What PR-2 does NOT close (release-notes honesty, P0 r18)
 
 1. **The ambiguous POST exception.** A transaction ACCEPTED by the gateway
@@ -277,17 +313,33 @@ discriminator).
 | `activate_conflict` | event, `activate_conflict` | — | `/upload` when the reservation under this operation's key belongs to someone else (incident: a protocol defect, not a path) |
 | `activate_remap` | event | — | `/upload` when `activate` re-reserved under the §5 checks (expired lease, changed reward) |
 | `observed_min_winston` | event | the minimum gateway balance handed to the detector (Winston, or −1 when not a safe integer) | `/upload` after a fresh balance read with a quorum (§3.4) |
+| `recovery_step` | event, state (`signed` / `redrop_pending`), action (`advance_posted` / `reschedule` / `resend` / `redrop` / `phase2`) | attempts so far | the per-key scheduler (RateLimiter alarm, or the recheck's nudge) at the start of one step |
+| `recovery_refused` | event, leg (`activate` / `permit` / `prepare` / `limits` / `release` / `recheck`), code | — | a step the guard or the configuration refused: the record is kept and rescheduled. `recheck` = phase 2 read the OLD txId again before anything else — before the release of its money and before a new signature — and the pool did not say dead (`pending` / `unavailable` / confirmations short of the quorum): nothing released, nothing signed (review 24.09 #6 H) |
+| `recovery_corrupt` | event, state | — | the stored bytes do not parse or are not the recorded txId: nothing sent, nothing signed |
+| `money_reconcile` | event, outcome (`spent` / `released` / `wait` / `watch`), result (`settled` / `noop` / `unknown` / `terminal_refusal` / `retry` / `in_flight` / `pending` / `expired` / `held` / `recheck_pending` / `stale`) | attempts so far | the per-key money index (review 24.09 #2 H4, #4 H2, #5 H1–H2): one step of settling a POSTed txId's reservation by the quorum, independent of client rechecks. `released` never ends the entry: it becomes a `watch` (the txId had a permit, so a late landing is still possible). A watch ends ONLY with the chain's proof that the anchor expired (`anchor_proof` below) AND a SECOND read of the full status set, taken after the proof, that still says dead (`watch`/`expired`); a dead read before the proof is not evidence (review #6 H: mined in between → the second read books `spent`; pending or short of the quorum → `watch`/`recheck_pending`, kept); no proof → `watch`/`held`. `in_flight` = `released` refused under an open send lease — the step fetched the proof and, with it accepted, read the pool AGAIN before asking: mined meanwhile → `spent`, dead again → `released`, anything else → `released`/`recheck_pending` (nothing freed). `stale` = the entry is older than `MONEY_STALE_MS` (7 d): escalated (a `MONEY_RECONCILE_STALE` log line), slowed to `MONEY_STALE_BACKOFF_MS` (6 h) — NEVER dropped (an obligation ends with a fact, not with age). A late money quorum on a watched txId is booked `released → spent` by this step (`spent`/`settled`, the lattice's `spend_conflict`) |
+| `anchor_proof` | event, kind (`expired` / `valid` / `unavailable`), reason (`ok` / `anchor_height` / `chain_height` / `anchor_disagreement` / `no_anchor`) | chain height − anchor height (−1 when unavailable) | `anchor-expiry.ts`: the chain facts behind the proof of expiry — the anchor block's height (must be AGREED by ≥ 2 operators) and the chain height (the MINIMUM over ≥ 2 operators); `no_anchor` = an entry older than the field, never provable, held |
+| `gateway_call` kind=`info` / `block` | event, kind, host, statusClass | latencyMs | the two reads of the proof of expiry (`/info` height, `/block/hash/<anchor>` height with `indep_hash` equality) |
+| `legacy_closure_failed` | event, where (the DO route that failed or answered an incomplete shape) | — | the closure of the legacy set stayed OPEN because an enumeration failed (never «closed, nothing to hold») |
+| `gateway_call` kind=`legacy_header` | event, `legacy_header`, host, statusClass (`invalid_response` = a header that does not verify: id ≠, signature, owner) | latencyMs | the legacy closure reading `/tx/<id>` of a pre-D10 transaction at a payload origin |
+| `legacy_reward_unknown` | event | — | the closure could not read a verified header at any origin: `init` refused |
+| `legacy_held_registered` | event | items registered | `/admin/spend/init` after the closure registered holds |
+| `legacy_resolved` | event, outcome (`spent` / `dropped`) | — | `/admin/spend/init` in `done`, one per held item resolved by the quorum |
+| `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
+
+| `spend_conflict` | event, outcome (`spent`) | — | `settleByTx` (recheck path, money index, scheduler) when the guard answered `conflict: true` — the lattice booked `released → spent` for a reservation that had been released (a late landing, §7); a `SPEND_CONFLICT` log line accompanies it. **An alert, not the evidence:** the answer can be lost and a retry is a no-op (`conflict: false`), and Analytics Engine may drop or sample a write. The soak's strict zero reads the DURABLE counter the DO writes in the same transaction as the booking — `/admin/spend/status` → `guard.conflicts { count, lastAt, lastSpendKey, lastOutcome }` (review 25.09) |
 
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
-`legacy_resolved{outcome}`, `ledger_inconsistent`, `spend_conflict` and the
-remaining gauges — they come with the scheduler and the closure of the legacy set.
+`ledger_inconsistent` and the remaining gauges — they come with the writer.
 
 The `/upload` answer codes the saga adds (`worker/src/upload-codes.json`):
 `spend_guard_unconfigured` (step 0, pre-admission — the limits are missing)
 and, post-admission, `spend_guard_unavailable`, `spend_frozen`,
 `spend_not_initialized`, `spend_floor`, `spend_window_cap`,
 `spend_quote_mismatch`, `spend_ledger_inconsistent`, `activate_conflict`,
-`spend_remap_refused` — all 503, all BEFORE any POST.
+`spend_remap_refused` — all 503, all BEFORE any POST. The scheduler adds
+`recovery_in_progress` (the note is a `signed` / `redrop_pending` record the
+scheduler owns; the request nudged one step) and `recovery_capacity` (the
+per-key recovery cap, refused before signing) — both 503, retryable.
 
 ## What PR-3a deliberately does NOT measure
 

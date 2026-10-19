@@ -21,9 +21,11 @@ import { metricsErrorCodes, metricsRay } from './metrics-diagnostics';
 import { verifyBearerSecret } from './admin-auth';
 import { probeStatusOrigin } from './gateway-reads';
 import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
+import { recoveryCensus } from './recovery-census';
 import { permittedPost } from './spend-send';
 import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
-import { moneyQuorum } from './spend-ledger';
+import { moneyQuorum, SPEND_CODES } from './spend-ledger';
+import { distinctOperators, operatorOfEnv } from './operators';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -81,6 +83,12 @@ interface Env {
    *  Empty/unset falls back to a lone arweave.net, where `dead` is unreachable
    *  by construction. */
   STATUS_GATEWAYS?: string;
+  /** `canonicalOrigin=operatorId` pairs for the status pool (operators.ts):
+   *  the D10 money quorums count OPERATORS, not origins. MUST equal the pin
+   *  in scripts/gateway-pins.mjs; the deploy gate checks it. Unset falls back
+   *  to the pinned default; an origin missing from the map casts no money
+   *  vote (fail-closed). */
+  STATUS_OPERATORS?: string;
   /** Bare https origins for D9 publication authentication, comma separated,
    *  and the ORDER IS NORMATIVE — the pool is tried in sequence. Separate from
    *  STATUS_GATEWAYS because the two answer different questions: status needs
@@ -262,6 +270,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       statusQuorumPolicy: QUORUM_POLICY_ID,
       statusGatewaysCount: origins.length,
       statusGatewaysHash: await statusGatewaysHash(origins),
+      // How many DISTINCT operators the pool maps to (operators.ts): below
+      // MIN_BALANCE_SOURCES no money quorum can ever form — visible here, not
+      // discovered at the first settle.
+      statusOperatorsCount: distinctOperators(env, origins),
       // Identity of what is ACTUALLY running: the SHA the trusted workflow
       // deployed, and the version id Cloudflare activated. The SHA alone cannot
       // distinguish a re-deploy of the same commit — the version id can.
@@ -310,6 +322,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === '/admin/ops' && request.method === 'POST') {
     return handleAdminOps(request, env);
+  }
+  if (url.pathname === '/admin/recovery-census' && request.method === 'POST') {
+    return handleAdminRecoveryCensus(request, env);
   }
   // D10 operator routes (spend-admin.ts): SPEND_ADMIN_SECRET only; the JSON
   // Content-Type rule above applies (POST), no-store is attached centrally.
@@ -1116,8 +1131,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
    */
   const liveOf = async (txId: string): Promise<'alive' | 'dead' | 'unavailable'> => {
     const { live, votes } = await getTxVerdictWorker(txId, emit, env);
-    const q = moneyQuorum(votes, origin => origin);
-    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height });
+    const q = moneyQuorum(votes, operatorOfEnv(env));
+    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height }, emit);
     return live;
   };
   /** The second call of the redrop order (§8): a PROVEN dead transaction
@@ -1382,6 +1397,20 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     // the historical txId.
     attest('conflict', checkResult.txId);
     return settle('conflict', idPayloadConflict(checkResult.txId), { txId: checkResult.txId });
+  }
+  if (checkResult.status === 'recovering') {
+    // PR-3b: the scheduler owns this note (`signed` / `redrop_pending`).
+    // Trigger (а) of the reconciliation: one step now, then a retryable 503 —
+    // the record moves only by resend of the same bytes or by the quorum,
+    // never by this request's payload. The DO closed the journal record
+    // itself; settle repeats the identical finish.
+    try { await doCall('/recover-now', { noteId }); } catch (e) { console.error('RECOVER_NOW_UNREACHABLE', noteId, e); }
+    return settle('recovery_in_progress', uploadError(503, 'recovery_in_progress', 'Publication is being recovered server-side, retry later', { txId: checkResult.txId }));
+  }
+  if (checkResult.status === 'recovery_capacity') {
+    // The recovery cap (MAX_RECOVERY_INFLIGHT = the hourly quota): refused
+    // BEFORE anything is signed, retryable once the backlog drains.
+    return settle('recovery_capacity', uploadError(503, 'recovery_capacity', 'Too many publications in recovery for this key, retry later'));
   }
 
   let reserveToken: string;
@@ -1677,6 +1706,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       uploadError(503, activated.refusal.code, 'Spend guard refused the activation', activated.refusal.detail));
   }
   if (activated.outcome === 'remap') emit('activate_remap', [], []);
+  if (activated.state !== 'active') {
+    // A terminal no-op (`spent` / `released` under our own activatedBy): the
+    // saga already ended elsewhere — POST is forbidden after a terminal
+    // activate (plan v19 «терминальный no-op», review 24.09 #2 H1).
+    emit('activate_conflict', ['terminal'], []);
+    const aborted = await abortBeforeSend(SPEND_CODES.activateConflict);
+    return settle(aborted ? 'audit_aborted' : SPEND_CODES.activateConflict,
+      uploadError(503, SPEND_CODES.activateConflict, 'Reservation already settled', { state: activated.state }));
+  }
 
   // Phase C. permit-send → the send, with nothing in between (spend-send.ts is
   // the ONLY path to POST /tx; worker/scripts/permit-send-static.test.mjs).
@@ -1684,11 +1722,24 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   const sent = await permittedPost(guard, arweave, signedTx,
     { txId: candidateTxId, kind: permitKind, cycle: activated.cycle, spendKey }, transportDeps);
   if (sent.sent === false) {
+    const code = sent.refusal.code;
+    emit('permit_refused', [code], []);
+    if (code === SPEND_CODES.sendInFlight) {
+      // A permit for this txId EXISTS and its executor has not reported: the
+      // bytes may be on the network. That is the «durable recovery» branch of
+      // §4.0, not the abort — nothing is released; the reservation is settled
+      // by the quorum (the money index). Unreachable for a fresh txId of the
+      // current format; kept for the protocol's sake (review 24.09 #4, high 1).
+      await safeRelease(reserveToken);
+      console.error('ARWEAVE_POST_IN_FLIGHT_ELSEWHERE', noteId, candidateTxId);
+      emit('upload_outcome', ['post_unknown', declaredVersion], []);
+      return settle('post_unknown',
+        uploadError(502, 'arweave_post_unknown', 'A send of this transaction is in progress elsewhere', { txId: candidateTxId }),
+        { paidResult: 'unknown', txId: candidateTxId });
+    }
     // No permit was ever issued for this txId — provably never sent (§4.0):
     // frozen / not initialised / the guard did not answer. The record stays
     // consistent: aborted, released, and answered with the guard's code.
-    const code = sent.refusal.code;
-    emit('permit_refused', [code], []);
     const aborted = await abortBeforeSend(code);
     return settle(aborted ? 'audit_aborted' : code, uploadError(503, code, 'Spend guard refused the send'));
   }
@@ -1725,7 +1776,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   let anchored = false;
   for (let attempt = 0; attempt < 3 && !anchored; attempt++) {
     try {
-      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken });
+      const resp = await doCall('/mark-posted', { noteId, txId, token: reserveToken, anchor: signedTx.last_tx });
       const body: { ok: boolean } = await resp.json();
       if (resp.ok && body.ok) anchored = true;
     } catch { /* retry */ }
@@ -1736,7 +1787,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   let committed = false;
   for (let attempt = 0; attempt < 3 && !committed; attempt++) {
     try {
-      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken });
+      const commitResp = await doCall('/commit', { noteId, txId, token: reserveToken, anchor: signedTx.last_tx });
       const commit: { ok: boolean; stale?: boolean } = await commitResp.json();
       if (commitResp.ok && commit.ok) committed = true;
       else if (commit.stale) break; // reservation superseded — do not keep retrying
@@ -2133,10 +2184,38 @@ function logTelemetryProbe(probeId: string): void {
  * question, and the metrics reader is the least-privilege identity that already
  * exists for telemetry (it holds no seed-invite or revoke rights).
  */
-const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops', ...SPEND_ADMIN_PATHS]);
+const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops', '/admin/recovery-census', ...SPEND_ADMIN_PATHS]);
 
 /** `/admin/spend/*` with the production dependencies (D10 spend-admin.ts). */
 const handleSpendAdmin = createSpendAdminHandler();
+
+// ─── /admin/recovery-census — is every recovery set empty? ──────────
+
+/**
+ * POST /admin/recovery-census — the operator's rollback census
+ * (recovery-census.ts; runbook reader release §5.1, review 25.09 H3).
+ *
+ * Read-only and behind the read-only METRICS_ADMIN_SECRET: it answers a
+ * question, it grants nothing. The answer is a SUMMARY — completeness of the
+ * enumeration, keys listed/checked/failed, recovery counter/index/records,
+ * reason codes — and the worker's identity, so the operator can tie the
+ * census to the version it was read from. Never a key, noteId or txId.
+ * The body is ignored (`{}` is enough); no-store like every admin path.
+ */
+async function handleAdminRecoveryCensus(request: Request, env: Env): Promise<Response> {
+  if (!env.METRICS_ADMIN_SECRET) return error('Census endpoint not configured', 503);
+  if (!(await verifyBearerSecret(env.METRICS_ADMIN_SECRET, request.headers.get('Authorization')))) {
+    return error('Unauthorized', 401);
+  }
+  const body = await readLimitedBody(request, METRICS_REQUEST_BODY_CAP_BYTES);
+  if ('tooLarge' in body) return body.tooLarge;
+  const census = await recoveryCensus(env);
+  return json({
+    workerVersionId: env.CF_VERSION_METADATA?.id ?? null,
+    releaseSha: env.RELEASE_SHA ?? null,
+    census,
+  });
+}
 
 // ─── /admin/ops — the operation journal, projected ──────────────────
 
