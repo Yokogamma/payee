@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import {
   checkWorkflowInvariants,
   loadWorkflowFiles,
@@ -62,6 +63,107 @@ describe('реестр co-deploy = env: шага подготовки', () => {
       expect(call.indexOf('env -u')).toBeLessThan(call.indexOf('node scripts/'));
       expect(call).toContain(k);
     }
+  });
+
+  // Ревью H2 (runbook reader-релиза рев. 7): добавить имя в реестр мало —
+  // нужны env:, --arg с веткой jq, env -u и строка в SECRETS.md. Каждое звено
+  // проверяется по КАЖДОМУ имени реестра, чтобы новое имя не прошло наполовину.
+  const loadPrep = async () => {
+    const { load } = await import('js-yaml');
+    const { readFileSync } = await import('node:fs');
+    const doc = load(readFileSync(new URL('../.github/workflows/deploy-worker.yml', import.meta.url), 'utf8'));
+    const steps = doc.jobs['deploy-worker'].steps ?? [];
+    const prepIndex = steps.findIndex(s => typeof s?.run === 'string' && s.run.includes('co-deploy-secrets.json') && s.env);
+    return { steps, prepIndex, prep: steps[prepIndex] };
+  };
+
+  it('каждое имя реестра: env из secrets.<NAME>, --arg из $CO_DEPLOY_<NAME> и ключ <NAME> в программе jq', async () => {
+    const { CO_DEPLOY_REGISTRY } = await import('./require-co-deploy-secrets.mjs');
+    const { prep } = await loadPrep();
+    for (const name of CO_DEPLOY_REGISTRY) {
+      expect(prep.env[`CO_DEPLOY_${name}`], name).toBe(`\${{ secrets.${name} }}`);
+      const arg = prep.run.match(new RegExp(`--arg (\\w+) "\\$CO_DEPLOY_${name}"`));
+      expect(arg, `--arg for ${name}`).toBeTruthy();
+      expect(prep.run, `jq branch for ${name}`).toMatch(new RegExp(`\\{ ${name}: \\$${arg[1]} \\}`));
+    }
+  });
+
+  it('SPEND_ADMIN_SECRET — в реестре, и шаг подготовки (отказ exit 1) стоит ДО шага деплоя', async () => {
+    const { CO_DEPLOY_REGISTRY } = await import('./require-co-deploy-secrets.mjs');
+    expect(CO_DEPLOY_REGISTRY).toContain('SPEND_ADMIN_SECRET');
+    const { steps, prepIndex } = await loadPrep();
+    const deployIndex = steps.findIndex(s => s?.id === 'deploy');
+    expect(prepIndex).toBeGreaterThanOrEqual(0);
+    expect(deployIndex).toBeGreaterThan(prepIndex);
+  });
+
+  it('таблица реестра в docs/SECRETS.md = CO_DEPLOY_REGISTRY', async () => {
+    const { CO_DEPLOY_REGISTRY } = await import('./require-co-deploy-secrets.mjs');
+    const { readFileSync } = await import('node:fs');
+    const md = readFileSync(new URL('../docs/SECRETS.md', import.meta.url), 'utf8');
+    const start = md.indexOf('**Registry of co-deployed secrets**');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const tableLines = md.slice(start).split(String.fromCharCode(10)).slice(1);
+    const rows = [];
+    let inTable = false;
+    for (const line of tableLines) {
+      if (line.startsWith('|')) { inTable = true; rows.push(line); } else if (inTable) break;
+    }
+    const names = rows.slice(2).map(r => r.split('|')[1].trim().replace(/`/g, '')).sort();
+    expect(names).toEqual([...CO_DEPLOY_REGISTRY].sort());
+  });
+});
+
+// Сам шаг подготовки, как его исполнит раннер (bash + jq). jq есть на
+// ubuntu-latest (CI); локально без jq блок пропускается — доказательство
+// даёт CI. Значение секрета не должно попадать ни в stdout, ни в stderr.
+const hasJq = spawnSync('jq', ['--version'], { encoding: 'utf8' }).status === 0;
+
+describe.skipIf(!hasJq)('шаг «Prepare the co-deployed secrets file» исполняется (bash + jq)', () => {
+  const runStep = async (env) => {
+    const { load } = await import('js-yaml');
+    const { readFileSync, mkdtempSync, writeFileSync, existsSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join, dirname } = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const root = dirname(dirname(fileURLToPath(import.meta.url)));
+    const doc = load(readFileSync(join(root, '.github/workflows/deploy-worker.yml'), 'utf8'));
+    const prep = doc.jobs['deploy-worker'].steps.find(s => typeof s?.run === 'string' && s.run.includes('co-deploy-secrets.json') && s.env);
+    const dir = mkdtempSync(join(tmpdir(), 'codeploy-'));
+    const script = join(dir, 'step.sh');
+    writeFileSync(script, prep.run);
+    const out = join(dir, 'github-output');
+    writeFileSync(out, '');
+    const r = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', script], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, RUNNER_TEMP: dir, GITHUB_OUTPUT: out, ...env },
+    });
+    const file = join(dir, 'co-deploy-secrets.json');
+    return { r, file, exists: existsSync(file), json: existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null, output: readFileSync(out, 'utf8') };
+  };
+  const VALUE = 'spend-admin-value-never-printed-4f1c';
+
+  it('required SPEND_ADMIN_SECRET не задан в Environment → exit 1 до деплоя, файл удалён', async () => {
+    const { r, exists } = await runStep({ CO_DEPLOY_CF_ANALYTICS_TOKEN: '', CO_DEPLOY_SPEND_ADMIN_SECRET: '', REQUIRED_SECRETS: 'SPEND_ADMIN_SECRET' });
+    expect(r.status).toBe(1);
+    expect(`${r.stdout}${r.stderr}`).toMatch(/SPEND_ADMIN_SECRET is not set in the Environment/);
+    expect(exists).toBe(false);
+  });
+
+  it('задан и required → exit 0, в файле ровно этот ключ, значение не напечатано', async () => {
+    const { r, json, output } = await runStep({ CO_DEPLOY_CF_ANALYTICS_TOKEN: '', CO_DEPLOY_SPEND_ADMIN_SECRET: VALUE, REQUIRED_SECRETS: 'SPEND_ADMIN_SECRET' });
+    expect(r.status).toBe(0);
+    expect(json).toEqual({ SPEND_ADMIN_SECRET: VALUE });
+    expect(output).toMatch(/count=1/);
+    expect(`${r.stdout}${r.stderr}`).not.toContain(VALUE);
+  });
+
+  it('обычный деплой без required и без секретов → {} и count=0', async () => {
+    const { r, json, output } = await runStep({ CO_DEPLOY_CF_ANALYTICS_TOKEN: '', CO_DEPLOY_SPEND_ADMIN_SECRET: '', REQUIRED_SECRETS: '' });
+    expect(r.status).toBe(0);
+    expect(json).toEqual({});
+    expect(output).toMatch(/count=0/);
   });
 });
 

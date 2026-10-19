@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ANCHOR_EXPIRY_BLOCKS, ANCHOR_EXPIRY_MARGIN_BLOCKS, MAX_STATUS_HEIGHT_SKEW, MIN_DEPOSIT_CONFIRMATIONS, PREPARED_LEASE_MS, SPEND_CODES, SPEND_WINDOW_MS, HOUR_MS,
-  activateOutcome, addToBucket, anchorExpired, available, creditDeposit, initTransition, leaseOpen, permitDecision, prepareDecision,
+  activateOutcome, addToBucket, anchorExpired, available, creditDeposit, initTransition, leaseOpen, moneyQuorum, permitDecision, prepareDecision,
   refusalBranch, reinit, resolveLegacy, settle, spentLast24h,
   type CycleLedger, type InitRecord, type FreezeState,
 } from '../src/spend-ledger';
@@ -250,6 +250,24 @@ describe('§4.0 п. 6 legacy resolution after done', () => {
     expect(resolveLegacy({ hInit: 100, verdict: { kind: 'dead', ageGuardPassed: false } })).toBe('held');
     expect(resolveLegacy({ hInit: 100, verdict: { kind: 'pending' } })).toBe('held');
     expect(resolveLegacy({ hInit: 100, verdict: { kind: 'unavailable' } })).toBe('held');
+  });
+});
+
+describe('the money quorum counts OPERATORS, not origins (D11 M4 / operator map, review 25.09)', () => {
+  const vote = (origin: string, confirmations = 60, blockHeight = 1000) => ({ origin, kind: 'confirmed' as const, confirmations, blockHeight });
+  it('two origins of ONE operator are one voice — no quorum; two operators — a quorum; the height is the maximum agreed', () => {
+    const same = () => 'op';
+    expect(moneyQuorum([vote('https://a'), vote('https://b')], same)).toEqual({ ok: false, operators: 1 });
+    const two = (o: string) => (o === 'https://a' ? 'op-a' : 'op-b');
+    expect(moneyQuorum([vote('https://a', 60, 1000), vote('https://b', 61, 1002)], two)).toMatchObject({ ok: true, height: 1002, operators: 2 });
+  });
+  it('an origin the map does not know casts NO vote (fail-closed): it neither forms a quorum nor becomes a voice of its own', () => {
+    const partial = (o: string) => (o === 'https://a' ? 'op-a' : null);
+    expect(moneyQuorum([vote('https://a'), vote('https://b')], partial)).toEqual({ ok: false, operators: 1 });
+    expect(moneyQuorum([vote('https://b'), vote('https://c')], () => null)).toEqual({ ok: false, operators: 0 });
+    // …and never lends its height to the agreed set.
+    const three = (o: string) => (o === 'https://c' ? null : o);
+    expect(moneyQuorum([vote('https://a', 60, 1000), vote('https://b', 60, 1001), vote('https://c', 60, 5000)], three)).toMatchObject({ ok: true, height: 1001, operators: 2 });
   });
 });
 

@@ -18,6 +18,10 @@ export default defineConfig({
           // Two origins: with a single one the dead quorum is unreachable by
           // construction, and the redrop suites are about reaching it.
           STATUS_GATEWAYS: 'https://arweave.net,https://g2.test',
+          // The operator map (operators.ts): the two test origins are two
+          // operators, so money quorums are reachable; a suite that wants
+          // ONE operator overrides STATUS_OPERATORS in its env.
+          STATUS_OPERATORS: 'https://arweave.net=arweave,https://g2.test=g2',
           ADMIN_SECRET: 'test-admin-secret',
           // A JWK whose ADDRESS is knowable: /upload refuses while the signing
           // wallet is outside TRUSTED_OWNERS, so the two must agree. Still not
@@ -38,6 +42,7 @@ export default defineConfig({
   test: {
     include: [
       'test/e2e-repost.test.ts',
+      'test/operator-map.test.ts',
       'test/v3-gate-e2e.test.ts',
       'test/v4-gate-e2e.test.ts',
       'test/uploads-gate-e2e.test.ts',
@@ -68,6 +73,9 @@ export default defineConfig({
       'test/rollback-reader-spend.test.ts',
       'test/recovery-scheduler.test.ts',
       'test/spend-guard.legacy.test.ts',
+      // /admin/recovery-census: env overrides and wrapped namespaces
+      // (failure injection) — same isolation reasoning as above.
+      'test/recovery-census.test.ts',
     ],
     // Same reasoning as vitest.config.mts: one module registry across files so
     // re-importing src/index.ts can't invalidate Durable Objects mid-run.

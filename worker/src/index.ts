@@ -21,9 +21,11 @@ import { metricsErrorCodes, metricsRay } from './metrics-diagnostics';
 import { verifyBearerSecret } from './admin-auth';
 import { probeStatusOrigin } from './gateway-reads';
 import { createSpendAdminHandler, readSpendLimits, SPEND_ADMIN_PATHS, SPEND_ADMIN_PREFIX } from './spend-admin';
+import { recoveryCensus } from './recovery-census';
 import { permittedPost } from './spend-send';
 import { activateSpend, prepareSpend, refreshBalanceIfStale, releaseSpend, settleByTx, spendKeyFor } from './spend-saga';
 import { moneyQuorum, SPEND_CODES } from './spend-ledger';
+import { distinctOperators, operatorOfEnv } from './operators';
 import { APP_NAME, SUPPORTED_VERSIONS, isSupportedVersion } from './protocol';
 import { computePublicationFp } from './publication-fp';
 import type { LegacySnapshot } from './rate-limiter';
@@ -81,6 +83,12 @@ interface Env {
    *  Empty/unset falls back to a lone arweave.net, where `dead` is unreachable
    *  by construction. */
   STATUS_GATEWAYS?: string;
+  /** `canonicalOrigin=operatorId` pairs for the status pool (operators.ts):
+   *  the D10 money quorums count OPERATORS, not origins. MUST equal the pin
+   *  in scripts/gateway-pins.mjs; the deploy gate checks it. Unset falls back
+   *  to the pinned default; an origin missing from the map casts no money
+   *  vote (fail-closed). */
+  STATUS_OPERATORS?: string;
   /** Bare https origins for D9 publication authentication, comma separated,
    *  and the ORDER IS NORMATIVE — the pool is tried in sequence. Separate from
    *  STATUS_GATEWAYS because the two answer different questions: status needs
@@ -262,6 +270,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       statusQuorumPolicy: QUORUM_POLICY_ID,
       statusGatewaysCount: origins.length,
       statusGatewaysHash: await statusGatewaysHash(origins),
+      // How many DISTINCT operators the pool maps to (operators.ts): below
+      // MIN_BALANCE_SOURCES no money quorum can ever form — visible here, not
+      // discovered at the first settle.
+      statusOperatorsCount: distinctOperators(env, origins),
       // Identity of what is ACTUALLY running: the SHA the trusted workflow
       // deployed, and the version id Cloudflare activated. The SHA alone cannot
       // distinguish a re-deploy of the same commit — the version id can.
@@ -310,6 +322,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === '/admin/ops' && request.method === 'POST') {
     return handleAdminOps(request, env);
+  }
+  if (url.pathname === '/admin/recovery-census' && request.method === 'POST') {
+    return handleAdminRecoveryCensus(request, env);
   }
   // D10 operator routes (spend-admin.ts): SPEND_ADMIN_SECRET only; the JSON
   // Content-Type rule above applies (POST), no-store is attached centrally.
@@ -1116,8 +1131,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
    */
   const liveOf = async (txId: string): Promise<'alive' | 'dead' | 'unavailable'> => {
     const { live, votes } = await getTxVerdictWorker(txId, emit, env);
-    const q = moneyQuorum(votes, origin => origin);
-    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height });
+    const q = moneyQuorum(votes, operatorOfEnv(env));
+    if (q.ok) await settleByTx(guard, { txId, outcome: 'spent', height: q.height }, emit);
     return live;
   };
   /** The second call of the redrop order (§8): a PROVEN dead transaction
@@ -2169,10 +2184,38 @@ function logTelemetryProbe(probeId: string): void {
  * question, and the metrics reader is the least-privilege identity that already
  * exists for telemetry (it holds no seed-invite or revoke rights).
  */
-const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops', ...SPEND_ADMIN_PATHS]);
+const NO_STORE_PATHS = new Set(['/admin/metrics', '/admin/telemetry-probe', '/admin/ops', '/admin/recovery-census', ...SPEND_ADMIN_PATHS]);
 
 /** `/admin/spend/*` with the production dependencies (D10 spend-admin.ts). */
 const handleSpendAdmin = createSpendAdminHandler();
+
+// ─── /admin/recovery-census — is every recovery set empty? ──────────
+
+/**
+ * POST /admin/recovery-census — the operator's rollback census
+ * (recovery-census.ts; runbook reader release §5.1, review 25.09 H3).
+ *
+ * Read-only and behind the read-only METRICS_ADMIN_SECRET: it answers a
+ * question, it grants nothing. The answer is a SUMMARY — completeness of the
+ * enumeration, keys listed/checked/failed, recovery counter/index/records,
+ * reason codes — and the worker's identity, so the operator can tie the
+ * census to the version it was read from. Never a key, noteId or txId.
+ * The body is ignored (`{}` is enough); no-store like every admin path.
+ */
+async function handleAdminRecoveryCensus(request: Request, env: Env): Promise<Response> {
+  if (!env.METRICS_ADMIN_SECRET) return error('Census endpoint not configured', 503);
+  if (!(await verifyBearerSecret(env.METRICS_ADMIN_SECRET, request.headers.get('Authorization')))) {
+    return error('Unauthorized', 401);
+  }
+  const body = await readLimitedBody(request, METRICS_REQUEST_BODY_CAP_BYTES);
+  if ('tooLarge' in body) return body.tooLarge;
+  const census = await recoveryCensus(env);
+  return json({
+    workerVersionId: env.CF_VERSION_METADATA?.id ?? null,
+    releaseSha: env.RELEASE_SHA ?? null,
+    census,
+  });
+}
 
 // ─── /admin/ops — the operation journal, projected ──────────────────
 

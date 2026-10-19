@@ -91,7 +91,7 @@ on:
       # rotation names the secrets it requires here and the job stops BEFORE
       # any upload when one of them is missing.
       required_secrets:
-        description: 'Comma-separated worker secret names that MUST be present in the co-deploy file (e.g. CF_ANALYTICS_TOKEN); empty for an ordinary deploy'
+        description: 'Comma-separated worker secret names that MUST be present in the co-deploy file (e.g. CF_ANALYTICS_TOKEN, SPEND_ADMIN_SECRET); empty for an ordinary deploy'
         required: false
         default: ''
         type: string
@@ -314,17 +314,21 @@ jobs:
       # every deploy did before this step existed.
       #
       # Registry of co-deployed secrets (docs/SECRETS.md «Co-deployed
-      # secrets»): CF_ANALYTICS_TOKEN. Adding one = one more `env:` line and
-      # one more `--arg` here, plus its row in the registry.
+      # secrets»): CF_ANALYTICS_TOKEN, SPEND_ADMIN_SECRET. Adding one = its
+      # name in CO_DEPLOY_REGISTRY (scripts/require-co-deploy-secrets.mjs),
+      # one more `env:` line, one more `--arg` + jq branch and one more
+      # `env -u` here, plus its row in the registry — the invariants test
+      # refuses any of them missing.
       - name: Prepare the co-deployed secrets file
         id: cosecrets
         run: |
           set +x
           umask 077
           FILE="$RUNNER_TEMP/co-deploy-secrets.json"
-          jq -n --arg cf_analytics_token "$CO_DEPLOY_CF_ANALYTICS_TOKEN" '
+          jq -n --arg cf_analytics_token "$CO_DEPLOY_CF_ANALYTICS_TOKEN" --arg spend_admin_secret "$CO_DEPLOY_SPEND_ADMIN_SECRET" '
             {}
             | if ($cf_analytics_token | length) > 0 then . + { CF_ANALYTICS_TOKEN: $cf_analytics_token } else . end
+            | if ($spend_admin_secret | length) > 0 then . + { SPEND_ADMIN_SECRET: $spend_admin_secret } else . end
           ' > "$FILE"
           COUNT=$(jq 'length' "$FILE")
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
@@ -337,12 +341,13 @@ jobs:
           # variable is removed from its environment (`env -u`), so the value
           # is not merely unread but absent from that process.
           PRESENT_SECRET_NAMES="$(jq -c 'keys' "$FILE")"
-          if ! env -u CO_DEPLOY_CF_ANALYTICS_TOKEN PRESENT_SECRET_NAMES="$PRESENT_SECRET_NAMES" node scripts/require-co-deploy-secrets.mjs; then
+          if ! env -u CO_DEPLOY_CF_ANALYTICS_TOKEN -u CO_DEPLOY_SPEND_ADMIN_SECRET PRESENT_SECRET_NAMES="$PRESENT_SECRET_NAMES" node scripts/require-co-deploy-secrets.mjs; then
             rm -f "$FILE"
             exit 1
           fi
         env:
           CO_DEPLOY_CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+          CO_DEPLOY_SPEND_ADMIN_SECRET: ${{ secrets.SPEND_ADMIN_SECRET }}
           REQUIRED_SECRETS: ${{ inputs.required_secrets }}
       # A candidate whose own wrangler does not know the flag would fail AFTER
       # the previous version was already replaced? No — it would fail at
@@ -386,17 +391,33 @@ jobs:
         run: node scripts/read-wrangler-version.mjs "$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
         env:
           OUTPUT_FILE: ${{ runner.temp }}/wrangler-output.ndjson
+      # ── The operator floor of THIS candidate (runbook reader release §6.9) ──
+      # Decided by the candidate's own config (scripts/operators-floor.mjs, run
+      # from this trusted checkout): a build that carries SpendGuard books
+      # money only on a quorum of >= 2 independent operators, so its /health
+      # must show them; a historical candidate without SpendGuard is not asked
+      # (its /health has no such field) and a rollback stays possible.
+      - id: opfloor
+        run: node scripts/operators-floor.mjs --config=candidate/worker/wrangler.toml >> "$GITHUB_OUTPUT"
       # ── Post-deploy smoke against the live worker ──
       # Detector, not a rollback: Cloudflare activates the version before this
       # can answer. Recovery from a red smoke is roll-forward (docs/ROLLBACK.md).
       - name: Smoke the live worker
         # The profile goes through env: — no `${{ }}` inside run: anywhere
         # (§1.7): the expression expands TEXTUALLY before the shell starts.
-        run: node worker/scripts/smoke-gateways.mjs --profile="$PROFILE"
+        #
+        # --allow-historical-pool: THIS step alone may expect a registered
+        # historical build's own pool (scripts/gateway-pins.mjs
+        # HISTORICAL_POOLS, full SHA — a rollback across a pool change). The
+        # Pages pre-publish smoke never passes it: the client it publishes is
+        # built on the current pool, so the worker under it must be too.
+        run: node worker/scripts/smoke-gateways.mjs --profile="$PROFILE" --allow-historical-pool
         env:
           PROFILE: ${{ inputs.profile }}
           EXPECT_RELEASE_SHA: ${{ inputs.candidate }}
           EXPECT_WORKER_VERSION_ID: ${{ steps.version.outputs.version_id }}
+          # Empty for a candidate without SpendGuard — then nothing is asserted.
+          EXPECT_MIN_OPERATORS: ${{ steps.opfloor.outputs.min_operators }}
           # Right after a deploy some edges still answer from the previous
           # version. That is propagation, not a bad release, so give the smoke
           # a minute to see the new one before it calls the release broken.

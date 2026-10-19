@@ -548,3 +548,32 @@ describe('legacy holds and reinit — cycle ledger ≠ audit ≠ budget', () => 
     expect((await call(sg, '/prepare', { spendKey: 'k2', reward: '10', revision: 1, quoteId: q2, bytes: 1000, limits: { ...big, windowCap: '905' }, now: T0 + 3 })).body.code).toBe(SPEND_CODES.windowCap);
   });
 });
+
+describe('durable money-conflict evidence (review 25.09, H): booked in the SAME transaction as the settle, survives a lost answer, never doubled by a retry', () => {
+  it('released -> spent books conflicts.count = 1 even when the answer is lost; the retry is a lattice no-op with conflict:false and the count stays 1; /status exposes it', async () => {
+    const sg = await initialized(fresh('conflicts'));
+    await credit(sg, 'D', '1000', 2000);
+    expect((await status(sg) as unknown as { conflicts: { count: number } }).conflicts).toEqual({ count: 0, lastAt: null, lastSpendKey: null, lastOutcome: null });
+    const q = await quote(sg, 100, '10');
+    await call(sg, '/prepare', { spendKey: 'k', reward: '10', revision: 0, quoteId: q, bytes: 100, limits: LIMITS, now: T0 });
+    await call(sg, '/activate', { spendKey: 'k', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: T0 });
+    const p = await call(sg, '/permit-send', { txId: 'LATE', kind: 'upload', cycle: 1, spendKey: 'k', anchor: ANCHOR_A, now: T0 });
+    await call(sg, '/send-done', { txId: 'LATE', sendToken: p.body.sendToken });
+    expect((await call(sg, '/settle', { spendKey: 'k', outcome: 'released', now: T0 + 1 })).body).toMatchObject({ state: 'released' });
+    // The reviewer's second scenario: the DO books the conflict, the ANSWER
+    // is lost on the way back (we simply do not look at it), the caller
+    // retries. The durable evidence was written with the booking.
+    await call(sg, '/settle-by-tx', { txId: 'LATE', outcome: 'spent', height: 5000, now: T0 + 2 });
+    const retry = await call(sg, '/settle-by-tx', { txId: 'LATE', outcome: 'spent', height: 5000, now: T0 + 3 });
+    expect(retry.body).toMatchObject({ state: 'spent', noop: true, conflict: false });
+    const s = await status(sg) as unknown as { ledger: { spent: string; pending: string }; conflicts: { count: number; lastAt: number; lastSpendKey: string; lastOutcome: string } };
+    expect(s.ledger).toMatchObject({ spent: '10', pending: '0' });
+    expect(s.conflicts).toMatchObject({ count: 1, lastAt: T0 + 2, lastSpendKey: 'k', lastOutcome: 'spent' });
+    // A second, honest settle of another reservation (active -> spent) is not a conflict.
+    const q2 = await quote(sg, 100, '10');
+    await call(sg, '/prepare', { spendKey: 'k2', reward: '10', revision: 0, quoteId: q2, bytes: 100, limits: LIMITS, now: T0 + 10 });
+    await call(sg, '/activate', { spendKey: 'k2', reward: '10', revision: 0, activatedBy: '10:0', limits: LIMITS, now: T0 + 10 });
+    expect((await call(sg, '/settle', { spendKey: 'k2', outcome: 'spent', now: T0 + 11 })).body).toMatchObject({ state: 'spent', conflict: false });
+    expect((await status(sg) as unknown as { conflicts: { count: number } }).conflicts.count).toBe(1);
+  });
+});

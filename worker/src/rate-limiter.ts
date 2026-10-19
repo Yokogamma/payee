@@ -32,6 +32,7 @@ import {
   type MoneyEntry, type PostedRecord, type RecoveryCas, type RecoveryRecord,
 } from './recovery';
 import { proveAnchorExpired } from './anchor-expiry';
+import { operatorOfEnv } from './operators';
 import { recoverOne, type RecoveryEnv, type RecoveryHost } from './recovery-runner';
 import { statusVerdict } from '../../src/lib/status-quorum';
 import { parseOriginList } from '../../src/lib/gateways-parse';
@@ -170,6 +171,7 @@ export class RateLimiter implements DurableObject {
     if (url.pathname === '/check-and-reserve') return this.handleCheckAndReserve(request);
     if (url.pathname === '/recover-now') return this.handleRecoverNow(request);
     if (url.pathname === '/recovery-status') return this.handleRecoveryStatus();
+    if (url.pathname === '/recovery-census') return this.handleRecoveryCensus();
     if (url.pathname === '/mark-posted') return this.handleMarkPosted(request);
     if (url.pathname === '/commit') return this.handleCommit(request);
     if (url.pathname === '/release') return this.handleRelease(request);
@@ -847,7 +849,7 @@ export class RateLimiter implements DurableObject {
     const origins = parsed.length > 0 ? parsed : [`https://${ARWEAVE_HOST}`];
     const probe = async () => {
       const votes = await Promise.all(origins.map(o => probeStatusOrigin(o, entry.txId, emit)));
-      return { money: moneyQuorum(votes, o => o), dead: statusVerdict(origins, votes).kind === 'dead' };
+      return { money: moneyQuorum(votes, operatorOfEnv(env)), dead: statusVerdict(origins, votes).kind === 'dead' };
     };
     const { money, dead } = await probe();
     const guard = env.SPEND_GUARD.get(env.SPEND_GUARD.idFromName('global'));
@@ -863,7 +865,7 @@ export class RateLimiter implements DurableObject {
       return p === 'expired' || p === 'unknown' ? 'expired' : 'held';
     };
     if (outcome !== null) {
-      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) });
+      let r = await settleByTx(guard, { txId: entry.txId, outcome, ...(money.ok ? { height: money.height } : {}) }, emit);
       let asked: 'spent' | 'released' = outcome;
       if (outcome === 'released' && r === 'in_flight' && (await proveExpiry()) === 'expired') {
         // The proof took time; the dead verdict that led here is stale
@@ -873,9 +875,9 @@ export class RateLimiter implements DurableObject {
         const again = await probe();
         if (again.money.ok) {
           asked = 'spent';
-          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height }, emit);
         } else if (again.dead) {
-          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' });
+          r = await settleByTx(guard, { txId: entry.txId, outcome: 'released' }, emit);
         } else {
           emit('money_reconcile', ['released', 'recheck_pending'], [entry.attempts]);
           r = 'retry';
@@ -906,7 +908,7 @@ export class RateLimiter implements DurableObject {
       } else {
         const again = await probe();
         if (again.money.ok) {
-          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height });
+          const r = await settleByTx(guard, { txId: entry.txId, outcome: 'spent', height: again.money.height }, emit);
           emit('money_reconcile', ['spent', r], [entry.attempts]);
           terminal = r === 'settled' || r === 'noop' || r === 'unknown' || r === 'terminal_refusal';
           result = terminal ? `spent:${r}` : 'retry';
@@ -1026,6 +1028,25 @@ export class RateLimiter implements DurableObject {
     } finally {
       await this.healRecoveryAlarm();
     }
+  }
+
+  /**
+   * COUNTS ONLY, for the operator's rollback census (recovery-census.ts;
+   * runbook reader release §5.1, review 25.09 H3). Three independent answers
+   * to «is this key's recovery set empty?» — the persistent counter, the
+   * index, and a direct scan of the note records — so a drifted counter or
+   * index can never read as empty. No noteId, txId or byte leaves the DO.
+   */
+  private async handleRecoveryCensus(): Promise<Response> {
+    const idx = await this.state.storage.list({ prefix: RECOVERY_INDEX_PREFIX });
+    const notes = await this.state.storage.list<NoteRecord>({ prefix: 'note:' });
+    let records = 0;
+    for (const record of notes.values()) if (record !== undefined && isRecoveryStatus(record.status)) records++;
+    return Response.json({
+      recoveryCount: (await this.state.storage.get<number>(RECOVERY_COUNT_KEY)) ?? 0,
+      due: idx.size,
+      records,
+    });
   }
 
   private async handleRecoveryStatus(): Promise<Response> {
