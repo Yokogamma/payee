@@ -4,7 +4,7 @@ import { MARKER_DEAD_AGE_MS } from '../src/spend-admin';
 import { deferred, setupOutboundMock } from './helpers/outbound-mock';
 import {
   LIMITS_ENV,
-  closed, confirmedAll, deadAll, freshWallet, guardCall, guardStatus, handlerWith, isolatedGuard, markerMocks, pendingAll,
+  ANCHOR, anchorRe, closed, confirmedAll, deadAll, freshWallet, guardCall, guardStatus, handlerWith, isolatedGuard, markerMocks, pendingAll, postRe, priceRe,
   spendEnv, viaHandler,
 } from './helpers/spend-admin';
 
@@ -23,17 +23,15 @@ async function frozen(name: string) {
 }
 
 describe('D10 marker automaton on durable storage', () => {
-  it('preconditions: not frozen → spend_init_not_frozen; limits missing → spend_guard_unconfigured; the legacy set not closed → spend_init_legacy_open (the production default) — no network, no state', async () => {
+  it('preconditions: not frozen → spend_init_not_frozen; limits missing → spend_guard_unconfigured; an open legacy set refuses with its code — no network, no state', async () => {
     const wallet = await freshWallet();
     const env = spendEnv(isolatedGuard('pre'), wallet);
     expect((await viaHandler(handler, 'init', env)).body.code).toBe(SPEND_CODES.initNotFrozen);
     await viaHandler(handler, 'freeze', env, { active: true });
     expect((await viaHandler(handler, 'init', { ...env, WALLET_FLOOR_WINSTON: undefined })).body.code).toBe(SPEND_CODES.guardUnconfigured);
-    // The production handler (default deps): the closure is NOT carried yet.
-    const { viaWorker } = await import('./helpers/spend-admin');
-    const prod = await viaWorker('init', env);
-    expect(prod.status).toBe(503);
-    expect(prod.body.code).toBe(SPEND_CODES.initLegacyOpen);
+    const open = await viaHandler(handlerWith({ closeLegacySet: async () => ({ kind: 'open', code: SPEND_CODES.initLegacyOpen }) }), 'init', env);
+    expect(open.status).toBe(503);
+    expect(open.body.code).toBe(SPEND_CODES.initLegacyOpen);
     const unknown = await viaHandler(handlerWith({ closeLegacySet: async () => ({ kind: 'open', code: SPEND_CODES.initLegacyRewardUnknown }) }), 'init', env);
     expect(unknown.body.code).toBe(SPEND_CODES.initLegacyRewardUnknown);
     expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('none');
@@ -135,19 +133,61 @@ describe('D10 marker automaton on durable storage', () => {
     expect((await guardStatus(env.SPEND_GUARD)).init.txId).toBe(txId);
   });
 
-  it('two concurrent init → exactly one marker signed and sent; the loser gets 409 init_in_progress', async () => {
+  // Two concurrent inits have TWO places where the second one can lose:
+  //   (1) at `/init-read`: if the winner's `/init-begin` already landed, the
+  //       loser reads the live `signing` lease and is refused BEFORE any fetch
+  //       (the pre-check in stepSign) — the deterministic form of that branch
+  //       is the «crash in `signing`» test above (a held lease, no mocks);
+  //   (2) at `/init-begin`: both read `none`, both fetch anchor + price, and
+  //       the DO's CAS refuses the second `begin` — 409 init_in_progress.
+  // Which one happens depends on how workerd interleaves the two DO round
+  // trips, so a test that merely fires both and counts the fetches is a coin
+  // flip (the anchor/price routes were registered ×2 and stayed half-consumed
+  // whenever (1) won). Here the interleaving is FORCED with barriers: one
+  // single-use anchor route per attempt (`reached` fires on the first arrival
+  // only) proves both attempts passed `/init-read` with `none` before either
+  // touched anything durable; the winner is then released alone and parked at
+  // its POST (durable `signed`), and only then the loser is let through to the
+  // CAS.
+  it('two concurrent init, both past the pre-sign fetches → exactly one marker signed and sent; the loser is refused at the CAS (409 init_in_progress) while the winner is still in flight', async () => {
     const env = await frozen('race');
-    const gate = deferred();
-    const { post } = markerMocks(mockRoute, { times: 2, hold: gate.promise });
+    const anchorA = deferred();
+    const anchorB = deferred();
+    const postGate = deferred();
+    const anchors = [
+      mockRoute('GET', anchorRe, 200, ANCHOR, 1, { hold: anchorA.promise }),
+      mockRoute('GET', anchorRe, 200, ANCHOR, 1, { hold: anchorB.promise }),
+    ];
+    const price = mockRoute('GET', priceRe, 200, '10', 2);
+    const post = mockRoute('POST', postRe, 200, 'OK', 1, { hold: postGate.promise });
+
     const a = viaHandler(handler, 'init', env);
     const b = viaHandler(handler, 'init', env);
-    gate.resolve();
-    const [ra, rb] = await Promise.all([a, b]);
-    const statuses = [ra.status, rb.status].sort();
-    expect(statuses).toEqual([200, 409]);
-    const loser = ra.status === 409 ? ra : rb;
+    // Both attempts are parked at the anchor: each read `none`, nothing durable yet.
+    await Promise.all(anchors.map(r => r.reached));
+    expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('none');
+
+    // The first arrival alone: price → begin (CAS wins) → sign → `signed` → POST (parked).
+    anchorA.resolve();
+    await post.reached;
+    expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('signed');
+
+    // The second arrival, with the winner still in flight: price → begin → refused by the CAS.
+    anchorB.resolve();
+    const loser = await Promise.race([a, b]);
+    expect(loser.status, JSON.stringify(loser.body)).toBe(409);
     expect(loser.body.code).toBe(SPEND_CODES.initInProgress);
-    expect(post!.calls).toBe(1);
+    expect(loser.body).toMatchObject({ step: 'init-begin', initState: 'signed' }); // the CAS, not the pre-check
+    expect(post.calls).toBe(1);
+
+    // Release the POST: the winner reaches `posted`; still exactly one send.
+    postGate.resolve();
+    const [ra, rb] = await Promise.all([a, b]);
+    const winner = ra.status === 409 ? rb : ra;
+    expect(winner.status, JSON.stringify(winner.body)).toBe(200);
+    expect(winner.body.init).toMatchObject({ state: 'posted' });
+    expect(post.calls).toBe(1);
+    expect(price.calls).toBe(2);
     expect((await guardStatus(env.SPEND_GUARD)).init.state).toBe('posted');
   });
 

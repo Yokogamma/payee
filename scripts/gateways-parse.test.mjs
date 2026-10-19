@@ -5,6 +5,7 @@ import {
   cspConnectOrigins,
   parseIndexSources as parseIndexSourcesJs,
   parseOriginList as parseOriginListJs,
+  parseOperatorMap as parseOperatorMapJs,
   serializeStatusOrigins as serializeJs,
 } from './gateways-parse.mjs';
 import {
@@ -12,6 +13,7 @@ import {
   canonicalOrigin as canonicalOriginTs,
   parseIndexSources as parseIndexSourcesTs,
   parseOriginList as parseOriginListTs,
+  parseOperatorMap as parseOperatorMapTs,
   serializeStatusOrigins as serializeTs,
 } from '../src/lib/gateways-parse';
 
@@ -93,5 +95,19 @@ describe('cspConnectOrigins — то, что попадёт в connect-src', () 
 
   it('пустой конфиг не добавляет ничего — дефолт подставляет сборка', () => {
     expect(cspConnectOrigins({ status: '', payload: '', indexSources: '' })).toEqual([]);
+  });
+});
+
+const OPERATOR_CASES = [
+  'https://a.example=op-a,https://b.example=op-b',
+  ' https://a.example/ = op-a ,https://a.example=op-other',
+  'https://a.example,https://b.example=',
+  'http://a.example=op-a,https://c.example/p=op-c,https://d.example=op-d',
+  '',
+];
+
+describe('parseOperatorMap — паритет JS/TS', () => {
+  it.each(OPERATOR_CASES)('%j', (raw) => {
+    expect([...parseOperatorMapJs(raw)]).toEqual([...parseOperatorMapTs(raw)]);
   });
 });

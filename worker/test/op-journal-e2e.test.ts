@@ -2,6 +2,7 @@ import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as ed from '@noble/ed25519';
 import worker from '../src/index';
+import { spendGuardReady } from './helpers/spend-guard-ready';
 import { addressOfJwk } from '../test-stubs/wallet-address';
 import { computePublicationFp } from '../src/publication-fp';
 import { setupOutboundMock, deferred, b64, sha256, type OutboundRoute } from './helpers/outbound-mock';
@@ -25,6 +26,9 @@ type WorkerEnv = Parameters<typeof worker.fetch>[1];
 const baseEnv = env as unknown as WorkerEnv;
 
 const { mockRoute } = setupOutboundMock();
+// D10 (PR-3b): the paid path needs an initialised, funded SpendGuard —
+// the fixture brings the shared one to `done` once, idempotently.
+beforeAll(() => spendGuardReady());
 
 const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
 const IV = 'AAAAAAAAAAAAAAAA'; // 12 bytes
@@ -42,6 +46,9 @@ beforeAll(async () => {
   );
   realJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
   realWalletOwners = await addressOfJwk(realJwk);
+  // …and the §3.4 balance detector must not add outbound calls to this
+  // suite's exact counts: mark the wallet's balance as just read.
+  await spendGuardReady({ walletAddress: realWalletOwners });
 });
 
 type Identity = { priv: Uint8Array; pkB64: string; ownerHash: string };
