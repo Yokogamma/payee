@@ -1,5 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { checkHealth, runAttempts } from './smoke-gateways.mjs';
+import { spawnSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { load } from 'js-yaml';
+import {
+  ALLOW_HISTORICAL_POOL,
+  SmokeUsageError,
+  checkHealth,
+  expectationsFor,
+  expectationsFromRepo,
+  expectedFromCli,
+  runAttempts,
+} from './smoke-gateways.mjs';
 import { DEPLOY_PROFILES, EXPECTED_VERSIONS } from './smoke-target.mjs';
 
 const HASH = 'ea0e6282b314266b';
@@ -323,5 +336,172 @@ describe('the pre-d2 profile judges the seed-legacy build, and only that build',
   // disjoint, so a mislabelled dispatch cannot succeed either way.
   it('the ff0954d body FAILS the normal profile', () => {
     expect(checkHealth(ff0954d(), expected).ok).toBe(false);
+  });
+});
+
+// The pool changed on 2026-09-27 (ar-io.dev removed). A rollback to 394156d
+// must still pass the post-deploy smoke of the WORKER deploy: that ONE build
+// (HISTORICAL_POOLS, full SHA) is expected to attest its own pool — the hash
+// its live /health reports today. But the Pages pre-publish smoke names the
+// same SHA while publishing a client built on the CURRENT pool; keyed by the
+// SHA alone, the exception waved that client through on top of the old worker
+// (review of #226, P2). So it is an explicit flag, and only deploy-worker.yml
+// passes it. The workflow steps are tested AS WRITTEN: the exception lives in
+// which step says the flag.
+describe('the historical pool is the worker deploy\'s explicit exception, never the Pages gate\'s (review of #226, P2)', () => {
+  const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  const H = '394156d5998dbaef5b1d273898ee8006104227f8';
+  const H_VERSION = '41773298-9b1e-47aa-b33b-a353a8c381db';
+  const H_HASH = 'ea0e6282b314266b';
+  const POOL_PROBLEMS = [
+    'statusGatewaysHash does not match the set configured in wrangler.toml',
+    'statusGatewaysCount does not match wrangler.toml',
+  ];
+
+  /** The live 394156d /health today: its own five-origin pool, no operator count. */
+  const live394156d = over => healthy({
+    nonce: 'n', statusGatewaysHash: H_HASH, statusGatewaysCount: 5, releaseSha: H, workerVersionId: H_VERSION, ...over,
+  });
+
+  /** The ONE smoke step of a workflow job, as written. */
+  const smokeStep = (file, job) => {
+    const doc = load(readFileSync(join(ROOT, '.github/workflows', file), 'utf8'));
+    const steps = doc.jobs[job].steps.filter(s => typeof s?.run === 'string' && s.run.includes('worker/scripts/smoke-gateways.mjs'));
+    expect(steps).toHaveLength(1);
+    return steps[0];
+  };
+
+  /**
+   * What that step hands the smoke for a dispatch naming `sha` / `versionId`:
+   * its `${{ }}` expressions resolved from a CLOSED table (an unknown one
+   * fails the test instead of resolving to nothing), and its one shell
+   * expansion ("$PROFILE") applied to the argv.
+   */
+  const invocation = (step, { sha, versionId, minOperators = '' }) => {
+    const table = {
+      'inputs.candidate': sha,
+      'inputs.worker_candidate': sha,
+      'inputs.profile': 'normal',
+      'steps.version.outputs.version_id': versionId,
+      'steps.identity.outputs.version_id': versionId,
+      'steps.opfloor.outputs.min_operators': minOperators,
+    };
+    const env = {};
+    for (const [key, value] of Object.entries(step.env ?? {})) {
+      env[key] = String(value).replace(/\$\{\{\s*([^}]+?)\s*\}\}/g, (_, expr) => {
+        if (!Object.hasOwn(table, expr)) throw new Error(`unresolved expression in ${key}: ${expr}`);
+        return table[expr];
+      });
+    }
+    const argv = step.run.trim().split(/\s+/);
+    expect(argv.slice(0, 2)).toEqual(['node', 'worker/scripts/smoke-gateways.mjs']);
+    return { args: argv.slice(2).map(a => a.replace('"$PROFILE"', env.PROFILE)), env };
+  };
+
+  const judge = async ({ args, env }, body) => checkHealth(body, { ...(await expectedFromCli(args, env)), nonce: body.nonce });
+
+  const pages = smokeStep('deploy-pages-cf.yml', 'build-and-deploy');
+  const worker = smokeStep('deploy-worker.yml', 'deploy-worker');
+
+  it('expectationsFor: without the flag EVERY release is held to the repository — 394156d included', async () => {
+    const repo = await expectationsFromRepo('');
+    expect(repo.statusGatewaysCount).toBe(4);
+    expect(repo.statusGatewaysHash).not.toBe(H_HASH);
+    for (const allowHistorical of [undefined, false, 'yes', 1]) {
+      expect(await expectationsFor({ releaseSha: H, allowHistorical }), String(allowHistorical)).toEqual(repo);
+    }
+  });
+
+  it('expectationsFor with the flag: 394156d → its own five-origin pool, the hash its live /health attests', async () => {
+    expect(await expectationsFor({ releaseSha: H, allowHistorical: true }))
+      .toEqual({ statusGatewaysHash: H_HASH, statusGatewaysCount: 5 });
+  });
+
+  it('with the flag, a foreign full SHA, an abbreviated or upper-cased 394156d, no SHA, or a staging smoke — the repository', async () => {
+    const repo = await expectationsFromRepo('');
+    for (const releaseSha of ['a'.repeat(40), H.slice(0, 7), H.toUpperCase(), undefined, 'constructor']) {
+      expect(await expectationsFor({ releaseSha, allowHistorical: true }), String(releaseSha)).toEqual(repo);
+    }
+    expect(await expectationsFor({ blockPrefix: 'env.staging.', releaseSha: H, allowHistorical: true }))
+      .toEqual(await expectationsFromRepo('env.staging.'));
+  });
+
+  it('the Pages step, as written, dispatched with worker_candidate=394156d: the live 394156d is REFUSED on its pool', async () => {
+    const r = await judge(invocation(pages, { sha: H, versionId: H_VERSION }), live394156d());
+    // The identity matches — only the pool fails, which is exactly the point:
+    // the client this run publishes is built on the current pool.
+    expect(r).toEqual({ ok: false, problems: POOL_PROBLEMS });
+  });
+
+  it('the Pages step still passes a worker that attests the current pool (the release order kept)', async () => {
+    const repo = await expectationsFromRepo('');
+    const R = 'c'.repeat(40);
+    const reader = healthy({ nonce: 'n', ...repo, releaseSha: R, workerVersionId: VERSION_ID, statusOperatorsCount: 4 });
+    expect(await judge(invocation(pages, { sha: R, versionId: VERSION_ID }), reader)).toEqual({ ok: true, problems: [] });
+  });
+
+  it('the deploy-worker step, as written, rolling back to 394156d: the live 394156d PASSES', async () => {
+    // opfloor prints an empty floor for a candidate without SpendGuard.
+    expect(await judge(invocation(worker, { sha: H, versionId: H_VERSION }), live394156d()))
+      .toEqual({ ok: true, problems: [] });
+  });
+
+  it('the flag keeps both identity checks: another SHA or another version id on the old pool is refused', async () => {
+    const inv = invocation(worker, { sha: H, versionId: H_VERSION });
+    const otherSha = await judge(inv, live394156d({ releaseSha: 'b'.repeat(40) }));
+    expect(otherSha.ok).toBe(false);
+    expect(otherSha.problems.join('\n')).toMatch(/releaseSha is "b{40}", expected the deployed candidate/);
+    const otherVersion = await judge(inv, live394156d({ workerVersionId: VERSION_ID }));
+    expect(otherVersion.ok).toBe(false);
+    expect(otherVersion.problems.join('\n')).toMatch(/workerVersionId is .*expected the version the deploy just activated/);
+  });
+
+  it('a foreign or abbreviated SHA gets no exception even from the deploy-worker step: the old pool is refused', async () => {
+    for (const sha of ['a'.repeat(40), H.slice(0, 7), H.toUpperCase()]) {
+      // The body names the same SHA, so the identity passes and ONLY the pool
+      // can refuse — the exception was not granted.
+      const r = await judge(invocation(worker, { sha, versionId: H_VERSION }), live394156d({ releaseSha: sha }));
+      expect(r, sha).toEqual({ ok: false, problems: POOL_PROBLEMS });
+    }
+  });
+
+  it('only deploy-worker.yml passes the flag, in its smoke step alone — no other workflow step, nor the staging path', () => {
+    const dir = join(ROOT, '.github/workflows');
+    const carriers = [];
+    for (const file of readdirSync(dir).filter(f => /\.ya?ml$/.test(f))) {
+      const doc = load(readFileSync(join(dir, file), 'utf8'));
+      for (const [job, def] of Object.entries(doc.jobs ?? {})) {
+        for (const step of def.steps ?? []) {
+          if (typeof step?.run === 'string' && step.run.includes(ALLOW_HISTORICAL_POOL)) carriers.push(`${file}:${job}:${step.name}`);
+        }
+      }
+    }
+    expect(carriers).toEqual(['deploy-worker.yml:deploy-worker:Smoke the live worker']);
+    expect(pages.run).not.toContain(ALLOW_HISTORICAL_POOL);
+    expect(readFileSync(join(ROOT, 'worker/scripts/deploy-staging.mjs'), 'utf8')).not.toContain(ALLOW_HISTORICAL_POOL);
+  });
+
+  it('the flag without the full identity, or with --staging, refuses to start', async () => {
+    const flag = ['--profile=normal', ALLOW_HISTORICAL_POOL];
+    for (const env of [{}, { EXPECT_RELEASE_SHA: H }, { EXPECT_WORKER_VERSION_ID: H_VERSION }]) {
+      await expect(expectedFromCli(flag, env), JSON.stringify(env)).rejects.toThrow(SmokeUsageError);
+    }
+    await expect(expectedFromCli([...flag, '--staging'], { EXPECT_RELEASE_SHA: H, EXPECT_WORKER_VERSION_ID: H_VERSION }))
+      .rejects.toThrow(SmokeUsageError);
+  });
+
+  it('the CLI turns a refusal to start into exit 2, before any request', () => {
+    const inherited = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(EXPECT|SMOKE)_/.test(k)));
+    // A 1 ms budget: were the refusal missing, the smoke would end in a fast
+    // exit 1 instead of reaching the network for real.
+    const run = (args, env) => spawnSync(process.execPath, ['worker/scripts/smoke-gateways.mjs', ...args], {
+      cwd: ROOT, encoding: 'utf8', env: { ...inherited, SMOKE_DEADLINE_MS: '1', SMOKE_ATTEMPTS: '1', ...env },
+    });
+    const noIdentity = run(['--profile=normal', ALLOW_HISTORICAL_POOL], { EXPECT_RELEASE_SHA: H });
+    expect(noIdentity.status).toBe(2);
+    expect(noIdentity.stderr).toContain(`✗ ${ALLOW_HISTORICAL_POOL} is the rollback exception of the worker deploy`);
+    const badFloor = run(['--profile=normal'], { EXPECT_MIN_OPERATORS: 'two' });
+    expect(badFloor.status).toBe(2);
+    expect(badFloor.stderr).toContain('✗ EXPECT_MIN_OPERATORS must be a positive integer, got "two"');
   });
 });

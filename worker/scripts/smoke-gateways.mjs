@@ -10,7 +10,9 @@
  * Used twice: after a Worker deploy, and — always with `--profile=normal` —
  * as the PRE-PUBLISH gate of the Pages release, where it answers the question
  * «is the safe worker actually live right now?» that a static config check
- * cannot.
+ * cannot. Only the first may admit a historical pool, and only when it says
+ * so (ALLOW_HISTORICAL_POOL): the second is about to publish a client built on
+ * the CURRENT pool.
  *
  * Freshness is proven, not assumed: every attempt carries a NEW nonce that the
  * worker must echo verbatim. `no-store` stops an intermediary from serving a
@@ -23,6 +25,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseOriginList, serializeStatusOrigins } from '../../scripts/gateways-parse.mjs';
 import { readWorkerStatusGateways } from '../../scripts/check-gateways-vs-worker.mjs';
+import { poolsFor } from '../../scripts/gateway-pins.mjs';
 import {
   AUTO_ALLOWED_WORKER_ORIGINS,
   DEPLOY_PROFILES,
@@ -179,6 +182,88 @@ export async function expectationsFromRepo(blockPrefix = '') {
 }
 
 /**
+ * The ONE argument that admits a registered historical pool. deploy-worker.yml
+ * passes it and nothing else does: that run has just activated the candidate
+ * and names its identity, so a rollback to a build that predates a pool change
+ * is smoked against the pool that build was made with.
+ *
+ * NOT inferred from the SHA, because the Pages pre-publish gate names the same
+ * SHA — and the client it is about to publish is built on the CURRENT pool.
+ * Keyed by the SHA alone, the exception let that client out on top of the old
+ * worker (review of #226, P2): the order «worker, then client» held only by
+ * the operator's care, and the two halves disagreed about `dead` from the
+ * first publish. Without the flag every smoke expects the repository's pool.
+ */
+export const ALLOW_HISTORICAL_POOL = '--allow-historical-pool';
+
+/**
+ * The pool expectations for the release being smoked: the repository's, unless
+ * the caller ADMITS the historical exception (`allowHistorical`, see
+ * ALLOW_HISTORICAL_POOL). Then a registered historical build
+ * (scripts/gateway-pins.mjs HISTORICAL_POOLS — by FULL SHA, through the same
+ * `poolsFor` the config gate uses) is expected to attest ITS OWN pool; a
+ * rollback to it across a pool change would otherwise fail the smoke after
+ * activation. Keyed by the release SHA the SAME smoke demands from the live
+ * /health, so naming a historical SHA cannot relax the check of any other
+ * build: that build fails the releaseSha comparison. A staging smoke is always
+ * held to the repository.
+ */
+export async function expectationsFor({ blockPrefix = '', releaseSha, allowHistorical = false } = {}) {
+  const pools = allowHistorical === true && blockPrefix === '' ? poolsFor(releaseSha) : null;
+  if (pools?.historical) {
+    const origins = parseOriginList(pools.statusCsv);
+    return { statusGatewaysHash: await statusGatewaysHash(origins), statusGatewaysCount: origins.length };
+  }
+  return expectationsFromRepo(blockPrefix);
+}
+
+/** The smoke refuses to START (exit 2) rather than check less than it was asked to. */
+export class SmokeUsageError extends Error {}
+
+/** EXPECT_MIN_OPERATORS: a positive integer, or the smoke refuses to start —
+ *  a typo must not silently turn the check off. */
+function parseMinOperators(raw) {
+  if (!/^[1-9][0-9]*$/.test(raw)) {
+    throw new SmokeUsageError(`EXPECT_MIN_OPERATORS must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return Number(raw);
+}
+
+/**
+ * Everything the smoke will demand, from its arguments and environment — the
+ * CLI's whole decision short of the network. Exported so that a workflow
+ * step, exactly as written, can be tested against a /health body: the
+ * exception above lives in WHICH step passes the flag, and only a test of the
+ * step's own words shows it.
+ */
+export async function expectedFromCli(args, env) {
+  const profile = (args.find(a => a.startsWith('--profile='))?.split('=')[1]) ?? 'normal';
+  const staging = args.includes('--staging');
+  const allowHistorical = args.includes(ALLOW_HISTORICAL_POOL);
+  // The exception is keyed by the release identity, so it is admitted only
+  // WITH that identity in full — the SHA the /health must report and the
+  // version id the deploy activated — and never for staging, which has no
+  // historical builds.
+  if (allowHistorical && (staging || !env.EXPECT_RELEASE_SHA || !env.EXPECT_WORKER_VERSION_ID)) {
+    throw new SmokeUsageError(
+      `${ALLOW_HISTORICAL_POOL} is the rollback exception of the worker deploy: it needs ` +
+        'EXPECT_RELEASE_SHA and EXPECT_WORKER_VERSION_ID, and is refused with --staging',
+    );
+  }
+  return {
+    profile,
+    ...(await expectationsFor({
+      blockPrefix: staging ? 'env.staging.' : '',
+      releaseSha: env.EXPECT_RELEASE_SHA,
+      allowHistorical,
+    })),
+    ...(env.EXPECT_RELEASE_SHA ? { releaseSha: env.EXPECT_RELEASE_SHA } : {}),
+    ...(env.EXPECT_WORKER_VERSION_ID ? { workerVersionId: env.EXPECT_WORKER_VERSION_ID } : {}),
+    ...(env.EXPECT_MIN_OPERATORS ? { minOperators: parseMinOperators(env.EXPECT_MIN_OPERATORS) } : {}),
+  };
+}
+
+/**
  * One attempt, under the SHARED deadline.
  *
  * The smoke has to honour the transport contract it is checking, or it is not
@@ -279,22 +364,10 @@ export async function runAttempts({
   return { ok: false, problems: last ?? ['no answer'] };
 }
 
-/** EXPECT_MIN_OPERATORS: a positive integer, or the smoke refuses to start —
- *  a typo must not silently turn the check off. */
-function parseMinOperators(raw) {
-  if (!/^[1-9][0-9]*$/.test(raw)) {
-    console.error(`✗ EXPECT_MIN_OPERATORS must be a positive integer, got ${JSON.stringify(raw)}`);
-    process.exit(2);
-  }
-  return Number(raw);
-}
-
 // ── CLI ──────────────────────────────────────────────────────────────
 if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
   const args = process.argv.slice(2);
-  const profile = (args.find(a => a.startsWith('--profile='))?.split('=')[1]) ?? 'normal';
   const staging = args.includes('--staging');
-  const blockPrefix = staging ? 'env.staging.' : '';
 
   // PRODUCTION: the target is repo-pinned, never an argument — a smoke pointed
   // wherever the caller likes proves nothing about the release that was gated.
@@ -329,14 +402,17 @@ if (process.argv[1]?.endsWith('smoke-gateways.mjs')) {
     origin = AUTO_ALLOWED_WORKER_ORIGINS[0];
   }
 
-  const expected = {
-    profile,
-    ...(await expectationsFromRepo(blockPrefix)),
-    ...(process.env.EXPECT_RELEASE_SHA ? { releaseSha: process.env.EXPECT_RELEASE_SHA } : {}),
-    ...(process.env.EXPECT_WORKER_VERSION_ID
-      ? { workerVersionId: process.env.EXPECT_WORKER_VERSION_ID } : {}),
-    ...(process.env.EXPECT_MIN_OPERATORS ? { minOperators: parseMinOperators(process.env.EXPECT_MIN_OPERATORS) } : {}),
-  };
+  // Decided before the deadline exists, so a refusal to start exits at once
+  // with no timer live (see the note on exitCode below).
+  let expected;
+  try {
+    expected = await expectedFromCli(args, process.env);
+  } catch (e) {
+    if (!(e instanceof SmokeUsageError)) throw e;
+    console.error(`✗ ${e.message}`);
+    process.exit(2);
+  }
+  const { profile } = expected;
 
   // ONE budget for the whole smoke: per-attempt timeouts of their own would
   // let a stalled worker hold the deploy for the sum of them.
