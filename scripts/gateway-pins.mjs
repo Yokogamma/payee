@@ -91,8 +91,45 @@ export const MIN_STATUS_ORIGINS = 2;
 export const EXPECTED_STATUS_CSV = STATUS_GATEWAYS.join(',');
 export const EXPECTED_PAYLOAD_CSV = PAYLOAD_GATEWAYS.join(',');
 
-// The rollback to 394156d across this pool change (its OLD pools, held by the
-// gateway gate and the smoke) is admitted by HISTORICAL_POOLS, which arrives
-// with the reader stack (#226). Merge this PR and that stack back to back —
-// no worker or Pages deploy in between: until then the gates hold 394156d to
-// the new pin and a Pages deploy fails its smoke against the live 394156d.
+/**
+ * The pools a HISTORICAL rollback target was built with — keyed by the FULL
+ * SHA of ONE verified build, never a range (the same rule as
+ * scripts/historical-candidates.mjs). Changing the pin above would otherwise
+ * refuse the rollback the runbook promises: the gates compare the candidate's
+ * own wrangler.toml with the pin, and the post-deploy smoke expects the pin's
+ * hash and count on the live /health.
+ *
+ * For a listed SHA the gates hold the candidate to ITS pools (in order, for
+ * payload) and the WORKER deploy's smoke — explicitly, with
+ * `--allow-historical-pool` — expects ITS hash; every other candidate is held
+ * to the current pin. The Pages pre-publish smoke never admits it: the client
+ * it publishes is built on the current pin. Deliberately NOT a profile: the
+ * rollback to 394156d runs under `normal` (runbook §5.1), and its /health
+ * reports the same profile fields as any modern build.
+ */
+export const HISTORICAL_POOLS = Object.freeze({
+  // The soak v3 candidate (worker 394156d, versionId 41773298…): live when the
+  // pool changed on 2026-09-27; its /health attests statusGatewaysHash
+  // ea0e6282b314266b over these five.
+  '394156d5998dbaef5b1d273898ee8006104227f8': Object.freeze({
+    status: Object.freeze([
+      'https://arweave.net', 'https://ar-io.dev', 'https://vilenarios.com', 'https://frostor.xyz', 'https://permagate.io',
+    ]),
+    payload: Object.freeze(['https://arweave.net', 'https://vilenarios.com', 'https://ar-io.dev', 'https://frostor.xyz']),
+    reason: 'soak v3 candidate — the pool before ar-io.dev was removed (2026-09-27)',
+  }),
+});
+
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * The pinned pools a candidate must match: its historical entry, or the
+ * current pin. `historical` tells the gate it is judging a rollback across a
+ * pool change.
+ */
+export function poolsFor(candidate) {
+  const entry = typeof candidate === 'string' && FULL_SHA_RE.test(candidate) ? HISTORICAL_POOLS[candidate] ?? null : null;
+  return entry
+    ? { statusCsv: entry.status.join(','), payloadCsv: entry.payload.join(','), historical: true }
+    : { statusCsv: EXPECTED_STATUS_CSV, payloadCsv: EXPECTED_PAYLOAD_CSV, historical: false };
+}

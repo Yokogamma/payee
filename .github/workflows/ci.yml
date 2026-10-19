@@ -48,6 +48,9 @@ jobs:
       # OFF would ship a release producing files the same build can neither
       # verify nor restore. Source-only check, so it runs before any build.
       - run: node scripts/check-backup-flags.mjs
+      # D10 spend-guard limits (PR-6): a worker that carries SpendGuard must
+      # declare the three limits in both var blocks, or it publishes nothing.
+      - run: node scripts/check-spend-limits.mjs
       # ── Worker ──
       - run: npm --prefix worker ci
       - run: npm --prefix worker run typecheck

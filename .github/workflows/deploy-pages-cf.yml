@@ -230,6 +230,10 @@ jobs:
           REPO: ${{ github.repository }}
           DEFAULT: ${{ github.event.repository.default_branch }}
       - name: Verify the live worker is the gated release
+        # Deliberately WITHOUT --allow-historical-pool: the client built above
+        # uses the CURRENT pool, so the worker it ships on must attest that
+        # pool too — a worker rolled back below a pool change (HISTORICAL_POOLS)
+        # is refused here, and the client waits for the current worker.
         run: node worker/scripts/smoke-gateways.mjs --profile=normal
         env:
           EXPECT_RELEASE_SHA: ${{ inputs.worker_candidate }}

@@ -23,10 +23,11 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseOriginList } from './gateways-parse.mjs';
+import { parseOperatorMap, parseOriginList } from './gateways-parse.mjs';
 import { readTomlString } from './toml-scan.mjs';
-import { EXPECTED_STATUS_CSV, EXPECTED_PAYLOAD_CSV, MIN_STATUS_ORIGINS } from './gateway-pins.mjs';
+import { EXPECTED_STATUS_CSV, MIN_STATUS_ORIGINS, STATUS_OPERATORS, poolsFor } from './gateway-pins.mjs';
 import { candidateLacksVar } from './historical-candidates.mjs';
+import { carriesSpendGuard } from './check-spend-limits.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -55,6 +56,38 @@ export function readWorkerStatusGateways(toml, blockPrefix = '') {
 
 export function readWorkerPayloadGateways(toml, blockPrefix = '') {
   return readTomlVar(toml, blockPrefix, 'PAYLOAD_GATEWAYS');
+}
+
+export function readWorkerStatusOperators(toml, blockPrefix = '') {
+  return readTomlVar(toml, blockPrefix, 'STATUS_OPERATORS');
+}
+
+/** Money quorums need this many DISTINCT operators (worker MIN_BALANCE_SOURCES). */
+export const MIN_MONEY_OPERATORS = 2;
+
+/**
+ * The operator map of ONE block against the pin and against that block's own
+ * status pool (D10/D11, reader release): equal to the pin, every status
+ * origin covered, ≥ MIN_MONEY_OPERATORS distinct operators. An origin the map
+ * leaves out casts NO money vote on the worker (fail-closed), so a missing
+ * entry cannot loosen a quorum — but it can make one unreachable, and that
+ * is exactly what this refuses to ship.
+ */
+export function checkOperatorMap(raw, statusOrigins) {
+  const problems = [];
+  const map = parseOperatorMap(raw ?? '');
+  const pin = parseOperatorMap(STATUS_OPERATORS);
+  if (map.size === 0) { problems.push('STATUS_OPERATORS is empty or fully unparseable'); return problems; }
+  const same = map.size === pin.size && [...pin].every(([o, op]) => map.get(o) === op);
+  if (!same) problems.push(`STATUS_OPERATORS does not match the repo-pinned operator map (${STATUS_OPERATORS})`);
+  for (const origin of statusOrigins) {
+    if (!map.has(origin)) problems.push(`STATUS_OPERATORS has no operator for the status origin ${origin} — it would cast no money vote`);
+  }
+  const distinct = new Set(statusOrigins.map(o => map.get(o)).filter(op => op !== undefined)).size;
+  if (distinct < MIN_MONEY_OPERATORS) {
+    problems.push(`the status pool maps to ${distinct} distinct operator(s), need ${MIN_MONEY_OPERATORS}: no money quorum could ever form`);
+  }
+  return problems;
 }
 
 /**
@@ -86,12 +119,23 @@ export function checkUploadSwitchesOff(toml, blockPrefix = '') {
 export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = null } = {}) {
   const problems = [];
 
-  const pinned = parseOriginList(EXPECTED_STATUS_CSV);
+  // The pools THIS candidate must match: the current pin, or — for ONE
+  // registered historical build (scripts/gateway-pins.mjs HISTORICAL_POOLS,
+  // full SHA) — the pools it was built with, so a rollback across a pool
+  // change is not refused by the pin that changed after it.
+  const pins = poolsFor(candidate);
+  const pinned = parseOriginList(pins.statusCsv);
+  const setOf = (list) => [...list].sort().join(',');
+  const current = setOf(parseOriginList(EXPECTED_STATUS_CSV));
 
   // In repo-only mode the client side IS the pin: there is no Environment to
   // read, and comparing the pin with itself would prove nothing — so the
   // meaningful check is worker-vs-pin, done below for both blocks.
   const client = repoOnly ? pinned : parseOriginList(clientCsv ?? '');
+  // A rollback across a pool change may meet a client already built on the
+  // CURRENT pin: the halves then disagree about `dead` for the length of the
+  // rollback — accepted (the worker decides every payment) and reported.
+  const clientOnCurrentAcrossRollback = pins.historical && !repoOnly && setOf(client) === current && current !== setOf(pinned);
 
   if (!repoOnly) {
     if (client.length === 0) {
@@ -99,9 +143,12 @@ export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = n
       // Order-insensitive below: status probes run in parallel, so only the SET
       // is pinned. (The payload pool IS ordered — that pin lives in the deploy
       // config gate, where the order carries meaning.)
-    } else if ([...client].sort().join(',') !== [...pinned].sort().join(',')) {
+    } else if (setOf(client) !== setOf(pinned) && !clientOnCurrentAcrossRollback) {
       problems.push(
-        `VITE_STATUS_GATEWAYS does not match the repo-pinned set (${EXPECTED_STATUS_CSV})`,
+        pins.historical
+          ? `VITE_STATUS_GATEWAYS matches neither this historical candidate's pool (${pins.statusCsv}) ` +
+              `nor the current pin (${EXPECTED_STATUS_CSV})`
+          : `VITE_STATUS_GATEWAYS does not match the repo-pinned set (${pins.statusCsv})`,
       );
     }
   }
@@ -121,19 +168,30 @@ export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = n
       problems.push(`${label}: STATUS_GATEWAYS is empty or fully unparseable`);
       continue;
     }
-    if ([...worker].sort().join(',') !== [...pinned].sort().join(',')) {
+    if (setOf(worker) !== setOf(pinned)) {
       problems.push(
-        `${label}: worker STATUS_GATEWAYS does not match the repo-pinned set (${EXPECTED_STATUS_CSV})`,
+        `${label}: worker STATUS_GATEWAYS does not match the ` +
+          `${pins.historical ? "historical candidate's pinned" : 'repo-pinned'} set (${pins.statusCsv})`,
       );
       continue;
     }
     // Set equality, order-insensitive: status probes run in parallel, so the
     // order carries no meaning — but a MISSING or EXTRA origin does.
-    if ([...worker].sort().join(',') !== [...client].sort().join(',')) {
+    if (setOf(worker) !== setOf(client) && !clientOnCurrentAcrossRollback) {
       problems.push(
         `${label}: worker and client status pools differ — the dead formula ` +
           'would not mean the same thing on the two halves',
       );
+    }
+    // The operator map of this block, against the pin and against this
+    // block's own pool (reader release: a mandatory condition). Applicable
+    // only to a config that carries the spend guard — the money quorums the
+    // map serves arrived with it (D10); a candidate without the binding (the
+    // soak build, a rollback target) has no code that reads the map.
+    if (carriesSpendGuard(toml) && !candidateLacksVar(candidate, 'STATUS_OPERATORS')) {
+      const ops = readWorkerStatusOperators(toml, prefix);
+      if (ops.error) problems.push(`${label}: ${ops.error}`);
+      else for (const p of checkOperatorMap(ops.value, worker)) problems.push(`${label}: ${p}`);
     }
   }
 
@@ -153,7 +211,7 @@ export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = n
   // because that build does have a quorum. The exception is keyed by the full
   // SHA in scripts/historical-candidates.mjs; nothing here can widen it.
   const skipPayload = candidateLacksVar(candidate, 'PAYLOAD_GATEWAYS');
-  const pinnedPayload = parseOriginList(EXPECTED_PAYLOAD_CSV);
+  const pinnedPayload = parseOriginList(pins.payloadCsv);
   for (const [label, prefix] of skipPayload ? [] : [['production', ''], ['staging', 'env.staging.']]) {
     const read = readWorkerPayloadGateways(toml, prefix);
     if (read.error) { problems.push(`${label}: ${read.error}`); continue; }
@@ -164,14 +222,18 @@ export function checkGateways(clientCsv, toml, { repoOnly = false, candidate = n
     }
     if (worker.join(',') !== pinnedPayload.join(',')) {
       problems.push(
-        `${label}: worker PAYLOAD_GATEWAYS does not match the repo-pinned list in order ` +
-          `(${EXPECTED_PAYLOAD_CSV}). The order is part of the pin: the pool is tried in ` +
+        `${label}: worker PAYLOAD_GATEWAYS does not match the ` +
+          `${pins.historical ? "historical candidate's pinned" : 'repo-pinned'} list in order ` +
+          `(${pins.payloadCsv}). The order is part of the pin: the pool is tried in ` +
           'sequence, and a reordered list silently changes which gateway is asked first.',
       );
     }
   }
 
-  return { ok: problems.length === 0, problems, skippedPayloadPool: skipPayload };
+  return {
+    ok: problems.length === 0, problems, skippedPayloadPool: skipPayload,
+    historicalPool: pins.historical, clientOnCurrentAcrossRollback,
+  };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -184,7 +246,8 @@ if (process.argv[1]?.endsWith('check-gateways-vs-worker.mjs')) {
   const configArg = process.argv.find(a => a.startsWith('--config='))?.split('=')[1];
   const toml = readFileSync(configArg ?? join(ROOT, 'worker', 'wrangler.toml'), 'utf8');
   const candidate = process.env.WORKER_CANDIDATE_SHA ?? null;
-  const { ok, problems, skippedPayloadPool } = checkGateways(process.env.VITE_STATUS_GATEWAYS, toml, { repoOnly, candidate });
+  const { ok, problems, skippedPayloadPool, historicalPool, clientOnCurrentAcrossRollback } =
+    checkGateways(process.env.VITE_STATUS_GATEWAYS, toml, { repoOnly, candidate });
   if (!ok) {
     console.error('✗ gateway config gate failed:');
     for (const p of problems) console.error(`  - ${p}`);
@@ -201,4 +264,12 @@ if (process.argv[1]?.endsWith('check-gateways-vs-worker.mjs')) {
         : `and the worker's payload pool matches the pin in order`) +
       `${repoOnly ? ' (repo-only mode)' : ''}`,
   );
+  if (historicalPool) {
+    console.log(
+      `  historical candidate ${candidate.slice(0, 7)}: held to ITS pinned pools (HISTORICAL_POOLS), not the current pin` +
+        (clientOnCurrentAcrossRollback
+          ? ' — the client is already on the CURRENT pool: the halves disagree about `dead` until the reader returns (accepted for a rollback; the worker decides every payment)'
+          : ''),
+    );
+  }
 }
