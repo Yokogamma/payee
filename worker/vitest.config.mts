@@ -26,6 +26,10 @@ export default defineConfig({
           // Two origins: with a single one the dead quorum is unreachable by
           // construction, and the redrop suites are about reaching it.
           STATUS_GATEWAYS: 'https://arweave.net,https://g2.test',
+          // The operator map (operators.ts): the two test origins are two
+          // operators, so money quorums are reachable; a suite that wants
+          // ONE operator overrides STATUS_OPERATORS in its env.
+          STATUS_OPERATORS: 'https://arweave.net=arweave,https://g2.test=g2',
           ADMIN_SECRET: 'test-admin-secret',
           // A JWK whose ADDRESS is knowable: /upload refuses while the signing
           // wallet is outside TRUSTED_OWNERS, so the two must agree. Still not
@@ -33,6 +37,12 @@ export default defineConfig({
           ARWEAVE_JWK: TEST_ARWEAVE_JWK,
           TRUSTED_OWNERS: TEST_WALLET_ADDRESS,
           RECOVERY_HMAC_SECRET: 'test-recovery-secret',
+          // D10 (PR-3b): the three spend limits are mandatory on every paid
+          // path (503 spend_guard_unconfigured without them). Same values as
+          // test/helpers/spend-guard-ready.ts SPEND_LIMITS_ENV.
+          WALLET_FLOOR_WINSTON: '0',
+          SPEND_WINDOW_CAP_WINSTON: '1000000000000000',
+          MAX_TX_REWARD_WINSTON: '1000000000000',
         },
       },
     }),
@@ -47,6 +57,7 @@ export default defineConfig({
     exclude: [
       '**/node_modules/**',
       'test/e2e-repost.test.ts',
+      'test/operator-map.test.ts',
       'test/v3-gate-e2e.test.ts',
       'test/v4-gate-e2e.test.ts',
       'test/arweave-transport.test.ts',
@@ -56,6 +67,17 @@ export default defineConfig({
       'test/legacy-backfill-e2e.test.ts',
       'test/op-journal-e2e.test.ts',
       'test/admin-ops.test.ts',
+      // D10 /admin/spend/* suites: direct dispatch with env overrides and a
+      // stubbed gateway pool — same isolation reasoning as above.
+      'test/spend-admin.test.ts',
+      'test/spend-guard.marker.test.ts',
+      'test/spend-guard.ledger.test.ts',
+      'test/spend-guard.permit.test.ts',
+      'test/upload-spend-saga.test.ts',
+      'test/rollback-reader-spend.test.ts',
+      'test/recovery-scheduler.test.ts',
+      'test/spend-guard.legacy.test.ts',
+      'test/recovery-census.test.ts',
     ],
     // Share ONE module registry across test files: per-file isolation re-imports
     // src/index.ts, changing the DO class identity — a DO instance that

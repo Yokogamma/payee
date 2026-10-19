@@ -3,6 +3,7 @@ import {
   canonicalIndexUrl,
   canonicalOrigin,
   parseIndexSources,
+  parseOperatorMap,
   parseOriginList,
   serializeStatusOrigins,
 } from './gateways-parse';
@@ -112,5 +113,21 @@ describe('serializeStatusOrigins — the attestation hash input', () => {
   it('distinguishes different sets', () => {
     expect(serializeStatusOrigins(['https://a.example']))
       .not.toBe(serializeStatusOrigins(['https://a.example', 'https://b.example']));
+  });
+});
+
+describe('parseOperatorMap — canonical origins, first operator wins, junk dropped', () => {
+  it('parses and canonizes', () => {
+    expect([...parseOperatorMap('https://a.example=op-a, https://b.example/ = op-b ')])
+      .toEqual([['https://a.example', 'op-a'], ['https://b.example', 'op-b']]);
+  });
+  it('keeps the FIRST operator for a repeated origin', () => {
+    expect(parseOperatorMap('https://a.example=one,https://a.example/=two').get('https://a.example')).toBe('one');
+  });
+  it('drops entries without an operator, with a bad origin, or with a path', () => {
+    expect(parseOperatorMap('https://a.example,https://b.example=,http://c.example=op,https://d.example/p=op').size).toBe(0);
+  });
+  it('empty input → empty map', () => {
+    expect(parseOperatorMap('').size).toBe(0);
   });
 });
