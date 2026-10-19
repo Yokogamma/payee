@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import {
   isRejection,
   ownerToAddress,
@@ -22,6 +22,20 @@ const REAL_OWNER = 'Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE';
 
 const SUPPORTED = new Set(['1', '2', '3', '4']);
 const OWNER_HASH = 'MpB2bWN6J4loBh1YNK6KcmGZX44UVL2lqXxdqPNujE0=';
+
+// EVERY RSA-4096 key this file signs with is generated HERE, never in a test
+// body. Keygen time is a lottery — the prime search is random — and CPU
+// contention (the rest of the suite running in parallel) stretches it further.
+// The wallets are lazy, so a key was paid by whichever test asked first, out
+// of that test's 5 s budget — and this file went red on such a timeout in the
+// full run while passing in isolation; the attacker test carried a private
+// 30 s budget for the same reason. Both wallets are memoized on globalThis
+// (see signed-tx.ts), so the tests below reuse exactly these keys. One key per
+// hook, each with its own budget (hooks run one after another).
+const KEYGEN_BUDGET_MS = 60_000;
+beforeAll(async () => { await testWallet(); }, KEYGEN_BUDGET_MS);
+// The «correctly signed by an attacker» test needs a real, DIFFERENT wallet.
+beforeAll(async () => { await otherWallet(); }, KEYGEN_BUDGET_MS);
 
 describe('D9 against a REAL transaction of this project', () => {
   it('accepts the genuine header and its genuine bytes', async () => {
@@ -102,7 +116,7 @@ describe('D9 binds the header to the REQUESTED txId (review 3 H1)', () => {
 });
 
 describe('D9 step 5 — a correctly signed ATTACKER transaction (review 11)', () => {
-  it('is rejected on TRUSTED_OWNERS, with id/signature/data_root all valid', { timeout: 30_000 }, async () => {
+  it('is rejected on TRUSTED_OWNERS, with id/signature/data_root all valid', async () => {
     const attacker = await otherWallet();
     const trusted = await testWallet();
     const tx = await buildSignedTx(

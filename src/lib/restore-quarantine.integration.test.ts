@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import { buildSignedTx, gatewayFetchMock, notesTags, testWallet } from '../test-stubs/signed-tx';
 
 // §1.9, интеграция: снятие карантина recovery_invalidated — привилегия
@@ -25,6 +25,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
 });
+
+// RSA-4096-ключ, которым здесь подписана каждая транзакция, генерируется ЗДЕСЬ,
+// а не в теле теста. Время генерации — лотерея (поиск простых случайный), а
+// конкуренция за CPU (остальной набор, идущий параллельно) растягивает его ещё.
+// Кошелёк ленивый: ключ оплачивал тот тест, который первым дошёл до
+// stubGateway(), — из своего лимита 5 с по умолчанию. Кошелёк мемоизирован на
+// globalThis (см. signed-tx.ts), поэтому stubGateway() переиспользует ровно
+// этот ключ.
+const KEYGEN_BUDGET_MS = 60_000;
+beforeAll(async () => { await testWallet(); }, KEYGEN_BUDGET_MS);
 
 type Storage = typeof import('./storage');
 
