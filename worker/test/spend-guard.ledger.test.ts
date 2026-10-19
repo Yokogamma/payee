@@ -9,6 +9,7 @@ import {
 import { balanceOnAll, makeIdentity, paidLegs, sagaEnv, upload, uploadRequest } from './helpers/spend-saga';
 import { resetSpendBalanceCache } from '../src/spend-saga';
 import { SPEND_LIMITS_ENV } from './helpers/spend-guard-ready';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // D10 §12 — «пополнение и маркер» (ревью #4–#6): `credit-deposit` through the
 // worker route with a stubbed gateway pool — the verification at ≥2 operators
@@ -17,6 +18,18 @@ import { SPEND_LIMITS_ENV } from './helpers/spend-guard-ready';
 
 const { mockRoute } = setupOutboundMock();
 const handler = handlerWith({ closeLegacySet: closed() });
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 18 = one per test (7), plus a fresh sender for each of the 11 mocked
+// deposits that name no `owner`.
+pregenerateWallets(18);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: bringToDone (the marker signed, posted and confirmed) and the
+// deposit verification after it, or uploads through the real /upload route.
+// They take up to 1.3 s on a quiet machine, and a loaded runner stretches a
+// run several times over (0.3 s was seen at 3.4 s, 0.6 s at 5.9 s).
+const LONG_TEST_MS = 20_000;
 
 /** A verified transfer INTO the worker wallet from another wallet, confirmed
  *  at both origins at the given heights. */
@@ -56,7 +69,7 @@ describe('D10 deposits, marker height and the balance detector', () => {
     const r2 = await viaWorker('credit-deposit', env, { txId: above });
     expect(r2.body).toMatchObject({ credited: false, deposits: '500' });
     expect((await guardStatus(env.SPEND_GUARD)).available).toBe('500');
-  });
+  }, LONG_TEST_MS);
 
   it('a transaction of the worker wallet itself (an outgoing one, or the marker) is never a deposit → 503 deposit_unverified', async () => {
     const wallet = await freshWallet();
@@ -72,7 +85,7 @@ describe('D10 deposits, marker height and the balance detector', () => {
     const o = await viaWorker('credit-deposit', env, { txId: outgoing });
     expect(o.body.code).toBe(SPEND_CODES.depositUnverified);
     expect((await guardStatus(env.SPEND_GUARD)).ledger.deposits).toBe('0');
-  });
+  }, LONG_TEST_MS);
 
   it('≥2 independent operators, each ≥ MIN_DEPOSIT_CONFIRMATIONS, heights within the skew; depositHeight = the minimum; one operator, disagreeing quantities, low confirmations or a wide skew → unverified', async () => {
     const wallet = await freshWallet();
@@ -100,7 +113,7 @@ describe('D10 deposits, marker height and the balance detector', () => {
     expect((await guardStatus(env.SPEND_GUARD)).ledger.deposits).toBe('0');
     await mockDeposit(t, wallet.address, { heights: [1503, 1500] });
     expect((await viaWorker('credit-deposit', env, { txId: t })).body).toMatchObject({ credited: true, depositHeight: 1500 });
-  });
+  }, LONG_TEST_MS);
 
   it('credit-deposit before init done → 503 spend_not_initialized (after the verification); a malformed txId → 400 before any network', async () => {
     const wallet = await freshWallet();
@@ -130,7 +143,7 @@ describe('D10 deposits, marker height and the balance detector', () => {
     expect(r.status).toBe(503);
     expect(r.body.code).toBe(SPEND_CODES.notInitialized);
     expect((await guardStatus(ns)).ledger.pending).toBe('0');
-  });
+  }, LONG_TEST_MS);
 
   it('§3.4 detector: observedMin (minimum over ≥ MIN_BALANCE_SOURCES gateway answers) below available → 503 spend_ledger_inconsistent; fewer answers than MIN_BALANCE_SOURCES → inert, the ledger decides alone', async () => {
     const { env, wallet, status } = await sagaEnv('detector', { deposit: '1000' });
@@ -165,7 +178,7 @@ describe('D10 deposits, marker height and the balance detector', () => {
     await upload(await uploadRequest(id, crypto.randomUUID()), env);
     expect(post2!.calls).toBe(1);
     expect((await status()).available).toBe('980');
-  });
+  }, LONG_TEST_MS);
 
   // DO-level rows (spend-guard.do.test.ts covers the quote binding and the
   // per-transaction isolation of the ledger); the concurrent case is the

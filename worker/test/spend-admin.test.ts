@@ -6,6 +6,7 @@ import {
   AUTH, INVITE_SECRET, METRICS_SECRET, LIMITS_ENV,
   adminReq, bringToDone, closed, freshWallet, guardStatus, handlerWith, isolatedGuard, spendEnv, viaHandler, viaWorker,
 } from './helpers/spend-admin';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // /admin/spend/* — routing, authentication order and scope (spec rev. 10 §5),
 // freeze, status and reinit through the worker (direct dispatch, env
@@ -13,6 +14,17 @@ import {
 // own §12 files (spend-guard.marker / spend-guard.ledger).
 
 const { mockRoute } = setupOutboundMock();
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 8 = one per test.
+pregenerateWallets(8);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: bringToDone (the marker signed, posted and confirmed) and a reinit
+// cycle. They take up to 1.3 s on a quiet machine, and a loaded runner
+// stretches a run several times over (0.3 s was seen at 3.4 s, 0.6 s at
+// 5.9 s).
+const LONG_TEST_MS = 20_000;
 
 describe('auth and config order', () => {
   it('503 spend_admin_unconfigured without SPEND_ADMIN_SECRET — checked BEFORE the bearer', async () => {
@@ -118,7 +130,7 @@ describe('status, freeze, reinit', () => {
     expect(again.body.init).toMatchObject({ state: 'posted', cycle: 2 });
     pendingAll(mockRoute, again.body.init!.txId!);
     expect((await viaHandler(handler, 'init', env)).body.step).toBe('waiting');
-  });
+  }, LONG_TEST_MS);
 
   it('SpendGuard unavailable → 503 spend_guard_unavailable on every op', async () => {
     const broken = {

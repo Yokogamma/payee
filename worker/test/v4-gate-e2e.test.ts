@@ -5,6 +5,7 @@ import worker from '../src/index';
 import { spendGuardReady } from './helpers/spend-guard-ready';
 import { withTrustedWallet } from '../test-stubs/wallet-address';
 import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
+import { freshWallet, pregenerateWallets } from './helpers/wallet-pool';
 
 // Direct-dispatch suite (env-override) for the v4 upload kill switch and the
 // v4 committed-idempotency e2e. Same pattern as v3-gate-e2e.test.ts: SELF gets
@@ -20,6 +21,9 @@ const { mockRoute } = setupOutboundMock();
 // D10 (PR-3b): the paid path needs an initialised, funded SpendGuard —
 // the fixture brings the shared one to `done` once, idempotently.
 beforeAll(() => spendGuardReady());
+// The idempotency e2e's signable wallet is generated before the first test —
+// never in a test body (helpers/wallet-pool.ts).
+pregenerateWallets(1);
 
 const MC = 'QUFBQUFBQUFBQUFBQUFBQQ=='; // 16 bytes
 const SC = 'QkJCQkJCQkJCQkJCQkJCQg=='; // 16 bytes
@@ -181,11 +185,7 @@ describe('v4 e2e idempotency (committed): exactly one paid POST', () => {
     const id = await makeIdentity();
     const noteId = uuidV8();
 
-    const keyPair = await crypto.subtle.generateKey(
-      { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-      true, ['sign', 'verify'],
-    );
-    const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
+    const { jwk } = await freshWallet();
     const envWithJwk = { ...baseEnv, ...(await withTrustedWallet(jwk)) };
 
     mockRoute('GET', /^https:\/\/arweave\.net(?::443)?\/tx_anchor$/, 200, 'A'.repeat(43));
@@ -205,5 +205,5 @@ describe('v4 e2e idempotency (committed): exactly one paid POST', () => {
     expect(b2.committed).toBe(true);
 
     expect(postTx.calls).toBe(1); // the financial invariant
-  });
+  }, 20_000); // two RSA-signed uploads through the real route: long by nature, headroom under load
 });

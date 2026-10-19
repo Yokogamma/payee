@@ -11,6 +11,7 @@ import {
 } from '../src/arweave-transport';
 import { makeEmit, metricIndexKey } from '../src/metrics';
 import { setupOutboundMock } from './helpers/outbound-mock';
+import { freshWallet, pregenerateWallets } from './helpers/wallet-pool';
 
 // Unit tests of the PR-2 transport adapter (spec: §4.PR-2 «Реализация», §R1).
 // Runs in the direct-dispatch config: this file stubs the isolate's global
@@ -27,12 +28,11 @@ function capturingEmit() {
   return { calls, emit };
 }
 
+// The two real private RSA sets below are generated before the first test —
+// never in a test body (helpers/wallet-pool.ts).
+pregenerateWallets(2);
 async function realRsaJwk(): Promise<Record<string, string>> {
-  const keyPair = await crypto.subtle.generateKey(
-    { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-    true, ['sign', 'verify'],
-  );
-  return await crypto.subtle.exportKey('jwk', keyPair.privateKey) as unknown as Record<string, string>;
+  return JSON.parse((await freshWallet()).jwk) as Record<string, string>;
 }
 
 describe('assertStructurallyCompleteJwk — the honest boundary', () => {

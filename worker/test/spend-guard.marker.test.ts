@@ -7,6 +7,7 @@ import {
   closed, confirmedAll, deadAll, freshWallet, guardCall, guardStatus, handlerWith, isolatedGuard, markerMocks, pendingAll,
   spendEnv, viaHandler,
 } from './helpers/spend-admin';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // D10 §12 — «маркер — durable-автомат» (ревью #7 H2): every crash boundary of
 // the init automaton through the REAL route (`/admin/spend/init` = «continue
@@ -15,6 +16,16 @@ import {
 
 const { mockRoute } = setupOutboundMock();
 const handler = handlerWith({ closeLegacySet: closed() });
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 11 = one per test (`frozen()` takes one).
+pregenerateWallets(11);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: the marker signed, posted and confirmed, then a second one. They
+// take up to 1.3 s on a quiet machine, and a loaded runner stretches a run
+// several times over (0.3 s was seen at 3.4 s, 0.6 s at 5.9 s).
+const LONG_TEST_MS = 20_000;
 
 async function frozen(name: string) {
   const env = spendEnv(isolatedGuard(name), await freshWallet());
@@ -165,7 +176,7 @@ describe('D10 marker automaton on durable storage', () => {
     const fresh = await viaHandler(aged, 'init', env);
     expect(fresh.body.init?.state).toBe('posted');
     expect(fresh.body.init!.txId).not.toBe(oldTx);
-  });
+  }, LONG_TEST_MS);
 
   it('signed, the POST keeps failing while other gateways already confirm the marker: the next init reconciles by the quorum → posted → done WITHOUT another send (review 24.09, high)', async () => {
     const env = await frozen('stuck');

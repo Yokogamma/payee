@@ -1,12 +1,12 @@
 import { env } from 'cloudflare:test';
 import { expect } from 'vitest';
 import worker from '../../src/index';
-import { addressOfJwk } from '../../test-stubs/wallet-address';
 import {
   createSpendAdminHandler, DEFAULT_SPEND_ADMIN_DEPS,
   type LegacyItem, type SpendAdminDeps, type SpendAdminEnv, type SpendAdminHandler,
 } from '../../src/spend-admin';
 import { STATUS_ORIGINS, statusUrlRe, type OutboundRoute } from './outbound-mock';
+import type { Wallet } from './wallet-pool';
 
 /**
  * Shared fixture for the `/admin/spend/*` suites (D10 spend-admin.ts):
@@ -74,18 +74,12 @@ export async function guardCall(ns: DurableObjectNamespace, path: string, body: 
   return { status: res.status, body: parsed };
 }
 
-export interface Wallet { jwk: string; address: string; n: string }
-
-/** A real signable RSA wallet (as the e2e suites generate) and its address. */
-export async function freshWallet(): Promise<Wallet> {
-  const keyPair = await crypto.subtle.generateKey(
-    { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-    true, ['sign', 'verify'],
-  );
-  const exported = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
-  const jwk = JSON.stringify(exported);
-  return { jwk, address: await addressOfJwk(jwk), n: exported.n! };
-}
+// A real signable RSA wallet and its address — handed out from the file's
+// pool, generated in beforeAll (wallet-pool.ts: a key generated in a test body
+// is paid from that test's 5 s budget). Re-exported so the suites keep
+// importing it from here; every file that takes one calls
+// pregenerateWallets(n).
+export { freshWallet, type Wallet } from './wallet-pool';
 
 export function spendEnv(ns: DurableObjectNamespace, wallet: Wallet, extra: Record<string, unknown> = {}): WorkerEnv & SpendAdminEnv {
   return {

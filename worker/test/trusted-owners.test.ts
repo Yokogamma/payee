@@ -6,11 +6,17 @@ import worker, { resolveTrustedOwners, walletTrust } from '../src/index';
 import { setupOutboundMock, b64, sha256 } from './helpers/outbound-mock';
 import { addressOfJwk } from '../test-stubs/wallet-address';
 import { TEST_ARWEAVE_JWK, TEST_WALLET_ADDRESS } from '../test-stubs/test-wallet.mjs';
+import { freshWallet, pregenerateWallets } from './helpers/wallet-pool';
 
 type Env = Parameters<typeof resolveTrustedOwners>[0];
 
 const baseEnv = env as unknown as Env;
 const withEnv = (extra: Record<string, unknown>) => ({ ...baseEnv, ...extra }) as unknown as Env;
+
+// The two generated wallets below («the JWK changes», «a freshly generated
+// wallet») are made before the first test — never in a test body
+// (helpers/wallet-pool.ts).
+pregenerateWallets(2);
 
 const A = 'Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE';
 const B = 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
@@ -69,11 +75,7 @@ describe('walletTrust — three states, and only one of them refuses', () => {
     // confusing. It now decides whether /upload may sign at all, so a cache
     // that ignored which key it derived from would clear the trust check for a
     // key that was never checked.
-    const other = await crypto.subtle.generateKey(
-      { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-      true, ['sign', 'verify'],
-    );
-    const otherJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', other.privateKey));
+    const otherJwk = (await freshWallet()).jwk;
     const otherAddress = await addressOfJwk(otherJwk);
     expect(otherAddress).not.toBe(TEST_WALLET_ADDRESS);
 
@@ -100,11 +102,7 @@ describe('the test fixture derives addresses the way Arweave does', () => {
   });
 
   it('matches it for a freshly generated wallet too', async () => {
-    const pair = await crypto.subtle.generateKey(
-      { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-      true, ['sign', 'verify'],
-    );
-    const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', pair.privateKey));
+    const { jwk } = await freshWallet();
     expect(await addressOfJwk(jwk)).toBe(await arweave.wallets.jwkToAddress(JSON.parse(jwk)));
   });
 });

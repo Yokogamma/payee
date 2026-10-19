@@ -49,7 +49,7 @@ beforeAll(async () => {
   // …and the §3.4 balance detector must not add outbound calls to this
   // suite's exact counts: mark the wallet's balance as just read.
   await spendGuardReady({ walletAddress: realWalletOwners });
-});
+}, 60_000); // an RSA keygen inside: an explicit budget, not the 10 s default
 
 type Identity = { priv: Uint8Array; pkB64: string; ownerHash: string };
 async function makeIdentity(): Promise<Identity> {

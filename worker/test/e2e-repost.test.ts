@@ -6,6 +6,7 @@ import { spendGuardReady } from './helpers/spend-guard-ready';
 import { setupOutboundMock, b64, sha256, STATUS_ORIGINS, statusUrlRe } from './helpers/outbound-mock';
 import { computePublicationFp } from '../src/publication-fp';
 import { withTrustedWallet } from '../test-stubs/wallet-address';
+import { freshWallet, pregenerateWallets } from './helpers/wallet-pool';
 
 // Residual reviewer gaps:
 // 1) invalid env config must 503 through the real /upload route (fail closed);
@@ -29,6 +30,9 @@ const { mockRoute } = setupOutboundMock();
 // D10 (PR-3b): the paid path needs an initialised, funded SpendGuard —
 // the fixture brings the shared one to `done` once, idempotently.
 beforeAll(() => spendGuardReady());
+// The re-post's signable wallet is generated before the first test — never
+// in a test body (helpers/wallet-pool.ts).
+pregenerateWallets(1);
 
 const NOTE_ID = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
 const C = 'AAAAAAAAAAAAAAAAAAAAAA=='; // 16 bytes: the GCM tag floor
@@ -192,11 +196,7 @@ describe('e2e: lost commit → posted anchor → TTL → redrop → successful r
     });
 
     // Real signable wallet so the re-post path can run end-to-end.
-    const keyPair = await crypto.subtle.generateKey(
-      { name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-      true, ['sign', 'verify'],
-    );
-    const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', keyPair.privateKey));
+    const { jwk } = await freshWallet();
 
     // Arweave HTTP surface for the re-post: dead status, then anchor/price/post.
     // (arweave-js requires a ≥43-char base64url tx anchor.)

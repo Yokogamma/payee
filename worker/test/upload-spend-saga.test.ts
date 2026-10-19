@@ -8,6 +8,7 @@ import {
   RATE_LIMITER,
   confirmedOnAll, deadOnAll, fpOf, guardCall, makeIdentity, opRecord, paidLegs, sagaEnv, statusBody, upload, uploadRequest,
 } from './helpers/spend-saga';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // D10 §12 — «интеграция потока» (§8) through the REAL /upload route (direct
 // dispatch, env overrides, a stubbed gateway pool, an isolated funded guard
@@ -18,6 +19,17 @@ import {
 // scheduler step of the reader release.
 
 const { mockRoute } = setupOutboundMock();
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 9 = one per `sagaEnv`.
+pregenerateWallets(9);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: RSA-signed uploads through the whole saga, settled by the quorum.
+// They take up to 1.3 s on a quiet machine, and a loaded runner stretches a
+// run several times over (0.3 s was seen at 3.4 s, 0.6 s at 5.9 s).
+const LONG_TEST_MS = 20_000;
+
 const uuidV4 = () => crypto.randomUUID();
 
 describe('upload → spend saga, crash after each boundary', () => {
@@ -71,7 +83,7 @@ describe('upload → spend saga, crash after each boundary', () => {
     const res = await runInDurableObject(ns.get(ns.idFromName('global')), (_i, state) =>
       state.storage.get<{ state: string; settledHeight?: number }>(`res:${permit!.spendKey}`));
     expect(res).toMatchObject({ state: 'spent', settledHeight: 5002 });
-  });
+  }, LONG_TEST_MS);
 
   it('a lost setAlarm never lets an ended lease hold the budget: the next prepare releases it BEFORE its own checks (review 24.09, medium)', async () => {
     const { env, ns, status, wallet } = await sagaEnv('alarmfail', { deposit: '10' });
@@ -99,7 +111,7 @@ describe('upload → spend saga, crash after each boundary', () => {
     expect(r.status, JSON.stringify(r.body)).toBe(200);
     expect((await status()).ledger.pending).toBe('10'); // only the new one
     expect(await runInDurableObject(stub, (_i, state) => state.storage.getAlarm())).toBeNull();
-  });
+  }, LONG_TEST_MS);
 
   it('crash after prepare (before sign): the signature fails → 502, the reservation is `prepared` with a lease, the alarm is armed, and expire-leases past the lease releases the pending; no POST', async () => {
     const { env, ns, status, wallet } = await sagaEnv('lease');
@@ -144,7 +156,7 @@ describe('upload → spend saga, crash after each boundary', () => {
     expect(r2.status).toBe(502);
     expect(r2.body.code).toBe('arweave_rejected');
     expect((await status()).ledger.pending).toBe('7');
-  });
+  }, LONG_TEST_MS);
 
   it('redrop: a PROVEN dead transaction releases its reservation, phase 2 opens a NEW generation and posts under permit-send(kind: redrop2)', async () => {
     const { env, ns, status } = await sagaEnv('redrop', { deposit: '1000' });
@@ -180,7 +192,7 @@ describe('upload → spend saga, crash after each boundary', () => {
     expect(await runInDurableObject(stub, (_i, state) => state.storage.get<{ state: string }>(`res:${oldKey}`))).toMatchObject({ state: 'released' });
     const permit = await runInDurableObject(stub, (_i, state) => state.storage.get<{ kind: string }>(`permit:${r.body.txId}`));
     expect(permit).toMatchObject({ kind: 'redrop2' });
-  });
+  }, LONG_TEST_MS);
 
   it('activate conflict: a reservation under this operation\'s spendKey already active for someone else → 503 activate_conflict, the journal record is aborted with that code, no POST', async () => {
     const { env, ns, status } = await sagaEnv('conflict');
@@ -200,7 +212,7 @@ describe('upload → spend saga, crash after each boundary', () => {
     // never reached `posting`, so it is closed as a plain refusal.
     expect(await opRecord(id.pkB64, opId)).toMatchObject({ status: 'finished', code: SPEND_CODES.activateConflict, paidResult: 'none' });
     expect((await status()).ledger.pending).toBe('5'); // the foreign reservation is untouched
-  });
+  }, LONG_TEST_MS);
 
   it('floor and window cap refuse BEFORE signing: 503 spend_floor / spend_window_cap, nothing pending, no POST', async () => {
     const id = await makeIdentity();
@@ -220,5 +232,5 @@ describe('upload → spend saga, crash after each boundary', () => {
     const r3 = await upload(await uploadRequest(id, uuidV4()), ceiling.env);
     expect(r3.body.code).toBe(SPEND_CODES.quoteMismatch);
     expect(SPEND_LIMITS_ENV.WALLET_FLOOR_WINSTON).toBe('0');
-  });
+  }, LONG_TEST_MS);
 });

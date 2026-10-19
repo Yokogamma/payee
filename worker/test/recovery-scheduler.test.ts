@@ -13,6 +13,7 @@ import {
   RATE_LIMITER,
   confirmedOnAll, deadOnAll, fpOf, guardCall, makeIdentity, opRecord, paidLegs, sagaEnv, statusBody, upload, uploadRequest,
 } from './helpers/spend-saga';
+import { pregenerateWallets } from './helpers/wallet-pool';
 import { getArweave } from '../src/arweave-transport';
 
 // PR-3b reader release, step 4: the single-alarm scheduler over durable
@@ -32,6 +33,18 @@ import { getArweave } from '../src/arweave-transport';
 const FAR = Date.now() + 1_000_000_000;
 
 const { mockRoute } = setupOutboundMock();
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 27 = one per `sagaEnv`.
+pregenerateWallets(27);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: a real upload or a writer-signed record, then several alarm runs
+// against the quorum on the real DO. They take up to 1.3 s on a quiet
+// machine, and a loaded runner stretches a run several times over (0.3 s was
+// seen at 3.4 s, 0.6 s at 5.9 s).
+const LONG_TEST_MS = 20_000;
+
 const uuidV4 = () => crypto.randomUUID();
 const ANCHOR = 'A'.repeat(64);
 /** The anchor block's height in every test that needs the chain. */
@@ -173,7 +186,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     // to the money index, and the alarm follows it (review #2, H4).
     expect(moneyOf(rs, noteId)).toMatchObject({ txId: record.txId, attempts: 0 });
     expect(rs.alarm).toBe(moneyOf(rs, noteId).dueAt);
-  });
+  }, LONG_TEST_MS);
 
   it('(H1) a run that lost the record to a concurrent phase 1 is stripped of the right to send: terminal activate → discarded, no POST; and the DO refuses the permit of a released reservation for everyone', async () => {
     const { env, ns, status, wallet } = await sagaEnv('rec-stale', { deposit: '1000' });
@@ -246,7 +259,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     await runNow(stub, FAR); // no anchor/price routes: a signature attempt would throw
     expect(await note(stub, noteB)).toMatchObject({ status: 'redrop_pending', attempts: 1 });
     expect((await status()).ledger.pending).toBe('10'); // B's 10 still held
-  });
+  }, LONG_TEST_MS);
 
   it('(H2, round 3) a temporary refusal of the guard keeps the money entry: unavailable and spend_send_in_flight → retry with backoff; only a confirmed final state removes it', async () => {
     const { env, ns, status } = await sagaEnv('rec-money-retry', { deposit: '1000' });
@@ -279,7 +292,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     expect((await recoveryStatus(stub)).money).toEqual({});
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     void ns;
-  });
+  }, LONG_TEST_MS);
 
   it('(H3, round 3) reserved → committed (mark-posted lost three times) enters the money index too — the reservation is reconciled without any client request', async () => {
     const { env, status } = await sagaEnv('rec-commit', { deposit: '1000' });
@@ -311,7 +324,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     await runNow(stub, moneyOf(rs, noteId).dueAt);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     expect((await recoveryStatus(stub)).money).toEqual({});
-  });
+  }, LONG_TEST_MS);
 
   it('(H4) the money index: a fresh upload schedules the reconciliation of its reservation independently of the client; the alarm settles it as spent under a money quorum, or released after a dead verdict past the age guard, and leaves a pre-D10 txId alone', async () => {
     const { env, status } = await sagaEnv('rec-money-idx', { deposit: '1000' });
@@ -389,7 +402,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     await runNow(stub, entryC.dueAt);
     expect((await recoveryStatus(stub)).money).toEqual({});
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
-  });
+  }, LONG_TEST_MS);
 
   it('confirmed with a MONEY quorum → posted AND spent at the max agreed height', async () => {
     const { env, ns, status, wallet } = await sagaEnv('rec-money', { deposit: '1000' });
@@ -427,7 +440,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     r = await note(stub, noteId);
     expect(r).toMatchObject({ status: 'posted', txId: bytes.txId });
     expect((await recoveryStatus(stub)).recoveryCount).toBe(0);
-  });
+  }, LONG_TEST_MS);
 
   it('a signed whose bytes do not match its txId is neither resent nor re-signed: the quorum still moves it (confirmed → posted); otherwise it is rescheduled', async () => {
     const { env, ns, wallet } = await sagaEnv('rec-corrupt', { deposit: '1000' });
@@ -442,7 +455,7 @@ describe('signed: reconciliation by the quorum, resend of the same bytes', () =>
     confirmedOnAll(mockRoute, record.txId, 100, 1);
     await runNow(stub, FAR + backoffMs(1) + 1);
     expect((await note(stub, noteId))?.status).toBe('posted');
-  });
+  }, LONG_TEST_MS);
 
   it('a frozen guard refuses the resend permit: the record is kept (signed, bytes, hold) and rescheduled — no release, no abort', async () => {
     const { env, ns, status, wallet } = await sagaEnv('rec-frozen', { deposit: '1000' });
@@ -716,7 +729,7 @@ describe('review 24.09 #5 — the proof of expiry comes from the chain; age neve
     STATUS_ORIGINS.forEach(o => mockRoute('GET', statusUrlRe(o, r!.txId), 202, 'Pending'));
     await runNow(stub, Math.max(oldWatch.dueAt, rows.find(x => x.txId === r!.txId)!.dueAt));
     expect(moneyRows(await recoveryStatus(stub), noteId).map(x => x.txId)).toEqual([r!.txId]);
-  });
+  }, LONG_TEST_MS);
 
   it('(H2) age never deletes an unresolved obligation: a watched txId with 49 confirmations on the 8th day stays (stale — slower, escalated), and when the 60th confirmation arrives it is booked spent', async () => {
     const { env, status } = await sagaEnv('rec-r5-h2', { deposit: '1000' });
@@ -756,7 +769,7 @@ describe('review 24.09 #5 — the proof of expiry comes from the chain; age neve
     rs = await recoveryStatus(stub);
     expect(rs.money).toEqual({});
     expect(rs.alarm).toBeNull();
-  });
+  }, LONG_TEST_MS);
 });
 
 describe('review 24.09 #6 — a dead read BEFORE the proof is not evidence for the deletion', () => {
@@ -820,7 +833,7 @@ describe('review 24.09 #6 — a dead read BEFORE the proof is not evidence for t
     await runNow(stub, await dueOf(pending.noteId));
     expect((await recoveryStatus(stub)).money).toEqual({});
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '20' });
-  });
+  }, LONG_TEST_MS);
 
   it('(M) proven-expired bytes get no new lease: the resend permit is refused spend_anchor_expired, nothing is posted, the record is rescheduled (dead → redrop is the way)', async () => {
     const { env, ns, status, wallet } = await sagaEnv('rec-r6-m', { deposit: '1000' });
@@ -906,7 +919,7 @@ describe('review 24.09 #6, second half — the re-read guards the RELEASE of an 
     expect(post!.calls).toBe(1);
     expect(await resOf(c.spendKey)).toMatchObject({ state: 'released' });
     expect(moneyRows(await recoveryStatus(c.stub), c.noteId).find(x => x.txId === c.record.txId)).toMatchObject({ watching: true });
-  });
+  }, LONG_TEST_MS);
 
   it('(H) phase 2 re-reads the old txId right before signing, whoever released the money: pending → no signature, rescheduled; confirmed → `released → spent` and posted with the old txId; only dead → the new generation', async () => {
     const { env, ns, status, wallet } = await sagaEnv('rec-r7-p2', { deposit: '1000' });
@@ -978,7 +991,7 @@ describe('scheduler mechanics', () => {
     // The alarm is now the earliest of the far record and the six money entries.
     expect(rs.alarm).toBeLessThanOrEqual(t0 + 10_000_000);
     expect(Object.keys(rs.money)).toHaveLength(ALARM_BATCH + 1);
-  });
+  }, LONG_TEST_MS);
 
   it('self-healing: a backlog without an alarm gets it back on the next /check-and-reserve; a note in recovery answers `recovering`', async () => {
     const { env, ns, wallet } = await sagaEnv('rec-heal', { deposit: '1000' });

@@ -9,6 +9,7 @@ import {
   confirmedAll, deadAll, freshWallet, guardCall, guardStatus, handlerWith, isolatedGuard, isolatedNs, markerMocks, pendingAll,
   spendEnv, txUrlRe, viaHandler, viaWorker, type Wallet,
 } from './helpers/spend-admin';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // D10 §12 — «покой и унаследованные» (ревью #7 H1, #8 H1, #9 H1/H2/M): the
 // closure of the legacy set (legacy-closure.ts) through the PRODUCTION
@@ -18,6 +19,18 @@ import {
 // after `done`. Spec §4.0 п. 2–6.
 
 const { mockRoute } = setupOutboundMock();
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 11 = one per test, two in (5)(5б).
+pregenerateWallets(11);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: the legacy closure over signed pre-D10 headers and per-key
+// journals, then the marker signed, posted and confirmed. They take up to
+// 1.3 s on a quiet machine, and a loaded runner stretches a run several times
+// over (0.3 s was seen at 3.4 s, 0.6 s at 5.9 s).
+const LONG_TEST_MS = 20_000;
+
 const RATE_LIMITER = (env as unknown as { RATE_LIMITER: DurableObjectNamespace }).RATE_LIMITER;
 const INVITE_MANAGER = (env as unknown as { INVITE_MANAGER: DurableObjectNamespace }).INVITE_MANAGER;
 const PAYLOAD = 'https://arweave.net,https://g2.test';
@@ -105,7 +118,7 @@ describe('D10 legacy set L and init preconditions', () => {
     // The permit's 5 is still the reservation's — reported by /open-permits, counted ONCE.
     expect(((await guardCall(guard, '/open-permits')).body.items as Array<{ txId: string }>).map(i => i.txId)).toEqual([permitTx]);
     expect((await guardStatus(guard)).ledger.pending).toBe('25'); // 5 (the carried reservation) + 20 (the journal hold)
-  });
+  }, LONG_TEST_MS);
 
   it('(H3) an active reservation carried by reinit is settled ONCE: the closure holds nothing for it, and a later confirmed quorum spends exactly its reward', async () => {
     const wallet = await freshWallet();
@@ -142,7 +155,7 @@ describe('D10 legacy set L and init preconditions', () => {
     expect(s.ledger).toMatchObject({ spent: '10', pending: '0' });
     expect((await guardCall(guard, '/settle-by-tx', { txId, outcome: 'spent', height: 3006 })).body).toMatchObject({ state: 'spent', noop: true });
     expect((await guardStatus(guard)).ledger.spent).toBe('10');
-  });
+  }, LONG_TEST_MS);
 
   it('(M, round 3) an /open-permits item that lacks a field, or names a state that is not an open reservation, keeps the set OPEN', async () => {
     const wallet = await freshWallet();
@@ -199,7 +212,7 @@ describe('D10 legacy set L and init preconditions', () => {
     // The journal refuses the range.
     r = await viaWorker('init', { ...e, RATE_LIMITER: broken('{"ops":[],"cursor":null,"error":"bad_range"}', 200) });
     expect(r.body.code).toBe(SPEND_CODES.initLegacyOpen);
-  });
+  }, LONG_TEST_MS);
 
   it('(3) an OLD reward of 20 above the NEW MAX_TX_REWARD of 10 is held at exactly 20 — the ceiling covers new transactions only', async () => {
     const wallet = await freshWallet();
@@ -238,7 +251,7 @@ describe('D10 legacy set L and init preconditions', () => {
     markerMocks(mockRoute, { price: '3' });
     expect((await viaWorker('init', e)).status).toBe(200);
     expect((await guardStatus(guard)).ledger.pending).toBe('7');
-  });
+  }, LONG_TEST_MS);
 
   it('(5)(5б) a header that does not verify is rejected and the next origin tried: a correctly signed DIFFERENT transaction of the same wallet (id ≠ requested), a foreign wallet, garbage; all rejected → reward unknown', async () => {
     const wallet = await freshWallet();
@@ -265,7 +278,7 @@ describe('D10 legacy set L and init preconditions', () => {
     headerAt('https://g2.test', c.txId, 200, '{"format":2,"id":"x"}');
     const r = await viaWorker('init', e2);
     expect(r.body.code).toBe(SPEND_CODES.initLegacyRewardUnknown);
-  });
+  }, LONG_TEST_MS);
 
   it('(7) journal membership: `unknown` → in L; `accepted` with a money quorum → NOT in L (no header read); `accepted` without a quorum → in L; `rejected` → not in L', async () => {
     const wallet = await freshWallet();
@@ -287,7 +300,7 @@ describe('D10 legacy set L and init preconditions', () => {
     expect((await viaWorker('init', e)).status).toBe(200);
     const items = (await guardCall(guard, '/legacy-list')).body.items as Array<{ txId: string; reward: string }>;
     expect(items.map(i => [i.txId, i.reward]).sort()).toEqual([[unknown.txId, '11'], [unconfirmed.txId, '13']].sort());
-  });
+  }, LONG_TEST_MS);
 
   it('(8) a revoked key is still enumerated (invite:* keeps publicKey); an old-format invite without a key → spend_init_keys_unknown until the operator acknowledges it through init-legacy-keys', async () => {
     const wallet = await freshWallet();
@@ -307,7 +320,7 @@ describe('D10 legacy set L and init preconditions', () => {
     markerMocks(mockRoute, { price: '3' });
     expect((await viaWorker('init', e)).status).toBe(200);
     expect((await guardCall(guard, '/legacy-list')).body.items).toEqual([{ txId: tx.txId, reward: '6', source: 'journal', state: 'held', registeredAt: expect.any(Number) }]);
-  });
+  }, LONG_TEST_MS);
 
   it('(9) resolution after done (each init in `done`): a money quorum above h_init → spent; at/below → dropped; unanimous dead past the age guard → dropped; pending → held without TTL', async () => {
     const wallet = await freshWallet();

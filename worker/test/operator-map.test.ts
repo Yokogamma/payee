@@ -11,6 +11,7 @@ import {
   bringToDone, confirmedAll, freshWallet, guardStatus, handlerWith, closed, isolatedGuard, markerMocks, mockTxAll, spendEnv, statusBody, txId43, viaHandler, viaWorker,
 } from './helpers/spend-admin';
 import { RATE_LIMITER, confirmedOnAll, makeIdentity, paidLegs, sagaEnv, upload, uploadRequest } from './helpers/spend-saga';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // The operator map on the WORKER (review 25.09: a mandatory condition of the
 // reader release). Every money decision of the guard counts OPERATORS, and the
@@ -20,6 +21,19 @@ import { RATE_LIMITER, confirmedOnAll, makeIdentity, paidLegs, sagaEnv, upload, 
 // one operator overrides the var — no dependency injection, the real path.
 
 const { mockRoute } = setupOutboundMock();
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 8 = one per test that needs a wallet (5; `sagaEnv` takes one), plus the
+// sender of each of the 3 mockDeposit calls.
+pregenerateWallets(8);
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: a real marker or upload, then the money quorum under two operator
+// maps. They take up to 1.3 s on a quiet machine, and a loaded runner
+// stretches a run several times over (0.3 s was seen at 3.4 s, 0.6 s at
+// 5.9 s).
+const LONG_TEST_MS = 20_000;
+
 const ONE_OPERATOR = 'https://arweave.net=same,https://g2.test=same';
 const HALF_KNOWN = 'https://arweave.net=arweave'; // g2.test unknown → no vote
 const ANCHOR = 'A'.repeat(64);
@@ -81,7 +95,7 @@ describe('deposit: two origins of one operator verify nothing', () => {
     expect((await guardStatus(env.SPEND_GUARD)).ledger.deposits).toBe('0');
     await mockDeposit(t, wallet.address, { heights: [1002, 1004], quantity: '500' });
     expect((await viaWorker('credit-deposit', env, { txId: t })).body).toMatchObject({ credited: true, witnesses: 2 });
-  });
+  }, LONG_TEST_MS);
 });
 
 describe('marker: `done` needs two operators', () => {
@@ -100,7 +114,7 @@ describe('marker: `done` needs two operators', () => {
     expect(r.body.quorum).toMatchObject({ confirmedOperators: 1, need: 2 });
     confirmedAll(mockRoute, txId);
     expect((await viaHandler(handler, 'init', env)).body.step).toBe('done');
-  });
+  }, LONG_TEST_MS);
 });
 
 describe('spend: the money index settles only under two operators', () => {
@@ -124,7 +138,7 @@ describe('spend: the money index settles only under two operators', () => {
     await runNow(stub, (await money(stub))[0].dueAt);
     expect((await status()).ledger).toMatchObject({ pending: '0', spent: '10' });
     expect(await money(stub)).toEqual([]);
-  });
+  }, LONG_TEST_MS);
 
   // The recheck path of /upload (`liveOf`) settles through the same
   // `moneyQuorum(votes, operatorOfEnv(env))` — the rule itself is covered by
@@ -166,7 +180,7 @@ describe('/health attests the operator count', () => {
     confirmedOnAll(mockRoute, r.body.txId!, 5000, 60);
     await runNow(stub, (await money(stub))[0].dueAt);
     expect((await status()).ledger).toMatchObject({ pending: '10', spent: '0' });
-  });
+  }, LONG_TEST_MS);
 });
 
 // ── small helpers ─────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { setupOutboundMock } from './helpers/outbound-mock';
 import { makeIdentity, sagaEnv, upload, uploadRequest } from './helpers/spend-saga';
+import { pregenerateWallets } from './helpers/wallet-pool';
 
 // D10 §12 — «откат writer → reader с деньгами» (plan «Rollback floor —
 // reader-before-writer», PR #206 v21: the reader carries SpendGuard whole).
@@ -8,6 +9,10 @@ import { makeIdentity, sagaEnv, upload, uploadRequest } from './helpers/spend-sa
 // scheduler step; the configuration row is executable now.
 
 setupOutboundMock(); // no routes: any Arweave call would fail the test
+// Every wallet the tests below take (freshWallet / sagaEnv) is generated
+// before the first test — never in a test body (helpers/wallet-pool.ts).
+// 1 = the one `sagaEnv`.
+pregenerateWallets(1);
 
 describe('writer → reader rollback keeps the limits', () => {
   // A writer-created `signed` is resent by the reader through the same

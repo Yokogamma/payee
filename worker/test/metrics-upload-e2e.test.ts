@@ -46,7 +46,14 @@ beforeAll(async () => {
   // …and the §3.4 balance detector must not add outbound calls to this
   // suite's exact counts: mark the wallet's balance as just read.
   await spendGuardReady({ walletAddress: realWalletOwners });
-});
+}, 60_000); // an RSA keygen inside: an explicit budget, not the 10 s default
+
+// Tests that are long BY NATURE carry an explicit budget instead of the 5 s
+// default: full paid uploads through the three legs (for every env variant,
+// at the price boundary) or the recovery path end to end. They take up to
+// 1.3 s on a quiet machine, and a loaded runner stretches a run several times
+// over (0.3 s was seen at 3.4 s, 0.6 s at 5.9 s).
+const LONG_TEST_MS = 20_000;
 
 async function makeIdentity() {
   const priv = ed.utils.randomSecretKey();
@@ -277,7 +284,7 @@ describe('gateway protocol defects → invalid_response, not SDK garbage', () =>
     const priceCall = cap.byEvent('gateway_call').find(p => p.blobs?.[1] === 'price')!;
     expect(priceCall.doubles?.[1]).toBe(-1); // not representable → "not recorded"
     expect((JSON.parse(post.lastBody!) as { reward: string }).reward).toBe(overMax);
-  });
+  }, LONG_TEST_MS);
 });
 
 describe('METRICS_ENABLED matrix + fail-open request path', () => {
@@ -297,7 +304,7 @@ describe('METRICS_ENABLED matrix + fail-open request path', () => {
       expect(r.status).toBe(200); // the request path never notices
       expect(cap.points).toEqual([]);
     }
-  });
+  }, LONG_TEST_MS);
 
   it('a THROWING writeDataPoint changes nothing for the client', async () => {
     const id = await makeIdentity();
@@ -435,7 +442,7 @@ describe('redrop_new_tx: a NEW paid txId after a PROVEN dead — both paths (rev
     expect(cap.byEvent('status_verdict').map(p => [p.blobs?.[1], p.blobs?.[2]]))
       .toEqual([['dead', 'arweave.net'], ['dead', 'g2.test'], ['dead', '_quorum']]);
     expect(cap.byEvent('upload_outcome').map(p => p.blobs?.[1])).toEqual(['accepted']);
-  });
+  }, LONG_TEST_MS);
 });
 
 describe('status leg: per-host metrics + the _quorum row (PR-3a)', () => {
