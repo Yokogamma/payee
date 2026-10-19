@@ -2194,11 +2194,15 @@ Winston as decimal strings in `worker/wrangler.toml` `[vars]` AND
 Gate: `scripts/check-spend-limits.mjs` (CI and the trusted deploy, over the
 candidate's config; not applicable to a candidate without the binding).
 
-| Limit | Value (PROPOSED 2026-09-24 — **placeholder**: the owner approved the METHOD on 2026-09-27; the numbers are recomputed from the quote on the release day) | Method (spec §10) | Input |
+| Limit | Value (owner decision 2026-10-07: the method of 2026-09-27, rounded UP to a step of 0.01 AR; re-quoted on the release day) | Method (spec §10) | Input |
 |---|---|---|---|
-| `MAX_TX_REWARD_WINSTON` | `15000000000` (0.015 AR) | price of one publication at `MAX_BODY_BYTES = 51200` × ~4.5 — the ceiling of ONE NEW transaction; legacy transactions are held at their SIGNED reward | `arweave.net/price/51200` = 3 295 552 823 W on 2026-09-24 10:50Z |
-| `SPEND_WINDOW_CAP_WINSTON` | `150000000000` (0.15 AR) | sliding 24 h cap = 21 publications/day (the soak budget) × ~3.3e9 × 2 | soak v3 volume (3–21 publications/day) |
-| `WALLET_FLOOR_WINSTON` | `70000000000` (0.07 AR) | 7 days × ~3 publications × ~3.3e9 — the untouchable remainder of the CYCLE's credited funds, so a trip leaves time to top up | the same price |
+| `MAX_TX_REWARD_WINSTON` | `20000000000` (0.02 AR) | price of one publication at `MAX_BODY_BYTES = 51200` × 4.5 = 15 393 213 788 W — the ceiling of ONE NEW transaction; legacy transactions are held at their SIGNED reward | `price/51200` = 3 420 714 175 W on 2026-10-07 09:01Z — the same at all four status origins (arweave.net, vilenarios.com, frostor.xyz, permagate.io) |
+| `SPEND_WINDOW_CAP_WINSTON` | `150000000000` (0.15 AR) | sliding 24 h cap = 21 publications/day (the soak budget) × price × 2 = 143 669 995 350 W | soak volume (3–21 publications/day) |
+| `WALLET_FLOOR_WINSTON` | `80000000000` (0.08 AR) | 7 days × 3 publications × price = 71 834 997 675 W — the untouchable remainder of the CYCLE's credited funds, so a trip leaves time to top up | the same price |
+
+History: the placeholder of 2026-09-24 (`price/51200` = 3 295 552 823 W) was
+0.07 / 0.15 / 0.015 AR; by 2026-10-07 the price had risen 3.8 % and the floor
+and ceiling formulas exceeded it.
 
 Changing a limit = a reviewed PR + a deploy (they are vars, not a dashboard
 edit); record the new values and the quote here. **Release-day rule (owner
@@ -2207,7 +2211,7 @@ all three by the method column (floor = 7 × 3 × price, cap = 21 × 2 × price,
 maxTx = price × 4.5), round UP, commit them to both blocks and record the
 quote here. (On 2026-09-25 the price had already moved +1.2 %: the floor
 formula gave 70.02e9 against the 70e9 placeholder.) The first cycle's
-`credit-deposit` (dev: ≈ 0.3 AR, owner decision 2026-09-27) must leave
+`credit-deposit` (dev: 0.4 AR, owner decision 2026-10-07; 0.3 AR on 2026-09-27) must leave
 `available ≥ WALLET_FLOOR + margin`.
 
 ### `STATUS_OPERATORS` — the operator map (mandatory, review 25.09)
@@ -2336,7 +2340,7 @@ dev, under the freeze, with the dev wallet.
    only the cycle's money. For dev (owner decision 2026-09-27) the cycle's
    working sum is taken from this remainder: move it out here, send the
    working sum back in step 5.
-5. Transfer the working sum (dev: ≈ 0.3 AR, owner decision 2026-09-27) INTO
+5. Transfer the working sum (dev: 0.4 AR, owner decision 2026-10-07) INTO
    the worker wallet, then `POST /admin/spend/credit-deposit
    {"txId":"<transfer id>"}` (verified at ≥ 2 operators, ≥ 50 confirmations,
    height strictly above the marker).
