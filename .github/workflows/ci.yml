@@ -95,8 +95,8 @@ jobs:
           VITE_PROXY_URL: https://ci-placeholder.invalid
           # NOT A WALLET — see the note above.
           VITE_TRUSTED_OWNERS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-          VITE_STATUS_GATEWAYS: https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io
-          VITE_PAYLOAD_GATEWAYS: https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz
+          VITE_STATUS_GATEWAYS: https://arweave.net,https://vilenarios.com,https://frostor.xyz,https://permagate.io
+          VITE_PAYLOAD_GATEWAYS: https://arweave.net,https://vilenarios.com,https://frostor.xyz
           VITE_INDEX_SOURCES: https://arweave.net/graphql|https://vilenarios.com/graphql,https://arweave-search.goldsky.com/graphql
       # The dist-reading assertions skip without a build, which is right for
       # `npm test` above and useless as proof. Same command as the deploy
