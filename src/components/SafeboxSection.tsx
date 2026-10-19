@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useNotes } from '../lib/store';
-import { SAFEBOX_WRITER_ENABLED } from '../lib/flags';
+import { SAFEBOX_WRITER_ENABLED, SECRET_LINK_ENABLED } from '../lib/flags';
+import { fingerprintOf, type SecretLinkFingerprint } from '../lib/secret-link';
 import { badgeFor } from './syncBadge';
 import { SyncStateBadge } from './SyncStateBadge';
 import { CardMenu } from './CardMenu';
-import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, IconVault } from './icons';
+import { IconCopy, IconEdit, IconHistory, IconLock, IconDownload, IconVault, IconLink } from './icons';
 import { SafeboxPinPad } from './SafeboxPinPad';
 import { SafeboxActivation, SafeboxSeedReset } from './SafeboxActivation';
 import { SafeboxEntryForm } from './SafeboxEntryForm';
@@ -44,6 +45,8 @@ export function SafeboxSection() {
     restoreSafeboxVersion,
     revealSafeboxSecret,
     copySafeboxPassword,
+    copySecretLink,
+    getSecretLinkHandles,
     downloadSafeboxAttachment,
     retrySync,
     syncStatuses,
@@ -62,8 +65,26 @@ export function SafeboxSection() {
   const [restoreTarget, setRestoreTarget] = useState<{ root: string; version: SafeboxEntryData } | null>(null);
   const [revealed, setRevealed] = useState<{ id: string; value: string } | null>(null);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  // root → handle, for the card fingerprints. Computed from the session's
+  // K_link off the render path; the subtree remounts on every lock, so a
+  // stale map never outlives the session that made it.
+  const [linkHandles, setLinkHandles] = useState<Record<string, string>>({});
 
   const syncActive = arweave.enabled && arweave.registered;
+
+  // One string, so the effect re-runs only when the SET of chains changes.
+  const linkRootsKey = SECRET_LINK_ENABLED && safeboxUnlocked
+    ? safeboxChains.map(c => c.root).sort().join(' ')
+    : '';
+  useEffect(() => {
+    if (linkRootsKey === '') return;
+    let cancelled = false;
+    getSecretLinkHandles(linkRootsKey.split(' ')).then(
+      handles => { if (!cancelled) setLinkHandles(handles); },
+      () => { /* locked meanwhile — the remount clears the cards anyway */ },
+    );
+    return () => { cancelled = true; };
+  }, [linkRootsKey, getSecretLinkHandles]);
 
   // Reveal auto-hides after 20 s; a second look means a fresh decrypt.
   useEffect(() => {
@@ -148,6 +169,15 @@ export function SafeboxSection() {
     });
   }
 
+  async function handleCopyLink(rootId: string) {
+    await withFeedback(async () => {
+      const ok = await copySecretLink(rootId);
+      setToast(ok
+        ? { kind: 'ok', text: 'Ссылка скопирована' }
+        : { kind: 'err', text: 'Не удалось скопировать ссылку.' });
+    });
+  }
+
   async function handleCopyLogin(login: string) {
     const ok = await navigator.clipboard.writeText(login).then(() => true).catch(() => false);
     setToast(ok
@@ -206,6 +236,8 @@ export function SafeboxSection() {
           const entry = chain.current;
           const info = syncStatuses[entry.id] ?? { status: 'queued' as const };
           const badge = badgeFor(info, syncActive);
+          const handle = SECRET_LINK_ENABLED ? linkHandles[chain.root] : undefined;
+          const fingerprint = handle === undefined ? null : fingerprintOf(handle);
           return (
             <div className="note-card safebox-card" key={chain.root}>
               {/* Название и логин НА ОДНОЙ строке, статус — у правого края.
@@ -214,6 +246,7 @@ export function SafeboxSection() {
               <div className="safebox-card-head">
                 <strong className="safebox-card-title">{entry.title}</strong>
                 {entry.login && <span className="safebox-card-login">{entry.login}</span>}
+                {fingerprint && <LinkFingerprint fp={fingerprint} />}
                 {chain.versions.length > 1 && (
                   <span className="state state--quiet">{chain.versions.length}-я версия</span>
                 )}
@@ -261,6 +294,14 @@ export function SafeboxSection() {
                           icon: <IconCopy />,
                           label: 'Копировать логин',
                           onSelect: () => void handleCopyLogin(entry.login),
+                        }]
+                      : []),
+                    ...(SECRET_LINK_ENABLED
+                      ? [{
+                          key: 'link',
+                          icon: <IconLink />,
+                          label: 'Скопировать ссылку',
+                          onSelect: () => void handleCopyLink(chain.root),
                         }]
                       : []),
                     ...(SAFEBOX_WRITER_ENABLED
@@ -356,5 +397,26 @@ export function SafeboxSection() {
         }}
       />
     </div>
+  );
+}
+
+/**
+ * The link's fingerprint (plan §1.1): two colour dots and the handle's first
+ * four characters — the same three values Baobook shows on its chip, so the
+ * two can be compared by eye.
+ *
+ * The colours go in as SVG `fill` PRESENTATION ATTRIBUTES, not as styles: the
+ * CSP is `style-src 'self'` with no 'unsafe-inline', and an attribute is not a
+ * style.
+ */
+function LinkFingerprint({ fp }: { fp: SecretLinkFingerprint }) {
+  return (
+    <span className="secret-link-fingerprint" title="Отпечаток ссылки">
+      <svg className="secret-link-fingerprint-dots" viewBox="0 0 18 8" aria-hidden="true" focusable="false">
+        <circle cx="4" cy="4" r="3.5" fill={`hsl(${fp.hue1}, 65%, 50%)`} />
+        <circle cx="14" cy="4" r="3.5" fill={`hsl(${fp.hue2}, 65%, 50%)`} />
+      </svg>
+      <code className="secret-link-fingerprint-tail">{fp.tail}</code>
+    </span>
   );
 }

@@ -37,6 +37,7 @@ vi.mock('./flags', async importOriginal => ({
 
 const vault: BackupVault = {
   deriveKeys: () => { throw new Error('keys must not be derived while the release is off'); },
+  deriveSecretLinkKey: () => { throw new Error('keys must not be derived while the release is off'); },
   dbGeneration: 1,
   assertAlive: () => {},
   now: () => 0,
@@ -55,6 +56,7 @@ const refuseEverything = (): BackupStorage => ({
   mergeRecord: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   readMeta: vi.fn(async () => { throw new Error('storage must not be touched'); }),
   writeMeta: vi.fn(async () => { throw new Error('storage must not be touched'); }),
+  rebuildSecretLinkIndex: vi.fn(async () => { throw new Error('storage must not be touched'); }),
 });
 
 const file = { size: 10, text: async () => '{}' };

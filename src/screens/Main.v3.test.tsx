@@ -9,7 +9,7 @@ import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testi
 vi.mock('../lib/flags', () => ({
   V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: false, QUICK_UNLOCK_ENABLED: false,
   // Every flag the settings screen reads: BackupSettings calls backupActions().
-  BACKUP_EXPORT_ENABLED: false, BACKUP_IMPORT_ENABLED: false,
+  BACKUP_EXPORT_ENABLED: false, BACKUP_IMPORT_ENABLED: false, SECRET_LINK_ENABLED: false,
 }));
 
 const h = vi.hoisted(() => ({ store: {} as Record<string, unknown> }));

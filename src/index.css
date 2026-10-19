@@ -2677,6 +2677,18 @@ mark {
 }
 .safebox-action svg { width: 15px; height: 15px; }
 
+/* Secret-link fingerprint: two dots + four characters, quiet like the login.
+   The dot colours are SVG fill attributes (CSP: no inline styles). */
+.secret-link-fingerprint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.secret-link-fingerprint-dots { width: 18px; height: 8px; flex: none; }
+.secret-link-fingerprint-tail { font-size: 13px; }
+
 /* Text + glyph, sized to the row rather than to a full-width form button. */
 .safebox-lock-btn {
   width: auto;

@@ -58,7 +58,7 @@ import {
 import { deriveBackupKey } from './backup';
 import { groupChains, groupSafeboxChains, type NoteChain, type SafeboxChain } from './chains';
 import { noteSearchText } from './note-search-text';
-import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED } from './flags';
+import { V3_WRITER_ENABLED, SAFEBOX_WRITER_ENABLED, QUICK_UNLOCK_ENABLED, SECRET_LINK_ENABLED } from './flags';
 import { saveBlob } from './download';
 import {
   estimateBackupSize as runEstimate,
@@ -190,9 +190,14 @@ import {
   getDbGeneration,
   noteExternalReset,
   isDbVersionError,
+  bumpLockGeneration,
+  SecretLinkConflictError,
+  type MaintenanceOp,
   type PinUnlockFailureOutcome,
   type VaultBindResult,
 } from './storage';
+import { buildSecretLink, deriveSecretLinkKey, secretLinkHandle } from './secret-link';
+import { commitEntryWithSecretLink, rebuildSecretLinkIndex } from './secret-link-index';
 import { ensurePersistentStorage } from './persistence';
 import { afterPoll, claimRestoredForUi } from './sync-transitions';
 import { runUploadAttempt, uploadItemId, MalformedRecordError, type UploadItem } from './upload-flow';
@@ -367,6 +372,16 @@ export class WriterDisabledError extends Error {
   constructor(message = 'Редактирование заметок недоступно в этой версии приложения.') {
     super(message);
     this.name = 'WriterDisabledError';
+  }
+}
+
+/** «Скопировать ссылку» (and the card fingerprints) called while
+ *  SECRET_LINK_ENABLED is false. Thrown, not a silent `false`: the caller would
+ *  read that as «the clipboard refused». */
+export class SecretLinkDisabledError extends Error {
+  constructor() {
+    super('Ссылки на секреты недоступны в этой версии приложения.');
+    this.name = 'SecretLinkDisabledError';
   }
 }
 
@@ -628,6 +643,15 @@ interface NotesStore {
   /** Copy straight from the decrypted string — the plaintext NEVER enters the
    *  DOM. Resolves false when the clipboard write was refused. */
   copySafeboxPassword: (entryId: string) => Promise<boolean>;
+  /** «Скопировать ссылку»: `origin + base + '#/s/' + handle` of the chain
+   *  rooted at `rootId`, from the unlocked session. Resolves false when the
+   *  clipboard write was refused. Gated by SECRET_LINK_ENABLED (throws
+   *  SecretLinkDisabledError). No clipboard auto-clear: a link is not the
+   *  secret. */
+  copySecretLink: (rootId: string) => Promise<boolean>;
+  /** root → handle for the card fingerprints; same gate and session rules as
+   *  `copySecretLink`. Unknown roots are left out. */
+  getSecretLinkHandles: (rootIds: readonly string[]) => Promise<Record<string, string>>;
   /** Decrypt one attachment and hand it to the browser as a download. */
   downloadSafeboxAttachment: (entryId: string, fid: string) => Promise<void>;
   /** Backup (release-gated in the ACTIONS — a hidden button is not a gate).
@@ -1057,6 +1081,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   /** Synchronous mirror of `safeboxUnlocked` for the lifecycle listeners (a
    *  React state read inside an event handler would be stale). */
   const safeboxUnlockedRef = useRef(false);
+  /** Secret link (P1): bumped by every lockApp scrub — each index rebuild in
+   *  flight captures it in its MaintenanceOp and stands down when it moves. */
+  const secretLinkMaintenanceRef = useRef(0);
+  /** Whether this tab's last durable lock reached `vault-lock-generation`.
+   *  `failed` is sticky: once a lock could not be made durable, the next
+   *  success does not vouch for the one that was lost (P2 refuses light
+   *  operations on it). */
+  const lockDurableRef = useRef<'idle' | 'done' | 'failed'>('idle');
 
   /** Fixed 5-minute idle lock (no setting in v1). */
   const SAFEBOX_IDLE_MS = 5 * 60 * 1000;
@@ -1472,7 +1504,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // ceremony lives. Without this line a foreign lock would leave the
         // sheet open and let it publish a vault afterwards.
         quickUnlockAbortRef.current?.abort();
-        lockApp({ broadcast: false }); // re-broadcasting would ping-pong forever
+        lockApp({ broadcast: false, durable: false }); // re-broadcasting would ping-pong forever
       } else if (msg.type === 'config') {
         void reconcileLockScreen();
         // The `config` message covers BOTH PIN contours. The safebox half
@@ -1492,7 +1524,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // screen would otherwise survive the wipe and re-bind an old seed
         // into the fresh database.
         quickUnlockAbortRef.current?.abort();
-        lockApp({ broadcast: false });
+        lockApp({ broadcast: false, durable: false });
         void reconcileLockScreen();
       }
     };
@@ -1647,7 +1679,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }, SAFEBOX_IDLE_MS);
   }
 
+  /** Synchronous: every secret-link maintenance operation in flight stands
+   *  down at its next check. Holds no plaintext to drop in P1. */
+  function scrubSecretLink(): void {
+    secretLinkMaintenanceRef.current++;
+  }
+
   function invalidateVaultLifecycle(): void {
+    scrubSecretLink();
     vaultEpochRef.current++;
     queueGenerationRef.current++;
     // A lock or a reset also RELEASES a backup operation that is waiting, not
@@ -1691,7 +1730,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // useful without a database, and this tab is now a dead end) and show
         // the non-destructive «reload» screen instead of failing obscurely.
         onBlocking: () => {
-          lockApp({ broadcast: false }); // no ping-pong: the other tab is fine
+          lockApp({ broadcast: false, durable: false }); // no ping-pong: the other tab is fine
           applyStorageOutdated(true);
           setScreen('error');            // AFTER lockApp — it sets its own screen
         },
@@ -2099,7 +2138,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
 
   /** Lock the vault NOW. Fully synchronous (§3): epoch bump → abort in-flight
    *  vault op → wipe state → PIN screen → (optionally) tell the other tabs. */
-  const lockApp = useCallback((opts: { broadcast?: boolean } = {}) => {
+  const lockApp = useCallback((opts: { broadcast?: boolean; durable?: boolean } = {}) => {
+    // Secret-link scrub FIRST, in every call — including the early return
+    // below: an index rebuild in flight belongs to the session being locked.
+    scrubSecretLink();
     // Nothing to lock without vault STATE in this tab — a foreign 'lock'
     // broadcast may arrive while we sit on landing/restore. A vault op still
     // in flight (PIN unlock / restore preparing, not yet committed) COUNTS:
@@ -2115,6 +2157,18 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (safeboxUnlockedRef.current) lockSafeboxNow();
       setLockGate(false);
       return;
+    }
+
+    // The ONE persistent revocation signal (plan §1.5). Not awaited — this
+    // function stays synchronous. Only a lock that actually locks a vault
+    // moves it (the same set of calls that would broadcast), and never on
+    // `durable: false`: an incoming lock/reset was already counted by the tab
+    // that sent it, and `onBlocking` has no database left to write to.
+    if (opts.durable !== false) {
+      void bumpLockGeneration().then(
+        () => { if (lockDurableRef.current !== 'failed') lockDurableRef.current = 'done'; },
+        () => { lockDurableRef.current = 'failed'; },
+      );
     }
 
     // Supersedes any pending return-verdict and owns the gate: the locked UI
@@ -2905,6 +2959,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     } else {
       setUpdateCheck({ status: 'checking', progress: null });
     }
+    // Kept for the secret-link rebuild in `finally` — the sweep's own key,
+    // derived from the seed, so it works with the section locked.
+    let sweepMetaKey: CryptoKey | null = null;
     try {
       // The safebox keys are derived HERE, on demand, straight from the
       // mnemonic: restore must work with the section locked and NO PIN (the
@@ -2915,6 +2972,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         deriveSafeboxMetaKey(mn),
         deriveSafeboxSecretKey(mn),
       ]);
+      sweepMetaKey = safeboxMeta;
       if (vaultEpochRef.current !== myEpoch) return;
 
       // «Известное» для инкрементальной проверки: есть sync-отметка с txId И
@@ -3111,6 +3169,13 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     } finally {
       if (vaultOpAbortRef.current === abort) vaultOpAbortRef.current = null;
       if (mode === 'restore' && vaultEpochRef.current === myEpoch) setRestoreProgress(null);
+      // Whatever the sweep merged — or failed to — the secret-link index is
+      // rebuilt over the whole store while the sweep's op is still alive. A
+      // lock aborts it (and the scrub stops a rebuild already running).
+      const sweepAlive = () => !abort.signal.aborted
+        && vaultEpochRef.current === myEpoch
+        && getDbGeneration() === myDbGen;
+      if (sweepMetaKey !== null && sweepAlive()) startSecretLinkRebuild(mn, sweepMetaKey, sweepAlive);
     }
   }
 
@@ -4199,7 +4264,44 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     setSafeboxEntryCount(stored.length);
     setSafeboxPinConfigured(true);
     armSafeboxIdleTimer();
+    // Opening the section rebuilds the secret-link index — from its OWN raw
+    // snapshot, never from `stored`/`metas` above (rows that failed there were
+    // swallowed by the per-row catch, and the rows may have moved since).
+    // Fire-and-forget: the open is already complete and must not wait for it.
+    const mn = mnemonicRef.current;
+    const myDbGen = getDbGeneration();
+    if (mn) {
+      startSecretLinkRebuild(mn, metaKey, () => vaultEpochRef.current === epoch
+        && safeboxSectionEpochRef.current === section
+        && getDbGeneration() === myDbGen);
+    }
     return true;
+  }
+
+  /**
+   * Run a secret-link index rebuild in the background (plan §1.3). `alive` is
+   * the trigger's own liveness (section session, sweep, …); the lockApp scrub
+   * stops every rebuild on top of it. Never rejects and never publishes: its
+   * failure must not change the outcome of what triggered it.
+   *
+   * The derivation starts synchronously, so the seed is not captured by the
+   * async continuation — only the non-extractable key is.
+   */
+  function startSecretLinkRebuild(mnemonic: string, metaKey: CryptoKey, alive: () => boolean): void {
+    const myGen = secretLinkMaintenanceRef.current;
+    const mop: MaintenanceOp = {
+      stillValid: () => secretLinkMaintenanceRef.current === myGen && alive(),
+    };
+    if (!mop.stillValid()) return;
+    const kLinkPromise = deriveSecretLinkKey(mnemonic);
+    void (async () => {
+      try {
+        const kLink = await kLinkPromise;
+        await rebuildSecretLinkIndex(kLink, metaKey, mop);
+      } catch (err) {
+        console.warn('secret link: index rebuild not started:', err instanceof Error ? err.name : typeof err);
+      }
+    })();
   }
 
   /**
@@ -4486,8 +4588,70 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         || safeboxSectionEpochRef.current !== session.section) {
       throw new SafeboxLockedError();
     }
-    await commitSafeboxEntry(entry, session.configId, myDbGen);
+    await writeSecretLinkForEntry(entry, metaFromInput(entry, input), session, myDbGen, metaKey);
     return entry;
+  }
+
+  /**
+   * The commit of ONE new version, with its secret-link index record and
+   * coverage row in the SAME transaction (plan §1.3, vault mode). Not gated by
+   * the flag or the setting — an index left unmaintained while the feature is
+   * off would be stale the day it is turned on.
+   *
+   * What the user sees is unchanged: the version is saved or it is not, and
+   * the errors are the ones this path always had. A lock (either epoch) makes
+   * every attempt refuse synchronously before its commit — SafeboxLockedError,
+   * nothing written. `config` is the old SafeboxConfigChangedError; a moved
+   * lock generation is a lock somewhere, i.e. SafeboxLockedError — and the
+   * section closes here as well. Damage or
+   * contention in the index costs only the index (the entry is saved alone).
+   *
+   * `K_link` is derived from the session's seed for this one save and dropped
+   * with it — like the secret key, it is never kept in a ref.
+   */
+  async function writeSecretLinkForEntry(
+    entry: EncryptedSafeboxEntry,
+    meta: SafeboxEntryData,
+    session: SafeboxSession,
+    myDbGen: number,
+    metaKey: CryptoKey,
+  ): Promise<void> {
+    const live = () => vaultEpochRef.current === session.epoch
+      && safeboxSectionEpochRef.current === session.section;
+    let kLink: CryptoKey;
+    try {
+      kLink = await deriveSecretLinkKey(session.mnemonic);
+    } catch (err) {
+      // No key, no index — but never no save: the original commit contract.
+      console.warn('secret link: index not updated for this save:', err instanceof Error ? err.name : typeof err);
+      if (!live()) throw new SafeboxLockedError();
+      await commitSafeboxEntry(entry, session.configId, myDbGen);
+      return;
+    }
+    try {
+      await commitEntryWithSecretLink({
+        entry,
+        meta,
+        kLink,
+        metaKey,
+        configId: session.configId,
+        dbGeneration: myDbGen,
+        mop: { stillValid: live },
+        deadError: () => new SafeboxLockedError(),
+      });
+    } catch (err) {
+      if (err instanceof SecretLinkConflictError) {
+        if (err.kind === 'config') throw new SafeboxConfigChangedError();
+        if (err.kind === 'lock') {
+          // The counter moved: the vault was locked in another tab whose
+          // broadcast never reached this one. The section here is revoked
+          // too, so the UI agrees with the error instead of staying open.
+          if (live()) lockSafeboxNow();
+          throw new SafeboxLockedError();
+        }
+      }
+      throw err;
+    }
   }
 
   function metaFromInput(entry: EncryptedSafeboxEntry, input: SafeboxEntryInput): SafeboxEntryData {
@@ -4649,6 +4813,51 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** The app's own address for a link: origin + Vite's BASE_URL (the same
+   *  base the viewer download uses), never the current hash or query. */
+  function secretLinkBase(): string {
+    return window.location.origin + import.meta.env.BASE_URL;
+  }
+
+  /** The chain roots of the unlocked section (fresh, from the ref). */
+  function unlockedSafeboxRoots(): Set<string> {
+    return new Set(safeboxEntriesRef.current.map(e => e.root));
+  }
+
+  const copySecretLink = useCallback(async (rootId: string): Promise<boolean> => {
+    if (!SECRET_LINK_ENABLED) throw new SecretLinkDisabledError();
+    const session = captureSafeboxSession();
+    if (!unlockedSafeboxRoots().has(rootId)) throw new Error('Запись сейфа не найдена.');
+    // K_link for this one call, from the captured session's seed — not kept.
+    const kLink = await deriveSecretLinkKey(session.mnemonic);
+    const handle = await secretLinkHandle(kLink, rootId);
+    // A lock (or a config replacement) during the derivation/HMAC refuses
+    // the copy — the same storage-backed recheck as every safebox output.
+    await assertSafeboxSessionLive(session);
+    armSafeboxIdleTimer();
+    // NO armClipboardClear: the link is not the secret, and clearing the
+    // clipboard under the user would only lose what they meant to paste.
+    return copyTextToClipboard(buildSecretLink(secretLinkBase(), handle));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const getSecretLinkHandles = useCallback(async (rootIds: readonly string[]): Promise<Record<string, string>> => {
+    if (!SECRET_LINK_ENABLED) throw new SecretLinkDisabledError();
+    const session = captureSafeboxSession();
+    const known = unlockedSafeboxRoots();
+    const kLink = await deriveSecretLinkKey(session.mnemonic);
+    const out: Record<string, string> = {};
+    for (const root of rootIds) {
+      if (!known.has(root)) continue;
+      try {
+        out[root] = await secretLinkHandle(kLink, root);
+      } catch { /* a root no handle can be made for — no fingerprint */ }
+    }
+    await assertSafeboxSessionLive(session);
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const downloadSafeboxAttachment = useCallback(async (entryId: string, fid: string) => {
     const session = captureSafeboxSession();
     const { meta, secret } = await openSafeboxEntry(session, entryId);
@@ -4798,6 +5007,14 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         const container = await deriveBackupKey(live());
         assertAlive();
         return { note, safeboxMeta, safeboxSecret, container };
+      },
+      // Same contract: the seed is read from the ref at call time, refused
+      // when gone, and only the non-extractable key leaves.
+      deriveSecretLinkKey: async () => {
+        if (!mnemonicRef.current) throw new BackupVaultLockedError();
+        const kLink = await deriveSecretLinkKey(mnemonicRef.current);
+        assertAlive();
+        return kLink;
       },
       dbGeneration: myDbGen,
       now: () => Date.now(),
@@ -5020,6 +5237,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     restoreSafeboxVersion,
     revealSafeboxSecret,
     copySafeboxPassword,
+    copySecretLink,
+    getSecretLinkHandles,
     downloadSafeboxAttachment,
     exportBackupFile,
     verifyBackupFile,
@@ -5074,8 +5293,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     activateSafebox, unlockSafebox, lockSafeboxAction, touchSafebox,
     changeSafeboxPin, deactivateSafebox, resetSafeboxPinWithSeed,
     getSafeboxPinLockState, addSafeboxEntry, editSafeboxEntry, restoreSafeboxVersion,
-    revealSafeboxSecret, copySafeboxPassword, downloadSafeboxAttachment,
-    exportBackupFile, verifyBackupFile, prepareBackupImport, applyBackupImport,
+    revealSafeboxSecret, copySafeboxPassword, copySecretLink, getSecretLinkHandles,
+    downloadSafeboxAttachment, exportBackupFile, verifyBackupFile, prepareBackupImport, applyBackupImport,
     readBackupFreshness, estimateBackupSize, downloadBackupViewer,
     goToRestore, goToOnboarding, goToLanding, showMnemonic, resetApp,
     toggleArweave, retrySync, registerWithInviteAction, checkAccessAction,

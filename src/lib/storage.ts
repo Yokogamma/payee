@@ -32,6 +32,17 @@ import {
   type LocalPayloadState,
 } from './backup-merge';
 import {
+  authSnapshotEquals,
+  isIndexBlob,
+  lockGenerationMatches,
+  rawEquals,
+  type AuthSnapshot,
+  type CurrentAuth,
+  type IndexBlob,
+  type IssueSnapshotRead,
+  type RawComparable,
+} from './secret-link';
+import {
   QUICK_UNLOCK_META_KEY,
   judgeQuickUnlock,
   parseQuickUnlockRecord,
@@ -626,8 +637,36 @@ export class SafeboxConfigChangedError extends Error {
  * write leaves a window in which another tab replaces/deletes the config — and
  * the version lands anyway, behind a PIN that is no longer the one the user
  * unlocked with.
+ *
+ * Two call shapes. `(entry, configId, gen)` is the original contract and runs
+ * EXACTLY as before — no lock-generation, rows or index checks. `(entry,
+ * expect, writes?)` is the secret-link CAS-writer: the same transaction also
+ * re-verifies the lock generation, (light) the authorization snapshot,
+ * optionally the safebox rows, and applies every index write by its
+ * `KeyExpect` — see commitSecretLinkTx.
  */
+export function commitSafeboxEntry(
+  entry: EncryptedSafeboxEntry,
+  expectedConfigId: string,
+  expectedDbGeneration: number,
+): Promise<void>;
+export function commitSafeboxEntry(
+  entry: EncryptedSafeboxEntry,
+  expect: ExpectVault | ExpectLight,
+  writes?: readonly IndexWrite[],
+): Promise<void>;
 export async function commitSafeboxEntry(
+  entry: EncryptedSafeboxEntry,
+  expectOrConfigId: string | ExpectVault | ExpectLight,
+  genOrWrites?: number | readonly IndexWrite[],
+): Promise<void> {
+  if (typeof expectOrConfigId === 'string') {
+    return commitSafeboxEntryLegacy(entry, expectOrConfigId, genOrWrites as number);
+  }
+  return commitSecretLinkTx(entry, expectOrConfigId, (genOrWrites ?? []) as readonly IndexWrite[]);
+}
+
+async function commitSafeboxEntryLegacy(
   entry: EncryptedSafeboxEntry,
   expectedConfigId: string,
   expectedDbGeneration: number,
@@ -641,6 +680,439 @@ export async function commitSafeboxEntry(
     if (config.configId !== expectedConfigId) throw new SafeboxConfigChangedError();
     await tx.objectStore('safebox').put(entry);
     await tx.done;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+// ─── Secret link: index, coverage, receipts, lock generation (P1) ────
+//
+// All values this feature keeps live in `meta` under its own keys; DB_VERSION
+// is untouched. Every decision that needs WebCrypto (decrypting the index,
+// classifying keys, encrypting new blobs) is made OUTSIDE the transaction from
+// a raw snapshot; the readwrite transaction only re-reads and compares
+// synchronously (the contract of mergeBackupRecord above), and aborts on any
+// divergence.
+
+/** `meta['secret-link:' + handle]` — one encrypted index record per chain. */
+export const SECRET_LINK_KEY_PREFIX = 'secret-link:';
+/** `meta['secret-link-coverage']` — NO colon: it is not an index key, and the
+ *  prefix scan below must not pick it up. */
+export const SECRET_LINK_COVERAGE_KEY = 'secret-link-coverage';
+/** `meta['secret-op:' + opOrigin + ':' + opId]` — drop receipts (written by P3). */
+export const SECRET_OP_KEY_PREFIX = 'secret-op:';
+/** `meta['vault-lock-generation']` — the only persistent revocation signal for
+ *  light operations; absent reads as 0. */
+export const VAULT_LOCK_GENERATION_KEY = 'vault-lock-generation';
+/** Read only (owned by the settings that P2/P3 add). */
+export const SECRET_LINKS_ENABLED_KEY = 'secret-links-enabled';
+export const SECRET_LINK_ORIGINS_KEY = 'secret-link-origins';
+
+/** What the writer saw under one key in its snapshot. `present` and the value
+ *  are separate on purpose: a key holding `undefined` is not an absent key. */
+export type KeyExpect =
+  | { present: false }
+  | { present: true; ct: string }
+  | { present: true; raw: RawComparable };
+
+/** `blob: null` deletes the key. */
+export interface IndexWrite {
+  key: string;
+  expect: KeyExpect;
+  blob: IndexBlob | null;
+}
+
+/** Authorization of a light (resolver/drop) operation, §1.5 — ONE definition,
+ *  owned by secret-link.ts. */
+export type { AuthSnapshot };
+
+/** `safeboxRows` — `[entryId, metaIv]` pairs in `entryId` order, i.e. exactly
+ *  what safeboxRowsOf(snapshot.entries) returns for a readSecretLinkSnapshot. */
+export interface ExpectVault {
+  mode: 'vault';
+  configId: string;
+  dbGeneration: number;
+  lockGeneration: number;
+  safeboxRows?: readonly (readonly [string, string])[];
+}
+
+export interface ExpectLight {
+  mode: 'light';
+  configId: string;
+  dbGeneration: number;
+  lockGeneration: number;
+  auth: AuthSnapshot;
+  safeboxRows?: readonly (readonly [string, string])[];
+}
+
+/** Liveness of a maintenance path (open section, import, sweep). No factor. */
+export interface MaintenanceOp {
+  stillValid(): boolean;
+}
+
+export type SecretLinkConflictKind = 'auth' | 'config' | 'lock' | 'rows' | 'key' | 'malformed';
+
+/** The transaction saw a state the caller's snapshot did not describe. ZERO
+ *  writes happened (the transaction was aborted). `key` names the index key
+ *  for `'key'` conflicts. */
+export class SecretLinkConflictError extends Error {
+  readonly kind: SecretLinkConflictKind;
+  readonly key?: string;
+  constructor(kind: SecretLinkConflictKind, key?: string) {
+    super(`Secret-link conflict: ${kind}`);
+    this.name = 'SecretLinkConflictError';
+    this.kind = kind;
+    if (key !== undefined) this.key = key;
+  }
+}
+
+/** Missing → 0. Anything that is not a non-negative safe integer also reads as
+ *  0 here. The light commit compares the RAW value (`lockGenerationMatches`),
+ *  so a damaged counter fails it closed (`'lock'`) until the next bump
+ *  rewrites it; the vault commit compares THIS normalized value, so the same
+ *  damage never costs an ordinary save (§0.2) — a real bump still moves it. */
+function lockGenerationOf(raw: unknown): number {
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0 ? raw : 0;
+}
+
+/** The coverage/rows identity of a stored row. A non-string `metaIv` (damaged
+ *  row) maps to '' — such a row never decrypts, so the transition into and out
+ *  of damage stays visible while two damaged values need not be told apart. */
+function safeboxRowOf(e: EncryptedSafeboxEntry): [string, string] {
+  const r = e as unknown as Record<string, unknown>;
+  return [String(r.entryId), typeof r.metaIv === 'string' ? r.metaIv : ''];
+}
+
+/** `[entryId, metaIv]` pairs, preserving the input order. */
+export function safeboxRowsOf(entries: readonly EncryptedSafeboxEntry[]): [string, string][] {
+  return entries.map(safeboxRowOf);
+}
+
+function rowsEqual(
+  a: readonly (readonly [string, string])[],
+  b: readonly (readonly [string, string])[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i][0] !== b[i][0] || a[i][1] !== b[i][1]) return false;
+  }
+  return true;
+}
+
+function ctOf(raw: unknown): string | null {
+  return isIndexBlob(raw) ? raw.ct : null;
+}
+
+/** The authorization-relevant state as stored right now — ONE definition,
+ *  owned by secret-link.ts (`CurrentAuth`). */
+export type CurrentAuthState = CurrentAuth;
+
+/** Pure, synchronous §1.5 comparison — safe inside a transaction. The same
+ *  rule `issueSnapshotEquals` applies in phase 3. */
+export function authStateMatches(current: CurrentAuthState, auth: AuthSnapshot): boolean {
+  return authSnapshotEquals(current, auth, pinSeedEquals);
+}
+
+function configIdOf(raw: unknown): string | null {
+  if (raw === undefined) return null;
+  try {
+    return assertValidSafeboxPinConfig(raw).configId;
+  } catch {
+    return null;
+  }
+}
+
+interface MetaReader {
+  get(key: string): Promise<unknown>;
+}
+
+async function readCurrentAuthState(meta: MetaReader): Promise<CurrentAuthState> {
+  const [pinSeed, rawQuickUnlock, vaultPublicKey, enabled, origins, safeboxPin, lockGeneration] =
+    await Promise.all([
+      meta.get('pin-seed'),
+      meta.get(QUICK_UNLOCK_META_KEY),
+      meta.get('vault-public-key'),
+      meta.get(SECRET_LINKS_ENABLED_KEY),
+      meta.get(SECRET_LINK_ORIGINS_KEY),
+      meta.get(SAFEBOX_PIN_META_KEY),
+      meta.get(VAULT_LOCK_GENERATION_KEY),
+    ]);
+  return {
+    pinSeed,
+    quickUnlock: judgeQuickUnlock(rawQuickUnlock, pinSeed, vaultPublicKey),
+    enabled,
+    origins,
+    configId: configIdOf(safeboxPin),
+    lockGeneration,
+  };
+}
+
+function isSecretLinkWriteKey(key: unknown): key is string {
+  if (typeof key !== 'string') return false;
+  if (key === SECRET_LINK_COVERAGE_KEY) return true;
+  if (key.startsWith(SECRET_LINK_KEY_PREFIX)) return key.length > SECRET_LINK_KEY_PREFIX.length;
+  if (key.startsWith(SECRET_OP_KEY_PREFIX)) return key.length > SECRET_OP_KEY_PREFIX.length;
+  return false;
+}
+
+function isKeyExpect(x: unknown): x is KeyExpect {
+  if (typeof x !== 'object' || x === null) return false;
+  const o = x as Record<string, unknown>;
+  if (o.present === false) return true;
+  if (o.present !== true) return false;
+  const hasCt = Object.prototype.hasOwnProperty.call(o, 'ct');
+  const hasRaw = Object.prototype.hasOwnProperty.call(o, 'raw');
+  if (hasCt === hasRaw) return false;
+  return !hasCt || typeof o.ct === 'string';
+}
+
+/** Caller contract, checked BEFORE the transaction: an index write can only
+ *  ever touch this feature's own keys — never `pin-seed` & co. */
+function assertValidSecretLinkCall(
+  expect: ExpectVault | ExpectLight,
+  writes: readonly IndexWrite[],
+): void {
+  if (typeof expect !== 'object' || expect === null
+      || (expect.mode !== 'vault' && expect.mode !== 'light')) {
+    throw new TypeError('secret-link commit: bad expect');
+  }
+  if (expect.mode === 'light' && (typeof expect.auth !== 'object' || expect.auth === null)) {
+    throw new TypeError('secret-link commit: light expect without auth');
+  }
+  if (!Array.isArray(writes)) throw new TypeError('secret-link commit: writes must be an array');
+  const seen = new Set<string>();
+  for (const w of writes) {
+    if (typeof w !== 'object' || w === null || !isSecretLinkWriteKey(w.key)) {
+      throw new TypeError('secret-link commit: write outside the secret-link keys');
+    }
+    if (seen.has(w.key)) throw new TypeError('secret-link commit: duplicate key');
+    seen.add(w.key);
+    if (!isKeyExpect(w.expect)) throw new TypeError('secret-link commit: bad KeyExpect');
+    if (w.blob !== null && !isIndexBlob(w.blob)) throw new TypeError('secret-link commit: bad blob');
+  }
+}
+
+function keyExpectHolds(expect: KeyExpect, present: boolean, existing: unknown): boolean {
+  if (!expect.present) return !present;
+  if (!present) return false;
+  if ('ct' in expect) {
+    return existing !== undefined && existing !== null && typeof existing === 'object'
+      && (existing as Record<string, unknown>).ct === expect.ct;
+  }
+  return rawEquals(existing, expect.raw);
+}
+
+/**
+ * The ONE secret-link readwrite transaction (`['meta','safebox']`), shared by
+ * commitSafeboxEntry (with an entry) and commitSecretLinkIndex (without).
+ *
+ * Order inside: config → lock generation → (light) auth → (optional) rows →
+ * every write's KeyExpect → writes. All comparisons are synchronous; no
+ * WebCrypto runs while the transaction is open.
+ */
+async function commitSecretLinkTx(
+  entry: EncryptedSafeboxEntry | null,
+  expect: ExpectVault | ExpectLight,
+  writes: readonly IndexWrite[],
+): Promise<void> {
+  assertValidSecretLinkCall(expect, writes);
+  assertDbGeneration(expect.dbGeneration);
+  const tx = getDB().transaction(['meta', 'safebox'], 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const safebox = tx.objectStore('safebox');
+
+    const rawConfig: unknown = await meta.get(SAFEBOX_PIN_META_KEY);
+    if (rawConfig === undefined) throw new SecretLinkConflictError('config');
+    // A malformed config keeps its existing fail-closed type (SafeboxPinUnavailableError).
+    if (assertValidSafeboxPinConfig(rawConfig).configId !== expect.configId) {
+      throw new SecretLinkConflictError('config');
+    }
+
+    const rawLockGeneration: unknown = await meta.get(VAULT_LOCK_GENERATION_KEY);
+    if (expect.mode === 'vault'
+      ? lockGenerationOf(rawLockGeneration) !== expect.lockGeneration
+      : !lockGenerationMatches(rawLockGeneration, expect.lockGeneration)) {
+      throw new SecretLinkConflictError('lock');
+    }
+
+    if (expect.mode === 'light') {
+      const auth = expect.auth;
+      if (auth.configId !== expect.configId || auth.lockGeneration !== expect.lockGeneration
+          || !authStateMatches(await readCurrentAuthState(meta), auth)) {
+        throw new SecretLinkConflictError('auth');
+      }
+    }
+
+    if (expect.safeboxRows !== undefined) {
+      const stored = await safebox.getAll() as EncryptedSafeboxEntry[];
+      if (!rowsEqual(safeboxRowsOf(stored), expect.safeboxRows)) {
+        throw new SecretLinkConflictError('rows');
+      }
+    }
+
+    const states = await Promise.all(writes.map(async w => {
+      const [presentKey, existing] = await Promise.all([meta.getKey(w.key), meta.get(w.key)]);
+      return { present: presentKey !== undefined, existing };
+    }));
+    for (let i = 0; i < writes.length; i++) {
+      if (!keyExpectHolds(writes[i].expect, states[i].present, states[i].existing)) {
+        throw new SecretLinkConflictError('key', writes[i].key);
+      }
+    }
+
+    if (entry !== null) await safebox.put(entry);
+    for (const w of writes) {
+      if (w.blob === null) await meta.delete(w.key);
+      else await meta.put(w.blob, w.key);
+    }
+    await tx.done;
+  } catch (e) {
+    tx.done.catch(() => {});
+    try { tx.abort(); } catch { /* already aborting/aborted */ }
+    throw e;
+  }
+}
+
+/** Index/coverage/receipt writes without a safebox entry (rebuild, receipt GC). */
+export async function commitSecretLinkIndex(
+  writes: readonly IndexWrite[],
+  expect: ExpectVault | ExpectLight,
+): Promise<void> {
+  return commitSecretLinkTx(null, expect, writes);
+}
+
+/** Collect `[key, value]` for every meta key starting with `prefix`. A cursor,
+ *  not get(): it reports a key whose value is `undefined` as present. */
+async function scanMetaPrefix(
+  meta: { openCursor(range: IDBKeyRange): Promise<{ key: IDBValidKey; value: unknown; continue(): Promise<unknown> } | null> },
+  prefix: string,
+): Promise<Map<string, unknown>> {
+  const out = new Map<string, unknown>();
+  let cursor = await meta.openCursor(IDBKeyRange.lowerBound(prefix));
+  while (cursor) {
+    const key = cursor.key;
+    if (typeof key !== 'string' || !key.startsWith(prefix)) break;
+    out.set(key, cursor.value);
+    cursor = await cursor.continue() as typeof cursor;
+  }
+  return out;
+}
+
+export interface SecretLinkSnapshot {
+  /** Every stored safebox row, raw, in `entryId` order. */
+  entries: EncryptedSafeboxEntry[];
+  /** Full meta key (`secret-link:<handle>`) → raw value. */
+  index: Map<string, unknown>;
+  /** Raw coverage value; `coveragePresent` tells an absent key from a key
+   *  holding `undefined`. */
+  coverage: unknown;
+  coveragePresent: boolean;
+  /** Full meta key (`secret-op:…`) → raw value. */
+  receipts: Map<string, unknown>;
+  lockGeneration: number;
+}
+
+/** ONE readonly transaction `['meta','safebox']` — every decryption a writer
+ *  or rebuild does must come from these bytes. */
+export async function readSecretLinkSnapshot(): Promise<SecretLinkSnapshot> {
+  const tx = getDB().transaction(['meta', 'safebox'], 'readonly');
+  const meta = tx.objectStore('meta');
+  const entries = await tx.objectStore('safebox').getAll() as EncryptedSafeboxEntry[];
+  const index = await scanMetaPrefix(meta, SECRET_LINK_KEY_PREFIX);
+  const receipts = await scanMetaPrefix(meta, SECRET_OP_KEY_PREFIX);
+  const coverageKey = await meta.getKey(SECRET_LINK_COVERAGE_KEY);
+  const coverage: unknown = await meta.get(SECRET_LINK_COVERAGE_KEY);
+  const lockGeneration = lockGenerationOf(await meta.get(VAULT_LOCK_GENERATION_KEY));
+  await tx.done;
+  return {
+    entries,
+    index,
+    coverage,
+    coveragePresent: coverageKey !== undefined,
+    receipts,
+    lockGeneration,
+  };
+}
+
+/** Resolver phase 1 (tx-R1, readonly `meta`): raw index record and coverage. */
+export async function readResolverPhase1(handle: string): Promise<{ rec: unknown; cov: unknown }> {
+  const tx = getDB().transaction('meta', 'readonly');
+  const meta = tx.objectStore('meta');
+  const [rec, cov] = await Promise.all([
+    meta.get(SECRET_LINK_KEY_PREFIX + handle),
+    meta.get(SECRET_LINK_COVERAGE_KEY),
+  ]);
+  await tx.done;
+  return { rec, cov };
+}
+
+export interface ResolverPhase2Read {
+  /** `ct` of the stored record / coverage; `null` = absent or not an IndexBlob. */
+  recCt: string | null;
+  covCt: string | null;
+  headEntry: EncryptedSafeboxEntry | undefined;
+  /** Every stored row, raw, in `entryId` order — the delta is decrypted from these bytes. */
+  entries: EncryptedSafeboxEntry[];
+  rows: [string, string][];
+}
+
+/** Resolver phase 2 (tx-R2, readonly `['meta','safebox']`). */
+export async function readResolverPhase2(handle: string, headId: string): Promise<ResolverPhase2Read> {
+  const tx = getDB().transaction(['meta', 'safebox'], 'readonly');
+  const meta = tx.objectStore('meta');
+  const safebox = tx.objectStore('safebox');
+  const [rec, cov, headEntry, entries] = await Promise.all([
+    meta.get(SECRET_LINK_KEY_PREFIX + handle),
+    meta.get(SECRET_LINK_COVERAGE_KEY),
+    safebox.get(headId) as Promise<EncryptedSafeboxEntry | undefined>,
+    safebox.getAll() as Promise<EncryptedSafeboxEntry[]>,
+  ]);
+  await tx.done;
+  return { recCt: ctOf(rec), covCt: ctOf(cov), headEntry, entries, rows: safeboxRowsOf(entries) };
+}
+
+export type { IssueSnapshotRead };
+
+/** Resolver phase 3 (`confirmIssue`): everything in ONE readonly transaction
+ *  with the rows. The comparison itself happens outside (issueSnapshotEquals). */
+export async function readIssueSnapshot(handle: string, headId: string): Promise<IssueSnapshotRead> {
+  const tx = getDB().transaction(['meta', 'safebox'], 'readonly');
+  const meta = tx.objectStore('meta');
+  const safebox = tx.objectStore('safebox');
+  const [rec, cov, headEntry, entries, currentAuth] = await Promise.all([
+    meta.get(SECRET_LINK_KEY_PREFIX + handle),
+    meta.get(SECRET_LINK_COVERAGE_KEY),
+    safebox.get(headId) as Promise<EncryptedSafeboxEntry | undefined>,
+    safebox.getAll() as Promise<EncryptedSafeboxEntry[]>,
+    readCurrentAuthState(meta),
+  ]);
+  await tx.done;
+  const headMetaIv = headEntry !== undefined && typeof headEntry.metaIv === 'string'
+    ? headEntry.metaIv
+    : null;
+  return { recCt: ctOf(rec), covCt: ctOf(cov), headMetaIv, rows: safeboxRowsOf(entries), currentAuth };
+}
+
+/** The current lock generation (missing → 0). */
+export async function readLockGeneration(): Promise<number> {
+  return lockGenerationOf(await getDB().get('meta', VAULT_LOCK_GENERATION_KEY));
+}
+
+/** Atomic read-increment-put in ONE readwrite `meta` transaction: two
+ *  concurrent bumps from the same `g` serialize and yield `g+1`, `g+2`.
+ *  Resolves with the new value. Deliberately NOT generation-checked: a lock
+ *  must persist even while a reset is in flight. */
+export async function bumpLockGeneration(): Promise<number> {
+  const tx = getDB().transaction('meta', 'readwrite');
+  try {
+    const meta = tx.objectStore('meta');
+    const next = lockGenerationOf(await meta.get(VAULT_LOCK_GENERATION_KEY)) + 1;
+    await meta.put(next, VAULT_LOCK_GENERATION_KEY);
+    await tx.done;
+    return next;
   } catch (e) {
     tx.done.catch(() => {});
     try { tx.abort(); } catch { /* already aborting/aborted */ }
@@ -2271,9 +2743,14 @@ export async function resetAll(): Promise<void> {
   dbGeneration++;
   const database = getDB();
   const tx = database.transaction(['notes', 'safebox', 'sync', 'meta'], 'readwrite');
+  // The lock generation SURVIVES the reset (read before the clear, g+1 after,
+  // same transaction): a light operation authorized against the destroyed
+  // vault must still see its generation move.
+  const lockGeneration = lockGenerationOf(await tx.objectStore('meta').get(VAULT_LOCK_GENERATION_KEY));
   await tx.objectStore('notes').clear();
   await tx.objectStore('safebox').clear();
   await tx.objectStore('sync').clear();
   await tx.objectStore('meta').clear();
+  await tx.objectStore('meta').put(lockGeneration + 1, VAULT_LOCK_GENERATION_KEY);
   await tx.done;
 }

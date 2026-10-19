@@ -8,7 +8,13 @@ import { render, act, cleanup, waitFor } from '@testing-library/react';
 // REAL storage (fake-indexeddb) and REAL envelope crypto, with only the network
 // and the (deliberately expensive) Argon2 KDF mocked.
 
-vi.mock('./flags', () => ({ V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true, QUICK_UNLOCK_ENABLED: false }));
+// SECRET_LINK_ENABLED is switchable per test (a getter, read at call time);
+// every suite that does not touch it sees the shipped OFF value.
+const flagState = vi.hoisted(() => ({ secretLink: false }));
+vi.mock('./flags', () => ({
+  V3_WRITER_ENABLED: true, SAFEBOX_WRITER_ENABLED: true, QUICK_UNLOCK_ENABLED: false,
+  get SECRET_LINK_ENABLED() { return flagState.secretLink; },
+}));
 
 // Argon2id is ~1 s per call by design. The REAL KDF profile is exercised in
 // safebox-pin.test.ts; here we only need the PIN gate's LOGIC, so swap in a
@@ -60,6 +66,57 @@ vi.mock('./crypto', async importOriginal => {
       cryptoHooks.beforeDeriveSecretKey = null; // one-shot
       await hook?.();
       return actual.deriveSafeboxSecretKey(...args);
+    }),
+  };
+});
+
+// Secret link (P1): park the HMAC / the derivation, and observe the lock
+// counter and the bootstrap's storage callbacks. Every wrapper passes through
+// to the real implementation; with no hook set, behaviour is unchanged.
+const linkHooks = vi.hoisted(() => ({
+  beforeHandle: null as null | (() => void | Promise<void>),
+}));
+vi.mock('./secret-link', async importOriginal => {
+  const actual = await importOriginal<typeof import('./secret-link')>();
+  return {
+    ...actual,
+    deriveSecretLinkKey: vi.fn(actual.deriveSecretLinkKey),
+    secretLinkHandle: vi.fn(async (...args: Parameters<typeof actual.secretLinkHandle>) => {
+      const hook = linkHooks.beforeHandle;
+      linkHooks.beforeHandle = null; // one-shot
+      await hook?.();
+      return actual.secretLinkHandle(...args);
+    }),
+  };
+});
+
+const storageHooks = vi.hoisted(() => ({
+  /** The store's own initStorage options (onBlocking lives there). */
+  storeInitOpts: null as null | { onBlocking?: () => void; onBlocked?: () => void },
+  beforePinUnlockFailure: null as null | (() => void | Promise<void>),
+  beforeSnapshot: null as null | (() => void | Promise<void>),
+}));
+vi.mock('./storage', async importOriginal => {
+  const actual = await importOriginal<typeof import('./storage')>();
+  return {
+    ...actual,
+    initStorage: vi.fn((opts?: Parameters<typeof actual.initStorage>[0]) => {
+      if (opts?.onBlocking) storageHooks.storeInitOpts = opts;
+      return actual.initStorage(opts);
+    }),
+    bumpLockGeneration: vi.fn(actual.bumpLockGeneration),
+    commitSecretLinkIndex: vi.fn(actual.commitSecretLinkIndex),
+    readSecretLinkSnapshot: vi.fn(async () => {
+      const hook = storageHooks.beforeSnapshot;
+      storageHooks.beforeSnapshot = null; // one-shot
+      await hook?.();
+      return actual.readSecretLinkSnapshot();
+    }),
+    commitPinUnlockFailure: vi.fn(async (...args: Parameters<typeof actual.commitPinUnlockFailure>) => {
+      const hook = storageHooks.beforePinUnlockFailure;
+      storageHooks.beforePinUnlockFailure = null; // one-shot
+      await hook?.();
+      return actual.commitPinUnlockFailure(...args);
     }),
   };
 });
@@ -1451,5 +1508,542 @@ describe('safebox targeted repair (§6.4)', () => {
     await setMeta('sweep-full-at', Date.now());
     await act(async () => { await store.checkForUpdates(); });
     expect(lastSweepOpts()?.known!.has('TX-SEED')).toBe(true); // деривация вне ремонтных try
+  });
+});
+
+// ─── Secret link (P1): «Скопировать ссылку», lock counter, old paths ─
+
+import { SecretLinkDisabledError, PinWipedError } from './store';
+import {
+  readLockGeneration, bumpLockGeneration, commitSafeboxEntry, commitPinUnlockFailure,
+  StorageResetError, DB_VERSION, SECRET_LINK_KEY_PREFIX, SECRET_LINK_COVERAGE_KEY,
+  VAULT_LOCK_GENERATION_KEY, readSecretLinkSnapshot, commitSecretLinkIndex,
+  getPinConfigMeta, SECRET_LINKS_ENABLED_KEY, SECRET_LINK_ORIGINS_KEY,
+} from './storage';
+import { QUICK_UNLOCK_META_KEY } from './quick-unlock';
+import { deriveSecretLinkKey, secretLinkHandle, fingerprintOf, isCoverageRecord, decryptIndexBlob } from './secret-link';
+import { verifySafeboxPin } from './crypto';
+
+/** Plan §1.1 vector: seed `abandon…about` (MN above). */
+const VECTOR_ROOT = '00000000-0000-8000-8000-000000000001';
+const VECTOR_HANDLE = 'TnYgaHGXuUjYvmglbl6DhA';
+const MAIN_PIN = '246802';
+
+/** A version of the chain rooted at VECTOR_ROOT. The root version itself is
+ *  not needed: the chain's identity is its `root`, and a rev-1 record would
+ *  have to carry the vector root as its own (random) entryId. */
+async function seedVectorChain() {
+  return seedEntry({ title: 'вектор', rev: 2, root: VECTOR_ROOT, prev: VECTOR_ROOT });
+}
+
+let clipboardWrites: string[] = [];
+let savedClipboard: PropertyDescriptor | undefined;
+function stubClipboard(writeText: (t: string) => Promise<void> = async t => { clipboardWrites.push(t); }) {
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: vi.fn(writeText) },
+  });
+}
+beforeAll(() => { savedClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard'); });
+afterAll(() => {
+  if (savedClipboard) Object.defineProperty(navigator, 'clipboard', savedClipboard);
+  else delete (navigator as { clipboard?: unknown }).clipboard;
+});
+
+/** The 60-s clipboard clear is the only 60 000-ms timer the store arms. */
+function clipboardClearArms(spy: { mock: { calls: unknown[][] } }): number {
+  return spy.mock.calls.filter(c => c[1] === 60_000).length;
+}
+
+/** The section open fires an index rebuild in the background; it calls the
+ *  same (hooked) HMAC. Hooks are armed only once it has committed, so a
+ *  one-shot hook is never consumed by the rebuild instead of the copy. */
+async function untilOpenRebuildDone() {
+  await waitFor(async () => expect((await readSecretLinkSnapshot()).coveragePresent).toBe(true));
+  await settle();
+}
+
+describe('secret link: copySecretLink (P1, flag ON)', () => {
+  beforeEach(() => {
+    flagState.secretLink = true;
+    clipboardWrites = [];
+    stubClipboard();
+    linkHooks.beforeHandle = null;
+  });
+  afterEach(() => { flagState.secretLink = false; linkHooks.beforeHandle = null; vi.restoreAllMocks(); });
+
+  it('copies origin + base + #/s/<handle> of the §1.1 vector; two copies are equal; no clipboard clear', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    expect(store.safeboxChains.map(c => c.root)).toEqual([VECTOR_ROOT]);
+
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    let ok1 = false, ok2 = false;
+    await act(async () => { ok1 = await store.copySecretLink(VECTOR_ROOT); });
+    await act(async () => { ok2 = await store.copySecretLink(VECTOR_ROOT); });
+    expect(ok1).toBe(true);
+    expect(ok2).toBe(true);
+    const expected = `${window.location.origin}${import.meta.env.BASE_URL}#/s/${VECTOR_HANDLE}`;
+    expect(clipboardWrites).toEqual([expected, expected]);
+    expect(clipboardClearArms(timers)).toBe(0);
+
+    // Positive control: the password copy DOES arm the 60-s clear, so the
+    // zero above is the absence of armClipboardClear, not a blind spy.
+    const entryId = store.safeboxEntries[0].id;
+    await act(async () => { await store.copySafeboxPassword(entryId); });
+    expect(clipboardClearArms(timers)).toBe(1);
+  });
+
+  it('a refused clipboard write resolves false (and still arms nothing)', async () => {
+    await seedVectorChain();
+    stubClipboard(async () => { throw new DOMException('denied', 'NotAllowedError'); });
+    renderStore();
+    await openSafebox();
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await expect(store.copySecretLink(VECTOR_ROOT)).resolves.toBe(false);
+    expect(clipboardClearArms(timers)).toBe(0);
+  });
+
+  it('getSecretLinkHandles gives the vector handle and fingerprint, and drops unknown roots', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    const handles = await store.getSecretLinkHandles([VECTOR_ROOT, '00000000-0000-8000-8000-0000000000ff']);
+    expect(handles).toEqual({ [VECTOR_ROOT]: VECTOR_HANDLE });
+    expect(fingerprintOf(handles[VECTOR_ROOT])).toEqual({ hue1: 110, hue2: 166, tail: 'TnYg' });
+  });
+
+  it('an unknown root is refused and nothing reaches the clipboard', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    await expect(store.copySecretLink('00000000-0000-8000-8000-0000000000ff')).rejects.toBeDefined();
+    expect(clipboardWrites).toEqual([]);
+  });
+
+  it('refuses outright while the section is locked', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    act(() => { store.lockSafebox(); });
+    await expect(store.copySecretLink(VECTOR_ROOT)).rejects.toBeInstanceOf(SafeboxLockedError);
+    await expect(store.getSecretLinkHandles([VECTOR_ROOT])).rejects.toBeInstanceOf(SafeboxLockedError);
+    expect(clipboardWrites).toEqual([]);
+  });
+
+  it('a section lock DURING the HMAC refuses the copy (nothing written)', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    await untilOpenRebuildDone();
+    linkHooks.beforeHandle = () => { store.lockSafebox(); };
+    let error: unknown;
+    await act(async () => { await store.copySecretLink(VECTOR_ROOT).catch(e => { error = e; }); });
+    expect(error).toBeInstanceOf(SafeboxLockedError);
+    expect(clipboardWrites).toEqual([]);
+    expect(vi.mocked(secretLinkHandle)).toHaveBeenCalled(); // the hook really ran inside the HMAC
+  });
+
+  it('an APP lock during the HMAC refuses the copy too', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    await untilOpenRebuildDone();
+    linkHooks.beforeHandle = () => { store.lockApp(); };
+    let error: unknown;
+    await act(async () => { await store.copySecretLink(VECTOR_ROOT).catch(e => { error = e; }); });
+    expect(error).toBeDefined();
+    expect(clipboardWrites).toEqual([]);
+    expect(store.safeboxUnlocked).toBe(false);
+  });
+
+  it('a config replaced during the HMAC (no BroadcastChannel) refuses with SafeboxConfigChangedError', async () => {
+    await seedVectorChain();
+    FakeBroadcastChannel.enabled = false;
+    renderStore();
+    await openSafebox();
+    await untilOpenRebuildDone();
+    linkHooks.beforeHandle = async () => { await foreignTabReplacesConfig(); };
+    await expect(store.copySecretLink(VECTOR_ROOT)).rejects.toBeInstanceOf(SafeboxConfigChangedError);
+    expect(clipboardWrites).toEqual([]);
+    await waitFor(() => expect(store.safeboxUnlocked).toBe(false));
+  });
+});
+
+describe('secret link: copySecretLink with the flag OFF', () => {
+  beforeEach(() => { flagState.secretLink = false; clipboardWrites = []; stubClipboard(); });
+
+  it('both actions throw SecretLinkDisabledError before touching the seed or the clipboard', async () => {
+    await seedVectorChain();
+    renderStore();
+    await openSafebox();
+    vi.mocked(deriveSecretLinkKey).mockClear();
+    await expect(store.copySecretLink(VECTOR_ROOT)).rejects.toBeInstanceOf(SecretLinkDisabledError);
+    await expect(store.getSecretLinkHandles([VECTOR_ROOT])).rejects.toBeInstanceOf(SecretLinkDisabledError);
+    expect(clipboardWrites).toEqual([]);
+    expect(vi.mocked(deriveSecretLinkKey)).not.toHaveBeenCalled();
+  });
+});
+
+// lockApp and `vault-lock-generation` (plan §1.5): the user's lock and every
+// return verdict move it once; incoming lock/reset and onBlocking do not.
+
+function setVisibility(state: 'visible' | 'hidden') {
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+  document.dispatchEvent(new Event('visibilitychange'));
+}
+
+/** Let fire-and-forget bumps land. */
+async function settle() {
+  await act(async () => { await new Promise(r => setTimeout(r, 20)); });
+}
+
+describe('secret link: lockApp moves the lock generation (P1)', () => {
+  afterEach(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    vi.mocked(bumpLockGeneration).mockClear();
+  });
+
+  it('the user action store.lockApp() bumps exactly once (durable by default)', async () => {
+    renderStore();
+    await openMain();
+    await settle();
+    const g = await readLockGeneration();
+    vi.mocked(bumpLockGeneration).mockClear();
+    act(() => { store.lockApp(); });
+    await waitFor(async () => expect(await readLockGeneration()).toBe(g + 1));
+    expect(vi.mocked(bumpLockGeneration)).toHaveBeenCalledTimes(1);
+  });
+
+  it('the gate\'s «Ввести PIN» button (lockApp()) bumps too', async () => {
+    renderStore();
+    await openMain();
+    await settle();
+    const g = await readLockGeneration();
+    const exit = document.querySelector<HTMLButtonElement>('.lock-gate-exit');
+    expect(exit).not.toBeNull();
+    act(() => { exit!.click(); });
+    await waitFor(async () => expect(await readLockGeneration()).toBe(g + 1));
+    expect(store.screen).toBe('restore');
+  });
+
+  it('the scrub runs synchronously and the bump is skipped when there is no vault to lock (early return)', async () => {
+    renderStore();
+    await waitFor(() => expect(store.isReady).toBe(true));
+    await settle();
+    const g = await readLockGeneration();
+    vi.mocked(bumpLockGeneration).mockClear();
+    act(() => { store.lockApp(); });
+    await settle();
+    expect(vi.mocked(bumpLockGeneration)).not.toHaveBeenCalled();
+    expect(await readLockGeneration()).toBe(g);
+  });
+
+  it('a rebuild in flight stands down at the lock: nothing it planned is committed', async () => {
+    await seedEntry();
+    renderStore();
+    await openMain();
+    // Park the NEXT snapshot read — the one the section-open rebuild makes.
+    let release!: () => void;
+    const parked = new Promise<void>(r => { release = r; });
+    let reached = false;
+    storageHooks.beforeSnapshot = async () => { reached = true; await parked; };
+    await act(async () => { await store.activateSafebox(PIN, { mnemonic: MN }); });
+    await waitFor(() => expect(reached).toBe(true));
+    vi.mocked(commitSecretLinkIndex).mockClear();
+
+    act(() => { store.lockApp(); });
+    release();
+    await settle();
+    expect(vi.mocked(commitSecretLinkIndex)).not.toHaveBeenCalled();
+    const snap = await readSecretLinkSnapshot();
+    expect(snap.index.size).toBe(0);
+    expect(snap.coveragePresent).toBe(false);
+  });
+
+  it('the fast-path return verdict («Сразу») bumps once', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.setupPin(MAIN_PIN); });
+    await act(async () => { await store.setAutoLockTimeout(0); });
+    await settle();
+    const g = await readLockGeneration();
+    act(() => { setVisibility('hidden'); });
+    act(() => { setVisibility('visible'); });
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    await waitFor(async () => expect(await readLockGeneration()).toBe(g + 1));
+    await settle();
+    expect(await readLockGeneration()).toBe(g + 1);
+  });
+
+  it('the async return verdict (config changed while hidden) bumps once', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.setupPin(MAIN_PIN); });
+    await settle();
+    expect(store.autoLockTimeout).toBeNull();
+    const g = await readLockGeneration();
+    act(() => { setVisibility('hidden'); });
+    await setMeta('auto-lock-timeout', 0); // another tab, no broadcast reached us
+    act(() => { setVisibility('visible'); });
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    await waitFor(async () => expect(await readLockGeneration()).toBe(g + 1));
+    await settle();
+    expect(await readLockGeneration()).toBe(g + 1);
+  });
+
+  it('an incoming broadcast lock locks this tab WITHOUT a second bump', async () => {
+    renderStore();
+    await openMain();
+    await settle();
+    const g = await readLockGeneration();
+    vi.mocked(bumpLockGeneration).mockClear();
+    const other = new FakeBroadcastChannel('eternal-notes-vault');
+    await act(async () => {
+      other.postMessage({ type: 'lock', originId: 'other-tab', messageId: crypto.randomUUID() });
+      await new Promise(r => setTimeout(r, 0));
+    });
+    await waitFor(() => expect(store.screen).not.toBe('main'));
+    await settle();
+    expect(vi.mocked(bumpLockGeneration)).not.toHaveBeenCalled();
+    expect(await readLockGeneration()).toBe(g);
+  });
+
+  it('an incoming broadcast reset locks this tab without a bump', async () => {
+    renderStore();
+    await openMain();
+    await settle();
+    const g = await readLockGeneration();
+    vi.mocked(bumpLockGeneration).mockClear();
+    const other = new FakeBroadcastChannel('eternal-notes-vault');
+    await act(async () => {
+      other.postMessage({ type: 'reset', originId: 'other-tab', messageId: crypto.randomUUID() });
+      await new Promise(r => setTimeout(r, 0));
+    });
+    await waitFor(() => expect(store.screen).not.toBe('main'));
+    await settle();
+    expect(vi.mocked(bumpLockGeneration)).not.toHaveBeenCalled();
+    expect(await readLockGeneration()).toBe(g);
+  });
+
+  it('two tabs: the sender\'s lock is counted ONCE in total', async () => {
+    renderStore();
+    await openMain();
+    await settle();
+    const g = await readLockGeneration();
+    // This tab is the sender; its broadcast reaches a listener that is NOT a
+    // store, so the total count is the sender's own bump.
+    const listener = new FakeBroadcastChannel('eternal-notes-vault');
+    const seen: unknown[] = [];
+    listener.onmessage = e => { seen.push(e.data); };
+    act(() => { store.lockApp(); });
+    await settle();
+    expect(seen.some(m => (m as { type?: string }).type === 'lock')).toBe(true);
+    expect(await readLockGeneration()).toBe(g + 1);
+  });
+
+  it('onBlocking locks with durable:false — no bump attempted (so nothing can mark the lock failed)', async () => {
+    renderStore();
+    await openMain();
+    await settle();
+    expect(storageHooks.storeInitOpts?.onBlocking).toBeTypeOf('function');
+    const g = await readLockGeneration();
+    vi.mocked(bumpLockGeneration).mockClear();
+    // Were a bump attempted it would fail (no database) and paint the ref
+    // `failed`; a rejecting stub makes any such attempt visible.
+    vi.mocked(bumpLockGeneration).mockRejectedValue(new Error('no database'));
+    try {
+      act(() => { storageHooks.storeInitOpts!.onBlocking!(); });
+      await settle();
+      expect(store.screen).toBe('error');
+      expect(vi.mocked(bumpLockGeneration)).not.toHaveBeenCalled();
+      expect(await getMeta(VAULT_LOCK_GENERATION_KEY) ?? 0).toBe(g);
+    } finally {
+      const actual = await vi.importActual<typeof import('./storage')>('./storage');
+      vi.mocked(bumpLockGeneration).mockImplementation(actual.bumpLockGeneration);
+    }
+  });
+});
+
+// §2.6 п.2 — the old paths P1 sits next to must not have moved.
+
+/** A legacy (no `kdf`) PBKDF2-600k blob, byte-compatible with the read path. */
+async function legacyPinBlob(mnemonic: string, pin: string) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' },
+    material, { name: 'AES-GCM', length: 256 }, false, ['encrypt'],
+  );
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(mnemonic));
+  return { ciphertext: bufferToBase64(ct), iv: bufferToBase64(iv), salt: bufferToBase64(salt) };
+}
+
+describe('§2.6 п.2: old paths unchanged by P1', () => {
+  it('main PIN: a config replaced during a wrong-PIN check keeps the config-changed policy', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.setupPin(MAIN_PIN); });
+    act(() => { store.lockApp(); });
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    await settle();
+    const g = await readLockGeneration();
+    const replaced = await encryptWithPin(MN, '999999');
+    storageHooks.beforePinUnlockFailure = async () => { await setMeta('pin-seed', replaced); };
+
+    await act(async () => { await expect(store.unlockWithPin('000000')).resolves.toBeUndefined(); });
+    expect(vi.mocked(commitPinUnlockFailure)).toHaveBeenCalled();
+    expect(await getMeta('pin-attempts')).toBeUndefined();   // nothing metered
+    expect(await getMeta('pin-seed')).toEqual(replaced);      // nothing wiped
+    expect(store.screen).toBe('pin');
+    await settle();
+    expect(await readLockGeneration()).toBe(g);               // not a lock
+  });
+
+  it('main PIN: the 10th wrong PIN still wipes the configuration (no lock counted)', async () => {
+    renderStore();
+    await openMain();
+    await act(async () => { await store.setupPin(MAIN_PIN); });
+    act(() => { store.lockApp(); });
+    await settle();
+    const g = await readLockGeneration();
+    let last: unknown;
+    for (let i = 1; i <= 10; i++) {
+      await setMeta('pin-locked-until', 0);
+      last = await store.unlockWithPin('000000').then(() => null, e => e);
+    }
+    expect(last).toBeInstanceOf(PinWipedError);
+    expect(await getMeta('pin-seed')).toBeUndefined();
+    await settle();
+    expect(await readLockGeneration()).toBe(g);
+  });
+
+  it('main PIN: a legacy blob is still re-wrapped to Argon2id on unlock', async () => {
+    await setMeta('pin-seed', await legacyPinBlob(MN, MAIN_PIN));
+    renderStore();
+    await waitFor(() => expect(store.screen).toBe('pin'));
+    await settle();
+    const g = await readLockGeneration();
+    await act(async () => { await store.unlockWithPin(MAIN_PIN); });
+    await waitFor(() => expect(store.screen).toBe('main'));
+    const blob = await getMeta<{ kdf?: string }>('pin-seed');
+    expect(blob?.kdf).toBe('argon2id');
+    await settle();
+    expect(await readLockGeneration()).toBe(g);
+  });
+
+  it('index maintenance needs no factor: a sweep with the section LOCKED (flag OFF) indexes the new chain', async () => {
+    flagState.secretLink = false;
+    renderStore();
+    await openSafebox();
+    act(() => { store.lockSafebox(); });
+    vi.mocked(verifySafeboxPin).mockClear();
+
+    const metaKey = await deriveSafeboxMetaKey(MN);
+    const secretKey = await deriveSafeboxSecretKey(MN);
+    const remote = await encryptSafeboxEntry(metaKey, secretKey, {
+      title: 'с другого устройства', login: '', url: '', note: '', password: 'pw', files: [], rev: 1,
+    });
+    const decrypted = await decryptSafeboxMeta(metaKey, remote);
+    vi.mocked(fetchAllNotes).mockResolvedValueOnce({
+      notes: [], safeboxEntries: [{ encrypted: remote, meta: decrypted, txId: 'TX-R' }], incomplete: false,
+    });
+
+    await act(async () => { await store.checkForUpdates(); });
+    const handle = await secretLinkHandle(await deriveSecretLinkKey(MN), remote.entryId);
+    await waitFor(async () => {
+      const snap = await readSecretLinkSnapshot();
+      expect(snap.index.has(SECRET_LINK_KEY_PREFIX + handle)).toBe(true);
+      expect(snap.coveragePresent).toBe(true);
+    });
+    const cov = await decryptIndexBlob(metaKey, (await getMeta(SECRET_LINK_COVERAGE_KEY))!);
+    expect(isCoverageRecord(cov)).toBe(true);
+    expect((cov as { rows: [string, string][] }).rows.map(r => r[0])).toContain(remote.entryId);
+    expect(store.safeboxUnlocked).toBe(false);
+    expect(vi.mocked(verifySafeboxPin)).not.toHaveBeenCalled();
+  });
+
+  it('commitSafeboxEntry(entry, configId, gen) keeps its old contract (no index, no new checks)', async () => {
+    renderStore();
+    await openSafebox();
+    const config = (await readSafeboxPinConfig())!;
+    const metaKey = await deriveSafeboxMetaKey(MN);
+    const secretKey = await deriveSafeboxSecretKey(MN);
+    const mk = () => encryptSafeboxEntry(metaKey, secretKey, {
+      title: 'old', login: '', url: '', note: '', password: 'pw', files: [], rev: 1,
+    });
+    // Let the open's own rebuild settle so the snapshot below is stable.
+    await settle();
+    const before = await readSecretLinkSnapshot();
+    const before_cov = await getMeta(SECRET_LINK_COVERAGE_KEY);
+
+    // A moved lock generation is NOT one of its checks.
+    await bumpLockGeneration();
+    const ok = await mk();
+    await commitSafeboxEntry(ok, config.configId, getDbGeneration());
+    expect((await getAllSafeboxEntries()).some(e => e.entryId === ok.entryId)).toBe(true);
+    const after = await readSecretLinkSnapshot();
+    expect([...after.index.keys()]).toEqual([...before.index.keys()]);
+    expect(await getMeta(SECRET_LINK_COVERAGE_KEY)).toEqual(before_cov);
+
+    const wrongConfig = await mk();
+    await expect(commitSafeboxEntry(wrongConfig, 'not-the-config', getDbGeneration()))
+      .rejects.toBeInstanceOf(SafeboxConfigChangedError);
+    const staleGen = await mk();
+    await expect(commitSafeboxEntry(staleGen, config.configId, getDbGeneration() - 1))
+      .rejects.toBeInstanceOf(StorageResetError);
+    await (await import('./storage')).deleteMeta(SAFEBOX_PIN_META_KEY);
+    const noConfig = await mk();
+    await expect(commitSafeboxEntry(noConfig, config.configId, getDbGeneration()))
+      .rejects.toBeInstanceOf(SafeboxConfigChangedError);
+    const ids = (await getAllSafeboxEntries()).map(e => e.entryId);
+    expect(ids).not.toContain(wrongConfig.entryId);
+    expect(ids).not.toContain(staleGen.entryId);
+    expect(ids).not.toContain(noConfig.entryId);
+  });
+
+  it('DB_VERSION is still 3', () => {
+    expect(DB_VERSION).toBe(3);
+  });
+
+  it('the return-verdict reader (getPinConfigMeta) reads exactly what it did before P1', async () => {
+    await setMeta(SECRET_LINKS_ENABLED_KEY, true);
+    await setMeta(SECRET_LINK_ORIGINS_KEY, ['https://baobook.app']);
+    await setMeta(VAULT_LOCK_GENERATION_KEY, 4);
+    const proto = (globalThis as unknown as { IDBObjectStore: { prototype: IDBObjectStore } }).IDBObjectStore.prototype;
+    const get = vi.spyOn(proto, 'get');
+    const getAll = vi.spyOn(proto, 'getAll');
+    const cursor = vi.spyOn(proto, 'openCursor');
+    try {
+      await getPinConfigMeta();
+      expect(get.mock.calls.map(c => c[0]).sort()).toEqual(['auto-lock-timeout', 'pin-seed']);
+      expect(getAll).not.toHaveBeenCalled();
+      expect(cursor).not.toHaveBeenCalled();
+    } finally {
+      get.mockRestore();
+      getAll.mockRestore();
+      cursor.mockRestore();
+    }
+  });
+
+  it('bumpLockGeneration writes the counter and nothing else (no PIN/PRF meter, no quick-unlock record)', async () => {
+    const record = { v: 1, credentialId: 'c', prfSalt: 'p', hkdfSalt: 'h', iv: 'i', ciphertext: 'x', pk: 'k', createdAt: 1 };
+    await setMeta('pin-attempts', 2);
+    await setMeta('pin-locked-until', 123);
+    await setMeta(QUICK_UNLOCK_META_KEY, record);
+    await setMeta(VAULT_LOCK_GENERATION_KEY, 4);
+    const put = vi.spyOn((globalThis as unknown as { IDBObjectStore: { prototype: IDBObjectStore } }).IDBObjectStore.prototype, 'put');
+    try {
+      expect(await bumpLockGeneration()).toBe(5);
+      expect(put.mock.calls.map(c => c[1])).toEqual([VAULT_LOCK_GENERATION_KEY]);
+    } finally {
+      put.mockRestore();
+    }
+    expect(await getMeta('pin-attempts')).toBe(2);
+    expect(await getMeta('pin-locked-until')).toBe(123);
+    expect(await getMeta(QUICK_UNLOCK_META_KEY)).toEqual(record);
   });
 });

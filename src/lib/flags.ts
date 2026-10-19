@@ -118,3 +118,23 @@ export const BACKUP_EXPORT_ENABLED: boolean = true;
  * branch into unreachable dead code under TS narrowing.
  */
 export const BACKUP_IMPORT_ENABLED: boolean = true;
+
+/**
+ * «Секрет по ссылке» gate (release P5 flips this to true in a dedicated
+ * commit/tag).
+ *
+ * Contract (enforced in the store and the parser, not just hidden UI):
+ * - GATED: the store ACTIONS of the feature (`copySecretLink` now, the
+ *   resolver and drop actions later) refuse, and `parseSecretLinkUrl` returns
+ *   `null` for every `#/s/…` hash, so the route canonicalizer treats it as an
+ *   unknown route.
+ * - NEVER GATED: maintenance of the index (`secret-link:<handle>`) and the
+ *   coverage (`secret-link-coverage`) on every safebox write, open, import and
+ *   sweep, and the lock counter `vault-lock-generation`. Flipping the flag on
+ *   must find an index that is already complete, and an OFF build must keep
+ *   revoking operations a P5+ tab may have started.
+ *
+ * Typed as `boolean` (not the literal) so OFF/ON test matrices don't turn one
+ * branch into unreachable dead code under TS narrowing.
+ */
+export const SECRET_LINK_ENABLED: boolean = false;

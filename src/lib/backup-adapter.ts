@@ -82,8 +82,10 @@ import {
   type BackupMergeResult,
   type BackupSizeEstimate,
   type LocalPayload,
+  type MaintenanceOp,
   type MergeBackupRecordInput,
 } from './storage';
+import { rebuildSecretLinkIndex, type RebuildOutcome } from './secret-link-index';
 import type { BackupArtifactMarker, BackupFreshness } from './backup-ui';
 
 /** D21: which file the freshness chip is about. */
@@ -159,6 +161,13 @@ export interface BackupVault {
    * page cannot read back out.
    */
   deriveKeys(): Promise<BackupVaultKeys>;
+  /**
+   * The secret-link HMAC key (`K_link`), under exactly the same contract as
+   * `deriveKeys`: the store reads its own seed reference at call time and
+   * refuses when it is gone, so the seed never travels with a prepared
+   * import. Used only by the index rebuild after stage B.
+   */
+  deriveSecretLinkKey(): Promise<CryptoKey>;
   dbGeneration: number;
   /** Epoch, database generation and the operation token — and it THROWS. */
   assertAlive(): void;
@@ -178,6 +187,8 @@ export interface BackupStorage {
   mergeRecord(input: MergeBackupRecordInput): Promise<BackupMergeResult>;
   readMeta<T>(key: string): Promise<T | undefined>;
   writeMeta(key: string, value: unknown): Promise<void>;
+  /** The secret-link index rebuild after an import (never throws). */
+  rebuildSecretLinkIndex(kLink: CryptoKey, metaKey: CryptoKey, mop: MaintenanceOp): Promise<RebuildOutcome>;
 }
 
 export const liveStorage: BackupStorage = {
@@ -188,6 +199,7 @@ export const liveStorage: BackupStorage = {
   mergeRecord: mergeBackupRecord,
   readMeta: getMeta,
   writeMeta: setMeta,
+  rebuildSecretLinkIndex: (kLink, metaKey, mop) => rebuildSecretLinkIndex(kLink, metaKey, mop),
 };
 
 /**
@@ -473,6 +485,37 @@ export class PreparedImport {
     // cannot produce keys at all.
     const keys = await vaultKeys(vault);
 
+    try {
+      return await this.#runStageB(keys);
+    } finally {
+      // Partial or complete, stage B may have added safebox rows: the secret
+      // link index is rebuilt over the WHOLE store — but only for a vault that
+      // is still the one stage B ran against. Never changes the report.
+      await this.#rebuildSecretLinkIndex(keys.safeboxMeta);
+    }
+  }
+
+  async #rebuildSecretLinkIndex(metaKey: CryptoKey): Promise<void> {
+    const vault = this.#vault;
+    const alive = () => {
+      try {
+        vault.assertAlive();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!alive()) return;
+    try {
+      const kLink = await vault.deriveSecretLinkKey();
+      await this.#storage.rebuildSecretLinkIndex(kLink, metaKey, { stillValid: alive });
+    } catch (err) {
+      console.warn('secret link: index not rebuilt after the import:', err instanceof Error ? err.name : typeof err);
+    }
+  }
+
+  #runStageB(keys: BackupVaultKeys): Promise<ImportReport> {
+    const vault = this.#vault;
     return runStageB(
       {
         now: vault.now,

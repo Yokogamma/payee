@@ -37,6 +37,7 @@ import {
   type EncryptedSafeboxEntry,
 } from './crypto';
 import type { ImportReport } from './backup-import';
+import { deriveSecretLinkKey } from './secret-link';
 
 /**
  * The wiring, which is where this feature can still go wrong.
@@ -63,6 +64,7 @@ const vaultKeys = async () => ({
 
 const vault = (over: Partial<BackupVault> = {}): BackupVault => ({
   deriveKeys: vaultKeys,
+  deriveSecretLinkKey: () => deriveSecretLinkKey(MNEMONIC),
   dbGeneration: DB_GENERATION,
   assertAlive: () => {},
   now: () => NOW,
@@ -95,6 +97,7 @@ function storage(over: Partial<BackupStorage> = {}) {
     },
     readMeta: async key => meta.get(key) as never,
     writeMeta: async (key, value) => { meta.set(key, value); },
+    rebuildSecretLinkIndex: async () => 'unchanged',
     ...over,
   };
   return { storage: base, meta, merges };
