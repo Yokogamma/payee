@@ -74,8 +74,10 @@ V4_UPLOADS_ENABLED = "true"
 # STRINGS (1 AR = 10^12 Winston). Read on EVERY request; any missing or
 # malformed value → 503 spend_guard_unconfigured on every paid path (fail
 # closed, never a default). Method and the quote they were derived from:
-# docs/ROLLBACK.md «Spend guard (D10)». Values below are the PROPOSAL of
-# 2026-09-24 (price/51200 = 3 295 552 823 W); the owner approves them there.
+# docs/ROLLBACK.md «Spend guard (D10)». Values below: the owner's numbers of
+# 2026-10-07 — the method of 2026-09-27 over price/51200 = 3 420 714 175 W,
+# rounded UP to a step of 0.01 AR (owner decision 2026-10-07); re-quoted on
+# the release day, a change is a new commit here and in ROLLBACK.
 # Gate: scripts/check-spend-limits.mjs (CI and the trusted deploy).
 #   WALLET_FLOOR_WINSTON     — the untouchable remainder of the CYCLE's
 #                              credited funds (7 days × ~3 publications × price).
@@ -83,9 +85,9 @@ V4_UPLOADS_ENABLED = "true"
 #   MAX_TX_REWARD_WINSTON    — ceiling of ONE NEW transaction's reward
 #                              (price at MAX_BODY_BYTES × ~4.5); legacy
 #                              transactions are held at their SIGNED reward.
-WALLET_FLOOR_WINSTON = "70000000000"
+WALLET_FLOOR_WINSTON = "80000000000"
 SPEND_WINDOW_CAP_WINSTON = "150000000000"
-MAX_TX_REWARD_WINSTON = "15000000000"
+MAX_TX_REWARD_WINSTON = "20000000000"
 # ── Trusted Arweave owners (D2/D9) ──
 # EVERY wallet address this project has ever posted under, comma separated.
 # The worker authenticates a publication before binding its txId to a payload
@@ -113,14 +115,14 @@ TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # Empty/unset falls back to a lone arweave.net, where `dead` is unreachable by
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
-STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+STATUS_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
 # The operator behind each status origin (D11 / D10 money quorums): two
 # origins of one operator are ONE voice, an origin missing here is NO voice
 # (fail-closed). Must equal the pin in scripts/gateway-pins.mjs
 # (STATUS_OPERATORS) and the client default; every STATUS_GATEWAYS origin must
 # have an operator and there must be >= 2 distinct operators. Gate:
 # scripts/check-gateways-vs-worker.mjs (CI and the trusted deploy).
-STATUS_OPERATORS = "https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,https://frostor.xyz=frostor,https://permagate.io=permagate"
+STATUS_OPERATORS = "https://arweave.net=arweave,https://vilenarios.com=ar-io,https://frostor.xyz=frostor,https://permagate.io=permagate"
 # ── Payload gateways (D2/D9) ──
 # Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
 # tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
@@ -135,7 +137,7 @@ STATUS_OPERATORS = "https://arweave.net=arweave,https://ar-io.dev=ar-io,https://
 # timed out past 25 s in the acceptance probes, and only the HTTP code matters
 # for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
 # the deploy gate compares them.
-PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://frostor.xyz"
 # ── Metrics (PR-2) ── Telemetry is fail-closed, the request path fail-open:
 # writes happen STRICTLY when METRICS_ENABLED = "true" AND the METRICS binding
 # exists; ANY other value (missing, garbage, no binding) disables writes
@@ -314,9 +316,9 @@ V3_UPLOADS_ENABLED = "true"
 V4_UPLOADS_ENABLED = "true"
 # D10 spend guard limits — declared explicitly for staging too (a named
 # environment inherits NOTHING); same values as production, same gate.
-WALLET_FLOOR_WINSTON = "70000000000"
+WALLET_FLOOR_WINSTON = "80000000000"
 SPEND_WINDOW_CAP_WINSTON = "150000000000"
-MAX_TX_REWARD_WINSTON = "15000000000"
+MAX_TX_REWARD_WINSTON = "20000000000"
 # ── Trusted Arweave owners (D2/D9) ──
 # EVERY wallet address this project has ever posted under, comma separated.
 # The worker authenticates a publication before binding its txId to a payload
@@ -345,14 +347,14 @@ TRUSTED_OWNERS = "Vgd_c_CcaG_DmGQ-dIvu_AVfq0bS1Wav9sjpQyeEPdE"
 # Empty/unset falls back to a lone arweave.net, where `dead` is unreachable by
 # construction — a production deploy with fewer than two origins is refused by
 # the config gate rather than shipped silently.
-STATUS_GATEWAYS = "https://arweave.net,https://ar-io.dev,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
+STATUS_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://frostor.xyz,https://permagate.io"
 # The operator behind each status origin (D11 / D10 money quorums): two
 # origins of one operator are ONE voice, an origin missing here is NO voice
 # (fail-closed). Must equal the pin in scripts/gateway-pins.mjs
 # (STATUS_OPERATORS) and the client default; every STATUS_GATEWAYS origin must
 # have an operator and there must be >= 2 distinct operators. Gate:
 # scripts/check-gateways-vs-worker.mjs (CI and the trusted deploy).
-STATUS_OPERATORS = "https://arweave.net=arweave,https://ar-io.dev=ar-io,https://vilenarios.com=vilenarios,https://frostor.xyz=frostor,https://permagate.io=permagate"
+STATUS_OPERATORS = "https://arweave.net=arweave,https://vilenarios.com=ar-io,https://frostor.xyz=frostor,https://permagate.io=permagate"
 # ── Payload gateways (D2/D9) ──
 # Bare https origins, comma separated, and the ORDER IS NORMATIVE: the pool is
 # tried in sequence, and this sequence is the one approved in §2.1 (arweave.net
@@ -367,7 +369,7 @@ STATUS_OPERATORS = "https://arweave.net=arweave,https://ar-io.dev=ar-io,https://
 # timed out past 25 s in the acceptance probes, and only the HTTP code matters
 # for status. MUST equal the client's VITE_PAYLOAD_GATEWAYS, order included —
 # the deploy gate compares them.
-PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://ar-io.dev,https://frostor.xyz"
+PAYLOAD_GATEWAYS = "https://arweave.net,https://vilenarios.com,https://frostor.xyz"
 # Metrics (PR-2) — same contract as production vars above; staging writes go
 # to its OWN dataset (explicit different name, M6 r14).
 METRICS_ENABLED = "true"

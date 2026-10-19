@@ -33,12 +33,15 @@ function chainAt(height: number) {
   }
 }
 describe('operators.ts — the map from the env, the pinned default, fail-closed unknowns', () => {
-  it('unset/blank → the pinned default (five origins, five operators); set → as-is; CORRUPT → an empty map, never the default (review 25.09 M4); an unknown origin is null', () => {
+  it('unset/blank → the pinned default (four origins, four operator groups since 2026-09-27); set → as-is; CORRUPT → an empty map, never the default (review 25.09 M4); an unknown origin is null', () => {
     const def = operatorMapOf({});
-    expect(def.size).toBe(5);
-    expect(new Set(def.values()).size).toBe(5);
-    expect(operatorMapOf({ STATUS_OPERATORS: '' }).size).toBe(5);
-    expect(operatorMapOf({ STATUS_OPERATORS: '  ' }).size).toBe(5);
+    expect(def.size).toBe(4);
+    expect(new Set(def.values()).size).toBe(4);
+    // ar-io.dev left the pool (testnet sandbox); vilenarios.com is AR.IO's.
+    expect(def.has('https://ar-io.dev')).toBe(false);
+    expect(def.get('https://vilenarios.com')).toBe('ar-io');
+    expect(operatorMapOf({ STATUS_OPERATORS: '' }).size).toBe(4);
+    expect(operatorMapOf({ STATUS_OPERATORS: '  ' }).size).toBe(4);
     // The reviewer's counterexample: a corrupt var must not turn into trust.
     for (const corrupt of ['garbage', 'https://arweave.net', 'http://arweave.net=arweave', '=arweave', 'https://arweave.net/path=arweave']) {
       const m = operatorMapOf({ STATUS_OPERATORS: corrupt });
@@ -54,7 +57,7 @@ describe('operators.ts — the map from the env, the pinned default, fail-closed
     expect(distinctOperators({ STATUS_OPERATORS: ONE_OPERATOR }, [...STATUS_ORIGINS])).toBe(1);
     expect(distinctOperators({ STATUS_OPERATORS: HALF_KNOWN }, [...STATUS_ORIGINS])).toBe(1);
     expect(distinctOperators({}, [...STATUS_ORIGINS])).toBe(1); // only arweave.net is in the default
-    expect(DEFAULT_STATUS_OPERATORS.split(',')).toHaveLength(5);
+    expect(DEFAULT_STATUS_OPERATORS.split(',')).toHaveLength(4);
   });
 });
 
