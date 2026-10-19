@@ -36,6 +36,7 @@ import { probeStatusOrigin } from './gateway-reads';
 import type { Emit } from './metrics';
 import { OP_PRUNE_MIN_AGE_MS, type OpProjection } from './op-journal';
 import { SPEND_CODES, moneyQuorum } from './spend-ledger';
+import { operatorOfEnv } from './operators';
 import { classifyStatus, classifyThrow } from './gateway-class';
 
 export interface LegacyItem { txId: string; reward: string; source: 'permit' | 'journal' }
@@ -49,6 +50,8 @@ export interface LegacyClosureEnv {
   RATE_LIMITER: DurableObjectNamespace;
   INVITE_MANAGER: DurableObjectNamespace;
   STATUS_GATEWAYS?: string;
+  /** The operator map of the status pool (`operators.ts`). */
+  STATUS_OPERATORS?: string;
   PAYLOAD_GATEWAYS?: string;
   TRUSTED_OWNERS?: string;
 }
@@ -61,7 +64,8 @@ export interface CloseLegacySetContext {
 }
 
 export interface LegacyClosureDeps {
-  operatorOf: (origin: string) => string;
+  /** Operator identity of a status origin; `null` = unknown = no money vote. */
+  operatorOf: (origin: string) => string | null;
   now: () => number;
 }
 
@@ -192,9 +196,12 @@ export async function journalCandidates(env: LegacyClosureEnv, key: string, now:
  * would count the same reward twice. The set is closed by construction for
  * them; only the journals' pre-D10 transactions need a hold.
  */
-export async function closeLegacySet(ctx: CloseLegacySetContext, deps: LegacyClosureDeps = { operatorOf: o => o, now: () => Date.now() }): Promise<LegacyClosure> {
+export async function closeLegacySet(ctx: CloseLegacySetContext, deps?: LegacyClosureDeps): Promise<LegacyClosure> {
+  // The env's operator map by default (operators.ts): the closure's money
+  // quorum counts operators like every other money decision.
+  const d: LegacyClosureDeps = deps ?? { operatorOf: operatorOfEnv(ctx.env), now: () => Date.now() };
   try {
-    return await closeLegacySetStrict(ctx, deps);
+    return await closeLegacySetStrict(ctx, d);
   } catch (e) {
     if (e instanceof ClosureFailure) {
       ctx.emit('legacy_closure_failed', [e.where], []);

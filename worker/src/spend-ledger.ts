@@ -476,7 +476,8 @@ export type MoneyQuorum =
 /**
  * The ONE rule under which the guard treats a transaction as CONFIRMED for
  * money (review 24.09, high): at least `MIN_BALANCE_SOURCES` independent
- * OPERATORS (two origins of one operator are one voice), each answering
+ * OPERATORS (two origins of one operator are one voice; an origin the map
+ * does not know is no voice — `operators.ts`), each answering
  * `confirmed` with ≥ `MIN_DEPOSIT_CONFIRMATIONS`, their heights within
  * `MAX_STATUS_HEIGHT_SKEW`. Liveness (the PR-3a `statusVerdict`, satisfied by
  * a single 200 with zero confirmations) is a different question and never
@@ -487,13 +488,16 @@ export type MoneyQuorum =
  * at or below the marker (`spend-guard.ts` initStep), and the marker's own
  * `h_init` is the maximum too (§4.1).
  */
-export function moneyQuorum(votes: readonly QuorumVoteLike[], operatorOf: (origin: string) => string): MoneyQuorum {
+export function moneyQuorum(votes: readonly QuorumVoteLike[], operatorOf: (origin: string) => string | null): MoneyQuorum {
   const byOperator = new Map<string, ConfirmedVote>();
   for (const v of votes) {
     if (v.kind !== 'confirmed') continue;
     const c = v as ConfirmedVote;
     if (c.confirmations < MIN_DEPOSIT_CONFIRMATIONS) continue;
+    // FAIL-CLOSED (D11 M4, operator map): an origin with no known operator
+    // casts no money vote at all — it must not become a voice of its own.
     const op = operatorOf(c.origin);
+    if (op === null) continue;
     if (!byOperator.has(op)) byOperator.set(op, c);
   }
   const agreed = [...byOperator.values()];

@@ -223,6 +223,42 @@ the journal are defined in docs/ROLLBACK.md.
 curl -sS -X POST https://<worker>/admin/ops -H 'Content-Type: application/json' -H 'Authorization: Bearer <METRICS_ADMIN_SECRET>'   -d '{"ownerPk":"<canonical base64 pk>","from":1789000000000,"to":1789086400000,"limit":200}'
 ```
 
+## POST /admin/recovery-census — the rollback census (PR-3b reader)
+
+Read-only, bearer `METRICS_ADMIN_SECRET`, `no-store`, body `{}`. Answers
+whether EVERY key's recovery set is empty — the proof a rollback below the
+reader needs (docs/ROLLBACK.md «PR-3b reader release», «Rollback»). The key
+set is the legacy closure's: used invites incl. revoked ones, the live `pk:*`
+and the keys the operator registered with `/admin/spend/init-legacy-keys`;
+old-format invites that hide a key keep it incomplete until acknowledged. Per
+key three independent counts are read — the persistent `recoveryCount`, the
+`recovery:` index and a direct scan of the note records — so a drifted counter
+cannot read as empty. At most 200 keys per census (more → `too_many_keys`,
+fail-closed).
+
+The answer is a SUMMARY and nothing else — never a key, noteId or txId:
+`{workerVersionId, releaseSha, census: {complete, verdict: empty | not_empty |
+incomplete, keys: {listed, checked, failed}, legacyInvites: {unknown,
+acknowledged}, recovery: {count, due, records, keysWithRecovery}, reasons}}`,
+`reasons` ⊆ `list_keys_failed`, `legacy_keys_failed`,
+`legacy_invites_unacknowledged`, `too_many_keys`, `key_read_failed`,
+`recovery_present`, `counter_drift`. A failed or malformed read is
+`incomplete`, never empty.
+
+The operator reads it through `worker/scripts/recovery-census.mjs`
+(`npm run census:recovery`, target allowlist of the smoke scripts), which
+re-checks every field on its own: exit 0 only for complete + empty, 1 =
+refused, 2 = usage. `CENSUS_MIN_KEYS` (default 1) refuses a contour with users
+that suddenly lists no keys. Identity is part of the proof: `workerVersionId`
+must be a non-empty string and `releaseSha` a full 40-hex SHA;
+`CENSUS_EXPECT_RELEASE_SHA` / `CENSUS_EXPECT_VERSION_ID` pin them to the
+version the operator means. `releaseSha: null` is always refused: the reader
+ships to dev only, and dev deploys with `RELEASE_SHA` (`deploy-worker.yml`).
+
+```bash
+CENSUS_URL=https://<worker> METRICS_ADMIN_SECRET=<secret> npm --prefix worker run census:recovery
+```
+
 ## What PR-2 does NOT close (release-notes honesty, P0 r18)
 
 1. **The ambiguous POST exception.** A transaction ACCEPTED by the gateway
@@ -290,9 +326,10 @@ discriminator).
 | `legacy_resolved` | event, outcome (`spent` / `dropped`) | — | `/admin/spend/init` in `done`, one per held item resolved by the quorum |
 | `post_accepted` / `redrop_new_tx` | as PR-2 | — | ALSO from the scheduler: a resend accepted / a phase-2 signature committed |
 
+| `spend_conflict` | event, outcome (`spent`) | — | `settleByTx` (recheck path, money index, scheduler) when the guard answered `conflict: true` — the lattice booked `released → spent` for a reservation that had been released (a late landing, §7); a `SPEND_CONFLICT` log line accompanies it. **An alert, not the evidence:** the answer can be lost and a retry is a no-op (`conflict: false`), and Analytics Engine may drop or sample a write. The soak's strict zero reads the DURABLE counter the DO writes in the same transaction as the booking — `/admin/spend/status` → `guard.conflicts { count, lastAt, lastSpendKey, lastOutcome }` (review 25.09) |
+
 Reserved (spec §11.9), NOT written yet: `freeze_active`, `legacy_held_winston`,
-`legacy_resolved{outcome}`, `ledger_inconsistent`, `spend_conflict` and the
-remaining gauges — they come with the scheduler and the closure of the legacy set.
+`ledger_inconsistent` and the remaining gauges — they come with the writer.
 
 The `/upload` answer codes the saga adds (`worker/src/upload-codes.json`):
 `spend_guard_unconfigured` (step 0, pre-admission — the limits are missing)

@@ -129,3 +129,25 @@ export function parseIndexSources(raw: string): string[][] {
 export function serializeStatusOrigins(origins: readonly string[]): string {
   return JSON.stringify([...origins].sort());
 }
+
+/**
+ * Parse the `canonicalOrigin → operatorId` map for the status pool (D11, v16):
+ * `https://a=op-a,https://b=op-b`. Origins are canonized with the same rule as
+ * the status list; an entry with an unparseable origin or an empty operator id
+ * is DROPPED; a duplicated origin keeps its FIRST operator. Operator ids are
+ * opaque labels — only their equality matters (two origins with the same id are
+ * ONE voice in the age quorum).
+ */
+export function parseOperatorMap(raw: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const part of String(raw ?? '').split(GROUP_SEPARATOR)) {
+    if (part.trim() === '') continue;
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const origin = canonicalOrigin(part.slice(0, eq));
+    const operator = part.slice(eq + 1).trim();
+    if (origin === null || operator === '' || out.has(origin)) continue;
+    out.set(origin, operator);
+  }
+  return out;
+}
